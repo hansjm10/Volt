@@ -31,7 +31,10 @@ type config struct {
 	ListenAddress           string
 	Issuer                  string
 	Audience                string
+	SigningMode             string
 	SigningKeyPath          string
+	KMSActiveKeyVersion     string
+	KMSRetiringKeyVersions  []string
 	DatabaseURL             string
 	AppCheckMode            string
 	DevAppCheck             string
@@ -55,15 +58,36 @@ func main() {
 		os.Exit(2)
 	}
 
-	signer, err := credential.LoadOrCreateSigner(
-		configuration.Issuer,
-		configuration.Audience,
-		configuration.SigningKeyPath,
-	)
+	var signer *credential.Signer
+	switch configuration.SigningMode {
+	case "local":
+		signer, err = credential.LoadOrCreateSigner(
+			configuration.Issuer,
+			configuration.Audience,
+			configuration.SigningKeyPath,
+		)
+	case "kms":
+		kmsContext, cancelKMS := context.WithTimeout(context.Background(), 30*time.Second)
+		signer, err = credential.NewKMSSigner(
+			kmsContext,
+			configuration.Issuer,
+			configuration.Audience,
+			configuration.KMSActiveKeyVersion,
+			configuration.KMSRetiringKeyVersions,
+		)
+		cancelKMS()
+	default:
+		err = fmt.Errorf("unsupported credential signing mode %q", configuration.SigningMode)
+	}
 	if err != nil {
-		logger.Error("load signing key", "error", err)
+		logger.Error("configure credential signer", "error", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if err := signer.Close(); err != nil {
+			logger.Error("close credential signer", "error", err)
+		}
+	}()
 	var appCheck httpapi.AppCheckVerifier
 	switch configuration.AppCheckMode {
 	case "development":
@@ -148,6 +172,8 @@ func main() {
 			"issuer", configuration.Issuer,
 			"audience", configuration.Audience,
 			"keyId", signer.KeyID(),
+			"acceptedKeyIds", signer.KeyIDs(),
+			"signingMode", configuration.SigningMode,
 			"appCheckMode", configuration.AppCheckMode,
 		)
 		serverErrors <- server.ListenAndServe()
@@ -215,6 +241,35 @@ func loadConfig() (config, error) {
 	allowedFirebaseAppIDs := commaSeparatedEnv(
 		os.Getenv("VOLT_ALLOWED_FIREBASE_APP_IDS"),
 	)
+	signingMode := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_SIGNING_MODE"))
+	if signingMode == "" {
+		return config{}, errors.New("VOLT_CREDENTIAL_SIGNING_MODE is required")
+	}
+	signingKeyPath := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_SIGNING_KEY_FILE"))
+	kmsActiveKeyVersion := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_KMS_ACTIVE_KEY_VERSION"))
+	kmsRetiringValue := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_KMS_RETIRING_KEY_VERSIONS"))
+	kmsRetiringKeyVersions, err := keyVersionsEnv(kmsRetiringValue)
+	if err != nil {
+		return config{}, err
+	}
+	switch signingMode {
+	case "local":
+		if kmsActiveKeyVersion != "" || kmsRetiringValue != "" {
+			return config{}, errors.New("Cloud KMS key versions require VOLT_CREDENTIAL_SIGNING_MODE=kms")
+		}
+		if signingKeyPath == "" {
+			signingKeyPath = defaultSigningKey
+		}
+	case "kms":
+		if signingKeyPath != "" {
+			return config{}, errors.New("VOLT_CREDENTIAL_SIGNING_KEY_FILE cannot be used in kms signing mode")
+		}
+		if kmsActiveKeyVersion == "" {
+			return config{}, errors.New("VOLT_CREDENTIAL_KMS_ACTIVE_KEY_VERSION is required in kms signing mode")
+		}
+	default:
+		return config{}, fmt.Errorf("unsupported credential signing mode %q", signingMode)
+	}
 	if appCheckMode == "development" && len(devAppCheck) < 32 {
 		return config{}, errors.New("VOLT_DEVELOPMENT_APP_CHECK_TOKEN must contain at least 32 characters in development mode")
 	}
@@ -226,7 +281,10 @@ func loadConfig() (config, error) {
 		ListenAddress:           stringEnv("VOLT_CREDENTIAL_LISTEN", defaultListenAddress),
 		Issuer:                  stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer),
 		Audience:                stringEnv("VOLT_CREDENTIAL_AUDIENCE", defaultAudience),
-		SigningKeyPath:          stringEnv("VOLT_CREDENTIAL_SIGNING_KEY_FILE", defaultSigningKey),
+		SigningMode:             signingMode,
+		SigningKeyPath:          signingKeyPath,
+		KMSActiveKeyVersion:     kmsActiveKeyVersion,
+		KMSRetiringKeyVersions:  kmsRetiringKeyVersions,
 		DatabaseURL:             databaseURL,
 		AppCheckMode:            appCheckMode,
 		DevAppCheck:             devAppCheck,
@@ -258,6 +316,25 @@ func commaSeparatedEnv(value string) []string {
 		}
 	}
 	return result
+}
+
+func keyVersionsEnv(value string) ([]string, error) {
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) > 7 {
+		return nil, errors.New("VOLT_CREDENTIAL_KMS_RETIRING_KEY_VERSIONS cannot contain more than seven versions")
+	}
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			return nil, errors.New("VOLT_CREDENTIAL_KMS_RETIRING_KEY_VERSIONS contains an empty version")
+		}
+		result = append(result, name)
+	}
+	return result, nil
 }
 
 func durationEnv(name string, fallback time.Duration) (time.Duration, error) {

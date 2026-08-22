@@ -1,6 +1,7 @@
 package credential
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -24,7 +25,7 @@ func TestSignerIssuesAndVerifiesNodeBoundToken(t *testing.T) {
 
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	nodeID := strings.Repeat("a", 64)
-	token, expiresAt, err := signer.Issue(nodeID, "host", "grant_identifier_one", "jwt_identifier_one", now, 15*time.Minute)
+	token, expiresAt, err := signer.Issue(context.Background(), nodeID, "host", "grant_identifier_one", "jwt_identifier_one", now, 15*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestSignerRejectsClaimsTheRelayWouldReject(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, _, err := signer.Issue(test.subject, test.endpointKind, test.grantID, test.jwtID, now, test.ttl); err == nil {
+			if _, _, err := signer.Issue(context.Background(), test.subject, test.endpointKind, test.grantID, test.jwtID, now, test.ttl); err == nil {
 				t.Fatal("relay-incompatible claim was issued")
 			}
 		})
@@ -100,6 +101,7 @@ func TestSignerInteropVector(t *testing.T) {
 		t.Fatal(err)
 	}
 	token, _, err := signer.Issue(
+		context.Background(),
 		nodeID,
 		"host",
 		"grant_identifier_one",

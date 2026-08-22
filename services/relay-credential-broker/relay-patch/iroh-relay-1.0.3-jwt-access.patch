@@ -1,11 +1,43 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6d6686743..2cd71e184 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2479,6 +2479,7 @@ dependencies = [
+  "serde_bytes",
+  "serde_json",
+  "sha1 0.11.0",
++ "sha2",
+  "simdutf8",
+  "strum",
+  "test-strategy",
+diff --git a/iroh-relay/Cargo.toml b/iroh-relay/Cargo.toml
+index a9815c227..d8eb56e4c 100644
+--- a/iroh-relay/Cargo.toml
++++ b/iroh-relay/Cargo.toml
+@@ -80,6 +80,7 @@ tokio-rustls-acme = { version = "0.9", optional = true }
+ tokio-websockets = { version = "0.13", features = ["rustls-bring-your-own-connector", "getrandom", "rand", "server", "sha1_smol"], optional = true } # server-side websocket implementation
+ simdutf8 = { version = "0.1.5", optional = true } # minimal version fix
+ sha1 = { version = "0.11.0", optional = true }
++sha2 = { version = "0.11.0", optional = true }
+ toml = { version = "1.0", optional = true }
+ serde_json = { version = "1", optional = true }
+ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+@@ -145,6 +146,7 @@ server = [
+     "dep:tokio-websockets",
+     "dep:simdutf8",
+     "dep:sha1",
++    "dep:sha2",
+     "dep:toml",
+     "dep:serde_json",
+     "dep:tracing-subscriber",
 diff --git a/iroh-relay/src/jwt_access.rs b/iroh-relay/src/jwt_access.rs
 new file mode 100644
-index 0000000..a8897ba
+index 000000000..35ed41377
 --- /dev/null
 +++ b/iroh-relay/src/jwt_access.rs
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,721 @@
 +use std::{
-+    collections::HashMap,
++    collections::{HashMap, HashSet},
 +    sync::Mutex,
 +    time::{SystemTime, UNIX_EPOCH},
 +};
@@ -15,11 +47,12 @@ index 0000000..a8897ba
 +use iroh_base::{EndpointId, PublicKey, Signature};
 +use iroh_relay::server::{Access, AccessControl, ClientRequest, ConnectionId};
 +use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
 +use tokio::sync::Semaphore;
 +use tracing::{debug, warn};
 +
 +const MAX_JWT_BYTES: usize = 8 * 1024;
-+const MAX_KEY_ID_BYTES: usize = 128;
++const MAX_VERIFICATION_KEYS: usize = 8;
 +const MAX_AUTHORITY_BYTES: usize = 512;
 +const MAX_IDENTIFIER_BYTES: usize = 128;
 +const MIN_IDENTIFIER_BYTES: usize = 16;
@@ -33,10 +66,8 @@ index 0000000..a8897ba
 +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 +#[serde(deny_unknown_fields)]
 +pub(crate) struct JwtAccessConfig {
-+    /// Ed25519 public key as unpadded base64url (the JWKS `x` value).
-+    pub(crate) public_key: String,
-+    /// Exact JWT `kid` accepted by this relay process.
-+    pub(crate) key_id: String,
++    /// Active and retiring Ed25519 public keys accepted by `kid` during rotation.
++    pub(crate) keys: Vec<JwtVerificationKey>,
 +    /// Exact JWT issuer.
 +    pub(crate) issuer: String,
 +    /// Exact JWT audience.
@@ -59,6 +90,14 @@ index 0000000..a8897ba
 +    /// Maximum simultaneous JWT signature verifications.
 +    #[serde(default = "default_max_concurrent_verifications")]
 +    pub(crate) max_concurrent_verifications: usize,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct JwtVerificationKey {
++    /// Ed25519 public key as unpadded base64url (the JWKS `x` value). The `kid`
++    /// is derived as base64url(SHA-256(public_key)[0..12]), matching the broker.
++    pub(crate) public_key: String,
 +}
 +
 +const fn default_max_token_lifetime_seconds() -> u64 {
@@ -95,8 +134,7 @@ index 0000000..a8897ba
 +
 +#[derive(Debug)]
 +struct JwtVerifier {
-+    public_key: PublicKey,
-+    key_id: String,
++    public_keys: HashMap<String, PublicKey>,
 +    issuer: String,
 +    audience: String,
 +    max_token_lifetime_seconds: i64,
@@ -152,14 +190,8 @@ index 0000000..a8897ba
 +
 +impl JwtAccess {
 +    pub(crate) fn new(config: JwtAccessConfig) -> Result<Self, &'static str> {
-+        if config.key_id.is_empty()
-+            || config.key_id.len() > MAX_KEY_ID_BYTES
-+            || config
-+                .key_id
-+                .bytes()
-+                .any(|byte| byte.is_ascii_whitespace() || byte == b',')
-+        {
-+            return Err("access.jwt.key_id is invalid");
++        if config.keys.is_empty() || config.keys.len() > MAX_VERIFICATION_KEYS {
++            return Err("access.jwt.keys must contain between one and eight keys");
 +        }
 +        if !valid_authority(&config.issuer) || !valid_authority(&config.audience) {
 +            return Err("access.jwt issuer or audience is invalid");
@@ -186,16 +218,26 @@ index 0000000..a8897ba
 +            return Err("access.jwt connection limits are invalid");
 +        }
 +
-+        let public_key_bytes = decode_array::<32>(&config.public_key).map_err(
-+            |_| "access.jwt.public_key must be a canonical 32-byte unpadded base64url value",
-+        )?;
-+        let public_key = PublicKey::from_bytes(&public_key_bytes)
-+            .map_err(|_| "access.jwt.public_key is not a valid Ed25519 key")?;
++        let mut public_keys = HashMap::with_capacity(config.keys.len());
++        let mut public_key_bytes = HashSet::with_capacity(config.keys.len());
++        for key in config.keys {
++            let key_bytes = decode_array::<32>(&key.public_key).map_err(
++                |_| "access.jwt.keys[].public_key must be a canonical 32-byte unpadded base64url value",
++            )?;
++            let public_key = PublicKey::from_bytes(&key_bytes)
++                .map_err(|_| "access.jwt.keys[].public_key is not a valid Ed25519 key")?;
++            if public_keys
++                .insert(key_id_for(&key_bytes), public_key)
++                .is_some()
++                || !public_key_bytes.insert(key_bytes)
++            {
++                return Err("access.jwt.keys must have unique public keys and derived key IDs");
++            }
++        }
 +
 +        Ok(Self {
 +            verifier: JwtVerifier {
-+                public_key,
-+                key_id: config.key_id,
++                public_keys,
 +                issuer: config.issuer,
 +                audience: config.audience,
 +                max_token_lifetime_seconds: config.max_token_lifetime_seconds as i64,
@@ -368,15 +410,19 @@ index 0000000..a8897ba
 +            .map_err(|_| "JWT header is not canonical base64url")?;
 +        let header: JwtHeader =
 +            serde_json::from_slice(&header_bytes).map_err(|_| "JWT header JSON is invalid")?;
-+        if header.alg != "EdDSA" || header.typ != "JWT" || header.kid != self.key_id {
++        if header.alg != "EdDSA" || header.typ != "JWT" {
 +            return Err("JWT header authority is invalid");
 +        }
++        let public_key = self
++            .public_keys
++            .get(&header.kid)
++            .ok_or("JWT signing key is not accepted")?;
 +
 +        let signature_bytes = decode_array::<64>(encoded_signature)
 +            .map_err(|_| "JWT signature encoding is invalid")?;
 +        let signature = Signature::from_bytes(&signature_bytes);
 +        let signing_input = format!("{encoded_header}.{encoded_claims}");
-+        self.public_key
++        public_key
 +            .verify(signing_input.as_bytes(), &signature)
 +            .map_err(|_| "JWT signature is invalid")?;
 +
@@ -417,6 +463,10 @@ index 0000000..a8897ba
 +            grant_id: claims.grant_id,
 +        })
 +    }
++}
++
++fn key_id_for(public_key: &[u8; 32]) -> String {
++    BASE64URL_NOPAD.encode(&Sha256::digest(public_key)[..12])
 +}
 +
 +fn valid_authority(value: &str) -> bool {
@@ -463,7 +513,6 @@ index 0000000..a8897ba
 +
 +    use super::*;
 +
-+    const KEY_ID: &str = "credential-key-one";
 +    const ISSUER: &str = "https://credentials.volt.test";
 +    const AUDIENCE: &str = "volt-iroh-relay-canary";
 +
@@ -471,14 +520,23 @@ index 0000000..a8897ba
 +        SecretKey::from_bytes(&[7; 32])
 +    }
 +
++    fn retiring_signing_key() -> SecretKey {
++        SecretKey::from_bytes(&[8; 32])
++    }
++
 +    fn endpoint_key() -> SecretKey {
 +        SecretKey::from_bytes(&[9; 32])
 +    }
 +
++    fn verification_key(signing_key: &SecretKey) -> JwtVerificationKey {
++        JwtVerificationKey {
++            public_key: BASE64URL_NOPAD.encode(signing_key.public().as_bytes()),
++        }
++    }
++
 +    fn config() -> JwtAccessConfig {
 +        JwtAccessConfig {
-+            public_key: BASE64URL_NOPAD.encode(signing_key().public().as_bytes()),
-+            key_id: KEY_ID.to_string(),
++            keys: vec![verification_key(&signing_key())],
 +            issuer: ISSUER.to_string(),
 +            audience: AUDIENCE.to_string(),
 +            max_token_lifetime_seconds: 3600,
@@ -491,11 +549,23 @@ index 0000000..a8897ba
 +    }
 +
 +    fn token(endpoint_id: EndpointId, overrides: serde_json::Value) -> String {
++        token_with_key(endpoint_id, overrides, &signing_key())
++    }
++
++    fn token_with_key(
++        endpoint_id: EndpointId,
++        overrides: serde_json::Value,
++        signing_key: &SecretKey,
++    ) -> String {
 +        let now = SystemTime::now()
 +            .duration_since(UNIX_EPOCH)
 +            .unwrap()
 +            .as_secs() as i64;
-+        let header = json!({"alg":"EdDSA","kid":KEY_ID,"typ":"JWT"});
++        let header = json!({
++            "alg":"EdDSA",
++            "kid":key_id_for(signing_key.public().as_bytes()),
++            "typ":"JWT"
++        });
 +        let mut claims = json!({
 +            "iss": ISSUER,
 +            "aud": AUDIENCE,
@@ -514,7 +584,7 @@ index 0000000..a8897ba
 +        let encoded_header = BASE64URL_NOPAD.encode(&serde_json::to_vec(&header).unwrap());
 +        let encoded_claims = BASE64URL_NOPAD.encode(&serde_json::to_vec(&claims).unwrap());
 +        let signing_input = format!("{encoded_header}.{encoded_claims}");
-+        let signature = signing_key().sign(signing_input.as_bytes());
++        let signature = signing_key.sign(signing_input.as_bytes());
 +        format!(
 +            "{signing_input}.{}",
 +            BASE64URL_NOPAD.encode(&signature.to_bytes())
@@ -617,13 +687,34 @@ index 0000000..a8897ba
 +    }
 +
 +    #[test]
++    fn accepts_active_and_retiring_keys_during_rotation() {
++        let endpoint_id = endpoint_key().public();
++        let mut rotation_config = config();
++        rotation_config
++            .keys
++            .push(verification_key(&retiring_signing_key()));
++        let access = JwtAccess::new(rotation_config).unwrap();
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++
++        let active = request(endpoint_id, &token(endpoint_id, json!({})));
++        access.verifier.verify_at(&active, now).unwrap();
++        let retiring_token = token_with_key(endpoint_id, json!({}), &retiring_signing_key());
++        let retiring = request(endpoint_id, &retiring_token);
++        access.verifier.verify_at(&retiring, now).unwrap();
++    }
++
++    #[test]
 +    fn accepts_go_issuer_interop_vector() {
 +        const NODE_ID: &str = "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618";
 +        const TOKEN: &str = "eyJhbGciOiJFZERTQSIsImtpZCI6Il9vRXNFdk9yVE9hc1hiYWEiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2NyZWRlbnRpYWxzLnZvbHQudGVzdCIsImF1ZCI6InZvbHQtaXJvaC1yZWxheS1jYW5hcnkiLCJzdWIiOiJmZDE3MjQzODVhYTBjNzViNjRmYjc4Y2Q2MDJmYTFkOTkxZmRlYmY3NmIxM2M1OGVkNzAyZWFjODM1ZTlmNjE4IiwiZXhwIjoxNzg3MzE0NTAwLCJpYXQiOjE3ODczMTM2MDAsImp0aSI6Imp3dF9pZGVudGlmaWVyX29uZSIsInNjb3BlIjoicmVsYXk6Y29ubmVjdCIsImVuZHBvaW50X2tpbmQiOiJob3N0IiwiZ3JhbnRfaWQiOiJncmFudF9pZGVudGlmaWVyX29uZSJ9.S0Eq4fPo1jq1ZUvASpZiE_6Grdx2Mb_iCkbtMLXxQktkJKSvriAc1CCISYwzd6ynPJKbNdcmnokG71jWpGvwCA";
 +        let endpoint_id: EndpointId = NODE_ID.parse().unwrap();
 +        let access = JwtAccess::new(JwtAccessConfig {
-+            public_key: "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw".to_string(),
-+            key_id: "_oEsEvOrTOasXbaa".to_string(),
++            keys: vec![JwtVerificationKey {
++                public_key: "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw".to_string(),
++            }],
 +            issuer: ISSUER.to_string(),
 +            audience: AUDIENCE.to_string(),
 +            max_token_lifetime_seconds: 3600,
@@ -650,7 +741,15 @@ index 0000000..a8897ba
 +        assert!(JwtAccess::new(unsafe_config).is_err());
 +
 +        let mut unsafe_config = config();
-+        unsafe_config.public_key = "not-base64url".to_string();
++        unsafe_config.keys[0].public_key = "not-base64url".to_string();
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.keys.clear();
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.keys.push(verification_key(&signing_key()));
 +        assert!(JwtAccess::new(unsafe_config).is_err());
 +
 +        let mut unsafe_config = config();
@@ -659,13 +758,13 @@ index 0000000..a8897ba
 +    }
 +}
 diff --git a/iroh-relay/src/main.rs b/iroh-relay/src/main.rs
-index 2ca043d..116c235 100644
+index 2ca043df0..7b798c6ba 100644
 --- a/iroh-relay/src/main.rs
 +++ b/iroh-relay/src/main.rs
 @@ -3,6 +3,8 @@
  //! This handles only the CLI and config file loading, the server implementation lives in
  //! [`iroh::relay::server`].
-
+ 
 +mod jwt_access;
 +
  use std::{
@@ -674,7 +773,7 @@ index 2ca043d..116c235 100644
 @@ -30,6 +32,8 @@ use tracing_subscriber::{EnvFilter, prelude::*};
  use url::Url;
  use webpki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-
+ 
 +use crate::jwt_access::{JwtAccess, JwtAccessConfig};
 +
  /// The default `http_bind_port` when using `--dev`.
@@ -695,7 +794,7 @@ index 2ca043d..116c235 100644
 -    #[serde(default)]
      access: AccessConfig,
  }
-
+ 
 @@ -173,6 +177,8 @@ enum AccessConfig {
      /// To grant access, the HTTP endpoint must return a `200` response with `true` as the response text.
      /// In all other cases, the endpoint will be denied access.
@@ -726,7 +825,7 @@ index 2ca043d..116c235 100644
 +        } else {
 +            bail_any!("--config-path is required outside --dev mode");
          };
-
+ 
 -        if config_path.exists() {
 -            Self::read_from_file(&config_path).await
 -        } else {
@@ -736,10 +835,10 @@ index 2ca043d..116c235 100644
          }
 +        Self::read_from_file(config_path).await
      }
-
+ 
      fn from_str(config: &str) -> Result<Self> {
 @@ -582,6 +593,7 @@ async fn main() -> Result<()> {
-
+ 
      let cli = Cli::parse();
      let mut cfg = Config::load(&cli).await?;
 +    validate_access_mode(&cli, &cfg)?;
@@ -749,7 +848,7 @@ index 2ca043d..116c235 100644
 @@ -612,6 +624,13 @@ async fn main() -> Result<()> {
      Ok(())
  }
-
+ 
 +fn validate_access_mode(cli: &Cli, cfg: &Config) -> Result<()> {
 +    if !cli.dev && matches!(cfg.access, AccessConfig::Everyone) {
 +        bail_any!("access = \"everyone\" is allowed only in --dev mode");
@@ -769,27 +868,31 @@ index 2ca043d..116c235 100644
              bytes_per_second = 400
              max_burst_bytes = 800
 @@ -816,7 +836,7 @@ mod tests {
-
+ 
      #[tokio::test]
      async fn test_rate_limit_default() -> Result {
 -        let config = Config::from_str("")?;
 +        let config = Config::from_str("access = \"everyone\"")?;
          let relay_config = build_relay_config(config).await?;
-
+ 
          let relay = relay_config.relay.expect("no relay config");
-@@ -898,6 +918,37 @@ mod tests {
+@@ -898,6 +918,42 @@ mod tests {
              })
          );
-
+ 
 +        let config = r#"
 +            [access.jwt]
-+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-+            key_id = "credential-key-one"
 +            issuer = "https://credentials.volt.test"
 +            audience = "volt-iroh-relay-canary"
 +            max_global_connections = 100
 +            max_node_connections = 4
 +            max_grant_connections = 8
++
++            [[access.jwt.keys]]
++            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++
++            [[access.jwt.keys]]
++            public_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA"
 +        "#
 +        .to_string();
 +        let config = Config::from_str(dbg!(&config))?;
@@ -797,11 +900,12 @@ index 2ca043d..116c235 100644
 +
 +        let misspelled_jwt_policy = r#"
 +            [access.jwt]
-+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-+            key_id = "credential-key-one"
 +            issuer = "https://credentials.volt.test"
 +            audience = "volt-iroh-relay-canary"
 +            max_node_connectons = 4
++
++            [[access.jwt.keys]]
++            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 +        "#;
 +        assert!(
 +            Config::from_str(misspelled_jwt_policy).is_err(),
@@ -815,7 +919,7 @@ index 2ca043d..116c235 100644
          let config = r#"
              access.shared_token = ["token-a", "token-b"]
          "#
-@@ -937,6 +988,7 @@ mod tests {
+@@ -937,6 +993,7 @@ mod tests {
      async fn test_enable_relay_config() -> Result {
          let config = "
              enable_relay = false
@@ -823,8 +927,8 @@ index 2ca043d..116c235 100644
          ";
          let config = Config::from_str(config)?;
          let relay_config = build_relay_config(config).await?;
-@@ -944,16 +996,37 @@ mod tests {
-
+@@ -944,16 +1001,37 @@ mod tests {
+ 
          let config = "
              enable_relay = true
 +            access = \"everyone\"
@@ -832,13 +936,13 @@ index 2ca043d..116c235 100644
          let config = Config::from_str(config)?;
          let relay_config = build_relay_config(config).await?;
          assert!(relay_config.relay.is_some());
-
+ 
 -        let config = "";
 -        let config = Config::from_str(config)?;
 -        let relay_config = build_relay_config(config).await?;
 -        assert!(relay_config.relay.is_some());
 +        assert!(Config::from_str("").is_err(), "access must be explicit");
-
+ 
          Ok(())
      }
 +
@@ -866,7 +970,7 @@ index 2ca043d..116c235 100644
 +    }
  }
 diff --git a/iroh-relay/src/server/http_server.rs b/iroh-relay/src/server/http_server.rs
-index 22384eb..374a311 100644
+index 22384ebfb..374a3115a 100644
 --- a/iroh-relay/src/server/http_server.rs
 +++ b/iroh-relay/src/server/http_server.rs
 @@ -25,7 +25,7 @@ use n0_error::{e, ensure, stack_error};
@@ -891,11 +995,11 @@ index 22384eb..374a311 100644
 +const MAX_HTTP_HEADERS: usize = 32;
 +/// Hard cap on Hyper's HTTP/1 read buffer during relay establishment.
 +const MAX_HTTP_BUFFER_BYTES: usize = 32 * 1024;
-
+ 
  /// Derives the accept key for WebSocket handshake according to RFC 6455.
  /// Takes the client's Sec-WebSocket-Key value and returns the calculated accept key.
 @@ -468,6 +475,7 @@ impl ServerBuilder {
-
+ 
          let cancel = cancel_token.clone();
          let loop_service = service.clone();
 +        let pending_connections = Arc::new(Semaphore::new(MAX_PENDING_CONNECTIONS));
@@ -921,7 +1025,7 @@ index 22384eb..374a311 100644
                                          .handle_connection(stream, tls_config, self.establish_timeout)
                                          .await
 @@ -1117,7 +1131,11 @@ impl RelayServiceWithNotify {
-
+ 
      /// Wrapper for the actual http connection (with upgrades)
      async fn serve_connection(self, io: MaybeTlsStream) -> Result<(), ServeConnectionError> {
 -        hyper::server::conn::http1::Builder::new()

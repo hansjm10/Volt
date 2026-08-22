@@ -10,7 +10,7 @@ The broker implements the accepted protocol in [Managed relay credentials produc
 - stable refresh secrets with a sliding inactivity expiry;
 - endpoint-local, host-authorized app, and grant-wide revocation;
 - short-lived Ed25519 JWTs bound to each endpoint's Iroh node ID;
-- a public JWKS endpoint; and
+- a public JWKS endpoint for active and retiring relay keys; and
 - a pinned `iroh-relay 1.0.3` JWT `AccessControl` patch and reproducible canary build script.
 
 ## Persistence and production blockers
@@ -19,10 +19,8 @@ PostgreSQL is the broker's only state store. Embedded, checksummed migrations cr
 
 Remaining production blockers:
 
-- Production should use the Firebase Admin Go verifier instead of maintaining the custom RS256/JWKS verifier.
 - The service still needs managed HTTPS deployment, edge rate limits, request budgets, secret-free monitoring, readiness checks, backup/restore verification, and administrative procedures.
-- Signing still uses one mode-`0600` local Ed25519 seed. Production uses Cloud KMS and an overlapping active/retiring relay key set.
-- The relay canary accepts the JWT shape, but production relays still need multi-key configuration, metrics, rollout, and artifact publication.
+- The relay canary accepts the JWT shape, but the multi-key relay patch still needs canary deployment, metrics, rollout, and artifact publication.
 
 Do not expose the development App Check mode to the public internet or use its token in an app build.
 
@@ -71,12 +69,13 @@ Go 1.23 or newer is required.
 ```sh
 cd services/relay-credential-broker
 export VOLT_CREDENTIAL_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/volt_credentials?sslmode=disable'
+export VOLT_CREDENTIAL_SIGNING_MODE=local
 export VOLT_APP_CHECK_MODE=development
 export VOLT_DEVELOPMENT_APP_CHECK_TOKEN="$(openssl rand -base64 32)"
 go run ./cmd/relay-credential-service
 ```
 
-The database user must be able to create tables and use PostgreSQL advisory locks. Migrations run automatically before the listener starts. The default listener and issuer are local-only: `127.0.0.1:8085` and `http://127.0.0.1:8085`. The service creates `./data/relay-credential-signing-key` with mode `0600`.
+The database user must be able to create tables and use PostgreSQL advisory locks. Migrations run automatically before the listener starts. The default listener and issuer are local-only: `127.0.0.1:8085` and `http://127.0.0.1:8085`. Local signing mode creates `./data/relay-credential-signing-key` with mode `0600`.
 
 For a normal daemon-generated canary pairing, start the broker with the canary signing key and Firebase configuration, then start a disposable daemon state directory against the canary relay:
 
@@ -147,13 +146,25 @@ curl -sS "$BASE_URL/.well-known/jwks.json" | jq
 For Firebase-backed verification, omit the development token and configure the exact Firebase authority and allowlist:
 
 ```sh
+export VOLT_CREDENTIAL_SIGNING_MODE=local
 export VOLT_APP_CHECK_MODE=firebase
 export VOLT_FIREBASE_PROJECT_NUMBER=546623825529
 export VOLT_ALLOWED_FIREBASE_APP_IDS=1:546623825529:ios:9f5a707e3f4ef89154d6a8
 go run ./cmd/relay-credential-service
 ```
 
-Firebase mode requires limited-use tokens with a `jti`, caches bounded JWKS responses, and throttles attacker-triggered unknown-key refreshes. The verifier returns only a SHA-256 `jti` digest to the broker; PostgreSQL consumes that digest in the approval transaction and provides the global replay barrier.
+Firebase mode uses Firebase Admin Go to verify limited-use tokens with a `jti`. The verifier returns only a SHA-256 `jti` digest to the broker; PostgreSQL consumes that digest in the approval transaction and provides the global replay barrier.
+
+Production signing uses an exact active Cloud KMS `EC_SIGN_ED25519` key version and an optional bounded list of retiring versions:
+
+```sh
+export VOLT_CREDENTIAL_SIGNING_MODE=kms
+export VOLT_CREDENTIAL_KMS_ACTIVE_KEY_VERSION=projects/volt/locations/us-central1/keyRings/relay/cryptoKeys/signing/cryptoKeyVersions/2
+export VOLT_CREDENTIAL_KMS_RETIRING_KEY_VERSIONS=projects/volt/locations/us-central1/keyRings/relay/cryptoKeys/signing/cryptoKeyVersions/1
+unset VOLT_CREDENTIAL_SIGNING_KEY_FILE
+```
+
+The service uses Application Default Credentials. Its runtime identity needs permission to view every configured public key and to sign using the active version. All versions must belong to one CryptoKey, and the active version number must be newer than every retiring version. Startup verifies each resource name, algorithm, PEM checksum, unique derived `kid`, and an active-key readiness signature; signing verifies request and response CRC32C values plus the returned Ed25519 signature.
 
 ## HTTP contract
 
@@ -167,7 +178,7 @@ Firebase mode requires limited-use tokens with a `jti`, caches bounded JWKS resp
 | `POST /v1/tokens/revoke` | Endpoint refresh bearer | Idempotently revokes that app endpoint; a host endpoint revokes the complete grant. |
 | `POST /v1/grant/endpoints/revoke` | Host refresh bearer | Idempotently revokes one app `{endpointId}` in the host's grant. |
 | `POST /v1/grant/revoke` | Host refresh bearer | Idempotently revokes the complete daemon identity grant. Body must be empty. |
-| `GET /.well-known/jwks.json` | Public | Returns the Ed25519 public verification key. |
+| `GET /.well-known/jwks.json` | Public | Returns active and retiring Ed25519 public verification keys. |
 | `GET /healthz` | Public | Returns liveness only. |
 
 Access JWT claims:
@@ -220,7 +231,21 @@ Build and validate the patch with pinned Rust, Zig, cargo-zigbuild, and LLVM ver
 
 The Linux build writes a sidecar manifest containing source, patch/tool versions, and hashes. The current canary binary SHA-256 is `7917f468dd81dee9c412eaf99de9cd35df75e5efd04d4e06091c695af234fc11`.
 
-The relay access check requires one bearer JWT, selects the configured Ed25519 key by `kid`, validates issuer/audience/scope/time bounds, requires canonical `sub` equal to the proven endpoint ID, and enforces node/grant/global connection limits. It fails closed on malformed tokens or invalid access configuration. Production key rotation requires a configured set of active and retiring keys rather than the canary's single key.
+The relay access check requires one bearer JWT, selects one of at most eight configured Ed25519 keys by `kid`, validates issuer/audience/scope/time bounds, requires canonical `sub` equal to the proven endpoint ID, and enforces node/grant/global connection limits. It fails closed on malformed tokens, duplicate key IDs/public keys, or invalid access configuration. Configure rotation overlap with TOML array-of-table entries:
+
+```toml
+[access.jwt]
+issuer = "https://credentials.volt-cli.dev"
+audience = "volt-iroh-relay-canary"
+
+[[access.jwt.keys]]
+public_key = "<active-jwks-x>"
+
+[[access.jwt.keys]]
+public_key = "<retiring-jwks-x>"
+```
+
+The relay derives each `kid` from the public key using the broker's SHA-256 rule, preventing key-ID/public-key mismatches. The checked-in patch supports this multi-key format. The currently deployed canary remains on the prior single-key binary until the Cloud Run/Cloud SQL canary rollout step.
 
 Relays verify locally instead of calling the credential service for each connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path.
 
@@ -231,7 +256,10 @@ Relays verify locally instead of calling the credential service for each connect
 | `VOLT_CREDENTIAL_LISTEN` | `127.0.0.1:8085` | HTTP listen address. |
 | `VOLT_CREDENTIAL_ISSUER` | `http://127.0.0.1:8085` | Exact JWT issuer expected by the relay. |
 | `VOLT_CREDENTIAL_AUDIENCE` | `volt-iroh-relay` | Exact JWT audience expected by the relay. |
-| `VOLT_CREDENTIAL_SIGNING_KEY_FILE` | `./data/relay-credential-signing-key` | Persistent mode-`0600` Ed25519 seed file. |
+| `VOLT_CREDENTIAL_SIGNING_MODE` | required | `local` for development or `kms` for Cloud KMS signing; no production fallback. |
+| `VOLT_CREDENTIAL_SIGNING_KEY_FILE` | `./data/relay-credential-signing-key` in local mode | Persistent mode-`0600` development Ed25519 seed file; forbidden in KMS mode. |
+| `VOLT_CREDENTIAL_KMS_ACTIVE_KEY_VERSION` | required in KMS mode | Exact active `EC_SIGN_ED25519` CryptoKeyVersion resource name. |
+| `VOLT_CREDENTIAL_KMS_RETIRING_KEY_VERSIONS` | empty | Comma-separated retiring CryptoKeyVersion resource names published in JWKS. |
 | `VOLT_CREDENTIAL_DATABASE_URL` | required | PostgreSQL connection URL. |
 | `VOLT_APP_CHECK_MODE` | `development` | `development` or `firebase`. |
 | `VOLT_DEVELOPMENT_APP_CHECK_TOKEN` | required in development | Constant-time local approval token, minimum 32 characters. |

@@ -2,6 +2,7 @@ package credential
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,12 +20,13 @@ import (
 var rawBase64 = base64.RawURLEncoding
 
 const (
-	maxJWTBytes        = 8 * 1024
-	maxAuthorityBytes  = 512
-	minIdentifierBytes = 16
-	maxIdentifierBytes = 128
-	maxAccessTokenTTL  = time.Hour
-	relayClockSkew     = 30 * time.Second
+	maxJWTBytes         = 8 * 1024
+	maxAuthorityBytes   = 512
+	minIdentifierBytes  = 16
+	maxIdentifierBytes  = 128
+	maxAccessTokenTTL   = time.Hour
+	relayClockSkew      = 30 * time.Second
+	maxVerificationKeys = 8
 )
 
 // Claims is the relay admission contract. The relay must validate the signature,
@@ -48,16 +50,60 @@ type jwtHeader struct {
 	Type      string `json:"typ"`
 }
 
-// Signer issues Ed25519 JWTs and publishes the matching public JWK.
+type signatureProvider interface {
+	Sign(ctx context.Context, message []byte) ([]byte, error)
+}
+
+type ed25519SignatureProvider struct {
+	private ed25519.PrivateKey
+}
+
+func (p *ed25519SignatureProvider) Sign(_ context.Context, message []byte) ([]byte, error) {
+	return ed25519.Sign(p.private, message), nil
+}
+
+type verificationKey struct {
+	keyID  string
+	public ed25519.PublicKey
+}
+
+// Signer issues Ed25519 JWTs with one active signing key and publishes the
+// active and retiring public keys accepted by relays during rotation.
 type Signer struct {
-	issuer   string
-	audience string
-	keyID    string
-	private  ed25519.PrivateKey
-	public   ed25519.PublicKey
+	issuer            string
+	audience          string
+	activeKeyID       string
+	activePublic      ed25519.PublicKey
+	signatureProvider signatureProvider
+	verificationKeys  []verificationKey
+	verificationByID  map[string]ed25519.PublicKey
+	close             func() error
 }
 
 func NewSigner(issuer, audience string, private ed25519.PrivateKey) (*Signer, error) {
+	if len(private) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid Ed25519 private key length: %d", len(private))
+	}
+	privateCopy := append(ed25519.PrivateKey(nil), private...)
+	public := append(ed25519.PublicKey(nil), private.Public().(ed25519.PublicKey)...)
+	return newSigner(
+		issuer,
+		audience,
+		&ed25519SignatureProvider{private: privateCopy},
+		public,
+		nil,
+		nil,
+	)
+}
+
+func newSigner(
+	issuer string,
+	audience string,
+	provider signatureProvider,
+	activePublic ed25519.PublicKey,
+	retiringPublic []ed25519.PublicKey,
+	closeProvider func() error,
+) (*Signer, error) {
 	issuer = strings.TrimSpace(issuer)
 	audience = strings.TrimSpace(audience)
 	if !validAuthority(issuer) {
@@ -66,19 +112,42 @@ func NewSigner(issuer, audience string, private ed25519.PrivateKey) (*Signer, er
 	if !validAuthority(audience) {
 		return nil, errors.New("audience is invalid")
 	}
-	if len(private) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("invalid Ed25519 private key length: %d", len(private))
+	if provider == nil {
+		return nil, errors.New("signature provider is required")
+	}
+	if len(activePublic) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("invalid active Ed25519 public key length: %d", len(activePublic))
+	}
+	if len(retiringPublic)+1 > maxVerificationKeys {
+		return nil, fmt.Errorf("at most %d active and retiring verification keys are allowed", maxVerificationKeys)
 	}
 
-	privateCopy := append(ed25519.PrivateKey(nil), private...)
-	public := append(ed25519.PublicKey(nil), private.Public().(ed25519.PublicKey)...)
-	digest := sha256.Sum256(public)
+	publicKeys := make([]ed25519.PublicKey, 0, len(retiringPublic)+1)
+	publicKeys = append(publicKeys, activePublic)
+	publicKeys = append(publicKeys, retiringPublic...)
+	verificationKeys := make([]verificationKey, 0, len(publicKeys))
+	verificationByID := make(map[string]ed25519.PublicKey, len(publicKeys))
+	for _, public := range publicKeys {
+		if len(public) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("invalid retiring Ed25519 public key length: %d", len(public))
+		}
+		publicCopy := append(ed25519.PublicKey(nil), public...)
+		keyID := keyIDFor(publicCopy)
+		if _, exists := verificationByID[keyID]; exists {
+			return nil, errors.New("active and retiring verification keys must be unique")
+		}
+		verificationKeys = append(verificationKeys, verificationKey{keyID: keyID, public: publicCopy})
+		verificationByID[keyID] = publicCopy
+	}
 	return &Signer{
-		issuer:   issuer,
-		audience: audience,
-		keyID:    rawBase64.EncodeToString(digest[:12]),
-		private:  privateCopy,
-		public:   public,
+		issuer:            issuer,
+		audience:          audience,
+		activeKeyID:       verificationKeys[0].keyID,
+		activePublic:      verificationKeys[0].public,
+		signatureProvider: provider,
+		verificationKeys:  verificationKeys,
+		verificationByID:  verificationByID,
+		close:             closeProvider,
 	}, nil
 }
 
@@ -111,7 +180,18 @@ func LoadOrCreateSigner(issuer, audience, path string) (*Signer, error) {
 	return NewSigner(issuer, audience, ed25519.NewKeyFromSeed(seed))
 }
 
-func (s *Signer) Issue(subject, endpointKind, grantID, jwtID string, now time.Time, ttl time.Duration) (string, time.Time, error) {
+func (s *Signer) Issue(
+	ctx context.Context,
+	subject string,
+	endpointKind string,
+	grantID string,
+	jwtID string,
+	now time.Time,
+	ttl time.Duration,
+) (string, time.Time, error) {
+	if ctx == nil {
+		return "", time.Time{}, errors.New("token signing context is required")
+	}
 	if ttl < time.Second || ttl > maxAccessTokenTTL {
 		return "", time.Time{}, errors.New("token TTL must be between one second and one hour")
 	}
@@ -130,7 +210,7 @@ func (s *Signer) Issue(subject, endpointKind, grantID, jwtID string, now time.Ti
 	if expiresAt.Unix() <= now.Unix() {
 		return "", time.Time{}, errors.New("token TTL must produce a positive whole-second lifetime")
 	}
-	headerBytes, err := json.Marshal(jwtHeader{Algorithm: "EdDSA", KeyID: s.keyID, Type: "JWT"})
+	headerBytes, err := json.Marshal(jwtHeader{Algorithm: "EdDSA", KeyID: s.activeKeyID, Type: "JWT"})
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("encode JWT header: %w", err)
 	}
@@ -150,12 +230,18 @@ func (s *Signer) Issue(subject, endpointKind, grantID, jwtID string, now time.Ti
 	}
 
 	signingInput := rawBase64.EncodeToString(headerBytes) + "." + rawBase64.EncodeToString(claimsBytes)
-	signature := ed25519.Sign(s.private, []byte(signingInput))
+	signature, err := s.signatureProvider.Sign(ctx, []byte(signingInput))
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("sign JWT: %w", err)
+	}
+	if len(signature) != ed25519.SignatureSize || !ed25519.Verify(s.activePublic, []byte(signingInput), signature) {
+		return "", time.Time{}, errors.New("signature provider returned an invalid Ed25519 signature")
+	}
 	return signingInput + "." + rawBase64.EncodeToString(signature), expiresAt, nil
 }
 
-// Verify checks tokens issued by this signer. It is used by tests and local
-// tooling; the relay must perform the equivalent checks in its AccessControl.
+// Verify checks tokens issued by the active or a retiring key. It is used by
+// tests and local tooling; relays must perform the equivalent checks.
 func (s *Signer) Verify(token string, now time.Time) (Claims, error) {
 	var claims Claims
 	if len(token) > maxJWTBytes {
@@ -174,7 +260,8 @@ func (s *Signer) Verify(token string, now time.Time) (Claims, error) {
 	if err := decodeStrictJSON(headerBytes, &header); err != nil {
 		return claims, errors.New("invalid JWT header")
 	}
-	if header.Algorithm != "EdDSA" || header.KeyID != s.keyID || header.Type != "JWT" {
+	public, ok := s.verificationByID[header.KeyID]
+	if header.Algorithm != "EdDSA" || header.Type != "JWT" || !ok {
 		return claims, errors.New("unexpected JWT header")
 	}
 
@@ -182,7 +269,7 @@ func (s *Signer) Verify(token string, now time.Time) (Claims, error) {
 	if err != nil || len(signature) != ed25519.SignatureSize {
 		return claims, errors.New("invalid JWT signature encoding")
 	}
-	if !ed25519.Verify(s.public, []byte(parts[0]+"."+parts[1]), signature) {
+	if !ed25519.Verify(public, []byte(parts[0]+"."+parts[1]), signature) {
 		return claims, errors.New("invalid JWT signature")
 	}
 
@@ -211,20 +298,42 @@ func (s *Signer) Verify(token string, now time.Time) (Claims, error) {
 }
 
 func (s *Signer) JWKS() map[string]any {
-	return map[string]any{
-		"keys": []map[string]string{{
+	keys := make([]map[string]string, 0, len(s.verificationKeys))
+	for _, key := range s.verificationKeys {
+		keys = append(keys, map[string]string{
 			"alg": "EdDSA",
 			"crv": "Ed25519",
-			"kid": s.keyID,
+			"kid": key.keyID,
 			"kty": "OKP",
 			"use": "sig",
-			"x":   rawBase64.EncodeToString(s.public),
-		}},
+			"x":   rawBase64.EncodeToString(key.public),
+		})
 	}
+	return map[string]any{"keys": keys}
 }
 
 func (s *Signer) KeyID() string {
-	return s.keyID
+	return s.activeKeyID
+}
+
+func (s *Signer) KeyIDs() []string {
+	keyIDs := make([]string, 0, len(s.verificationKeys))
+	for _, key := range s.verificationKeys {
+		keyIDs = append(keyIDs, key.keyID)
+	}
+	return keyIDs
+}
+
+func (s *Signer) Close() error {
+	if s.close == nil {
+		return nil
+	}
+	return s.close()
+}
+
+func keyIDFor(public ed25519.PublicKey) string {
+	digest := sha256.Sum256(public)
+	return rawBase64.EncodeToString(digest[:12])
 }
 
 func validAuthority(value string) bool {

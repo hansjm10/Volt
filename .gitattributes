@@ -22,5 +22,6 @@
 *.woff binary
 *.woff2 binary
 
-# Preserve the exact upstream Node.js license bytes, including its original indentation.
+# Preserve exact vendored/generated text whose format intentionally includes trailing whitespace.
 compliance/node-v22.23.1/LICENSE -whitespace
+services/relay-credential-broker/relay-patch/*.patch -whitespace

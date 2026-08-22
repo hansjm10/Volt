@@ -366,7 +366,7 @@ func (b *Broker) ApprovePairingClaim(
 		if err := transaction.Commit(ctx); err != nil {
 			return Approval{}, fmt.Errorf("commit pairing approval retry: %w", err)
 		}
-		access, err := b.issueAccessToken(app, now)
+		access, err := b.issueAccessToken(ctx, app, now)
 		if err != nil {
 			return Approval{}, err
 		}
@@ -445,7 +445,7 @@ func (b *Broker) ApprovePairingClaim(
 	if err := transaction.Commit(ctx); err != nil {
 		return Approval{}, fmt.Errorf("commit pairing approval: %w", err)
 	}
-	access, err := b.issueAccessToken(app, now)
+	access, err := b.issueAccessToken(ctx, app, now)
 	if err != nil {
 		return Approval{}, err
 	}
@@ -553,7 +553,7 @@ func (b *Broker) ExchangePairingClaim(ctx context.Context, claimID, claimSecret 
 	if err := transaction.Commit(ctx); err != nil {
 		return Exchange{}, fmt.Errorf("commit pairing exchange: %w", err)
 	}
-	access, err := b.issueAccessToken(host, now)
+	access, err := b.issueAccessToken(ctx, host, now)
 	if err != nil {
 		return Exchange{}, err
 	}
@@ -601,7 +601,7 @@ func (b *Broker) RefreshAccessToken(ctx context.Context, refreshToken string) (A
 	if err := transaction.Commit(ctx); err != nil {
 		return AccessToken{}, fmt.Errorf("commit credential refresh: %w", err)
 	}
-	return b.issueAccessToken(endpoint, now)
+	return b.issueAccessToken(ctx, endpoint, now)
 }
 
 func (b *Broker) RevokeRefreshToken(ctx context.Context, refreshToken string) error {
@@ -1030,12 +1030,13 @@ func revokeGrant(ctx context.Context, transaction pgx.Tx, grantID string, now ti
 	return nil
 }
 
-func (b *Broker) issueAccessToken(endpoint endpointRecord, now time.Time) (AccessToken, error) {
+func (b *Broker) issueAccessToken(ctx context.Context, endpoint endpointRecord, now time.Time) (AccessToken, error) {
 	jwtID, err := randomIdentifier()
 	if err != nil {
 		return AccessToken{}, err
 	}
 	accessToken, expiresAt, err := b.signer.Issue(
+		ctx,
 		endpoint.NodeID,
 		endpoint.Kind,
 		endpoint.GrantID,

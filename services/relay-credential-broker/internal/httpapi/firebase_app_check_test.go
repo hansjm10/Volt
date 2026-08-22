@@ -1,18 +1,23 @@
 package httpapi
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"firebase.google.com/go/v4/appcheck"
 )
 
 const (
@@ -20,36 +25,39 @@ const (
 	testFirebaseAppID         = "1:546623825529:ios:9f5a707e3f4ef89154d6a8"
 )
 
-func TestFirebaseAppCheckVerifierReturnsReplayMetadataAndCachesKeys(t *testing.T) {
+func TestFirebaseAppCheckVerifierUsesFirebaseAdminAndReturnsReplayMetadata(t *testing.T) {
 	key := generateRSAKey(t)
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
-		writer.Header().Set("Cache-Control", "public, max-age=3600")
-		writeJSON(writer, http.StatusOK, appCheckJWKS{
-			Keys: []appCheckJWK{jwkFor(&key.PublicKey, "key-one")},
+		writeJSON(writer, http.StatusOK, testAppCheckJWKS{
+			Keys: []testAppCheckJWK{jwkFor(&key.PublicKey, "key-one")},
 		})
 	}))
 	defer server.Close()
 
-	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
-	verifier := newFirebaseVerifier(t, server, now)
-	token := signAppCheckToken(t, key, "key-one", map[string]any{
-		"iss": "https://firebaseappcheck.googleapis.com/" + testFirebaseProjectNumber,
-		"sub": testFirebaseAppID,
-		"aud": []string{"projects/" + testFirebaseProjectNumber},
-		"exp": now.Add(time.Hour).Unix(),
-		"iat": now.Unix(),
-		"jti": "limited-use-token-identifier-one",
-	})
+	originalJWKSURL := appcheck.JWKSUrl
+	appcheck.JWKSUrl = server.URL
+	defer func() { appcheck.JWKSUrl = originalJWKSURL }()
 
+	now := time.Now().UTC().Truncate(time.Second)
+	verifier, err := NewFirebaseAppCheckVerifier(FirebaseAppCheckConfig{
+		ProjectNumber: testFirebaseProjectNumber,
+		AllowedAppIDs: []string{testFirebaseAppID},
+		Now:           func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signAppCheckToken(t, key, "key-one", validAppCheckClaims(now, nil))
 	request := httptest.NewRequest(http.MethodPost, "/approve", nil)
 	request.Header.Set("X-Firebase-AppCheck", token)
+
 	verified, err := verifier.Verify(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified.AppID != testFirebaseAppID || !verified.ReplayProtected || verified.ExpiresAt != now.Add(time.Hour) {
+	if verified.AppID != testFirebaseAppID || !verified.ReplayProtected || !verified.ExpiresAt.Equal(now.Add(time.Hour)) {
 		t.Fatalf("unexpected verified App Check metadata: %+v", verified)
 	}
 	expectedJTIHash := sha256.Sum256([]byte("limited-use-token-identifier-one"))
@@ -57,154 +65,198 @@ func TestFirebaseAppCheckVerifierReturnsReplayMetadataAndCachesKeys(t *testing.T
 		t.Fatalf("jti hash = %x, want %x", verified.JTIHash, expectedJTIHash)
 	}
 	if _, err := verifier.Verify(request); err != nil {
-		t.Fatalf("stateless verification rejected a valid token: %v", err)
+		t.Fatalf("Firebase Admin rejected a second stateless verification: %v", err)
+	}
+	forgedToken := signAppCheckToken(t, generateRSAKey(t), "key-one", validAppCheckClaims(now, map[string]any{
+		"jti": "limited-use-token-identifier-forged",
+	}))
+	request.Header.Set("X-Firebase-AppCheck", forgedToken)
+	if _, err := verifier.Verify(request); err == nil {
+		t.Fatal("Firebase Admin accepted a forged signature")
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("JWKS request count = %d, want 1", got)
 	}
 }
 
-func TestFirebaseAppCheckVerifierRejectsWrongAuthorityAndMissingJTI(t *testing.T) {
-	key := generateRSAKey(t)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writeJSON(writer, http.StatusOK, appCheckJWKS{
-			Keys: []appCheckJWK{jwkFor(&key.PublicKey, "key-one")},
-		})
-	}))
-	defer server.Close()
+func TestFirebaseAppCheckVerifierRejectsInvalidVerifiedClaims(t *testing.T) {
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
-
 	tests := []struct {
 		name   string
-		claims map[string]any
+		mutate func(*appcheck.DecodedAppCheckToken)
 	}{
 		{
 			name: "issuer",
-			claims: validAppCheckClaims(now, map[string]any{
-				"iss": "https://firebaseappcheck.googleapis.com/wrong",
-			}),
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.Issuer = "https://firebaseappcheck.googleapis.com/wrong"
+			},
 		},
 		{
 			name: "audience",
-			claims: validAppCheckClaims(now, map[string]any{
-				"aud": []string{"projects/wrong"},
-			}),
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.Audience = []string{"projects/wrong"}
+			},
 		},
 		{
 			name: "app ID",
-			claims: validAppCheckClaims(now, map[string]any{
-				"sub": "wrong-app",
-			}),
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.AppID = "wrong-app"
+				token.Subject = "wrong-app"
+			},
+		},
+		{
+			name: "subject mismatch",
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.Subject = "wrong-app"
+			},
 		},
 		{
 			name: "expiry",
-			claims: validAppCheckClaims(now, map[string]any{
-				"exp": now.Unix(),
-			}),
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.ExpiresAt = now
+			},
+		},
+		{
+			name: "future issue time",
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.IssuedAt = now.Add(time.Second)
+			},
+		},
+		{
+			name: "excessive lifetime",
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.IssuedAt = now.Add(-8 * 24 * time.Hour)
+			},
 		},
 		{
 			name: "missing limited-use jti",
-			claims: validAppCheckClaims(now, map[string]any{
-				"jti": "",
-			}),
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				delete(token.Claims, "jti")
+			},
+		},
+		{
+			name: "non-string limited-use jti",
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.Claims["jti"] = float64(1)
+			},
+		},
+		{
+			name: "malformed limited-use jti",
+			mutate: func(token *appcheck.DecodedAppCheckToken) {
+				token.Claims["jti"] = "contains whitespace"
+			},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			verifier := newFirebaseVerifier(t, server, now)
-			token := signAppCheckToken(t, key, "key-one", test.claims)
+			decoded := validDecodedAppCheckToken(now)
+			test.mutate(decoded)
+			verifier := newFakeFirebaseVerifier(t, now, &fakeFirebaseTokenVerifier{decoded: decoded})
 			request := httptest.NewRequest(http.MethodPost, "/approve", nil)
-			request.Header.Set("X-Firebase-AppCheck", token)
+			request.Header.Set("X-Firebase-AppCheck", "firebase-admin-verified-token")
 			if _, err := verifier.Verify(request); err == nil {
-				t.Fatal("invalid App Check token was accepted")
+				t.Fatal("invalid App Check token metadata was accepted")
 			}
 		})
 	}
 }
 
-func TestFirebaseAppCheckVerifierRefreshesUnknownKey(t *testing.T) {
-	firstKey := generateRSAKey(t)
-	secondKey := generateRSAKey(t)
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		requestNumber := requests.Add(1)
-		key := jwkFor(&firstKey.PublicKey, "key-one")
-		if requestNumber > 1 {
-			key = jwkFor(&secondKey.PublicKey, "key-two")
-		}
-		writeJSON(writer, http.StatusOK, appCheckJWKS{Keys: []appCheckJWK{key}})
-	}))
-	defer server.Close()
+func TestFirebaseAppCheckVerifierRejectsAdminFailures(t *testing.T) {
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
-	verifier := newFirebaseVerifier(t, server, now)
-	token := signAppCheckToken(
-		t,
-		secondKey,
-		"key-two",
-		validAppCheckClaims(now, nil),
-	)
-	request := httptest.NewRequest(http.MethodPost, "/approve", nil)
-	request.Header.Set("X-Firebase-AppCheck", token)
-	if _, err := verifier.Verify(request); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name   string
+		client *fakeFirebaseTokenVerifier
+	}{
+		{name: "error", client: &fakeFirebaseTokenVerifier{err: errors.New("verification failed")}},
+		{name: "nil token", client: &fakeFirebaseTokenVerifier{}},
+		{name: "panic", client: &fakeFirebaseTokenVerifier{panicValue: "malformed claims"}},
 	}
-	if got := requests.Load(); got != 2 {
-		t.Fatalf("JWKS request count = %d, want 2", got)
-	}
-}
-
-func TestFirebaseAppCheckVerifierThrottlesRepeatedUnknownKeyRefresh(t *testing.T) {
-	key := generateRSAKey(t)
-	unknownKey := generateRSAKey(t)
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		requests.Add(1)
-		writer.Header().Set("Cache-Control", "public, max-age=3600")
-		writeJSON(writer, http.StatusOK, appCheckJWKS{
-			Keys: []appCheckJWK{jwkFor(&key.PublicKey, "known-key")},
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			verifier := newFakeFirebaseVerifier(t, now, test.client)
+			request := httptest.NewRequest(http.MethodPost, "/approve", nil)
+			request.Header.Set("X-Firebase-AppCheck", "untrusted-token")
+			if _, err := verifier.Verify(request); err == nil {
+				t.Fatal("Firebase Admin failure was accepted")
+			}
 		})
-	}))
-	defer server.Close()
-
-	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
-	verifier := newFirebaseVerifier(t, server, now)
-	for index := 0; index < 2; index++ {
-		token := signAppCheckToken(
-			t,
-			unknownKey,
-			fmt.Sprintf("unknown-key-%d", index),
-			validAppCheckClaims(now, map[string]any{
-				"jti": fmt.Sprintf("limited-use-token-identifier-%d", index),
-			}),
-		)
-		request := httptest.NewRequest(http.MethodPost, "/approve", nil)
-		request.Header.Set("X-Firebase-AppCheck", token)
-		if _, err := verifier.Verify(request); err == nil {
-			t.Fatal("unknown Firebase signing key was accepted")
-		}
-	}
-	if got := requests.Load(); got != 2 {
-		t.Fatalf("JWKS request count = %d, want 2", got)
 	}
 }
 
-func newFirebaseVerifier(
+func TestFirebaseAppCheckVerifierRequiresOneBoundedHeader(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	client := &fakeFirebaseTokenVerifier{decoded: validDecodedAppCheckToken(now)}
+	verifier := newFakeFirebaseVerifier(t, now, client)
+	tests := []struct {
+		name   string
+		values []string
+	}{
+		{name: "missing"},
+		{name: "empty", values: []string{""}},
+		{name: "duplicate", values: []string{"one", "two"}},
+		{name: "comma", values: []string{"one,two"}},
+		{name: "oversized", values: []string{strings.Repeat("a", maxAppCheckTokenBytes+1)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/approve", nil)
+			for _, value := range test.values {
+				request.Header.Add("X-Firebase-AppCheck", value)
+			}
+			if _, err := verifier.Verify(request); err == nil {
+				t.Fatal("invalid App Check header was accepted")
+			}
+		})
+	}
+	if client.calls != 0 {
+		t.Fatalf("Firebase Admin call count = %d, want 0", client.calls)
+	}
+}
+
+func newFakeFirebaseVerifier(
 	t *testing.T,
-	server *httptest.Server,
 	now time.Time,
+	client firebaseAppCheckTokenVerifier,
 ) *FirebaseAppCheckVerifier {
 	t.Helper()
-	verifier, err := NewFirebaseAppCheckVerifier(FirebaseAppCheckConfig{
+	verifier, err := newFirebaseAppCheckVerifier(context.Background(), FirebaseAppCheckConfig{
 		ProjectNumber: testFirebaseProjectNumber,
 		AllowedAppIDs: []string{testFirebaseAppID},
-		JWKSURL:       server.URL,
-		HTTPClient:    server.Client(),
 		Now:           func() time.Time { return now },
-	})
+	}, client)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return verifier
+}
+
+type fakeFirebaseTokenVerifier struct {
+	decoded    *appcheck.DecodedAppCheckToken
+	err        error
+	panicValue any
+	calls      int
+}
+
+func (v *fakeFirebaseTokenVerifier) VerifyToken(string) (*appcheck.DecodedAppCheckToken, error) {
+	v.calls++
+	if v.panicValue != nil {
+		panic(v.panicValue)
+	}
+	return v.decoded, v.err
+}
+
+func validDecodedAppCheckToken(now time.Time) *appcheck.DecodedAppCheckToken {
+	return &appcheck.DecodedAppCheckToken{
+		Issuer:    "https://firebaseappcheck.googleapis.com/" + testFirebaseProjectNumber,
+		Subject:   testFirebaseAppID,
+		Audience:  []string{"projects/" + testFirebaseProjectNumber},
+		ExpiresAt: now.Add(time.Hour),
+		IssuedAt:  now,
+		AppID:     testFirebaseAppID,
+		Claims: map[string]interface{}{
+			"jti": "limited-use-token-identifier-one",
+		},
+	}
 }
 
 func validAppCheckClaims(now time.Time, overrides map[string]any) map[string]any {
@@ -251,9 +303,22 @@ func signAppCheckToken(
 	return fmt.Sprintf("%s.%s.%s", header, payload, base64.RawURLEncoding.EncodeToString(signature))
 }
 
-func jwkFor(key *rsa.PublicKey, keyID string) appCheckJWK {
+type testAppCheckJWKS struct {
+	Keys []testAppCheckJWK `json:"keys"`
+}
+
+type testAppCheckJWK struct {
+	Algorithm string `json:"alg"`
+	Exponent  string `json:"e"`
+	KeyID     string `json:"kid"`
+	KeyType   string `json:"kty"`
+	Modulus   string `json:"n"`
+	Use       string `json:"use"`
+}
+
+func jwkFor(key *rsa.PublicKey, keyID string) testAppCheckJWK {
 	exponent := bigEndianExponent(key.E)
-	return appCheckJWK{
+	return testAppCheckJWK{
 		Algorithm: "RS256",
 		Exponent:  base64.RawURLEncoding.EncodeToString(exponent),
 		KeyID:     keyID,
