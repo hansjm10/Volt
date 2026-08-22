@@ -11,17 +11,26 @@ export interface IrohNodeIdLike {
 	toString(): string;
 }
 
+export interface IrohEndpointAddrLike {
+	relayUrl(): string | null;
+}
+
+export interface IrohWatchHandleLike {
+	stop(): Promise<void>;
+}
+
 export interface IrohSecretKeyLike {
 	toBytes(): number[];
 }
 
 export interface IrohEndpointLike {
 	id(): IrohNodeIdLike;
-	addr(): unknown;
+	addr(): IrohEndpointAddrLike;
 	online(): Promise<void>;
 	close(): Promise<void>;
 	insertRelay?(config: IrohRelayConfigLike): Promise<void>;
 	removeRelay?(url: string): Promise<boolean>;
+	watchAddr?(callback: (addr: IrohEndpointAddrLike) => void): IrohWatchHandleLike;
 	acceptNext(): Promise<IrohIncomingLike | null | undefined>;
 	secretKey(): IrohSecretKeyLike;
 }
@@ -72,15 +81,34 @@ export interface IrohModuleLike {
 
 export interface IrohNativeLoadResult {
 	iroh?: IrohModuleLike;
+	packageVersion?: string;
+	watchApiSafe?: boolean;
 	error?: unknown;
 }
 
+/** PR #281 fixes sync watcher registration starting with the next release after 1.1.0. */
+export function isIrohWatchApiSafe(version: string | undefined): boolean {
+	const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/.exec(version ?? "");
+	if (!match) return false;
+	const [major, minor, patch] = match.slice(1).map(Number);
+	return major > 1 || (major === 1 && (minor > 1 || (minor === 1 && patch >= 1)));
+}
+
 export function loadIrohModule(): IrohNativeLoadResult {
-	const { iroh, irohLoadError } = nativeAdapter.loadIroh();
+	const { iroh, irohLoadError, irohPackageVersion } = nativeAdapter.loadIroh() as {
+		iroh?: unknown;
+		irohLoadError?: unknown;
+		irohPackageVersion?: unknown;
+	};
 	if (!iroh) {
 		return { error: irohLoadError };
 	}
-	return { iroh: iroh as IrohModuleLike };
+	const packageVersion = typeof irohPackageVersion === "string" ? irohPackageVersion : undefined;
+	return {
+		iroh: iroh as IrohModuleLike,
+		...(packageVersion === undefined ? {} : { packageVersion }),
+		watchApiSafe: isIrohWatchApiSafe(packageVersion),
+	};
 }
 
 export function formatIrohLoadError(error: unknown): string {

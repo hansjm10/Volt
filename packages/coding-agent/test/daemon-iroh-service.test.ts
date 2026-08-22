@@ -21,8 +21,11 @@ import { createIntegratedConversationHandshakeResponse } from "../src/daemon/han
 import {
 	formatIrohLoadError,
 	type IrohConnectionLike,
+	type IrohEndpointAddrLike,
 	type IrohEndpointLike,
 	type IrohIncomingLike,
+	type IrohRelayConfigLike,
+	isIrohWatchApiSafe,
 	loadIrohModule,
 } from "../src/daemon/iroh-native.ts";
 import { DEFAULT_IROH_REMOTE_RESOURCE_LIMITS } from "../src/daemon/iroh-resource-guard.ts";
@@ -55,6 +58,14 @@ describe("native Iroh test prerequisite", () => {
 		if (nativeRequired && !native.iroh) {
 			throw new Error(formatIrohLoadError(native.error));
 		}
+	});
+
+	it("enables watcher calls only for releases containing upstream PR #281", () => {
+		expect(isIrohWatchApiSafe(undefined)).toBe(false);
+		expect(isIrohWatchApiSafe("1.1.0")).toBe(false);
+		expect(isIrohWatchApiSafe("1.1.1")).toBe(true);
+		expect(isIrohWatchApiSafe("1.2.0")).toBe(true);
+		expect(native.watchApiSafe).toBe(isIrohWatchApiSafe(native.packageVersion));
 	});
 });
 
@@ -327,6 +338,130 @@ describe("relay config resolution", () => {
 		expect(resolved.relayUrls).toEqual(VOLT_PRODUCTION_RELAY_URLS);
 		expect(resolved.warning).toContain("VOLT_IROH_RELAY_MODE");
 	});
+});
+
+describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
+	it("recycles a lost relay registration without replacing identity or credential authority", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-relay-recovery-"));
+		const relayUrl = "https://relay-recovery.example.com";
+		const relayAuthToken = "unit-test-relay-token";
+		const relayInsertions: IrohRelayConfigLike[] = [];
+		const relayRemovals: string[] = [];
+		const controlEvents: ControlEvent[] = [];
+		let emitRelayUrl: ((url: string | null) => void) | undefined;
+		let endpointCloseCalls = 0;
+		let watchStopped = false;
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{ relayUrls: [relayUrl], relayAuthToken },
+				{
+					relayWatchApiSafe: true,
+					relayRecoveryDelayMs: 20,
+					relayRecoveryRetryMs: 20,
+					decorateEndpoint: (endpoint) => {
+						let watcher: ((addr: IrohEndpointAddrLike) => void) | undefined;
+						emitRelayUrl = (url) => watcher?.({ relayUrl: () => url });
+						return {
+							id: () => endpoint.id(),
+							addr: () => endpoint.addr(),
+							online: () => Promise.resolve(),
+							insertRelay: async (config) => {
+								relayInsertions.push(config);
+								watcher?.({ relayUrl: () => config.url });
+							},
+							removeRelay: async (url) => {
+								relayRemovals.push(url);
+								return true;
+							},
+							watchAddr: (callback) => {
+								watcher = callback;
+								return {
+									async stop() {
+										watcher = undefined;
+										watchStopped = true;
+									},
+								};
+							},
+							acceptNext: () => endpoint.acceptNext(),
+							secretKey: () => endpoint.secretKey(),
+							async close() {
+								endpointCloseCalls++;
+								await endpoint.close();
+							},
+						};
+					},
+				},
+			),
+		]);
+
+		try {
+			let status: DaemonProbeResult = await probeDaemon(agentDir);
+			for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				status = await probeDaemon(agentDir);
+			}
+			expect(status.healthy).toBe(true);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+				onEvent: (event) => controlEvents.push(event),
+			});
+			const pairAndReadNodeId = async (): Promise<string> => {
+				const started = await control?.request({ type: "pair_request" });
+				if (started?.type !== "pair_started") throw new Error("pair request did not start");
+				let ticket: string | undefined;
+				await expect
+					.poll(() => {
+						const event = controlEvents.find(
+							(candidate) =>
+								candidate.type === "pairing_progress" &&
+								candidate.requestId === started.requestId &&
+								candidate.phase === "ticket",
+						);
+						ticket = event?.type === "pairing_progress" ? event.ticket : undefined;
+						return ticket;
+					})
+					.toBeTypeOf("string");
+				expect(await control?.request({ type: "pair_cancel", requestId: started.requestId })).toMatchObject({
+					type: "ok",
+				});
+				const nodeId = decodeIrohRemoteTicketPayload(ticket as string).nodeId;
+				if (nodeId === undefined) throw new Error("pairing ticket node id missing");
+				return nodeId;
+			};
+
+			const nodeIdBeforeLoss = await pairAndReadNodeId();
+			emitRelayUrl?.(relayUrl);
+			emitRelayUrl?.(null);
+			await expect.poll(() => relayInsertions.length).toBe(1);
+			expect(relayRemovals).toEqual([relayUrl]);
+			expect(relayInsertions).toEqual([{ url: relayUrl, authToken: relayAuthToken }]);
+			expect(endpointCloseCalls).toBe(0);
+			expect(await pairAndReadNodeId()).toBe(nodeIdBeforeLoss);
+			const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+				settings: { relayAuthToken?: string };
+			};
+			expect(state.settings.relayAuthToken).toBe(relayAuthToken);
+			await new Promise((resolve) => setTimeout(resolve, 80));
+			expect(relayInsertions).toHaveLength(1);
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await daemon;
+			daemonStopped = true;
+			expect(watchStopped).toBe(true);
+		} finally {
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await control?.close();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe("iroh daemon lifecycle ownership", () => {

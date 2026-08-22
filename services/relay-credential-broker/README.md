@@ -21,6 +21,7 @@ Remaining production blockers:
 
 - The public `credentials.volt-cli.dev` Cloud Run canary is deployed with Cloud SQL, KMS, Secret Manager, single-instance bootstrap/approval budgets, and dependency readiness. Secret-free monitoring, backup/restore verification, and administrative procedures remain outstanding.
 - The multi-key relay binary is deployed and published. Relay rejection metrics plus crash, replay, key-rotation, and log-redaction drills remain outstanding.
+- Bounded daemon re-registration after relay restart is implemented behind a native-version safety gate, but remains blocked until `@number0/iroh` publishes the watcher runtime fix merged in [iroh-ffi #281](https://github.com/n0-computer/iroh-ffi/pull/281). Unsafe 1.0.0/1.1.0 watcher APIs are never called.
 
 Do not expose the development App Check mode to the public internet or use its token in an app build.
 
