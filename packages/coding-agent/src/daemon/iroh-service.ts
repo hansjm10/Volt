@@ -118,7 +118,6 @@ import { IrohConnectionSupervisor } from "./iroh-connection-supervisor.ts";
 import {
 	formatIrohLoadError,
 	type IrohConnectionLike,
-	type IrohEndpointAddrLike,
 	type IrohEndpointLike,
 	type IrohModuleLike,
 	loadIrohModule,
@@ -316,9 +315,7 @@ export interface IrohDaemonServiceDependencies {
 		kind: "conversation" | "workspace_discovery" | "workspace_management" | "worktree_management" | "relay",
 		authorization: IrohRemoteClientAuthorizationSuccess,
 	): void | Promise<void>;
-	/** Override relay-loss observation and timing (test-only). */
-	readRelayAddress?(endpoint: IrohEndpointLike): IrohEndpointAddrLike;
-	relayRecoveryPollIntervalMs?: number;
+	/** Override relay-loss recovery timing (test-only). */
 	relayRecoveryDelayMs?: number;
 	relayRecoveryRetryMs?: number;
 }
@@ -1156,7 +1153,6 @@ class IrohDaemonService {
 		const endpoint = this.endpoint;
 		if (endpoint?.insertRelay === undefined || endpoint.removeRelay === undefined) return;
 		const monitor = new IrohRelayRecoveryMonitor({
-			readAddr: () => this.dependencies.readRelayAddress?.(endpoint) ?? endpoint.addr(),
 			recover: () =>
 				this.enqueueRelayConfigurationMutation(async () => {
 					if (!this.admission.isOpen || this.endpoint !== endpoint || this.relayCredentialIsRevoking) return;
@@ -1172,12 +1168,10 @@ class IrohDaemonService {
 					}
 				}),
 			log: (level, message, details) => this.log(level, message, details),
-			pollIntervalMs: this.dependencies.relayRecoveryPollIntervalMs,
 			recoveryDelayMs: this.dependencies.relayRecoveryDelayMs,
 			retryDelayMs: this.dependencies.relayRecoveryRetryMs,
 		});
 		this.relayRecoveryMonitor = monitor;
-		monitor.start();
 	}
 
 	private async stopRelayRecoveryMonitor(): Promise<void> {
@@ -1989,6 +1983,7 @@ class IrohDaemonService {
 			authenticated = true;
 			clearTimeout(unauthenticatedTimer);
 			unauthenticatedAdmission.lease.release();
+			this.relayRecoveryMonitor?.reportAuthenticatedConnection();
 			this.log("info", `client connection opened: ${remoteId} (${connectionId})`);
 			await this.logAudit({
 				type: "client_connected",
@@ -2068,6 +2063,9 @@ class IrohDaemonService {
 				supervisor.trackChild(task);
 			}
 		} catch (error) {
+			if (authenticated && !supervisor.isClosing && !isExpectedApplicationClose(error)) {
+				this.relayRecoveryMonitor?.reportUnexpectedTransportFailure();
+			}
 			if (acceptedStreamCount === 0 && authenticated) {
 				throw error;
 			}

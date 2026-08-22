@@ -333,47 +333,41 @@ describe("relay config resolution", () => {
 describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 	it("recycles a lost relay registration without replacing identity or credential authority", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-relay-recovery-"));
+		const workspaceDir = join(agentDir, "ws");
+		mkdirSync(workspaceDir, { recursive: true });
 		const relayUrl = "https://relay-recovery.example.com";
 		const relayAuthToken = "unit-test-relay-token";
 		const relayInsertions: IrohRelayConfigLike[] = [];
 		const relayRemovals: string[] = [];
 		const controlEvents: ControlEvent[] = [];
-		let observedRelayUrl: string | null = null;
-		const emitRelayUrl = (url: string | null) => {
-			observedRelayUrl = url;
-		};
 		let endpointCloseCalls = 0;
 		let daemonStopped = false;
 		let control: DaemonClient | undefined;
+		let phone: PhoneEndpoint | undefined;
 		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
 			createIrohDaemonService(
 				{ relayUrls: [relayUrl], relayAuthToken },
 				{
-					readRelayAddress: () => ({ relayUrl: () => observedRelayUrl }),
-					relayRecoveryPollIntervalMs: 5,
 					relayRecoveryDelayMs: 20,
 					relayRecoveryRetryMs: 20,
-					decorateEndpoint: (endpoint) => {
-						return {
-							id: () => endpoint.id(),
-							addr: () => endpoint.addr(),
-							online: () => Promise.resolve(),
-							insertRelay: async (config) => {
-								relayInsertions.push(config);
-								observedRelayUrl = config.url;
-							},
-							removeRelay: async (url) => {
-								relayRemovals.push(url);
-								return true;
-							},
-							acceptNext: () => endpoint.acceptNext(),
-							secretKey: () => endpoint.secretKey(),
-							async close() {
-								endpointCloseCalls++;
-								await endpoint.close();
-							},
-						};
-					},
+					decorateEndpoint: (endpoint) => ({
+						id: () => endpoint.id(),
+						addr: () => endpoint.addr(),
+						online: () => Promise.resolve(),
+						insertRelay: async (config) => {
+							relayInsertions.push(config);
+						},
+						removeRelay: async (url) => {
+							relayRemovals.push(url);
+							return true;
+						},
+						acceptNext: () => endpoint.acceptNext(),
+						secretKey: () => endpoint.secretKey(),
+						async close() {
+							endpointCloseCalls++;
+							await endpoint.close();
+						},
+					}),
 				},
 			),
 		]);
@@ -393,8 +387,11 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 				reconnect: false,
 				onEvent: (event) => controlEvents.push(event),
 			});
-			const pairAndReadNodeId = async (): Promise<string> => {
-				const started = await control?.request({ type: "pair_request" });
+			expect(await control.request({ type: "workspace_register", name: "ws", path: workspaceDir })).toMatchObject({
+				type: "ok",
+			});
+			const startPairing = async () => {
+				const started = await control?.request({ type: "pair_request", workspaceName: "ws" });
 				if (started?.type !== "pair_started") throw new Error("pair request did not start");
 				let ticket: string | undefined;
 				await expect
@@ -409,35 +406,64 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 						return ticket;
 					})
 					.toBeTypeOf("string");
-				expect(await control?.request({ type: "pair_cancel", requestId: started.requestId })).toMatchObject({
-					type: "ok",
-				});
-				const nodeId = decodeIrohRemoteTicketPayload(ticket as string).nodeId;
-				if (nodeId === undefined) throw new Error("pairing ticket node id missing");
-				return nodeId;
+				return { started, payload: decodeIrohRemoteTicketPayload(ticket as string) };
 			};
 
-			const nodeIdBeforeLoss = await pairAndReadNodeId();
-			emitRelayUrl(relayUrl);
-			await new Promise((resolve) => setTimeout(resolve, 20));
-			emitRelayUrl(null);
+			const firstPairing = await startPairing();
+			if (firstPairing.payload.nodeId === undefined) throw new Error("pairing ticket node id missing");
+			const nodeIdBeforeLoss = firstPairing.payload.nodeId;
+			const iroh = native.iroh;
+			if (!iroh) throw new Error("native iroh unavailable");
+			const endpointTicket = (
+				iroh.EndpointTicket as unknown as { fromString(value: string): { endpointAddr(): unknown } }
+			).fromString(firstPairing.payload.irohTicket);
+			phone = await createPhoneEndpoint();
+			const connection = await phone.connect(endpointTicket.endpointAddr(), ALPN);
+			const stream = await connection.openBi();
+			await writeJsonLine(stream, {
+				type: "volt_iroh_hello",
+				protocol: IROH_REMOTE_ALPN,
+				workspace: "ws",
+				secret: firstPairing.payload.secret,
+				clientLabel: "vitest-relay-recovery-phone",
+				workspaceDiscovery: { purpose: "list_sessions" },
+			});
+			expect((await readJsonLine(stream)).value.success).toBe(true);
+			await expect
+				.poll(() =>
+					controlEvents.some(
+						(event) =>
+							event.type === "pairing_progress" &&
+							event.requestId === firstPairing.started.requestId &&
+							event.phase === "completed",
+					),
+				)
+				.toBe(true);
+
+			await phone.close();
+			phone = undefined;
 			await expect.poll(() => relayInsertions.length).toBe(1);
 			expect(relayRemovals).toEqual([relayUrl]);
 			expect(relayInsertions).toEqual([{ url: relayUrl, authToken: relayAuthToken }]);
 			expect(endpointCloseCalls).toBe(0);
-			expect(await pairAndReadNodeId()).toBe(nodeIdBeforeLoss);
+			const secondPairing = await startPairing();
+			expect(secondPairing.payload.nodeId).toBe(nodeIdBeforeLoss);
+			expect(
+				await control.request({ type: "pair_cancel", requestId: secondPairing.started.requestId }),
+			).toMatchObject({
+				type: "ok",
+			});
 			const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
 				settings: { relayAuthToken?: string };
 			};
 			expect(state.settings.relayAuthToken).toBe(relayAuthToken);
-
-			emitRelayUrl(relayUrl);
 			await new Promise((resolve) => setTimeout(resolve, 80));
 			expect(relayInsertions).toHaveLength(1);
 			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
 			await daemon;
 			daemonStopped = true;
 		} finally {
+			await phone?.close().catch(() => {});
 			if (!daemonStopped) {
 				await control?.request({ type: "shutdown" }).catch(() => {});
 				await daemon;
