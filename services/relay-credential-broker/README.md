@@ -291,3 +291,4 @@ Cloud Run is private by default. The deployed canary uses `VOLT_CREDENTIAL_CANAR
 | `VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS` | `64` | In-process HTTP concurrency cap; not an edge-control substitute. |
 | `VOLT_CREDENTIAL_MAX_BOOTSTRAP_REQUESTS_PER_MINUTE` | `60` | Process-wide unauthenticated bootstrap budget; canary runs one broker instance so direct Cloud Run traffic cannot bypass it. |
 | `VOLT_CREDENTIAL_MAX_APPROVAL_REQUESTS_PER_MINUTE` | `120` | Process-wide App Check approval budget applied before verification and database work. |
+| `VOLT_CREDENTIAL_MAX_EXCHANGE_REQUESTS_PER_MINUTE` | `600` | Process-wide claim exchange budget applied before database work. |

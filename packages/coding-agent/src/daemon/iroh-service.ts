@@ -138,6 +138,9 @@ import {
 	type IrohManagedRelayAppEndpoint,
 	type IrohManagedRelayCredential,
 	type IrohManagedRelayCredentialClaim,
+	managedRelayCredentialFailureRetryMs,
+	managedRelayCredentialPendingRetryMs,
+	managedRelayCredentialRateLimitRetryMs,
 	managedRelayCredentialRefreshAt,
 	normalizeIrohCredentialServiceUrl,
 	parseIrohManagedRelayAppEndpoint,
@@ -1227,6 +1230,8 @@ class IrohDaemonService {
 		claim: IrohManagedRelayCredentialClaim,
 		expectedEpoch: number,
 	): Promise<void> {
+		let pendingResponseCount = 0;
+		let consecutiveFailureCount = 0;
 		while (
 			this.admission.isOpen &&
 			!this.relayCredentialIsRevoking &&
@@ -1237,8 +1242,16 @@ class IrohDaemonService {
 		) {
 			try {
 				const result = await exchangeIrohManagedRelayCredentialClaim(claim);
+				consecutiveFailureCount = 0;
 				if (result.status === "pending") {
-					await waitForRelayCredentialRetry(result.retryAfterMs);
+					pendingResponseCount++;
+					await waitForRelayCredentialRetry(
+						managedRelayCredentialPendingRetryMs(result.retryAfterMs, pendingResponseCount),
+					);
+					continue;
+				}
+				if (result.status === "rate_limited") {
+					await waitForRelayCredentialRetry(managedRelayCredentialRateLimitRetryMs(result.retryAfterMs));
 					continue;
 				}
 				if (
@@ -1269,10 +1282,11 @@ class IrohDaemonService {
 				return;
 			} catch (error) {
 				if (!this.admission.isOpen || this.relayCredentialIsRevoking) return;
+				consecutiveFailureCount++;
 				this.log("warn", "managed Iroh relay credential claim exchange failed", {
 					error: error instanceof Error ? error.message : String(error),
 				});
-				await waitForRelayCredentialRetry(1000);
+				await waitForRelayCredentialRetry(managedRelayCredentialFailureRetryMs(consecutiveFailureCount));
 			}
 		}
 		if (

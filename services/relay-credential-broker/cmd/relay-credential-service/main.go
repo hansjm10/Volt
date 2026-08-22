@@ -50,6 +50,7 @@ type config struct {
 	MaxConcurrentRequests      int
 	MaxBootstrapRequestsPerMin int
 	MaxApprovalRequestsPerMin  int
+	MaxExchangeRequestsPerMin  int
 }
 
 func main() {
@@ -150,6 +151,7 @@ func main() {
 		RefreshMinInterval:            configuration.RefreshMinInterval,
 		MaxBootstrapRequestsPerMinute: configuration.MaxBootstrapRequestsPerMin,
 		MaxApprovalRequestsPerMinute:  configuration.MaxApprovalRequestsPerMin,
+		MaxExchangeRequestsPerMinute:  configuration.MaxExchangeRequestsPerMin,
 		ReadinessCheck:                pool.Ping,
 	}, logger)
 	if err != nil {
@@ -242,6 +244,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	maxExchangeRequestsPerMin, err := positiveIntEnv("VOLT_CREDENTIAL_MAX_EXCHANGE_REQUESTS_PER_MINUTE", 600)
+	if err != nil {
+		return config{}, err
+	}
 	databaseURL := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_DATABASE_URL"))
 	if databaseURL == "" {
 		return config{}, errors.New("VOLT_CREDENTIAL_DATABASE_URL is required")
@@ -313,6 +319,7 @@ func loadConfig() (config, error) {
 		MaxConcurrentRequests:      maxConcurrentRequests,
 		MaxBootstrapRequestsPerMin: maxBootstrapRequestsPerMin,
 		MaxApprovalRequestsPerMin:  maxApprovalRequestsPerMin,
+		MaxExchangeRequestsPerMin:  maxExchangeRequestsPerMin,
 	}, nil
 }
 

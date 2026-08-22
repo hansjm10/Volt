@@ -66,6 +66,7 @@ func newTestService(t *testing.T) *testService {
 		RefreshMinInterval:            5 * time.Second,
 		MaxBootstrapRequestsPerMinute: 100,
 		MaxApprovalRequestsPerMinute:  100,
+		MaxExchangeRequestsPerMinute:  100,
 		ReadinessCheck:                pool.Ping,
 		Now:                           func() time.Time { return service.now },
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -501,6 +502,23 @@ func TestLivenessAndReadinessAreSeparate(t *testing.T) {
 
 func TestEnrollmentRequestBudgetsFailClosedAndReset(t *testing.T) {
 	service := newTestService(t)
+	hostNodeID := strings.Repeat("6", 64)
+	claimSecret := testSecret("vpc_", 25)
+	claim := service.createBootstrapClaim(t, hostNodeID, claimSecret, testSecret("vrr_", 26))
+	service.handler.exchangeBudget = newRequestBudget(1, func() time.Time { return service.now })
+	firstExchange := service.request(t, http.MethodPost, "/v1/pairing-claims/"+claim.ClaimID+"/exchange", "", map[string]string{
+		"Authorization": "Bearer " + claimSecret,
+	})
+	if firstExchange.Code != http.StatusAccepted {
+		t.Fatalf("first exchange status = %d, body = %s", firstExchange.Code, firstExchange.Body.String())
+	}
+	limitedExchange := service.request(t, http.MethodPost, "/v1/pairing-claims/"+claim.ClaimID+"/exchange", "", map[string]string{
+		"Authorization": "Bearer " + claimSecret,
+	})
+	if limitedExchange.Code != http.StatusTooManyRequests || limitedExchange.Header().Get("Retry-After") != "60" {
+		t.Fatalf("limited exchange status = %d, headers = %v, body = %s", limitedExchange.Code, limitedExchange.Header(), limitedExchange.Body.String())
+	}
+
 	service.handler.bootstrapBudget = newRequestBudget(1, func() time.Time { return service.now })
 	firstBootstrap := service.request(t, http.MethodPost, "/v1/pairing-claims", "{}", nil)
 	if firstBootstrap.Code != http.StatusBadRequest {
@@ -525,6 +543,12 @@ func TestEnrollmentRequestBudgetsFailClosedAndReset(t *testing.T) {
 	resetBootstrap := service.request(t, http.MethodPost, "/v1/pairing-claims", "{}", nil)
 	if resetBootstrap.Code != http.StatusBadRequest {
 		t.Fatalf("reset bootstrap status = %d, body = %s", resetBootstrap.Code, resetBootstrap.Body.String())
+	}
+	resetExchange := service.request(t, http.MethodPost, "/v1/pairing-claims/"+claim.ClaimID+"/exchange", "", map[string]string{
+		"Authorization": "Bearer " + claimSecret,
+	})
+	if resetExchange.Code != http.StatusAccepted {
+		t.Fatalf("reset exchange status = %d, body = %s", resetExchange.Code, resetExchange.Body.String())
 	}
 }
 

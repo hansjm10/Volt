@@ -6,6 +6,11 @@ const MAX_RESPONSE_BYTES = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_ACCESS_TOKEN_LIFETIME_MS = 60 * 60_000;
 const LOCAL_CANARY_PORT = "8085";
+const FAST_PENDING_RESPONSE_COUNT = 3;
+const STEADY_PENDING_RETRY_MS = 2_000;
+const MAX_EXCHANGE_FAILURE_RETRY_MS = 30_000;
+const RETRY_JITTER_RATIO = 0.2;
+const MAX_RATE_LIMIT_RETRY_AFTER_SECONDS = 60;
 
 export interface IrohManagedRelayCredential {
 	schemaVersion: 2;
@@ -61,7 +66,49 @@ export interface IrohRelayCredentialExchangeResponse {
 
 export type IrohRelayCredentialExchangeResult =
 	| { status: "pending"; retryAfterMs: number }
+	| { status: "rate_limited"; retryAfterMs: number }
 	| { status: "approved"; exchange: IrohRelayCredentialExchangeResponse };
+
+export function managedRelayCredentialPendingRetryMs(
+	serverRetryAfterMs: number,
+	pendingResponseCount: number,
+	randomFraction = Math.random(),
+): number {
+	expectRetryDelay(serverRetryAfterMs, "pending retry delay");
+	expectRetryCount(pendingResponseCount, "pending response count");
+	expectRandomFraction(randomFraction);
+	if (pendingResponseCount <= FAST_PENDING_RESPONSE_COUNT) return serverRetryAfterMs;
+	return jitterRetryDelay(
+		Math.max(serverRetryAfterMs, STEADY_PENDING_RETRY_MS),
+		serverRetryAfterMs,
+		Number.MAX_SAFE_INTEGER,
+		randomFraction,
+	);
+}
+
+export function managedRelayCredentialFailureRetryMs(
+	consecutiveFailureCount: number,
+	randomFraction = Math.random(),
+): number {
+	expectRetryCount(consecutiveFailureCount, "exchange failure count");
+	expectRandomFraction(randomFraction);
+	const exponentialDelay = 1_000 * 2 ** Math.min(consecutiveFailureCount - 1, 5);
+	return jitterRetryDelay(
+		Math.min(exponentialDelay, MAX_EXCHANGE_FAILURE_RETRY_MS),
+		1_000,
+		MAX_EXCHANGE_FAILURE_RETRY_MS,
+		randomFraction,
+	);
+}
+
+export function managedRelayCredentialRateLimitRetryMs(
+	serverRetryAfterMs: number,
+	randomFraction = Math.random(),
+): number {
+	expectRetryDelay(serverRetryAfterMs, "rate-limit retry delay");
+	expectRandomFraction(randomFraction);
+	return Math.round(serverRetryAfterMs * (1 + RETRY_JITTER_RATIO * randomFraction));
+}
 
 export function parseIrohManagedRelayCredential(value: unknown): IrohManagedRelayCredential {
 	const record = expectExactRecord(
@@ -220,6 +267,20 @@ export async function exchangeIrohManagedRelayCredentialClaim(
 	const response = await requestCredentialService(claim.serviceUrl, `/v1/pairing-claims/${claim.claimId}/exchange`, {
 		authorization: claim.claimSecret,
 	});
+	if (response.status === 429) {
+		const retryAfter = response.headers.get("retry-after");
+		await cancelResponseBody(response);
+		const retryAfterSeconds = Number(retryAfter);
+		if (
+			retryAfter === null ||
+			!Number.isInteger(retryAfterSeconds) ||
+			retryAfterSeconds < 1 ||
+			retryAfterSeconds > MAX_RATE_LIMIT_RETRY_AFTER_SECONDS
+		) {
+			throw new Error("relay credential exchange rate-limit response is invalid");
+		}
+		return { status: "rate_limited", retryAfterMs: retryAfterSeconds * 1000 };
+	}
 	if (response.status === 202 && isJSONContentType(response.headers.get("content-type"))) {
 		const body = expectExactRecord(
 			JSON.parse(await readBoundedResponse(response)),
@@ -605,6 +666,29 @@ function expectString(value: unknown, label: string): string {
 		throw new Error(`managed relay credential ${label} must be a non-empty string`);
 	}
 	return value;
+}
+
+function expectRetryDelay(value: number, label: string): void {
+	if (!Number.isSafeInteger(value) || value < 1) {
+		throw new Error(`managed relay credential ${label} is invalid`);
+	}
+}
+
+function expectRetryCount(value: number, label: string): void {
+	if (!Number.isSafeInteger(value) || value < 1) {
+		throw new Error(`managed relay credential ${label} is invalid`);
+	}
+}
+
+function expectRandomFraction(value: number): void {
+	if (!Number.isFinite(value) || value < 0 || value > 1) {
+		throw new Error("managed relay credential retry jitter is invalid");
+	}
+}
+
+function jitterRetryDelay(baseMs: number, minimumMs: number, maximumMs: number, randomFraction: number): number {
+	const factor = 1 - RETRY_JITTER_RATIO + 2 * RETRY_JITTER_RATIO * randomFraction;
+	return Math.min(maximumMs, Math.max(minimumMs, Math.round(baseMs * factor)));
 }
 
 function expectAllowedRecord(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {

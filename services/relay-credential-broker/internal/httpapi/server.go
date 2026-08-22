@@ -67,6 +67,7 @@ type Config struct {
 	RefreshMinInterval            time.Duration
 	MaxBootstrapRequestsPerMinute int
 	MaxApprovalRequestsPerMinute  int
+	MaxExchangeRequestsPerMinute  int
 	ReadinessCheck                func(context.Context) error
 	Now                           func() time.Time
 }
@@ -89,6 +90,7 @@ type Server struct {
 	readinessCheck    func(context.Context) error
 	bootstrapBudget   *requestBudget
 	approvalBudget    *requestBudget
+	exchangeBudget    *requestBudget
 	handler           http.Handler
 }
 
@@ -127,7 +129,7 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 	if config.MaxConcurrentRequests <= 0 || config.RefreshMinInterval <= 0 {
 		return nil, errors.New("HTTP concurrency and refresh interval must be positive")
 	}
-	if config.MaxBootstrapRequestsPerMinute <= 0 || config.MaxApprovalRequestsPerMinute <= 0 {
+	if config.MaxBootstrapRequestsPerMinute <= 0 || config.MaxApprovalRequestsPerMinute <= 0 || config.MaxExchangeRequestsPerMinute <= 0 {
 		return nil, errors.New("enrollment request budgets must be positive")
 	}
 	if config.ReadinessCheck == nil {
@@ -151,6 +153,7 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 		readinessCheck:    config.ReadinessCheck,
 		bootstrapBudget:   newRequestBudget(config.MaxBootstrapRequestsPerMinute, config.Now),
 		approvalBudget:    newRequestBudget(config.MaxApprovalRequestsPerMinute, config.Now),
+		exchangeBudget:    newRequestBudget(config.MaxExchangeRequestsPerMinute, config.Now),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /livez", server.handleLive)
@@ -312,6 +315,9 @@ func (s *Server) handleExchangeClaim(writer http.ResponseWriter, request *http.R
 	claimSecret, ok := bearerToken(request)
 	if !ok {
 		writeError(writer, http.StatusUnauthorized, "claim_secret_required")
+		return
+	}
+	if !enforceRequestBudget(writer, s.exchangeBudget) {
 		return
 	}
 	exchange, err := s.broker.ExchangePairingClaim(request.Context(), request.PathValue("claimID"), claimSecret)

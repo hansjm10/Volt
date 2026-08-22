@@ -18,7 +18,7 @@ func TestLoadConfigSelectsCloudKMSSigning(t *testing.T) {
 	if len(configuration.KMSRetiringKeyVersions) != 2 {
 		t.Fatalf("retiring key versions = %v, want two", configuration.KMSRetiringKeyVersions)
 	}
-	if configuration.MaxBootstrapRequestsPerMin != 60 || configuration.MaxApprovalRequestsPerMin != 120 {
+	if configuration.MaxBootstrapRequestsPerMin != 60 || configuration.MaxApprovalRequestsPerMin != 120 || configuration.MaxExchangeRequestsPerMin != 600 {
 		t.Fatalf("unexpected enrollment request budgets: %+v", configuration)
 	}
 }
@@ -87,6 +87,7 @@ func setMinimumEnvironment(t *testing.T) {
 		"VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS",
 		"VOLT_CREDENTIAL_MAX_BOOTSTRAP_REQUESTS_PER_MINUTE",
 		"VOLT_CREDENTIAL_MAX_APPROVAL_REQUESTS_PER_MINUTE",
+		"VOLT_CREDENTIAL_MAX_EXCHANGE_REQUESTS_PER_MINUTE",
 	} {
 		t.Setenv(name, "")
 	}

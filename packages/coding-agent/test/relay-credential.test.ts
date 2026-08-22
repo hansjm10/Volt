@@ -8,6 +8,9 @@ import {
 	exchangeIrohManagedRelayCredentialClaim,
 	type IrohManagedRelayCredential,
 	type IrohManagedRelayCredentialClaim,
+	managedRelayCredentialFailureRetryMs,
+	managedRelayCredentialPendingRetryMs,
+	managedRelayCredentialRateLimitRetryMs,
 	managedRelayCredentialRefreshAt,
 	parseIrohManagedRelayCredential,
 	parseIrohManagedRelayCredentialClaim,
@@ -22,7 +25,7 @@ const claimId = "abcdefghijklmnopqrstuvwx";
 const hostNodeId = "a".repeat(64);
 const appNodeId = "b".repeat(64);
 let server: Server;
-let responseMode: "normal" | "pending" | "oversized" | "redirect" | "revoke" = "normal";
+let responseMode: "normal" | "pending" | "rate-limited" | "oversized" | "redirect" | "revoke" = "normal";
 let observedRequest: { url?: string; method?: string; authorization?: string; body: string } | undefined;
 let redirectedRequestCount = 0;
 
@@ -101,19 +104,25 @@ beforeAll(async () => {
 				return;
 			}
 			if (request.url === `/v1/pairing-claims/${claimId}/exchange`) {
-				response.writeHead(responseMode === "pending" ? 202 : 200, { "content-type": "application/json" });
+				const status = responseMode === "pending" ? 202 : responseMode === "rate-limited" ? 429 : 200;
+				response.writeHead(status, {
+					"content-type": "application/json",
+					...(responseMode === "rate-limited" ? { "retry-after": "7" } : {}),
+				});
 				response.end(
 					JSON.stringify(
 						responseMode === "pending"
 							? { status: "pending", retryAfterSeconds: 1 }
-							: {
-									grantId: "grantabcdefghijklmnopqrs",
-									endpointId: "hostendpointabcdefghijkl",
-									hostNodeId,
-									appEndpointId: "appendpointabcdefghijklm",
-									appNodeId,
-									credential: accessTokenResponse(),
-								},
+							: responseMode === "rate-limited"
+								? { error: "request_rate_limited" }
+								: {
+										grantId: "grantabcdefghijklmnopqrs",
+										endpointId: "hostendpointabcdefghijkl",
+										hostNodeId,
+										appEndpointId: "appendpointabcdefghijklm",
+										appNodeId,
+										credential: accessTokenResponse(),
+									},
 					),
 				);
 				return;
@@ -198,6 +207,12 @@ describe("managed relay credential enrollment", () => {
 			retryAfterMs: 1000,
 		});
 
+		responseMode = "rate-limited";
+		expect(await exchangeIrohManagedRelayCredentialClaim(created)).toEqual({
+			status: "rate_limited",
+			retryAfterMs: 7000,
+		});
+
 		responseMode = "normal";
 		const result = await exchangeIrohManagedRelayCredentialClaim(created);
 		if (result.status !== "approved") throw new Error("expected approved exchange");
@@ -207,6 +222,26 @@ describe("managed relay credential enrollment", () => {
 		expect(active.endpointId).toBe("hostendpointabcdefghijkl");
 		expect(active.grantId).toBe("grantabcdefghijklmnopqrs");
 		expect(observedRequest?.authorization).toBe(`Bearer ${created.claimSecret}`);
+	});
+});
+
+describe("managed relay credential retry timing", () => {
+	it("keeps a fast pending burst before adding bounded jitter", () => {
+		expect(managedRelayCredentialPendingRetryMs(1000, 1, 0)).toBe(1000);
+		expect(managedRelayCredentialPendingRetryMs(1000, 3, 1)).toBe(1000);
+		expect(managedRelayCredentialPendingRetryMs(1000, 4, 0)).toBe(1600);
+		expect(managedRelayCredentialPendingRetryMs(1000, 4, 0.5)).toBe(2000);
+		expect(managedRelayCredentialPendingRetryMs(1000, 4, 1)).toBe(2400);
+		expect(managedRelayCredentialPendingRetryMs(3000, 4, 0)).toBe(3000);
+	});
+
+	it("exponentially backs off failures and honors rate-limit floors", () => {
+		expect(managedRelayCredentialFailureRetryMs(1, 0)).toBe(1000);
+		expect(managedRelayCredentialFailureRetryMs(2, 0)).toBe(1600);
+		expect(managedRelayCredentialFailureRetryMs(3, 0.5)).toBe(4000);
+		expect(managedRelayCredentialFailureRetryMs(6, 1)).toBe(30_000);
+		expect(managedRelayCredentialRateLimitRetryMs(10_000, 0)).toBe(10_000);
+		expect(managedRelayCredentialRateLimitRetryMs(10_000, 1)).toBe(12_000);
 	});
 });
 
