@@ -118,6 +118,7 @@ import { IrohConnectionSupervisor } from "./iroh-connection-supervisor.ts";
 import {
 	formatIrohLoadError,
 	type IrohConnectionLike,
+	type IrohEndpointAddrLike,
 	type IrohEndpointLike,
 	type IrohModuleLike,
 	loadIrohModule,
@@ -315,7 +316,9 @@ export interface IrohDaemonServiceDependencies {
 		kind: "conversation" | "workspace_discovery" | "workspace_management" | "worktree_management" | "relay",
 		authorization: IrohRemoteClientAuthorizationSuccess,
 	): void | Promise<void>;
-	/** Override relay-loss recovery timing (test-only). */
+	/** Override relay-loss observation and timing (test-only). */
+	readRelayAddress?(endpoint: IrohEndpointLike): IrohEndpointAddrLike;
+	relayRecoveryPollIntervalMs?: number;
 	relayRecoveryDelayMs?: number;
 	relayRecoveryRetryMs?: number;
 }
@@ -1151,16 +1154,9 @@ class IrohDaemonService {
 			return;
 		}
 		const endpoint = this.endpoint;
-		if (
-			endpoint?.watchAddr === undefined ||
-			endpoint.insertRelay === undefined ||
-			endpoint.removeRelay === undefined
-		) {
-			return;
-		}
-		const watchAddr = endpoint.watchAddr.bind(endpoint);
+		if (endpoint?.insertRelay === undefined || endpoint.removeRelay === undefined) return;
 		const monitor = new IrohRelayRecoveryMonitor({
-			watchAddr,
+			readAddr: () => this.dependencies.readRelayAddress?.(endpoint) ?? endpoint.addr(),
 			recover: () =>
 				this.enqueueRelayConfigurationMutation(async () => {
 					if (!this.admission.isOpen || this.endpoint !== endpoint || this.relayCredentialIsRevoking) return;
@@ -1176,6 +1172,7 @@ class IrohDaemonService {
 					}
 				}),
 			log: (level, message, details) => this.log(level, message, details),
+			pollIntervalMs: this.dependencies.relayRecoveryPollIntervalMs,
 			recoveryDelayMs: this.dependencies.relayRecoveryDelayMs,
 			retryDelayMs: this.dependencies.relayRecoveryRetryMs,
 		});

@@ -21,7 +21,6 @@ import { createIntegratedConversationHandshakeResponse } from "../src/daemon/han
 import {
 	formatIrohLoadError,
 	type IrohConnectionLike,
-	type IrohEndpointAddrLike,
 	type IrohEndpointLike,
 	type IrohIncomingLike,
 	type IrohRelayConfigLike,
@@ -339,40 +338,33 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 		const relayInsertions: IrohRelayConfigLike[] = [];
 		const relayRemovals: string[] = [];
 		const controlEvents: ControlEvent[] = [];
-		let emitRelayUrl: ((url: string | null) => void) | undefined;
+		let observedRelayUrl: string | null = null;
+		const emitRelayUrl = (url: string | null) => {
+			observedRelayUrl = url;
+		};
 		let endpointCloseCalls = 0;
-		let watchStopped = false;
 		let daemonStopped = false;
 		let control: DaemonClient | undefined;
 		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
 			createIrohDaemonService(
 				{ relayUrls: [relayUrl], relayAuthToken },
 				{
+					readRelayAddress: () => ({ relayUrl: () => observedRelayUrl }),
+					relayRecoveryPollIntervalMs: 5,
 					relayRecoveryDelayMs: 20,
 					relayRecoveryRetryMs: 20,
 					decorateEndpoint: (endpoint) => {
-						let watcher: ((addr: IrohEndpointAddrLike) => void) | undefined;
-						emitRelayUrl = (url) => watcher?.({ relayUrl: () => url });
 						return {
 							id: () => endpoint.id(),
 							addr: () => endpoint.addr(),
 							online: () => Promise.resolve(),
 							insertRelay: async (config) => {
 								relayInsertions.push(config);
-								watcher?.({ relayUrl: () => config.url });
+								observedRelayUrl = config.url;
 							},
 							removeRelay: async (url) => {
 								relayRemovals.push(url);
 								return true;
-							},
-							watchAddr: (callback) => {
-								watcher = callback;
-								return {
-									async stop() {
-										watcher = undefined;
-										watchStopped = true;
-									},
-								};
 							},
 							acceptNext: () => endpoint.acceptNext(),
 							secretKey: () => endpoint.secretKey(),
@@ -426,8 +418,9 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 			};
 
 			const nodeIdBeforeLoss = await pairAndReadNodeId();
-			emitRelayUrl?.(relayUrl);
-			emitRelayUrl?.(null);
+			emitRelayUrl(relayUrl);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			emitRelayUrl(null);
 			await expect.poll(() => relayInsertions.length).toBe(1);
 			expect(relayRemovals).toEqual([relayUrl]);
 			expect(relayInsertions).toEqual([{ url: relayUrl, authToken: relayAuthToken }]);
@@ -438,13 +431,12 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 			};
 			expect(state.settings.relayAuthToken).toBe(relayAuthToken);
 
-			emitRelayUrl?.(relayUrl);
+			emitRelayUrl(relayUrl);
 			await new Promise((resolve) => setTimeout(resolve, 80));
 			expect(relayInsertions).toHaveLength(1);
 			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
 			await daemon;
 			daemonStopped = true;
-			expect(watchStopped).toBe(true);
 		} finally {
 			if (!daemonStopped) {
 				await control?.request({ type: "shutdown" }).catch(() => {});

@@ -15,10 +15,6 @@ export interface IrohEndpointAddrLike {
 	relayUrl(): string | null;
 }
 
-export interface IrohWatchHandleLike {
-	stop(): Promise<void>;
-}
-
 export interface IrohSecretKeyLike {
 	toBytes(): number[];
 }
@@ -30,7 +26,6 @@ export interface IrohEndpointLike {
 	close(): Promise<void>;
 	insertRelay?(config: IrohRelayConfigLike): Promise<void>;
 	removeRelay?(url: string): Promise<boolean>;
-	watchAddr?(callback: (addr: IrohEndpointAddrLike) => void): IrohWatchHandleLike;
 	acceptNext(): Promise<IrohIncomingLike | null | undefined>;
 	secretKey(): IrohSecretKeyLike;
 }
