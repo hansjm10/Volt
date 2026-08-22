@@ -513,7 +513,7 @@ func TestEnrollmentRequestBudgetsFailClosedAndReset(t *testing.T) {
 
 	service.handler.approvalBudget = newRequestBudget(1, func() time.Time { return service.now })
 	firstApproval := service.request(t, http.MethodPost, "/v1/pairing-claims/unknown/approve", "{}", nil)
-	if firstApproval.Code != http.StatusBadRequest {
+	if firstApproval.Code != http.StatusUnauthorized {
 		t.Fatalf("first approval status = %d, body = %s", firstApproval.Code, firstApproval.Body.String())
 	}
 	limitedApproval := service.request(t, http.MethodPost, "/v1/pairing-claims/unknown/approve", "{}", nil)
