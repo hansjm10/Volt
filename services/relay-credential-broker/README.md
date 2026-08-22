@@ -77,7 +77,7 @@ go run ./cmd/relay-credential-service
 
 The database user must be able to create tables and use PostgreSQL advisory locks. Migrations run automatically before the listener starts. The default listener and issuer are local-only: `127.0.0.1:8085` and `http://127.0.0.1:8085`. Local signing mode creates `./data/relay-credential-signing-key` with mode `0600`.
 
-For a normal daemon-generated canary pairing, start the broker with the canary signing key and Firebase configuration, then start a disposable daemon state directory against the canary relay:
+After the broker is deployed at `https://credentials.volt-cli.dev` with the canary signing key and Firebase configuration, start a disposable daemon state directory against the canary relay:
 
 ```sh
 VOLT_CODING_AGENT_DIR=/tmp/volt-relay-canary \

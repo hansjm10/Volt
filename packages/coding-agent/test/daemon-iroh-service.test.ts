@@ -264,7 +264,15 @@ describe("relay config resolution", () => {
 		expect(resolveIrohRelayCredentialServiceUrl("production", VOLT_CANARY_RELAY_URLS)).toBe(
 			VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
 		);
+		expect(VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL).toBe("https://credentials.volt-cli.dev");
 		expect(resolveIrohRelayCredentialServiceUrl("production", ["https://self-managed.example.com"])).toBeUndefined();
+		expect(
+			resolveIrohRelayCredentialServiceUrl(
+				"production",
+				["https://self-managed.example.com"],
+				"https://credentials.volt-cli.dev",
+			),
+		).toBeUndefined();
 		expect(resolveIrohRelayCredentialServiceUrl("disabled", VOLT_PRODUCTION_RELAY_URLS)).toBeUndefined();
 	});
 

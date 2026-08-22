@@ -275,7 +275,7 @@ export type IrohRelayMode = "disabled" | "development" | "production";
 export const VOLT_PRODUCTION_RELAY_URLS = ["https://iroh-relay-us-central.volt-cli.dev"];
 export const VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL = "https://credentials.volt-cli.dev";
 export const VOLT_CANARY_RELAY_URLS = ["https://iroh-relay-us-central-canary.volt-cli.dev"];
-export const VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL = "http://127.0.0.1:8085";
+export const VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL = "https://credentials.volt-cli.dev";
 
 export interface IrohDaemonServiceConfig {
 	relayMode?: IrohRelayMode;
@@ -351,18 +351,17 @@ export function resolveIrohRelayCredentialServiceUrl(
 	relayUrls: string[],
 	explicitServiceUrl?: string,
 ): string | undefined {
+	if (relayMode !== "production") return undefined;
+	const normalized = relayUrls.map((value) => new URL(value).origin).sort();
+	const isProductionDeployment = sameStringSet(normalized, [...VOLT_PRODUCTION_RELAY_URLS].sort());
+	const isCanaryDeployment = sameStringSet(normalized, [...VOLT_CANARY_RELAY_URLS].sort());
+	if (!isProductionDeployment && !isCanaryDeployment) return undefined;
 	if (explicitServiceUrl !== undefined) {
 		return normalizeIrohCredentialServiceUrl(explicitServiceUrl);
 	}
-	if (relayMode !== "production") return undefined;
-	const normalized = relayUrls.map((value) => new URL(value).origin).sort();
-	if (sameStringSet(normalized, [...VOLT_PRODUCTION_RELAY_URLS].sort())) {
-		return VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL;
-	}
-	if (sameStringSet(normalized, [...VOLT_CANARY_RELAY_URLS].sort())) {
-		return VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL;
-	}
-	return undefined;
+	return isProductionDeployment
+		? VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL
+		: VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL;
 }
 
 function sameStringSet(left: string[], right: string[]): boolean {
