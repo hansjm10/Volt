@@ -252,7 +252,7 @@ Required behavior:
 - A candidate is promoted only after the expected host authenticates over Iroh.
 - Access refresh updates the live relay configuration without replacing the endpoint key.
 - A daemon restart falls back to the relay origins in persisted managed authority when no explicit relay configuration is supplied; an explicit origin mismatch still fails closed.
-- After a previously-online endpoint loses every advertised home relay, a safe native address watcher triggers bounded live relay-map recycling with the current credential without replacing the endpoint key. Native releases with the known watcher runtime crash remain gated off.
+- After a previously-online endpoint loses every connected home relay, a safe native home-relay watcher triggers bounded live relay-map recycling with the current credential without replacing the endpoint key. Native releases with the known watcher runtime crash remain gated off.
 - Relay-origin rotation replaces the complete authenticated origin set; retired origins are removed before future refreshes.
 - Local Forget always commits even if another revocation remains pending.
 - App and daemon revocation outboxes are keyed by endpoint ID rather than represented by one global tombstone; replacing a saved host durably queues the retired endpoint before discarding its refresh authority.

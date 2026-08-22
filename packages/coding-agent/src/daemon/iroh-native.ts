@@ -11,15 +11,11 @@ export interface IrohNodeIdLike {
 	toString(): string;
 }
 
-export interface IrohEndpointAddrLike {
-	relayUrl(): string | null;
-}
-
 export interface IrohWatchHandleLike {
 	stop(): Promise<void>;
 }
 
-export type IrohAddrWatchCallback = (errorOrAddr: unknown, addr?: IrohEndpointAddrLike) => void;
+export type IrohHomeRelayWatchCallback = (errorOrRelayUrls: unknown, relayUrls?: string[]) => void;
 
 export interface IrohSecretKeyLike {
 	toBytes(): number[];
@@ -27,12 +23,12 @@ export interface IrohSecretKeyLike {
 
 export interface IrohEndpointLike {
 	id(): IrohNodeIdLike;
-	addr(): IrohEndpointAddrLike;
+	addr(): unknown;
 	online(): Promise<void>;
 	close(): Promise<void>;
 	insertRelay?(config: IrohRelayConfigLike): Promise<void>;
 	removeRelay?(url: string): Promise<boolean>;
-	watchAddr?(callback: IrohAddrWatchCallback): IrohWatchHandleLike;
+	watchHomeRelay?(callback: IrohHomeRelayWatchCallback): IrohWatchHandleLike;
 	acceptNext(): Promise<IrohIncomingLike | null | undefined>;
 	secretKey(): IrohSecretKeyLike;
 }

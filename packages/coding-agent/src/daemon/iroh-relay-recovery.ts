@@ -1,18 +1,18 @@
-import type { IrohAddrWatchCallback, IrohEndpointAddrLike, IrohWatchHandleLike } from "./iroh-native.ts";
+import type { IrohHomeRelayWatchCallback, IrohWatchHandleLike } from "./iroh-native.ts";
 
 export const IROH_RELAY_RECOVERY_DELAY_MS = 15_000;
 export const IROH_RELAY_RECOVERY_RETRY_MS = 30_000;
 
 export interface IrohRelayRecoveryMonitorOptions {
-	watchAddr(callback: IrohAddrWatchCallback): IrohWatchHandleLike;
+	watchHomeRelay(callback: IrohHomeRelayWatchCallback): IrohWatchHandleLike;
 	recover(): Promise<void>;
 	log(level: "info" | "warn", message: string, details?: Record<string, unknown>): void;
 	recoveryDelayMs?: number;
 	retryDelayMs?: number;
 }
 
-function isIrohEndpointAddrLike(value: unknown): value is IrohEndpointAddrLike {
-	return typeof value === "object" && value !== null && "relayUrl" in value && typeof value.relayUrl === "function";
+function isRelayUrlList(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((url) => typeof url === "string");
 }
 
 /** Recycles live relay configuration after a previously-online endpoint loses every advertised home relay. */
@@ -35,13 +35,13 @@ export class IrohRelayRecoveryMonitor {
 
 	start(): void {
 		if (this.watchHandle !== undefined || this.stopped) return;
-		this.watchHandle = this.options.watchAddr((errorOrAddr, addr) => {
-			const normalized = addr ?? (isIrohEndpointAddrLike(errorOrAddr) ? errorOrAddr : undefined);
+		this.watchHandle = this.options.watchHomeRelay((errorOrRelayUrls, relayUrls) => {
+			const normalized = relayUrls ?? (isRelayUrlList(errorOrRelayUrls) ? errorOrRelayUrls : undefined);
 			if (normalized === undefined) {
 				this.options.log("warn", "Iroh relay registration watcher emitted an invalid update");
 				return;
 			}
-			this.observeRelayAddress(normalized);
+			this.observeHomeRelays(normalized);
 		});
 	}
 
@@ -57,9 +57,9 @@ export class IrohRelayRecoveryMonitor {
 		await Promise.allSettled([watchHandle?.stop(), this.recoveryTask]);
 	}
 
-	private observeRelayAddress(addr: IrohEndpointAddrLike): void {
+	private observeHomeRelays(relayUrls: string[]): void {
 		if (this.stopped) return;
-		if (addr.relayUrl() !== null) {
+		if (relayUrls.length > 0) {
 			const recovered = this.relayOffline;
 			this.hasConnected = true;
 			this.relayOffline = false;

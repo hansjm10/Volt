@@ -1164,15 +1164,15 @@ class IrohDaemonService {
 		}
 		const endpoint = this.endpoint;
 		if (
-			endpoint?.watchAddr === undefined ||
+			endpoint?.watchHomeRelay === undefined ||
 			endpoint.insertRelay === undefined ||
 			endpoint.removeRelay === undefined
 		) {
 			return;
 		}
-		const watchAddr = endpoint.watchAddr.bind(endpoint);
+		const watchHomeRelay = endpoint.watchHomeRelay.bind(endpoint);
 		const monitor = new IrohRelayRecoveryMonitor({
-			watchAddr,
+			watchHomeRelay,
 			recover: () =>
 				this.enqueueRelayConfigurationMutation(async () => {
 					if (!this.admission.isOpen || this.endpoint !== endpoint || this.relayCredentialIsRevoking) return;
