@@ -11,17 +11,13 @@ export interface IrohNodeIdLike {
 	toString(): string;
 }
 
-export interface IrohEndpointAddrLike {
-	relayUrl(): string | null;
-}
-
 export interface IrohSecretKeyLike {
 	toBytes(): number[];
 }
 
 export interface IrohEndpointLike {
 	id(): IrohNodeIdLike;
-	addr(): IrohEndpointAddrLike;
+	addr(): unknown;
 	online(): Promise<void>;
 	close(): Promise<void>;
 	insertRelay?(config: IrohRelayConfigLike): Promise<void>;

@@ -122,7 +122,6 @@ import {
 	type IrohModuleLike,
 	loadIrohModule,
 } from "./iroh-native.ts";
-import { IrohRelayRecoveryMonitor } from "./iroh-relay-recovery.ts";
 import { IrohRemoteResourceGuard } from "./iroh-resource-guard.ts";
 import {
 	createLifecycleFencedIrohStream,
@@ -315,9 +314,6 @@ export interface IrohDaemonServiceDependencies {
 		kind: "conversation" | "workspace_discovery" | "workspace_management" | "worktree_management" | "relay",
 		authorization: IrohRemoteClientAuthorizationSuccess,
 	): void | Promise<void>;
-	/** Override relay-loss recovery timing (test-only). */
-	relayRecoveryDelayMs?: number;
-	relayRecoveryRetryMs?: number;
 }
 
 export interface ResolvedIrohRelayConfig {
@@ -698,8 +694,6 @@ class IrohDaemonService {
 	private relayCredentialRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	private relayCredentialRefreshTask: Promise<void> | undefined;
 	private relayCredentialExchangeTask: Promise<void> | undefined;
-	private relayConfigurationTask: Promise<void> = Promise.resolve();
-	private relayRecoveryMonitor: IrohRelayRecoveryMonitor | undefined;
 	private relayCredentialEpoch = 0;
 	private relayCredentialIsRevoking = false;
 	private readonly relayConfigWarning: string | undefined;
@@ -1136,50 +1130,6 @@ class IrohDaemonService {
 		this.trackNativeLifecycleTask(cleanupTask);
 	}
 
-	private enqueueRelayConfigurationMutation(operation: () => Promise<void>): Promise<void> {
-		const task = this.relayConfigurationTask.catch(() => {}).then(operation);
-		this.relayConfigurationTask = task;
-		return task;
-	}
-
-	private ensureRelayRecoveryMonitor(): void {
-		if (
-			this.relayRecoveryMonitor !== undefined ||
-			this.relayMode !== "production" ||
-			(this.relayCredentialServiceUrl !== undefined && this.relayAuthToken === undefined)
-		) {
-			return;
-		}
-		const endpoint = this.endpoint;
-		if (endpoint?.insertRelay === undefined || endpoint.removeRelay === undefined) return;
-		const monitor = new IrohRelayRecoveryMonitor({
-			recover: () =>
-				this.enqueueRelayConfigurationMutation(async () => {
-					if (!this.admission.isOpen || this.endpoint !== endpoint || this.relayCredentialIsRevoking) return;
-					const authToken = this.relayAuthToken;
-					if (this.relayCredentialServiceUrl !== undefined && authToken === undefined) return;
-					for (const url of this.relayUrls) {
-						try {
-							await endpoint.removeRelay?.(url);
-						} catch {
-							// Replacement below is authoritative even if the stale entry was already absent.
-						}
-						await endpoint.insertRelay?.({ url, ...(authToken === undefined ? {} : { authToken }) });
-					}
-				}),
-			log: (level, message, details) => this.log(level, message, details),
-			recoveryDelayMs: this.dependencies.relayRecoveryDelayMs,
-			retryDelayMs: this.dependencies.relayRecoveryRetryMs,
-		});
-		this.relayRecoveryMonitor = monitor;
-	}
-
-	private async stopRelayRecoveryMonitor(): Promise<void> {
-		const monitor = this.relayRecoveryMonitor;
-		this.relayRecoveryMonitor = undefined;
-		await monitor?.stop();
-	}
-
 	private async createManagedRelayCredentialClaim(): Promise<IrohManagedRelayCredentialClaim | undefined> {
 		if (
 			this.relayMode !== "production" ||
@@ -1372,21 +1322,17 @@ class IrohDaemonService {
 			return false;
 		}
 		if (this.endpoint !== undefined) {
-			const endpoint = this.endpoint;
-			if (endpoint.id().toString() !== credential.endpointNodeId) {
+			if (this.endpoint.id().toString() !== credential.endpointNodeId) {
 				throw new Error("managed relay credential does not match the persistent Iroh endpoint identity");
 			}
-			if (endpoint.insertRelay === undefined) {
+			if (this.endpoint.insertRelay === undefined) {
 				throw new Error("the installed Iroh binding cannot update a live relay credential");
 			}
-			const insertRelay = endpoint.insertRelay.bind(endpoint);
-			await this.enqueueRelayConfigurationMutation(async () => {
-				for (const url of this.relayUrls) {
-					if (this.relayCredentialIsRevoking || expectedEpoch !== this.relayCredentialEpoch) return;
-					await insertRelay({ url, authToken: credential.accessToken });
-				}
-			});
-			if (this.relayCredentialIsRevoking || expectedEpoch !== this.relayCredentialEpoch) return false;
+			for (const url of this.relayUrls) {
+				if (this.relayCredentialIsRevoking || expectedEpoch !== this.relayCredentialEpoch) return false;
+				await this.endpoint.insertRelay({ url, authToken: credential.accessToken });
+				if (this.relayCredentialIsRevoking || expectedEpoch !== this.relayCredentialEpoch) return false;
+			}
 		}
 		const nextAppEndpoints =
 			approvedAppEndpoint === undefined
@@ -1408,7 +1354,6 @@ class IrohDaemonService {
 		this.managedRelayCredential = credential;
 		this.managedRelayAppEndpoints = nextAppEndpoints;
 		this.relayAuthToken = credential.accessToken;
-		this.ensureRelayRecoveryMonitor();
 		if (exchangedClaim !== undefined) {
 			this.managedRelayCredentialClaim = undefined;
 		}
@@ -1474,7 +1419,6 @@ class IrohDaemonService {
 		}
 		this.relayCredentialIsRevoking = true;
 		this.relayCredentialEpoch += 1;
-		await this.stopRelayRecoveryMonitor();
 		if (this.relayCredentialRefreshTimer !== undefined) {
 			clearTimeout(this.relayCredentialRefreshTimer);
 			this.relayCredentialRefreshTimer = undefined;
@@ -1496,16 +1440,13 @@ class IrohDaemonService {
 
 		let removalError: unknown;
 		if (this.endpoint !== undefined) {
-			const endpoint = this.endpoint;
-			await this.enqueueRelayConfigurationMutation(async () => {
-				for (const url of this.relayUrls) {
-					try {
-						await endpoint.removeRelay?.(url);
-					} catch (error) {
-						removalError ??= error;
-					}
+			for (const url of this.relayUrls) {
+				try {
+					await this.endpoint.removeRelay?.(url);
+				} catch (error) {
+					removalError ??= error;
 				}
-			});
+			}
 		}
 		await revokeIrohManagedRelayCredential(credential);
 		this.services.state.updateSettings({
@@ -1740,7 +1681,6 @@ class IrohDaemonService {
 			this.hostNodeId = hostNodeId;
 			this.endpointTicket = endpointTicket;
 			this.engine = engine;
-			this.ensureRelayRecoveryMonitor();
 			this.ready.resolve();
 			this.startManagedRelayCredentialExchange();
 			this.scheduleManagedRelayCredentialRefresh();
@@ -1983,7 +1923,6 @@ class IrohDaemonService {
 			authenticated = true;
 			clearTimeout(unauthenticatedTimer);
 			unauthenticatedAdmission.lease.release();
-			this.relayRecoveryMonitor?.reportAuthenticatedConnection();
 			this.log("info", `client connection opened: ${remoteId} (${connectionId})`);
 			await this.logAudit({
 				type: "client_connected",
@@ -2063,9 +2002,6 @@ class IrohDaemonService {
 				supervisor.trackChild(task);
 			}
 		} catch (error) {
-			if (authenticated && !supervisor.isClosing && !isExpectedApplicationClose(error)) {
-				this.relayRecoveryMonitor?.reportUnexpectedTransportFailure();
-			}
 			if (acceptedStreamCount === 0 && authenticated) {
 				throw error;
 			}
@@ -4984,14 +4920,12 @@ class IrohDaemonService {
 		// ownership commits, relay offers, and turn-starting commands now fail
 		// closed against the same state.
 		this.admission.close();
-		await this.stopRelayRecoveryMonitor();
 		if (this.relayCredentialRefreshTimer !== undefined) {
 			clearTimeout(this.relayCredentialRefreshTimer);
 			this.relayCredentialRefreshTimer = undefined;
 		}
 		await this.relayCredentialRefreshTask?.catch(() => {});
 		await this.relayCredentialExchangeTask?.catch(() => {});
-		await this.relayConfigurationTask.catch(() => {});
 		this.worktreeRetention.dispose();
 		// Freeze expiry callbacks at the same cut. Once admission is closed, no
 		// disconnect callback may mutate durable pairing state; quiesce becomes the
@@ -5086,7 +5020,6 @@ class IrohDaemonService {
 	}
 
 	async dispose(): Promise<void> {
-		await this.stopRelayRecoveryMonitor();
 		const endpoints = new Set(
 			[this.endpoint, this.startupEndpoint].filter(
 				(endpoint): endpoint is IrohEndpointLike => endpoint !== undefined,
