@@ -28,26 +28,28 @@ const (
 )
 
 type config struct {
-	ListenAddress           string
-	Issuer                  string
-	Audience                string
-	SigningMode             string
-	SigningKeyPath          string
-	KMSActiveKeyVersion     string
-	KMSRetiringKeyVersions  []string
-	DatabaseURL             string
-	AppCheckMode            string
-	DevAppCheck             string
-	FirebaseProjectNumber   string
-	AllowedFirebaseAppIDs   []string
-	ClaimTTL                time.Duration
-	AccessTTL               time.Duration
-	RefreshInactivityTTL    time.Duration
-	RefreshMinInterval      time.Duration
-	MaxClaims               int
-	MaxEndpoints            int
-	MaxAppEndpointsPerGrant int
-	MaxConcurrentRequests   int
+	ListenAddress              string
+	Issuer                     string
+	Audience                   string
+	SigningMode                string
+	SigningKeyPath             string
+	KMSActiveKeyVersion        string
+	KMSRetiringKeyVersions     []string
+	DatabaseURL                string
+	AppCheckMode               string
+	DevAppCheck                string
+	FirebaseProjectNumber      string
+	AllowedFirebaseAppIDs      []string
+	ClaimTTL                   time.Duration
+	AccessTTL                  time.Duration
+	RefreshInactivityTTL       time.Duration
+	RefreshMinInterval         time.Duration
+	MaxClaims                  int
+	MaxEndpoints               int
+	MaxAppEndpointsPerGrant    int
+	MaxConcurrentRequests      int
+	MaxBootstrapRequestsPerMin int
+	MaxApprovalRequestsPerMin  int
 }
 
 func main() {
@@ -144,9 +146,11 @@ func main() {
 		os.Exit(2)
 	}
 	handler, err := httpapi.NewServer(brokerService, signer, appCheck, httpapi.Config{
-		MaxConcurrentRequests: configuration.MaxConcurrentRequests,
-		RefreshMinInterval:    configuration.RefreshMinInterval,
-		ReadinessCheck:        pool.Ping,
+		MaxConcurrentRequests:         configuration.MaxConcurrentRequests,
+		RefreshMinInterval:            configuration.RefreshMinInterval,
+		MaxBootstrapRequestsPerMinute: configuration.MaxBootstrapRequestsPerMin,
+		MaxApprovalRequestsPerMinute:  configuration.MaxApprovalRequestsPerMin,
+		ReadinessCheck:                pool.Ping,
 	}, logger)
 	if err != nil {
 		logger.Error("configure HTTP server", "error", err)
@@ -230,6 +234,14 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	maxBootstrapRequestsPerMin, err := positiveIntEnv("VOLT_CREDENTIAL_MAX_BOOTSTRAP_REQUESTS_PER_MINUTE", 60)
+	if err != nil {
+		return config{}, err
+	}
+	maxApprovalRequestsPerMin, err := positiveIntEnv("VOLT_CREDENTIAL_MAX_APPROVAL_REQUESTS_PER_MINUTE", 120)
+	if err != nil {
+		return config{}, err
+	}
 	databaseURL := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_DATABASE_URL"))
 	if databaseURL == "" {
 		return config{}, errors.New("VOLT_CREDENTIAL_DATABASE_URL is required")
@@ -279,26 +291,28 @@ func loadConfig() (config, error) {
 	}
 
 	return config{
-		ListenAddress:           stringEnv("VOLT_CREDENTIAL_LISTEN", defaultListenAddress),
-		Issuer:                  stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer),
-		Audience:                stringEnv("VOLT_CREDENTIAL_AUDIENCE", defaultAudience),
-		SigningMode:             signingMode,
-		SigningKeyPath:          signingKeyPath,
-		KMSActiveKeyVersion:     kmsActiveKeyVersion,
-		KMSRetiringKeyVersions:  kmsRetiringKeyVersions,
-		DatabaseURL:             databaseURL,
-		AppCheckMode:            appCheckMode,
-		DevAppCheck:             devAppCheck,
-		FirebaseProjectNumber:   firebaseProjectNumber,
-		AllowedFirebaseAppIDs:   allowedFirebaseAppIDs,
-		ClaimTTL:                claimTTL,
-		AccessTTL:               accessTTL,
-		RefreshInactivityTTL:    refreshInactivityTTL,
-		RefreshMinInterval:      refreshMinInterval,
-		MaxClaims:               maxClaims,
-		MaxEndpoints:            maxEndpoints,
-		MaxAppEndpointsPerGrant: maxAppEndpointsPerGrant,
-		MaxConcurrentRequests:   maxConcurrentRequests,
+		ListenAddress:              stringEnv("VOLT_CREDENTIAL_LISTEN", defaultListenAddress),
+		Issuer:                     stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer),
+		Audience:                   stringEnv("VOLT_CREDENTIAL_AUDIENCE", defaultAudience),
+		SigningMode:                signingMode,
+		SigningKeyPath:             signingKeyPath,
+		KMSActiveKeyVersion:        kmsActiveKeyVersion,
+		KMSRetiringKeyVersions:     kmsRetiringKeyVersions,
+		DatabaseURL:                databaseURL,
+		AppCheckMode:               appCheckMode,
+		DevAppCheck:                devAppCheck,
+		FirebaseProjectNumber:      firebaseProjectNumber,
+		AllowedFirebaseAppIDs:      allowedFirebaseAppIDs,
+		ClaimTTL:                   claimTTL,
+		AccessTTL:                  accessTTL,
+		RefreshInactivityTTL:       refreshInactivityTTL,
+		RefreshMinInterval:         refreshMinInterval,
+		MaxClaims:                  maxClaims,
+		MaxEndpoints:               maxEndpoints,
+		MaxAppEndpointsPerGrant:    maxAppEndpointsPerGrant,
+		MaxConcurrentRequests:      maxConcurrentRequests,
+		MaxBootstrapRequestsPerMin: maxBootstrapRequestsPerMin,
+		MaxApprovalRequestsPerMin:  maxApprovalRequestsPerMin,
 	}, nil
 }
 

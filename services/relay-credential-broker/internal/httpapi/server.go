@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
@@ -62,9 +63,20 @@ func (v *DevelopmentAppCheckVerifier) Verify(request *http.Request) (VerifiedApp
 }
 
 type Config struct {
-	MaxConcurrentRequests int
-	RefreshMinInterval    time.Duration
-	ReadinessCheck        func(context.Context) error
+	MaxConcurrentRequests         int
+	RefreshMinInterval            time.Duration
+	MaxBootstrapRequestsPerMinute int
+	MaxApprovalRequestsPerMinute  int
+	ReadinessCheck                func(context.Context) error
+	Now                           func() time.Time
+}
+
+type requestBudget struct {
+	mutex       sync.Mutex
+	limit       int
+	windowStart time.Time
+	count       int
+	now         func() time.Time
 }
 
 type Server struct {
@@ -75,6 +87,8 @@ type Server struct {
 	requestSemaphore  chan struct{}
 	refreshRetryAfter string
 	readinessCheck    func(context.Context) error
+	bootstrapBudget   *requestBudget
+	approvalBudget    *requestBudget
 	handler           http.Handler
 }
 
@@ -113,11 +127,17 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 	if config.MaxConcurrentRequests <= 0 || config.RefreshMinInterval <= 0 {
 		return nil, errors.New("HTTP concurrency and refresh interval must be positive")
 	}
+	if config.MaxBootstrapRequestsPerMinute <= 0 || config.MaxApprovalRequestsPerMinute <= 0 {
+		return nil, errors.New("enrollment request budgets must be positive")
+	}
 	if config.ReadinessCheck == nil {
 		return nil, errors.New("readiness check is required")
 	}
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if config.Now == nil {
+		config.Now = time.Now
 	}
 
 	refreshRetryAfterSeconds := int((config.RefreshMinInterval + time.Second - 1) / time.Second)
@@ -129,6 +149,8 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 		requestSemaphore:  make(chan struct{}, config.MaxConcurrentRequests),
 		refreshRetryAfter: strconv.Itoa(refreshRetryAfterSeconds),
 		readinessCheck:    config.ReadinessCheck,
+		bootstrapBudget:   newRequestBudget(config.MaxBootstrapRequestsPerMinute, config.Now),
+		approvalBudget:    newRequestBudget(config.MaxApprovalRequestsPerMinute, config.Now),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /livez", server.handleLive)
@@ -147,6 +169,40 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	s.handler.ServeHTTP(writer, request)
+}
+
+func newRequestBudget(limit int, now func() time.Time) *requestBudget {
+	return &requestBudget{limit: limit, now: now}
+}
+
+func (b *requestBudget) take() (bool, int) {
+	now := b.now()
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	if b.windowStart.IsZero() || now.Before(b.windowStart) || !now.Before(b.windowStart.Add(time.Minute)) {
+		b.windowStart = now
+		b.count = 0
+	}
+	if b.count >= b.limit {
+		remaining := b.windowStart.Add(time.Minute).Sub(now)
+		retryAfter := int((remaining + time.Second - 1) / time.Second)
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		return false, retryAfter
+	}
+	b.count++
+	return true, 0
+}
+
+func enforceRequestBudget(writer http.ResponseWriter, budget *requestBudget) bool {
+	allowed, retryAfter := budget.take()
+	if allowed {
+		return true
+	}
+	writer.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	writeError(writer, http.StatusTooManyRequests, "request_rate_limited")
+	return false
 }
 
 func (s *Server) handleLive(writer http.ResponseWriter, _ *http.Request) {
@@ -170,6 +226,9 @@ func (s *Server) handleJWKS(writer http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleCreateClaim(writer http.ResponseWriter, request *http.Request) {
 	authorizationValues := request.Header.Values("Authorization")
 	if len(authorizationValues) == 0 {
+		if !enforceRequestBudget(writer, s.bootstrapBudget) {
+			return
+		}
 		var body createBootstrapClaimRequest
 		if err := decodeJSON(writer, request, &body); err != nil {
 			writeError(writer, http.StatusBadRequest, "invalid_request")
@@ -218,6 +277,9 @@ func (s *Server) handleCreateClaim(writer http.ResponseWriter, request *http.Req
 }
 
 func (s *Server) handleApproveClaim(writer http.ResponseWriter, request *http.Request) {
+	if !enforceRequestBudget(writer, s.approvalBudget) {
+		return
+	}
 	var body approveClaimRequest
 	if err := decodeJSON(writer, request, &body); err != nil {
 		writeError(writer, http.StatusBadRequest, "invalid_request")

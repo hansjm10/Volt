@@ -289,3 +289,5 @@ Cloud Run is private by default. Set `VOLT_CREDENTIAL_CANARY_PUBLIC=1` only afte
 | `VOLT_CREDENTIAL_MAX_ENDPOINTS` | `100000` | Database-wide endpoint/tombstone cap. |
 | `VOLT_CREDENTIAL_MAX_APP_ENDPOINTS_PER_GRANT` | `8` | Active phone endpoint cap per daemon identity grant. |
 | `VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS` | `64` | In-process HTTP concurrency cap; not an edge-control substitute. |
+| `VOLT_CREDENTIAL_MAX_BOOTSTRAP_REQUESTS_PER_MINUTE` | `60` | Process-wide unauthenticated bootstrap budget; canary runs one broker instance so direct Cloud Run traffic cannot bypass it. |
+| `VOLT_CREDENTIAL_MAX_APPROVAL_REQUESTS_PER_MINUTE` | `120` | Process-wide App Check approval budget applied before verification and database work. |

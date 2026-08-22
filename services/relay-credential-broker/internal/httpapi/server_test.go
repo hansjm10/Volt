@@ -62,9 +62,12 @@ func newTestService(t *testing.T) *testService {
 		t.Fatal(err)
 	}
 	handler, err := NewServer(brokerService, signer, appCheck, Config{
-		MaxConcurrentRequests: 8,
-		RefreshMinInterval:    5 * time.Second,
-		ReadinessCheck:        pool.Ping,
+		MaxConcurrentRequests:         8,
+		RefreshMinInterval:            5 * time.Second,
+		MaxBootstrapRequestsPerMinute: 100,
+		MaxApprovalRequestsPerMinute:  100,
+		ReadinessCheck:                pool.Ping,
+		Now:                           func() time.Time { return service.now },
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -493,6 +496,35 @@ func TestLivenessAndReadinessAreSeparate(t *testing.T) {
 	live := service.request(t, http.MethodGet, "/livez", "", nil)
 	if live.Code != http.StatusOK {
 		t.Fatalf("liveness during dependency outage status = %d, body = %s", live.Code, live.Body.String())
+	}
+}
+
+func TestEnrollmentRequestBudgetsFailClosedAndReset(t *testing.T) {
+	service := newTestService(t)
+	service.handler.bootstrapBudget = newRequestBudget(1, func() time.Time { return service.now })
+	firstBootstrap := service.request(t, http.MethodPost, "/v1/pairing-claims", "{}", nil)
+	if firstBootstrap.Code != http.StatusBadRequest {
+		t.Fatalf("first bootstrap status = %d, body = %s", firstBootstrap.Code, firstBootstrap.Body.String())
+	}
+	limitedBootstrap := service.request(t, http.MethodPost, "/v1/pairing-claims", "{}", nil)
+	if limitedBootstrap.Code != http.StatusTooManyRequests || limitedBootstrap.Header().Get("Retry-After") != "60" {
+		t.Fatalf("limited bootstrap status = %d, headers = %v, body = %s", limitedBootstrap.Code, limitedBootstrap.Header(), limitedBootstrap.Body.String())
+	}
+
+	service.handler.approvalBudget = newRequestBudget(1, func() time.Time { return service.now })
+	firstApproval := service.request(t, http.MethodPost, "/v1/pairing-claims/unknown/approve", "{}", nil)
+	if firstApproval.Code != http.StatusBadRequest {
+		t.Fatalf("first approval status = %d, body = %s", firstApproval.Code, firstApproval.Body.String())
+	}
+	limitedApproval := service.request(t, http.MethodPost, "/v1/pairing-claims/unknown/approve", "{}", nil)
+	if limitedApproval.Code != http.StatusTooManyRequests || limitedApproval.Header().Get("Retry-After") != "60" {
+		t.Fatalf("limited approval status = %d, headers = %v, body = %s", limitedApproval.Code, limitedApproval.Header(), limitedApproval.Body.String())
+	}
+
+	service.now = service.now.Add(time.Minute)
+	resetBootstrap := service.request(t, http.MethodPost, "/v1/pairing-claims", "{}", nil)
+	if resetBootstrap.Code != http.StatusBadRequest {
+		t.Fatalf("reset bootstrap status = %d, body = %s", resetBootstrap.Code, resetBootstrap.Body.String())
 	}
 }
 
