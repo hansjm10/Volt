@@ -2,11 +2,13 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -62,6 +64,7 @@ func newTestService(t *testing.T) *testService {
 	handler, err := NewServer(brokerService, signer, appCheck, Config{
 		MaxConcurrentRequests: 8,
 		RefreshMinInterval:    5 * time.Second,
+		ReadinessCheck:        pool.Ping,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -471,6 +474,28 @@ func TestJWKSExposesOnlyPublicVerificationKey(t *testing.T) {
 	}
 }
 
+func TestLivenessAndReadinessAreSeparate(t *testing.T) {
+	service := newTestService(t)
+	for _, path := range []string{"/livez", "/readyz"} {
+		response := service.request(t, http.MethodGet, path, "", nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, body = %s", path, response.Code, response.Body.String())
+		}
+	}
+
+	service.handler.readinessCheck = func(context.Context) error {
+		return errors.New("database unavailable")
+	}
+	unavailable := service.request(t, http.MethodGet, "/readyz", "", nil)
+	if unavailable.Code != http.StatusServiceUnavailable || !strings.Contains(unavailable.Body.String(), "service_unavailable") {
+		t.Fatalf("unavailable readiness status = %d, body = %s", unavailable.Code, unavailable.Body.String())
+	}
+	live := service.request(t, http.MethodGet, "/livez", "", nil)
+	if live.Code != http.StatusOK {
+		t.Fatalf("liveness during dependency outage status = %d, body = %s", live.Code, live.Body.String())
+	}
+}
+
 func TestConcurrencyLimitFailsClosed(t *testing.T) {
 	service := newTestService(t)
 	for index := 0; index < cap(service.handler.requestSemaphore); index++ {
@@ -482,7 +507,7 @@ func TestConcurrencyLimitFailsClosed(t *testing.T) {
 		}
 	}()
 
-	response := service.request(t, http.MethodGet, "/healthz", "", nil)
+	response := service.request(t, http.MethodGet, "/livez", "", nil)
 	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" {
 		t.Fatalf("busy service status = %d, headers = %v, body = %s", response.Code, response.Header(), response.Body.String())
 	}

@@ -179,7 +179,8 @@ The service uses Application Default Credentials. Its runtime identity needs per
 | `POST /v1/grant/endpoints/revoke` | Host refresh bearer | Idempotently revokes one app `{endpointId}` in the host's grant. |
 | `POST /v1/grant/revoke` | Host refresh bearer | Idempotently revokes the complete daemon identity grant. Body must be empty. |
 | `GET /.well-known/jwks.json` | Public | Returns active and retiring Ed25519 public verification keys. |
-| `GET /healthz` | Public | Returns liveness only. |
+| `GET /livez` | Public | Returns process liveness without checking dependencies. |
+| `GET /readyz` | Public | Returns readiness only while PostgreSQL is reachable. |
 
 Access JWT claims:
 
@@ -248,6 +249,21 @@ public_key = "<retiring-jwks-x>"
 The relay derives each `kid` from the public key using the broker's SHA-256 rule, preventing key-ID/public-key mismatches. The checked-in patch supports this multi-key format. The currently deployed canary remains on the prior single-key binary until the Cloud Run/Cloud SQL canary rollout step.
 
 Relays verify locally instead of calling the credential service for each connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path.
+
+## Canary deployment
+
+The canary deployment script is pinned to GCP project `volt-3fae7` (project number `546623825529`) and `us-central1`. It provisions one zonal `db-f1-micro` Cloud SQL instance with backups, a software-protected Ed25519 Cloud KMS key, a dedicated runtime service account, Secret Manager database authority, Artifact Registry, and a single-instance Cloud Run service:
+
+```sh
+cd services/relay-credential-broker
+./deploy/canary.sh preflight
+./deploy/canary.sh provision
+./deploy/canary.sh build
+./deploy/canary.sh deploy
+./deploy/canary.sh describe
+```
+
+Cloud Run is private by default. Set `VOLT_CREDENTIAL_CANARY_PUBLIC=1` only after `credentials.volt-cli.dev` is mapped to the service and non-bypassable public request budgets are active. The script never deletes infrastructure, rotates database authority, or changes DNS.
 
 ## Configuration
 

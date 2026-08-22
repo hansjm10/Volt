@@ -146,6 +146,7 @@ func main() {
 	handler, err := httpapi.NewServer(brokerService, signer, appCheck, httpapi.Config{
 		MaxConcurrentRequests: configuration.MaxConcurrentRequests,
 		RefreshMinInterval:    configuration.RefreshMinInterval,
+		ReadinessCheck:        pool.Ping,
 	}, logger)
 	if err != nil {
 		logger.Error("configure HTTP server", "error", err)

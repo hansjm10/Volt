@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -63,6 +64,7 @@ func (v *DevelopmentAppCheckVerifier) Verify(request *http.Request) (VerifiedApp
 type Config struct {
 	MaxConcurrentRequests int
 	RefreshMinInterval    time.Duration
+	ReadinessCheck        func(context.Context) error
 }
 
 type Server struct {
@@ -72,6 +74,7 @@ type Server struct {
 	logger            *slog.Logger
 	requestSemaphore  chan struct{}
 	refreshRetryAfter string
+	readinessCheck    func(context.Context) error
 	handler           http.Handler
 }
 
@@ -110,6 +113,9 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 	if config.MaxConcurrentRequests <= 0 || config.RefreshMinInterval <= 0 {
 		return nil, errors.New("HTTP concurrency and refresh interval must be positive")
 	}
+	if config.ReadinessCheck == nil {
+		return nil, errors.New("readiness check is required")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -122,9 +128,11 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 		logger:            logger,
 		requestSemaphore:  make(chan struct{}, config.MaxConcurrentRequests),
 		refreshRetryAfter: strconv.Itoa(refreshRetryAfterSeconds),
+		readinessCheck:    config.ReadinessCheck,
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", server.handleHealth)
+	mux.HandleFunc("GET /livez", server.handleLive)
+	mux.HandleFunc("GET /readyz", server.handleReady)
 	mux.HandleFunc("GET /.well-known/jwks.json", server.handleJWKS)
 	mux.HandleFunc("POST /v1/pairing-claims", server.handleCreateClaim)
 	mux.HandleFunc("POST /v1/pairing-claims/{claimID}/approve", server.handleApproveClaim)
@@ -141,7 +149,16 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	s.handler.ServeHTTP(writer, request)
 }
 
-func (s *Server) handleHealth(writer http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleLive(writer http.ResponseWriter, _ *http.Request) {
+	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleReady(writer http.ResponseWriter, request *http.Request) {
+	if err := s.readinessCheck(request.Context()); err != nil {
+		s.logger.Error("credential service readiness failed", "error", err)
+		writeError(writer, http.StatusServiceUnavailable, "service_unavailable")
+		return
+	}
 	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 }
 
