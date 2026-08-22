@@ -12,6 +12,7 @@ SQL_DATABASE="relay_credentials"
 SQL_USER="relay_broker"
 DATABASE_SECRET="relay-credential-database-url-canary"
 ARTIFACT_REPOSITORY="relay-services"
+RELAY_ARTIFACT_REPOSITORY="relay-artifacts"
 KMS_KEYRING="relay"
 KMS_KEY="signing"
 ISSUER="https://credentials.volt-cli.dev"
@@ -91,6 +92,13 @@ provision() {
 			--project "$PROJECT_ID" --location "$REGION" \
 			--repository-format docker \
 			--description 'Volt relay service containers'
+	fi
+	if ! gcloud artifacts repositories describe "$RELAY_ARTIFACT_REPOSITORY" \
+		--project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
+		gcloud artifacts repositories create "$RELAY_ARTIFACT_REPOSITORY" \
+			--project "$PROJECT_ID" --location "$REGION" \
+			--repository-format generic \
+			--description 'Attested Volt relay binaries and manifests'
 	fi
 	if ! gcloud kms keyrings describe "$KMS_KEYRING" \
 		--project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then

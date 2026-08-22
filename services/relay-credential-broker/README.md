@@ -19,8 +19,8 @@ PostgreSQL is the broker's only state store. Embedded, checksummed migrations cr
 
 Remaining production blockers:
 
-- The service still needs managed HTTPS deployment, edge rate limits, request budgets, secret-free monitoring, readiness checks, backup/restore verification, and administrative procedures.
-- The relay canary accepts the JWT shape, but the multi-key relay patch still needs canary deployment, metrics, rollout, and artifact publication.
+- The private Cloud Run, Cloud SQL, KMS, and Secret Manager canary is deployed. It still needs the `credentials.volt-cli.dev` domain mapping, public request budgets, secret-free monitoring, backup/restore verification, and administrative procedures before public traffic.
+- The multi-key relay binary is deployed and published. Relay rejection metrics and the complete enrollment/rotation/revocation acceptance run remain outstanding.
 
 Do not expose the development App Check mode to the public internet or use its token in an app build.
 
@@ -230,7 +230,7 @@ Build and validate the patch with pinned Rust, Zig, cargo-zigbuild, and LLVM ver
 ./relay-patch/build.sh linux-x86_64 /tmp/iroh-relay-1.0.3-volt-jwt
 ```
 
-The Linux build writes a sidecar manifest containing source, patch/tool versions, and hashes. The current canary binary SHA-256 is `7917f468dd81dee9c412eaf99de9cd35df75e5efd04d4e06091c695af234fc11`.
+The Linux build writes a sidecar manifest containing source, patch/tool versions, and hashes. The deployed canary binary SHA-256 is `28eb14fbb323b0f74f8068317c263cb48fa19fe4c29dc834ceb397630e0e8cc8`. The binary and manifest are published in Artifact Registry package `iroh-relay`, version `1.0.3-volt-jwt-743a6202d57d`.
 
 The relay access check requires one bearer JWT, selects one of at most eight configured Ed25519 keys by `kid`, validates issuer/audience/scope/time bounds, requires canonical `sub` equal to the proven endpoint ID, and enforces node/grant/global connection limits. It fails closed on malformed tokens, duplicate key IDs/public keys, or invalid access configuration. Configure rotation overlap with TOML array-of-table entries:
 
@@ -246,7 +246,7 @@ public_key = "<active-jwks-x>"
 public_key = "<retiring-jwks-x>"
 ```
 
-The relay derives each `kid` from the public key using the broker's SHA-256 rule, preventing key-ID/public-key mismatches. The checked-in patch supports this multi-key format. The currently deployed canary remains on the prior single-key binary until the Cloud Run/Cloud SQL canary rollout step.
+The relay derives each `kid` from the public key using the broker's SHA-256 rule, preventing key-ID/public-key mismatches. The deployed canary uses this multi-key format with the active KMS public key.
 
 Relays verify locally instead of calling the credential service for each connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path.
 
