@@ -166,22 +166,45 @@ describe("voltd state migration", () => {
 		expect(parsed.settings).toEqual({ detachedRuntimeTtlMs: 60_000, allowTools: ["read", "grep"] });
 	});
 
-	it("round-trips a managed relay credential and rejects malformed persisted credentials", async () => {
+	it("round-trips managed relay authority and rejects malformed persisted credentials", async () => {
 		const managedCredential = {
-			schemaVersion: 1 as const,
-			serviceUrl: "http://127.0.0.1:18085",
+			schemaVersion: 2 as const,
+			serviceUrl: "http://127.0.0.1:8085",
 			relayUrls: ["https://iroh-relay-us-central-canary.volt-cli.dev"],
 			endpointNodeId: "a".repeat(64),
-			grantId: "abcdefghijklmnopqrstuvwx",
+			endpointId: "abcdefghijklmnopqrstuvwx",
+			grantId: "zyxwvutsrqponmlkjihgfedc",
 			accessToken: "aaaaaa.bbbbbb.cccccc",
 			accessTokenExpiresAt: Date.now() + 15 * 60_000,
 			refreshToken: `vrr_${"d".repeat(43)}`,
-			refreshTokenExpiresAt: Date.now() + 30 * 24 * 60 * 60_000,
+		};
+		const managedClaim = {
+			schemaVersion: 1 as const,
+			serviceUrl: managedCredential.serviceUrl,
+			relayUrls: managedCredential.relayUrls,
+			hostNodeId: managedCredential.endpointNodeId,
+			claimSecret: `vpc_${"c".repeat(43)}`,
+			claimId: "abcdefghijklmnopqrstuvwx",
+			expiresAt: Date.now() + 10 * 60_000,
 		};
 		const state = createEmptyVoltdState();
+		const appEndpoint = {
+			schemaVersion: 1 as const,
+			claimId: managedClaim.claimId,
+			nodeId: "b".repeat(64),
+			endpointId: "appendpointabcdefghijklm",
+			revocationPending: false,
+		};
 		state.settings.relayCredential = managedCredential;
-		expect(parseVoltdState(JSON.parse(JSON.stringify(state))).settings.relayCredential).toEqual(managedCredential);
+		state.settings.relayCredentialClaim = managedClaim;
+		state.settings.relayCredentialAppEndpoints = [appEndpoint];
+		const parsed = parseVoltdState(JSON.parse(JSON.stringify(state))).settings;
+		expect(parsed.relayCredential).toEqual(managedCredential);
+		expect(parsed.relayCredentialClaim).toEqual(managedClaim);
+		expect(parsed.relayCredentialAppEndpoints).toEqual([appEndpoint]);
 		state.settings.relayCredential = undefined;
+		state.settings.relayCredentialClaim = undefined;
+		state.settings.relayCredentialAppEndpoints = undefined;
 		state.settings.relayCredentialRevocation = managedCredential;
 		expect(parseVoltdState(JSON.parse(JSON.stringify(state))).settings.relayCredentialRevocation).toEqual(
 			managedCredential,

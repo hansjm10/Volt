@@ -1,73 +1,67 @@
-import { readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 
-const RELAY_CREDENTIAL_SCHEMA_VERSION = 1;
+const RELAY_CREDENTIAL_SCHEMA_VERSION = 2;
+const RELAY_CREDENTIAL_CLAIM_SCHEMA_VERSION = 1;
 const MAX_RESPONSE_BYTES = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_ACCESS_TOKEN_LIFETIME_MS = 60 * 60_000;
-const LOCAL_CANARY_PORT = "18085";
+const LOCAL_CANARY_PORT = "8085";
 
 export interface IrohManagedRelayCredential {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	serviceUrl: string;
 	relayUrls: string[];
 	endpointNodeId: string;
+	endpointId: string;
 	grantId: string;
 	accessToken: string;
 	accessTokenExpiresAt: number;
 	refreshToken: string;
-	refreshTokenExpiresAt: number;
+}
+
+/** Durable daemon-owned authority for one broker claim. */
+export interface IrohManagedRelayCredentialClaim {
+	schemaVersion: 1;
+	serviceUrl: string;
+	relayUrls: string[];
+	hostNodeId: string;
+	claimSecret: string;
+	/** Present only for the bootstrap claim that will create the host endpoint. */
+	bootstrapRefreshToken?: string;
+	/** Added only after the broker has acknowledged claim creation. */
+	claimId?: string;
+	expiresAt?: number;
+}
+
+export interface IrohManagedRelayAppEndpoint {
+	schemaVersion: 1;
+	claimId: string;
+	nodeId: string;
+	endpointId: string;
+	revocationPending: boolean;
+}
+
+export interface IrohRelayCredentialClaimResponse {
+	claimId: string;
+	expiresAt: number;
 }
 
 export interface IrohRelayCredentialExchangeResponse {
 	grantId: string;
+	endpointId: string;
 	hostNodeId: string;
+	appEndpointId: string;
+	appNodeId: string;
 	credential: {
 		accessToken: string;
-		accessTokenExpiresAt: string;
-		refreshToken: string;
-		refreshTokenExpiresAt: string;
+		accessTokenExpiresAt: number;
 		tokenType: "Bearer";
 	};
 }
 
-export function loadIrohRelayCredentialExchangeFile(
-	path: string,
-	serviceUrl: string,
-	relayUrls: string[],
-): IrohManagedRelayCredential {
-	const stat = statSync(path);
-	if (!stat.isFile() || stat.size <= 0 || stat.size > 32 * 1024 || (stat.mode & 0o077) !== 0) {
-		throw new Error("relay credential file must be a non-empty mode-0600 regular file under 32 KiB");
-	}
-	return parseIrohRelayCredentialExchange(JSON.parse(readFileSync(path, "utf8")), serviceUrl, relayUrls);
-}
-
-export function parseIrohRelayCredentialExchange(
-	value: unknown,
-	serviceUrl: string,
-	relayUrls: string[],
-): IrohManagedRelayCredential {
-	const response = expectExactRecord(value, ["grantId", "hostNodeId", "credential"], "relay credential exchange");
-	const credential = expectExactRecord(
-		response.credential,
-		["accessToken", "accessTokenExpiresAt", "refreshToken", "refreshTokenExpiresAt", "tokenType"],
-		"relay credential",
-	);
-	if (credential.tokenType !== "Bearer") {
-		throw new Error("relay credential tokenType must be Bearer");
-	}
-	return parseIrohManagedRelayCredential({
-		schemaVersion: RELAY_CREDENTIAL_SCHEMA_VERSION,
-		serviceUrl,
-		relayUrls,
-		endpointNodeId: response.hostNodeId,
-		grantId: response.grantId,
-		accessToken: credential.accessToken,
-		accessTokenExpiresAt: parseTimestamp(credential.accessTokenExpiresAt, "accessTokenExpiresAt"),
-		refreshToken: credential.refreshToken,
-		refreshTokenExpiresAt: parseTimestamp(credential.refreshTokenExpiresAt, "refreshTokenExpiresAt"),
-	});
-}
+export type IrohRelayCredentialExchangeResult =
+	| { status: "pending"; retryAfterMs: number }
+	| { status: "approved"; exchange: IrohRelayCredentialExchangeResponse };
 
 export function parseIrohManagedRelayCredential(value: unknown): IrohManagedRelayCredential {
 	const record = expectExactRecord(
@@ -77,45 +71,218 @@ export function parseIrohManagedRelayCredential(value: unknown): IrohManagedRela
 			"serviceUrl",
 			"relayUrls",
 			"endpointNodeId",
+			"endpointId",
 			"grantId",
 			"accessToken",
 			"accessTokenExpiresAt",
 			"refreshToken",
-			"refreshTokenExpiresAt",
 		],
 		"managed relay credential",
 	);
 	if (record.schemaVersion !== RELAY_CREDENTIAL_SCHEMA_VERSION) {
 		throw new Error("unsupported managed relay credential schema");
 	}
-	const serviceUrl = normalizeCredentialServiceUrl(expectString(record.serviceUrl, "serviceUrl"));
+	const serviceUrl = normalizeIrohCredentialServiceUrl(expectString(record.serviceUrl, "serviceUrl"));
 	const relayUrls = normalizeRelayUrls(record.relayUrls);
-	const endpointNodeId = expectString(record.endpointNodeId, "endpointNodeId");
-	if (!/^[0-9a-f]{64}$/.test(endpointNodeId)) {
-		throw new Error("managed relay credential endpointNodeId is invalid");
-	}
+	const endpointNodeId = expectNodeId(record.endpointNodeId, "endpointNodeId");
+	const endpointId = expectBoundedToken(record.endpointId, "endpointId", 16, 128);
 	const grantId = expectBoundedToken(record.grantId, "grantId", 16, 128);
 	const accessToken = expectAccessToken(record.accessToken);
-	const refreshToken = expectBoundedToken(record.refreshToken, "refreshToken", 32, 256);
-	if (!refreshToken.startsWith("vrr_")) {
-		throw new Error("managed relay refreshToken is invalid");
-	}
 	const accessTokenExpiresAt = expectTimestamp(record.accessTokenExpiresAt, "accessTokenExpiresAt");
-	const refreshTokenExpiresAt = expectTimestamp(record.refreshTokenExpiresAt, "refreshTokenExpiresAt");
-	if (refreshTokenExpiresAt <= accessTokenExpiresAt) {
-		throw new Error("managed relay refresh credential must outlive the access token");
-	}
+	const refreshToken = expectRefreshToken(record.refreshToken);
 	return {
 		schemaVersion: RELAY_CREDENTIAL_SCHEMA_VERSION,
 		serviceUrl,
 		relayUrls,
 		endpointNodeId,
+		endpointId,
 		grantId,
 		accessToken,
 		accessTokenExpiresAt,
 		refreshToken,
-		refreshTokenExpiresAt,
 	};
+}
+
+export function parseIrohManagedRelayAppEndpoint(value: unknown): IrohManagedRelayAppEndpoint {
+	const record = expectExactRecord(
+		value,
+		["schemaVersion", "claimId", "nodeId", "endpointId", "revocationPending"],
+		"managed relay app endpoint",
+	);
+	if (record.schemaVersion !== 1 || typeof record.revocationPending !== "boolean") {
+		throw new Error("managed relay app endpoint is invalid");
+	}
+	return {
+		schemaVersion: 1,
+		claimId: expectClaimId(record.claimId),
+		nodeId: expectNodeId(record.nodeId, "app endpoint nodeId"),
+		endpointId: expectBoundedToken(record.endpointId, "app endpointId", 16, 128),
+		revocationPending: record.revocationPending,
+	};
+}
+
+export function parseIrohManagedRelayCredentialClaim(value: unknown): IrohManagedRelayCredentialClaim {
+	const record = expectAllowedRecord(
+		value,
+		[
+			"schemaVersion",
+			"serviceUrl",
+			"relayUrls",
+			"hostNodeId",
+			"claimSecret",
+			"bootstrapRefreshToken",
+			"claimId",
+			"expiresAt",
+		],
+		"managed relay credential claim",
+	);
+	if (record.schemaVersion !== RELAY_CREDENTIAL_CLAIM_SCHEMA_VERSION) {
+		throw new Error("unsupported managed relay credential claim schema");
+	}
+	const claimId = expectOptionalClaimId(record.claimId);
+	const expiresAt = record.expiresAt === undefined ? undefined : expectTimestamp(record.expiresAt, "claim expiresAt");
+	if ((claimId === undefined) !== (expiresAt === undefined)) {
+		throw new Error("managed relay credential claim id and expiry must be persisted together");
+	}
+	const bootstrapRefreshToken =
+		record.bootstrapRefreshToken === undefined ? undefined : expectRefreshToken(record.bootstrapRefreshToken);
+	return {
+		schemaVersion: RELAY_CREDENTIAL_CLAIM_SCHEMA_VERSION,
+		serviceUrl: normalizeIrohCredentialServiceUrl(expectString(record.serviceUrl, "claim serviceUrl")),
+		relayUrls: normalizeRelayUrls(record.relayUrls),
+		hostNodeId: expectNodeId(record.hostNodeId, "claim hostNodeId"),
+		claimSecret: expectPrefixedSecret(record.claimSecret, "claimSecret", "vpc_"),
+		...(bootstrapRefreshToken === undefined ? {} : { bootstrapRefreshToken }),
+		...(claimId === undefined ? {} : { claimId, expiresAt }),
+	};
+}
+
+export async function createIrohManagedRelayCredentialClaim(
+	candidate: IrohManagedRelayCredentialClaim,
+	activeCredential?: IrohManagedRelayCredential,
+): Promise<IrohManagedRelayCredentialClaim> {
+	const claim = parseIrohManagedRelayCredentialClaim(candidate);
+	if (claim.claimId !== undefined) {
+		throw new Error("managed relay credential claim is already created");
+	}
+	const claimSecretHash = hashSecret(claim.claimSecret);
+	let authorization: string | undefined;
+	let body: Record<string, string>;
+	if (activeCredential === undefined) {
+		if (claim.bootstrapRefreshToken === undefined) {
+			throw new Error("bootstrap relay credential claim requires a host refresh token");
+		}
+		body = {
+			hostNodeId: claim.hostNodeId,
+			claimSecretHash,
+			hostRefreshTokenHash: hashSecret(claim.bootstrapRefreshToken),
+		};
+	} else {
+		const active = parseIrohManagedRelayCredential(activeCredential);
+		if (
+			active.endpointNodeId !== claim.hostNodeId ||
+			active.serviceUrl !== claim.serviceUrl ||
+			!sameOrigins(active.relayUrls, claim.relayUrls) ||
+			claim.bootstrapRefreshToken !== undefined
+		) {
+			throw new Error("later relay credential claim does not match the active daemon grant");
+		}
+		authorization = active.refreshToken;
+		body = { claimSecretHash };
+	}
+	const response = await requestCredentialService(claim.serviceUrl, "/v1/pairing-claims", {
+		authorization,
+		jsonBody: body,
+	});
+	if (response.status !== 201 || !isJSONContentType(response.headers.get("content-type"))) {
+		await cancelResponseBody(response);
+		throw new Error(`relay credential claim creation failed with status ${response.status}`);
+	}
+	const decoded = expectExactRecord(
+		JSON.parse(await readBoundedResponse(response)),
+		["claimId", "expiresAt"],
+		"relay credential claim response",
+	);
+	return parseIrohManagedRelayCredentialClaim({
+		...claim,
+		claimId: expectClaimId(decoded.claimId),
+		expiresAt: parseTimestamp(decoded.expiresAt, "claim expiresAt"),
+	});
+}
+
+export async function exchangeIrohManagedRelayCredentialClaim(
+	claimValue: IrohManagedRelayCredentialClaim,
+): Promise<IrohRelayCredentialExchangeResult> {
+	const claim = parseIrohManagedRelayCredentialClaim(claimValue);
+	if (claim.claimId === undefined || claim.expiresAt === undefined) {
+		throw new Error("managed relay credential claim has not been created");
+	}
+	const response = await requestCredentialService(claim.serviceUrl, `/v1/pairing-claims/${claim.claimId}/exchange`, {
+		authorization: claim.claimSecret,
+	});
+	if (response.status === 202 && isJSONContentType(response.headers.get("content-type"))) {
+		const body = expectExactRecord(
+			JSON.parse(await readBoundedResponse(response)),
+			["status", "retryAfterSeconds"],
+			"relay credential pending exchange response",
+		);
+		if (
+			body.status !== "pending" ||
+			typeof body.retryAfterSeconds !== "number" ||
+			!Number.isInteger(body.retryAfterSeconds) ||
+			body.retryAfterSeconds < 1 ||
+			body.retryAfterSeconds > 30
+		) {
+			throw new Error("relay credential pending exchange response is invalid");
+		}
+		return { status: "pending", retryAfterMs: body.retryAfterSeconds * 1000 };
+	}
+	if (response.status !== 200 || !isJSONContentType(response.headers.get("content-type"))) {
+		await cancelResponseBody(response);
+		throw new Error(`relay credential claim exchange failed with status ${response.status}`);
+	}
+	return {
+		status: "approved",
+		exchange: parseExchangeResponse(JSON.parse(await readBoundedResponse(response))),
+	};
+}
+
+export function activateIrohManagedRelayCredential(
+	claimValue: IrohManagedRelayCredentialClaim,
+	exchangeValue: IrohRelayCredentialExchangeResponse,
+	activeCredential?: IrohManagedRelayCredential,
+): IrohManagedRelayCredential {
+	const claim = parseIrohManagedRelayCredentialClaim(claimValue);
+	const exchange = parseExchangeResponse(exchangeValue);
+	if (exchange.hostNodeId !== claim.hostNodeId) {
+		throw new Error("relay credential exchange returned another host identity");
+	}
+	const active = activeCredential === undefined ? undefined : parseIrohManagedRelayCredential(activeCredential);
+	const refreshToken = claim.bootstrapRefreshToken ?? active?.refreshToken;
+	if (refreshToken === undefined) {
+		throw new Error("relay credential exchange has no local host refresh authority");
+	}
+	if (
+		active !== undefined &&
+		(active.endpointNodeId !== exchange.hostNodeId ||
+			active.endpointId !== exchange.endpointId ||
+			active.grantId !== exchange.grantId ||
+			active.serviceUrl !== claim.serviceUrl ||
+			!sameOrigins(active.relayUrls, claim.relayUrls))
+	) {
+		throw new Error("relay credential exchange changed the active daemon grant");
+	}
+	return parseIrohManagedRelayCredential({
+		schemaVersion: RELAY_CREDENTIAL_SCHEMA_VERSION,
+		serviceUrl: claim.serviceUrl,
+		relayUrls: claim.relayUrls,
+		endpointNodeId: exchange.hostNodeId,
+		endpointId: exchange.endpointId,
+		grantId: exchange.grantId,
+		accessToken: exchange.credential.accessToken,
+		accessTokenExpiresAt: exchange.credential.accessTokenExpiresAt,
+		refreshToken,
+	});
 }
 
 export async function refreshIrohManagedRelayCredential(
@@ -123,10 +290,9 @@ export async function refreshIrohManagedRelayCredential(
 ): Promise<IrohManagedRelayCredential> {
 	const validated = parseIrohManagedRelayCredential(credential);
 	const now = Date.now();
-	if (!Number.isFinite(now) || now >= validated.refreshTokenExpiresAt) {
-		throw new Error("managed relay refresh credential has expired");
-	}
-	const response = await requestCredentialService(validated, "/v1/tokens/refresh");
+	const response = await requestCredentialService(validated.serviceUrl, "/v1/tokens/refresh", {
+		authorization: validated.refreshToken,
+	});
 	if (response.status !== 200 || !isJSONContentType(response.headers.get("content-type"))) {
 		await cancelResponseBody(response);
 		throw new Error(`relay credential refresh failed with status ${response.status}`);
@@ -150,13 +316,35 @@ export async function refreshIrohManagedRelayCredential(
 	return refreshed;
 }
 
-export async function revokeIrohManagedRelayCredential(credential: IrohManagedRelayCredential): Promise<void> {
+export async function revokeIrohManagedRelayAppEndpoint(
+	credential: IrohManagedRelayCredential,
+	endpointId: string,
+): Promise<void> {
 	const validated = parseIrohManagedRelayCredential(credential);
-	const now = Date.now();
-	if (!Number.isFinite(now) || now >= validated.refreshTokenExpiresAt) {
+	const validatedEndpointId = expectBoundedToken(endpointId, "app endpointId", 16, 128);
+	const response = await requestCredentialService(validated.serviceUrl, "/v1/grant/endpoints/revoke", {
+		authorization: validated.refreshToken,
+		jsonBody: { endpointId: validatedEndpointId },
+	});
+	if (response.status === 401 || response.status === 410) {
+		await cancelResponseBody(response);
 		return;
 	}
-	const response = await requestCredentialService(validated, "/v1/tokens/revoke");
+	if (response.status !== 204) {
+		await cancelResponseBody(response);
+		throw new Error(`relay app endpoint revocation failed with status ${response.status}`);
+	}
+	const body = await readBoundedResponse(response);
+	if (body.length !== 0) {
+		throw new Error("relay app endpoint revocation response must be empty");
+	}
+}
+
+export async function revokeIrohManagedRelayCredential(credential: IrohManagedRelayCredential): Promise<void> {
+	const validated = parseIrohManagedRelayCredential(credential);
+	const response = await requestCredentialService(validated.serviceUrl, "/v1/grant/revoke", {
+		authorization: validated.refreshToken,
+	});
 	if (response.status === 401 || response.status === 410) {
 		await cancelResponseBody(response);
 		return;
@@ -176,6 +364,66 @@ export function managedRelayCredentialRefreshAt(credential: IrohManagedRelayCred
 	const remaining = validated.accessTokenExpiresAt - now;
 	const lead = Math.min(2 * 60_000, Math.max(30_000, Math.floor(remaining / 5)));
 	return validated.accessTokenExpiresAt - lead;
+}
+
+export function normalizeIrohCredentialServiceUrl(value: string): string {
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		throw new Error("managed relay credential serviceUrl is invalid");
+	}
+	const isLocalCanary =
+		url.protocol === "http:" &&
+		(url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost") &&
+		url.port === LOCAL_CANARY_PORT;
+	if (
+		(url.protocol !== "https:" && !isLocalCanary) ||
+		url.username !== "" ||
+		url.password !== "" ||
+		url.search !== "" ||
+		url.hash !== "" ||
+		(url.pathname !== "" && url.pathname !== "/")
+	) {
+		throw new Error("managed relay credential serviceUrl must be an HTTPS origin or the local canary");
+	}
+	return `${url.protocol}//${url.host}`;
+}
+
+function parseExchangeResponse(value: unknown): IrohRelayCredentialExchangeResponse {
+	const record = expectExactRecord(
+		value,
+		["grantId", "endpointId", "hostNodeId", "appEndpointId", "appNodeId", "credential"],
+		"relay credential exchange response",
+	);
+	const credential = expectExactRecord(
+		record.credential,
+		["accessToken", "accessTokenExpiresAt", "tokenType"],
+		"relay credential exchange access token",
+	);
+	if (credential.tokenType !== "Bearer") {
+		throw new Error("relay credential exchange tokenType must be Bearer");
+	}
+	const now = Date.now();
+	const accessTokenExpiresAt =
+		typeof credential.accessTokenExpiresAt === "number"
+			? expectTimestamp(credential.accessTokenExpiresAt, "accessTokenExpiresAt")
+			: parseTimestamp(credential.accessTokenExpiresAt, "accessTokenExpiresAt");
+	if (accessTokenExpiresAt <= now || accessTokenExpiresAt > now + MAX_ACCESS_TOKEN_LIFETIME_MS) {
+		throw new Error("relay credential exchange returned an invalid access-token lifetime");
+	}
+	return {
+		grantId: expectBoundedToken(record.grantId, "grantId", 16, 128),
+		endpointId: expectBoundedToken(record.endpointId, "endpointId", 16, 128),
+		hostNodeId: expectNodeId(record.hostNodeId, "hostNodeId"),
+		appEndpointId: expectBoundedToken(record.appEndpointId, "appEndpointId", 16, 128),
+		appNodeId: expectNodeId(record.appNodeId, "appNodeId"),
+		credential: {
+			accessToken: expectAccessToken(credential.accessToken),
+			accessTokenExpiresAt,
+			tokenType: "Bearer",
+		},
+	};
 }
 
 function normalizeRelayUrls(value: unknown): string[] {
@@ -210,38 +458,25 @@ function normalizeRelayUrls(value: unknown): string[] {
 	return origins;
 }
 
-function normalizeCredentialServiceUrl(value: string): string {
-	let url: URL;
-	try {
-		url = new URL(value);
-	} catch {
-		throw new Error("managed relay credential serviceUrl is invalid");
-	}
-	const isLocalCanary =
-		url.protocol === "http:" &&
-		(url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost") &&
-		url.port === LOCAL_CANARY_PORT;
-	if (
-		(url.protocol !== "https:" && !isLocalCanary) ||
-		url.username !== "" ||
-		url.password !== "" ||
-		url.search !== "" ||
-		url.hash !== "" ||
-		(url.pathname !== "" && url.pathname !== "/")
-	) {
-		throw new Error("managed relay credential serviceUrl must be an HTTPS origin or the local canary");
-	}
-	return `${url.protocol}//${url.host}`;
+function sameOrigins(left: string[], right: string[]): boolean {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-async function requestCredentialService(credential: IrohManagedRelayCredential, path: string): Promise<Response> {
-	return fetch(`${credential.serviceUrl}${path}`, {
+async function requestCredentialService(
+	serviceUrlValue: string,
+	path: string,
+	options: { authorization?: string; jsonBody?: Record<string, string> },
+): Promise<Response> {
+	const serviceUrl = normalizeIrohCredentialServiceUrl(serviceUrlValue);
+	const body = options.jsonBody === undefined ? null : JSON.stringify(options.jsonBody);
+	return fetch(`${serviceUrl}${path}`, {
 		method: "POST",
 		headers: {
 			Accept: "application/json",
-			Authorization: `Bearer ${credential.refreshToken}`,
+			...(options.authorization === undefined ? {} : { Authorization: `Bearer ${options.authorization}` }),
+			...(body === null ? {} : { "Content-Type": "application/json" }),
 		},
-		body: null,
+		body,
 		redirect: "error",
 		signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 	});
@@ -293,6 +528,10 @@ function isJSONContentType(value: string | null): boolean {
 	return value?.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
 }
 
+function hashSecret(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("base64url");
+}
+
 function parseTimestamp(value: unknown, label: string): number {
 	if (typeof value !== "string") {
 		throw new Error(`relay credential ${label} must be an RFC 3339 string`);
@@ -311,6 +550,14 @@ function expectTimestamp(value: unknown, label: string): number {
 	return value;
 }
 
+function expectNodeId(value: unknown, label: string): string {
+	const nodeId = expectString(value, label);
+	if (!/^[0-9a-f]{64}$/.test(nodeId)) {
+		throw new Error(`managed relay credential ${label} is invalid`);
+	}
+	return nodeId;
+}
+
 function expectAccessToken(value: unknown): string {
 	const token = expectBoundedToken(value, "accessToken", 16, 8 * 1024);
 	const segments = token.split(".");
@@ -318,6 +565,31 @@ function expectAccessToken(value: unknown): string {
 		throw new Error("managed relay credential accessToken is not a JWT");
 	}
 	return token;
+}
+
+function expectRefreshToken(value: unknown): string {
+	return expectPrefixedSecret(value, "refreshToken", "vrr_");
+}
+
+function expectPrefixedSecret(value: unknown, label: string, prefix: "vpc_" | "vrr_"): string {
+	const token = expectString(value, label);
+	const encoded = token.slice(prefix.length);
+	if (!token.startsWith(prefix) || encoded.length !== 43 || !/^[A-Za-z0-9_-]{43}$/.test(encoded)) {
+		throw new Error(`managed relay credential ${label} is invalid`);
+	}
+	return token;
+}
+
+function expectClaimId(value: unknown): string {
+	const claimId = expectString(value, "claimId");
+	if (!/^[A-Za-z0-9_-]{24}$/.test(claimId)) {
+		throw new Error("managed relay credential claimId is invalid");
+	}
+	return claimId;
+}
+
+function expectOptionalClaimId(value: unknown): string | undefined {
+	return value === undefined ? undefined : expectClaimId(value);
 }
 
 function expectBoundedToken(value: unknown, label: string, minimum: number, maximum: number): string {
@@ -335,11 +607,20 @@ function expectString(value: unknown, label: string): string {
 	return value;
 }
 
-function expectExactRecord(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {
+function expectAllowedRecord(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new Error(`${label} must be an object`);
 	}
 	const record = value as Record<string, unknown>;
+	const allowed = new Set(keys);
+	if (Object.keys(record).some((key) => !allowed.has(key))) {
+		throw new Error(`${label} has unexpected fields`);
+	}
+	return record;
+}
+
+function expectExactRecord(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {
+	const record = expectAllowedRecord(value, keys, label);
 	const actual = Object.keys(record).sort();
 	const expected = [...keys].sort();
 	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {

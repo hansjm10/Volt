@@ -31,6 +31,10 @@ import {
 	IrohDaemonAdmissionGate,
 	IrohPhysicalStreamOwner,
 	resolveIrohRelayConfig,
+	resolveIrohRelayCredentialServiceUrl,
+	VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
+	VOLT_CANARY_RELAY_URLS,
+	VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
 	VOLT_PRODUCTION_RELAY_URLS,
 } from "../src/daemon/iroh-service.ts";
 import {
@@ -251,6 +255,17 @@ describe("relay config resolution", () => {
 			relayMode: "production",
 			relayUrls: VOLT_PRODUCTION_RELAY_URLS,
 		});
+	});
+
+	it("resolves managed broker origins only for the built-in relay deployments", () => {
+		expect(resolveIrohRelayCredentialServiceUrl("production", VOLT_PRODUCTION_RELAY_URLS)).toBe(
+			VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
+		);
+		expect(resolveIrohRelayCredentialServiceUrl("production", VOLT_CANARY_RELAY_URLS)).toBe(
+			VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
+		);
+		expect(resolveIrohRelayCredentialServiceUrl("production", ["https://self-managed.example.com"])).toBeUndefined();
+		expect(resolveIrohRelayCredentialServiceUrl("disabled", VOLT_PRODUCTION_RELAY_URLS)).toBeUndefined();
 	});
 
 	it("uses VOLT_IROH_RELAY_URLS for a self-managed relay fleet", () => {

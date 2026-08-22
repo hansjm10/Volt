@@ -23,7 +23,7 @@ This remains an in-memory protocol POC, not a production service:
 - The service still needs managed HTTPS deployment, edge rate limits, request budgets, secret-free monitoring, readiness checks, migrations, backup/restore verification, and administrative procedures.
 - Signing still uses one mode-`0600` local Ed25519 seed. Production uses Cloud KMS and an overlapping active/retiring relay key set.
 - The relay canary accepts the JWT shape, but production relays still need multi-key configuration, metrics, rollout, and artifact publication.
-- Normal daemon claim creation/exchange and normal confirmed iOS approval are the next implementation step. The existing credential-file and Debug canary bootstrap clients speak the prior POC protocol and are intentionally not compatible with this revised service.
+- Normal daemon claim creation/exchange and confirmed iOS approval now implement this protocol. Production deployment, PostgreSQL, KMS, and relay key-set rollout remain blockers.
 
 Do not expose this POC to the public internet or use its development App Check token in an app build.
 
@@ -53,8 +53,8 @@ Each app can revoke itself. The host can revoke one app endpoint or the complete
 3. The reviewed app-facing pairing payload carries `claimId`, never either plaintext daemon secret.
 4. The app generates and stores its own `vrr_` refresh secret, obtains a limited-use App Check token, and approves the claim with its endpoint node ID and refresh-secret hash.
 5. Approval creates one grant plus separate host/app endpoint records and returns only an app access JWT.
-6. The daemon polls exchange with its claim secret and receives only a host access JWT. Its pre-persisted host refresh secret is now active.
-7. Each endpoint presents its access JWT to the relay. The relay requires JWT `sub` to equal the Iroh-handshake-proven endpoint ID.
+6. The daemon polls exchange with its claim secret and receives only a host access JWT. Its pre-persisted host refresh secret is now active, and it records the approved app node/endpoint.
+7. The daemon consumes the pairing secret only from that broker-approved app node. Each endpoint presents its own access JWT to the relay, which requires JWT `sub` to equal the Iroh-handshake-proven endpoint ID.
 
 ### Later phone pairing
 
@@ -77,6 +77,20 @@ go run ./cmd/relay-credential-service
 ```
 
 The default listener and issuer are local-only: `127.0.0.1:8085` and `http://127.0.0.1:8085`. The service creates `./data/relay-credential-signing-key` with mode `0600`.
+
+For a normal daemon-generated canary pairing, start the broker with the canary signing key and Firebase configuration, then start a disposable daemon state directory against the canary relay:
+
+```sh
+VOLT_CODING_AGENT_DIR=/tmp/volt-relay-canary \
+VOLT_IROH_RELAY_URLS=https://iroh-relay-us-central-canary.volt-cli.dev \
+  ./volt-test.sh daemon start
+VOLT_CODING_AGENT_DIR=/tmp/volt-relay-canary \
+  ./volt-test.sh remote workspace add "$PWD" --name canary
+VOLT_CODING_AGENT_DIR=/tmp/volt-relay-canary \
+  ./volt-test.sh remote pair --workspace canary
+```
+
+The daemon recognizes the exact canary relay set, pre-persists its claim and host refresh secrets, creates the broker claim, and emits a normal reviewed ticket. Confirming that ticket in iOS obtains App Check, pre-persists the app refresh secret, approves the claim, and connects with the app access JWT. The daemon exchanges the same claim and installs its separate host JWT. No credential file or credential-specific launch argument is used.
 
 Run validation:
 
@@ -179,7 +193,7 @@ A host credential is node-bound and must not be transferred to the app. Pipe any
 APP_TICKET="$(printf '%s' "$HOST_TICKET" | go run ./cmd/sanitize-pairing-ticket)"
 ```
 
-The sanitizer preserves the existing one-time pairing secret and non-credential fields but removes `relayAuthToken`. The final daemon flow will add `claimId` directly to the reviewed pairing payload and will never serialize the host access or refresh credential.
+The sanitizer preserves the existing one-time pairing secret and non-credential fields but removes `relayAuthToken`. Normal daemon tickets carry `relayCredentialClaim: { claimId, serviceUrl }`; iOS removes that complete one-time object when creating the saved reconnect ticket. Host access and refresh credentials are never serialized into app-facing tickets.
 
 Do not pass unsanitized tickets or credentials as process arguments.
 

@@ -1,6 +1,6 @@
 # Managed relay credentials production design
 
-- Status: Accepted; protocol POC implemented
+- Status: Accepted; protocol POC and normal daemon/iOS clients implemented
 - Workspaces: `Volt` broker/daemon/relay integration and `volt-app` iOS client
 - Current proof of concept: `packages/coding-agent/examples/remote/relay-credential-service`
 
@@ -157,7 +157,18 @@ Unauthenticated but edge-rate-limited body:
 }
 ```
 
-Returns `claimId` and `expiresAt`. The daemon includes `claimId` in the reviewed pairing payload and retains both plaintext secrets locally.
+Returns `claimId` and `expiresAt`. The daemon includes this one-time object in the reviewed pairing payload and retains both plaintext secrets locally:
+
+```json
+{
+  "relayCredentialClaim": {
+    "claimId": "<public-claim-id>",
+    "serviceUrl": "https://credentials.volt-cli.dev"
+  }
+}
+```
+
+The service origin is deployment metadata, not authority. iOS accepts Volt-controlled HTTPS origins and the exact local Debug POC origin only; sanitized reconnect tickets remove the complete claim object.
 
 ### Create claim for an existing grant
 
@@ -196,7 +207,7 @@ The response includes `grantId`, `endpointId`, `hostNodeId`, the app access JWT,
 
 Authenticated with the daemon-generated claim secret. Returns `202` while pending. After approval it returns the grant and host endpoint identifiers plus a host access JWT. It never returns a refresh secret.
 
-The daemon treats a successful response as the point at which the pre-persisted bootstrap refresh secret becomes active. Later-pairing exchange only reports approval and refreshes the existing host access JWT.
+The daemon treats a successful response as the point at which the pre-persisted bootstrap refresh secret becomes active. It durably records the approved app node/endpoint and refuses to consume the Iroh pairing secret from any other node. Later-pairing exchange only reports approval and refreshes the existing host access JWT.
 
 ### Refresh
 
@@ -242,10 +253,10 @@ Required behavior:
 - Access refresh updates the live relay configuration without replacing the endpoint key.
 - Relay-origin rotation replaces the complete authenticated origin set; retired origins are removed before future refreshes.
 - Local Forget always commits even if another revocation remains pending.
-- The revocation outbox is keyed by endpoint ID rather than represented by one global tombstone.
+- App and daemon revocation outboxes are keyed by endpoint ID rather than represented by one global tombstone; replacing a saved host durably queues the retired endpoint before discarding its refresh authority.
 - Normal confirmed pairing, not Debug launch arguments, owns claim approval and credential promotion.
 
-The daemon owns claim creation and exchange directly. Production removes `VOLT_IROH_RELAY_CREDENTIAL_FILE`, `VOLT_IROH_RELAY_CREDENTIAL_SERVICE`, and the source-file-removal state used by the canary.
+The daemon owns claim creation and exchange directly. Built-in production and canary relay sets resolve to their broker origins; custom relay sets remain self-managed. The normal path has removed `VOLT_IROH_RELAY_CREDENTIAL_FILE`, `VOLT_IROH_RELAY_CREDENTIAL_SERVICE`, and the source-file-removal state used by the old canary bootstrap.
 
 ## Signing and relay verification
 
@@ -310,7 +321,7 @@ Alert only on sustained 5xx responses, database/KMS unavailability, unexpected s
 ## Implementation order
 
 1. **Completed:** accept this contract and update the POC protocol/tests to client-generated stable refresh secrets and daemon-identity grants, including host-authorized app revocation.
-2. Wire normal daemon claim creation/exchange and normal confirmed iOS approval; remove file/Debug bootstrap paths.
+2. **Completed:** wire durable daemon claim creation/exchange and normal confirmed iOS approval; remove file/Debug bootstrap paths.
 3. Replace in-memory broker state with PostgreSQL transactions and migrations.
 4. Replace custom Firebase signature verification with the Firebase Admin Go verifier while retaining PostgreSQL `jti` consumption.
 5. Add KMS signing and multi-key relay configuration.

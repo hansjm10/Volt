@@ -14,7 +14,14 @@ import {
 } from "../core/remote/iroh/state.ts";
 import { DEFAULT_INTEGRATED_DETACHED_RUNTIME_TTL_MS } from "../remote/integrated-runtime-retention.ts";
 import { writeDurableAtomicFile } from "../utils/durable-atomic-write.ts";
-import { type IrohManagedRelayCredential, parseIrohManagedRelayCredential } from "./relay-credential.ts";
+import {
+	type IrohManagedRelayAppEndpoint,
+	type IrohManagedRelayCredential,
+	type IrohManagedRelayCredentialClaim,
+	parseIrohManagedRelayAppEndpoint,
+	parseIrohManagedRelayCredential,
+	parseIrohManagedRelayCredentialClaim,
+} from "./relay-credential.ts";
 
 /**
  * Persistent daemon state. The pairing/client sections reuse the remote host
@@ -48,6 +55,10 @@ export interface VoltdStateFileV1 {
 		relayAuthToken?: string;
 		/** Refreshable node-bound credential for Volt-managed JWT relays. */
 		relayCredential?: IrohManagedRelayCredential;
+		/** Durable one-time broker claim retained across daemon restart until exchange. */
+		relayCredentialClaim?: IrohManagedRelayCredentialClaim;
+		/** Broker app endpoints approved for this grant, including durable host-revocation work. */
+		relayCredentialAppEndpoints?: IrohManagedRelayAppEndpoint[];
 		/** Durable, non-usable credential retained only to finish broker revocation. */
 		relayCredentialRevocation?: IrohManagedRelayCredential;
 		/** Worktree cleanup policies (design §5.3); all opt-in except pruneOnStart. */
@@ -77,6 +88,14 @@ export function resolveWorktreeCleanupPolicy(
 			? { enabled: true, ttlMs: cleanup.retention.ttlMs }
 			: undefined;
 	return { retention, pruneOnStart: cleanup?.pruneOnStart !== false };
+}
+
+function parseRelayCredentialAppEndpoints(value: unknown): IrohManagedRelayAppEndpoint[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) {
+		throw new Error("relay credential app endpoints must be an array");
+	}
+	return value.map(parseIrohManagedRelayAppEndpoint);
 }
 
 function parseWorktreeCleanupSettings(value: unknown): WorktreeCleanupSettings | undefined {
@@ -192,6 +211,11 @@ export function parseVoltdState(value: unknown): VoltdStateFileV1 {
 		settingsRecord.relayCredential === undefined
 			? undefined
 			: parseIrohManagedRelayCredential(settingsRecord.relayCredential);
+	const relayCredentialClaim =
+		settingsRecord.relayCredentialClaim === undefined
+			? undefined
+			: parseIrohManagedRelayCredentialClaim(settingsRecord.relayCredentialClaim);
+	const relayCredentialAppEndpoints = parseRelayCredentialAppEndpoints(settingsRecord.relayCredentialAppEndpoints);
 	const relayCredentialRevocation =
 		settingsRecord.relayCredentialRevocation === undefined
 			? undefined
@@ -205,6 +229,8 @@ export function parseVoltdState(value: unknown): VoltdStateFileV1 {
 		...(keepAwakeEnabled ? { keepAwakeEnabled } : {}),
 		...(relayAuthToken === undefined ? {} : { relayAuthToken }),
 		...(relayCredential === undefined ? {} : { relayCredential }),
+		...(relayCredentialClaim === undefined ? {} : { relayCredentialClaim }),
+		...(relayCredentialAppEndpoints === undefined ? {} : { relayCredentialAppEndpoints }),
 		...(relayCredentialRevocation === undefined ? {} : { relayCredentialRevocation }),
 		...(worktreeCleanup === undefined ? {} : { worktreeCleanup }),
 	});
