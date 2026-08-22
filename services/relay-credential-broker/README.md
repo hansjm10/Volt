@@ -265,6 +265,17 @@ cd services/relay-credential-broker
 
 Cloud Run is private by default. The deployed canary uses `VOLT_CREDENTIAL_CANARY_PUBLIC=1` after `credentials.volt-cli.dev` became certificate-ready and the single-instance public request budgets were active. Normal confirmed simulator enrollment, broker approval/exchange, relayed reconnect after app cold start, app endpoint revocation, and host grant revocation have passed against the deployed stack. The script never deletes infrastructure, rotates database authority, or changes DNS.
 
+### Canary monitoring
+
+Deploy or update the checked-in Cloud Monitoring dashboard and its bounded-cardinality pairing request metric:
+
+```sh
+cd services/relay-credential-broker
+./deploy/monitoring.sh
+```
+
+The dashboard covers pairing outcomes and logs, broker status and latency, Cloud Run capacity, Cloud KMS request results, and Cloud SQL CPU, disk, and connection health. The deployment is idempotent and pinned to project `volt-3fae7`; it does not create alert policies or notification channels. Log-based metric data begins at metric creation and is not backfilled.
+
 ## Configuration
 
 | Environment variable | Default | Purpose |
