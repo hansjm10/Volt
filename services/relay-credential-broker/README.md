@@ -19,8 +19,8 @@ PostgreSQL is the broker's only state store. Embedded, checksummed migrations cr
 
 Remaining production blockers:
 
-- The private Cloud Run, Cloud SQL, KMS, and Secret Manager canary is deployed. It still needs the `credentials.volt-cli.dev` domain mapping, public request budgets, secret-free monitoring, backup/restore verification, and administrative procedures before public traffic.
-- The multi-key relay binary is deployed and published. Relay rejection metrics and the complete enrollment/rotation/revocation acceptance run remain outstanding.
+- The public `credentials.volt-cli.dev` Cloud Run canary is deployed with Cloud SQL, KMS, Secret Manager, single-instance bootstrap/approval budgets, and dependency readiness. Secret-free monitoring, backup/restore verification, and administrative procedures remain outstanding.
+- The multi-key relay binary is deployed and published. Relay rejection metrics plus crash, replay, key-rotation, and log-redaction drills remain outstanding.
 
 Do not expose the development App Check mode to the public internet or use its token in an app build.
 
@@ -263,7 +263,7 @@ cd services/relay-credential-broker
 ./deploy/canary.sh describe
 ```
 
-Cloud Run is private by default. Set `VOLT_CREDENTIAL_CANARY_PUBLIC=1` only after `credentials.volt-cli.dev` is mapped to the service and non-bypassable public request budgets are active. The script never deletes infrastructure, rotates database authority, or changes DNS.
+Cloud Run is private by default. The deployed canary uses `VOLT_CREDENTIAL_CANARY_PUBLIC=1` after `credentials.volt-cli.dev` became certificate-ready and the single-instance public request budgets were active. Normal confirmed simulator enrollment, broker approval/exchange, relayed reconnect after app cold start, app endpoint revocation, and host grant revocation have passed against the deployed stack. The script never deletes infrastructure, rotates database authority, or changes DNS.
 
 ## Configuration
 
