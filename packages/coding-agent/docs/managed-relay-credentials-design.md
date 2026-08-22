@@ -251,6 +251,8 @@ Required behavior:
 - Candidate refresh authority is persisted before approval.
 - A candidate is promoted only after the expected host authenticates over Iroh.
 - Access refresh updates the live relay configuration without replacing the endpoint key.
+- A daemon restart falls back to the relay origins in persisted managed authority when no explicit relay configuration is supplied; an explicit origin mismatch still fails closed.
+- After first registration, sustained loss of the advertised home relay recycles the live relay-map entry with the current credential without replacing the endpoint key.
 - Relay-origin rotation replaces the complete authenticated origin set; retired origins are removed before future refreshes.
 - Local Forget always commits even if another revocation remains pending.
 - App and daemon revocation outboxes are keyed by endpoint ID rather than represented by one global tombstone; replacing a saved host durably queues the retired endpoint before discarding its refresh authority.
@@ -269,8 +271,8 @@ Rotation procedure:
 1. Create a new disabled or non-active KMS key version and obtain its public key.
 2. Deploy the old and new public keys to every relay.
 3. Verify relay uptake, then switch the broker's active signing version.
-4. Wait at least access-token TTL plus relay rollout time and clock skew.
-5. Remove the retiring key from relays and disable it in KMS.
+4. Verify already-running endpoints recover from any relay process restart without an endpoint restart, then wait at least access-token TTL plus relay rollout time and clock skew.
+5. Remove the retiring key from relays, repeat the live recovery gate, and disable it in KMS.
 
 The broker's JWKS endpoint publishes the same active and retiring public set for inspection. Asymmetric rotation is an explicit operator workflow; no separate key service or automatic rotation controller is introduced.
 
