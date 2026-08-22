@@ -385,6 +385,7 @@ interface PendingPairRequest {
 	secretHash: string;
 	expiresAt: number;
 	timer: NodeJS.Timeout;
+	relayCredentialClaim?: IrohManagedRelayCredentialClaim;
 	cancellation?: Promise<void>;
 }
 
@@ -4161,6 +4162,7 @@ class IrohDaemonService {
 				secretHash: hashIrohRemotePairingSecret(pairing.secret),
 				expiresAt: pairing.expiresAt,
 				timer,
+				...(relayCredentialClaim === undefined ? {} : { relayCredentialClaim }),
 			});
 		} catch (error) {
 			if (relayCredentialClaim !== undefined && !pairingPublished) {
@@ -4836,6 +4838,9 @@ class IrohDaemonService {
 				await this.engine.cancelPairingSecretByHash(pending.secretHash);
 			} else {
 				await this.stateManager.removePendingPairingTicket(pending.secretHash);
+			}
+			if (pending.relayCredentialClaim !== undefined) {
+				await this.discardManagedRelayCredentialClaim(pending.relayCredentialClaim);
 			}
 			await this.services.state.flush();
 			if (this.pendingPairRequests.get(requestId) === pending) {

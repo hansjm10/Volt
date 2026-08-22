@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerFauxProvider } from "@hansjm10/volt-ai";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import {
 	type IrohRemoteHandshakeSuccess,
@@ -1442,6 +1442,103 @@ describe.skipIf(!nativeAvailable)("voltd iroh control pairing ownership", () => 
 			}
 			await pairingControl?.close();
 			await shutdownControl?.close();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("cancels managed relay claims with their pairing request and allows immediate replacement", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-pair-cancel-"));
+		const createdClaimIds: string[] = [];
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims`) {
+				const claimId = String(createdClaimIds.length + 1).padStart(24, "a");
+				createdClaimIds.push(claimId);
+				return new Response(
+					JSON.stringify({ claimId, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() }),
+					{ status: 201, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (
+				url.startsWith(`${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims/`) &&
+				url.endsWith("/exchange")
+			) {
+				return new Response(JSON.stringify({ status: "pending", retryAfterSeconds: 1 }), {
+					status: 202,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`unexpected managed relay credential request: ${url}`);
+		});
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		let activePairingRequestId: string | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [createIrohDaemonService()]);
+
+		try {
+			let status: DaemonProbeResult = await probeDaemon(agentDir);
+			for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				status = await probeDaemon(agentDir);
+			}
+			expect(status.healthy).toBe(true);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			const paths = getDaemonPaths(agentDir);
+			const readPairingState = () =>
+				JSON.parse(readFileSync(paths.statePath, "utf8")) as {
+					pendingPairingTickets: unknown[];
+					settings: { relayCredentialClaim?: { claimId: string } };
+				};
+
+			const firstPairing = await control.request({ type: "pair_request" });
+			expect(firstPairing).toMatchObject({ type: "pair_started" });
+			if (firstPairing.type !== "pair_started") throw new Error("first pairing did not start");
+			activePairingRequestId = firstPairing.requestId;
+			expect(readPairingState()).toMatchObject({
+				pendingPairingTickets: [expect.any(Object)],
+				settings: { relayCredentialClaim: { claimId: createdClaimIds[0] } },
+			});
+
+			expect(await control.request({ type: "pair_cancel", requestId: firstPairing.requestId })).toMatchObject({
+				type: "ok",
+			});
+			activePairingRequestId = undefined;
+			const cancelledState = readPairingState();
+			expect(cancelledState.pendingPairingTickets).toEqual([]);
+			expect(cancelledState.settings.relayCredentialClaim).toBeUndefined();
+
+			const replacementPairing = await control.request({ type: "pair_request" });
+			expect(replacementPairing).toMatchObject({ type: "pair_started" });
+			if (replacementPairing.type !== "pair_started") throw new Error("replacement pairing did not start");
+			activePairingRequestId = replacementPairing.requestId;
+			expect(createdClaimIds).toHaveLength(2);
+			expect(readPairingState()).toMatchObject({
+				pendingPairingTickets: [expect.any(Object)],
+				settings: { relayCredentialClaim: { claimId: createdClaimIds[1] } },
+			});
+
+			expect(await control.request({ type: "pair_cancel", requestId: replacementPairing.requestId })).toMatchObject({
+				type: "ok",
+			});
+			activePairingRequestId = undefined;
+			expect(readPairingState()).toMatchObject({ pendingPairingTickets: [], settings: {} });
+		} finally {
+			if (!daemonStopped) {
+				if (activePairingRequestId !== undefined) {
+					await control?.request({ type: "pair_cancel", requestId: activePairingRequestId }).catch(() => {});
+				}
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+				daemonStopped = true;
+			}
+			await control?.close();
+			fetchSpy.mockRestore();
 			rmSync(agentDir, { recursive: true, force: true });
 		}
 	}, 30_000);
