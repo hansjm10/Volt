@@ -353,7 +353,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		expect(await first.attach.acquire("old")).toMatchObject({ kind: "granted" });
 		expect(await second.attach.acquire("occupied")).toMatchObject({ kind: "granted" });
 
-		await expect(first.attach.prepareRekey("old", "occupied")).rejects.toThrow(/target_in_use/);
+		await expect(first.attach.prepareRekey("old", "occupied")).rejects.toThrow(/held_by_tui/);
 		expect(daemon.broker.lookup("ws", "old")?.state).toBe("tui-owned");
 		expect(daemon.broker.lookup("ws", "occupied")?.state).toBe("tui-owned");
 
@@ -364,6 +364,35 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		await transaction?.commit();
 		expect(daemon.broker.lookup("ws", "old")).toBeUndefined();
 		expect(daemon.broker.lookup("ws", "fresh-new")?.state).toBe("tui-owned");
+	}, 20_000);
+
+	it("switches to an existing daemon-owned conversation through a warm takeover", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-"));
+		const cwd = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-ws-"));
+		cleanups.push(() => {
+			rmSync(agentDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		});
+		const paths = getDaemonPaths(agentDir);
+		ensureDaemonDirs(paths);
+		const daemon = await startDaemonHalf(paths.socketPath, { workspaces: [{ name: "ws", path: cwd }] });
+		cleanups.push(() => daemon.close());
+		const runtimeOwner = publishDaemonRuntime(daemon.broker, "ws", "phone-session");
+		daemon.broker.onDaemonRuntimeStreamCountChanged(runtimeOwner, "ws", "phone-session", 0);
+
+		const tui = await startTuiHalf(agentDir, cwd);
+		expect(await tui.attach.acquire("old")).toMatchObject({ kind: "granted" });
+
+		const transaction = await tui.attach.prepareRekey("old", "phone-session");
+		expect(transaction).toBeDefined();
+		expect(daemon.disposed).toEqual([{ reason: "lease_transferred_to_tui" }]);
+		expect(daemon.closedStreams).toEqual([{ reason: "lease_transferred" }]);
+		expect(daemon.broker.lookup("ws", "old")?.state).toBe("tui-owned");
+		expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("tui-owned");
+
+		await transaction?.commit();
+		expect(daemon.broker.lookup("ws", "old")).toBeUndefined();
+		expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("tui-owned");
 	}, 20_000);
 
 	it("commits local session tracking while disconnected and reacquires only the replacement", async () => {

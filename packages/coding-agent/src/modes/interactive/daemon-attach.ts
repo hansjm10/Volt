@@ -10,6 +10,7 @@ import {
 	CONTROL_RPC_GRANTS_CAPABILITY,
 	CONTROL_WORKTREES_CAPABILITY,
 	type ControlEvent,
+	type ControlResponse,
 	type ControlWorktreeStatus,
 	type LeaseReleaseReason,
 	type LeaseState,
@@ -701,7 +702,10 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			const sourceLeaseConnectionGeneration = connectionGeneration;
 			let targetLeasePreacquired = false;
 			let targetLeaseConnectionGeneration: number | undefined;
-			if (contextChanged && activeClient && workspaceName && state === "connected") {
+			const preacquireTargetLease = async (): Promise<void> => {
+				if (!activeClient || !workspaceName || state !== "connected") {
+					throw new Error("replacement session lease was not acquired");
+				}
 				let targetAcquireStarted = false;
 				try {
 					targetAcquireStarted = true;
@@ -738,6 +742,13 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							})
 							.catch(() => {});
 					}
+					throw error;
+				}
+			};
+			if (contextChanged && activeClient && workspaceName && state === "connected") {
+				try {
+					await preacquireTargetLease();
+				} catch (error) {
 					pendingRekeyTransactionId = undefined;
 					resolvedWorkspaceName = previousWorkspaceName;
 					resolvedContextCwd = previousContextCwd;
@@ -749,12 +760,56 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					throw error;
 				}
 			}
+			let prepared: ControlResponse | undefined;
+			if (
+				heldSessionId === oldSessionId &&
+				activeClient &&
+				workspaceName &&
+				state === "connected" &&
+				!contextChanged
+			) {
+				prepared = await activeClient.request({
+					type: "lease_rekey_prepare",
+					workspaceName,
+					oldSessionId,
+					newSessionId,
+				});
+				if (prepared.type !== "lease_rekey_prepared") {
+					if (prepared.type === "error" && prepared.code === "target_in_use") {
+						try {
+							// An existing daemon-owned conversation is a warm-switch target,
+							// not a new identity to overwrite. Acquire it through the normal
+							// drain/takeover path while retaining the source for rollback.
+							await preacquireTargetLease();
+						} catch (error) {
+							pendingRekeyTransactionId = undefined;
+							resolvedWorkspaceName = previousWorkspaceName;
+							resolvedContextCwd = previousContextCwd;
+							resolvedWorktreeId = previousWorktreeId;
+							boundWorktreeSessionId = previousBoundWorktreeSessionId;
+							throw error;
+						}
+					} else {
+						pendingRekeyTransactionId = undefined;
+						resolvedWorkspaceName = previousWorkspaceName;
+						resolvedContextCwd = previousContextCwd;
+						resolvedWorktreeId = previousWorktreeId;
+						boundWorktreeSessionId = previousBoundWorktreeSessionId;
+						throw new Error(
+							prepared.type === "error"
+								? prepared.message
+								: `unexpected daemon response to conversation lease rekey preflight: ${prepared.type}`,
+						);
+					}
+				}
+			}
 			if (
 				heldSessionId !== oldSessionId ||
 				!activeClient ||
 				!workspaceName ||
 				state !== "connected" ||
-				contextChanged
+				contextChanged ||
+				targetLeasePreacquired
 			) {
 				pendingRekeyTransactionId = "local";
 				const previousHeldSessionId = heldSessionId;
@@ -923,23 +978,8 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					},
 				};
 			}
-			const prepared = await activeClient.request({
-				type: "lease_rekey_prepare",
-				workspaceName,
-				oldSessionId,
-				newSessionId,
-			});
-			if (prepared.type !== "lease_rekey_prepared") {
-				pendingRekeyTransactionId = undefined;
-				resolvedWorkspaceName = previousWorkspaceName;
-				resolvedContextCwd = previousContextCwd;
-				resolvedWorktreeId = previousWorktreeId;
-				boundWorktreeSessionId = previousBoundWorktreeSessionId;
-				throw new Error(
-					prepared.type === "error"
-						? prepared.message
-						: `unexpected daemon response to conversation lease rekey preflight: ${prepared.type}`,
-				);
+			if (prepared?.type !== "lease_rekey_prepared") {
+				throw new Error("conversation lease rekey preflight did not reserve its target");
 			}
 			const transactionId = prepared.transactionId;
 			pendingRekeyTransactionId = transactionId;
