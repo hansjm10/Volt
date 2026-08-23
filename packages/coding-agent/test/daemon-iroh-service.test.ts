@@ -119,15 +119,18 @@ function withRecordedRelayCredentialInstall(
 	insertions: IrohRelayConfigLike[],
 	onClose: () => void,
 	removals?: string[],
+	mutations?: string[],
 ): IrohEndpointLike {
 	return {
 		id: () => endpoint.id(),
 		addr: () => endpoint.addr(),
 		online: () => Promise.resolve(),
 		insertRelay: async (config) => {
+			mutations?.push(`insert:${config.url}`);
 			insertions.push(config);
 		},
 		removeRelay: async (url) => {
+			mutations?.push(`remove:${url}`);
 			removals?.push(url);
 			return (await endpoint.removeRelay?.(url)) ?? false;
 		},
@@ -1991,6 +1994,82 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 			fetchSpy.mockRestore();
 			rmSync(agentDir, { recursive: true, force: true });
 			rmSync(restartAgentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("recycles the live relay registration when refreshing a valid JWT", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-refresh-recycle-"));
+		const originalCredential = await provisionManagedRelayCredentialState(agentDir, 31_000);
+		const refreshedAccessToken = "refreshed.payload.signature";
+		const relayInsertions: IrohRelayConfigLike[] = [];
+		const relayRemovals: string[] = [];
+		const relayMutations: string[] = [];
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url !== `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/tokens/refresh`) {
+				throw new Error(`unexpected managed relay credential request: ${url}`);
+			}
+			return new Response(
+				JSON.stringify({
+					accessToken: refreshedAccessToken,
+					accessTokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+					tokenType: "Bearer",
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{},
+				{
+					decorateEndpoint: (endpoint) =>
+						withRecordedRelayCredentialInstall(
+							endpoint,
+							relayInsertions,
+							() => {},
+							relayRemovals,
+							relayMutations,
+						),
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expectIrohEndpointReady(control);
+			await expect
+				.poll(() => relayInsertions, { timeout: 5_000 })
+				.toEqual([{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: refreshedAccessToken }]);
+			expect(Date.now()).toBeLessThan(originalCredential.accessTokenExpiresAt);
+			expect(relayRemovals).toEqual(VOLT_PRODUCTION_RELAY_URLS);
+			expect(relayMutations).toEqual([
+				`remove:${VOLT_PRODUCTION_RELAY_URLS[0]}`,
+				`insert:${VOLT_PRODUCTION_RELAY_URLS[0]}`,
+			]);
+			const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+				settings: { relayCredential?: IrohManagedRelayCredential };
+			};
+			expect(state.settings.relayCredential?.accessToken).toBe(refreshedAccessToken);
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await daemon;
+			daemonStopped = true;
+		} finally {
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await control?.close();
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
 		}
 	}, 30_000);
 

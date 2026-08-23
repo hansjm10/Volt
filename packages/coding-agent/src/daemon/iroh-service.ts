@@ -1480,6 +1480,10 @@ class IrohDaemonService {
 						if (credential.accessTokenExpiresAt <= Date.now()) {
 							throw new Error("managed relay credential expired before installation");
 						}
+						// Replacing a relay config does not reauthenticate an existing relay
+						// connection. Remove it first so the refreshed JWT owns a fresh
+						// registration before the old connection reaches strict expiry.
+						await endpoint.removeRelay?.(url);
 						await endpoint.insertRelay({ url, authToken: credential.accessToken });
 						insertedRelayUrls.push(url);
 						if (credential.accessTokenExpiresAt <= Date.now()) {
