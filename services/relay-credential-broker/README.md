@@ -22,7 +22,7 @@ Each Volt-managed relay set is bound to one exact broker origin and JWT issuer:
 | Production | `https://iroh-relay-us-central.volt-cli.dev` | `https://credentials.volt-cli.dev` |
 | Canary | `https://iroh-relay-us-central-canary.volt-cli.dev` | `https://credentials-canary.volt-cli.dev` |
 
-Daemon and app clients reject cross-deployment broker overrides for these built-in relay sets. Custom relay sets remain self-managed and do not acquire a broker automatically. These are the target release bindings; production managed credentials remain disabled and unreleased until `credentials.volt-cli.dev` serves a separately configured production broker.
+Daemon and app clients reject cross-deployment broker overrides for these built-in relay sets. Custom relay sets remain self-managed and do not acquire a broker automatically. Both authority pairs are separately deployed as of 2026-08-23; managed credential client code remains unreleased until the normal product release workflow completes.
 
 ## Persistence and production blockers
 
@@ -30,8 +30,8 @@ PostgreSQL is the broker's only state store. Embedded, checksummed migrations cr
 
 Remaining production blockers:
 
-- The Cloud Run canary is deployed with Cloud SQL, KMS, Secret Manager, single-instance bootstrap/approval budgets, and dependency readiness. The `credentials-canary.volt-cli.dev` DNS, managed certificate, broker issuer, and relay issuer cutover completed on 2026-08-23. Both custom domains still target this one canary service, so `credentials.volt-cli.dev` is only a temporary rollback HTTP alias and is not production authority. Production managed credentials remain disabled and unreleased until that hostname is remapped to a separately configured production broker. Secret-free monitoring, backup/restore drills, and administrative procedures remain outstanding.
-- The multi-key relay binary is deployed and published. The deployed SHA-256 remains `28eb14fbb323b0f74f8068317c263cb48fa19fe4c29dc834ceb397630e0e8cc8` and predates the source-only strict established-connection expiry patch; rebuilding, publishing, deploying, and acceptance-testing that revision remain outstanding alongside relay rejection metrics, crash, replay, key-rotation, and log-redaction drills.
+- Canary and production now use separate Cloud Run, Cloud SQL, Secret Manager, KMS, issuer, audience, JWKS, and relay authority. Production uses a Cloud Armor-protected external HTTPS load balancer, private-ingress Cloud Run, regional-HA PostgreSQL with point-in-time recovery, and a successful pre-admission restore drill. Production alert policies, secret-free operator dashboards, and administrative runbooks remain outstanding.
+- Both managed relays now run the published strict-expiry artifact with SHA-256 `e7dff08edd35abc7d66244682d3136e2cb4c3288ac455a2b424435646fe3e1ca`, a 900-second maximum token lifetime, and 30-second clock skew. The pinned relay tests cover idle and sustained established connections plus blocked writes at expiry. Relay rejection metrics and crash, replay, key-rotation, and log-redaction drills remain outstanding.
 - Bounded daemon re-registration after relay restart is implemented behind a native-version safety gate, but remains blocked until `@number0/iroh` publishes the watcher runtime fix merged in [iroh-ffi #281](https://github.com/n0-computer/iroh-ffi/pull/281). Unsafe 1.0.0/1.1.0 watcher APIs are never called.
 
 Do not expose the development App Check mode to the public internet or use its token in an app build.
@@ -226,16 +226,18 @@ The sanitizer preserves the existing one-time pairing secret and non-credential 
 
 Do not pass unsanitized tickets or credentials as process arguments.
 
-## Canary relay integration
+## Managed relay integration
 
-The current relay canary is:
+The managed relays are:
 
 ```text
+https://iroh-relay-us-central.volt-cli.dev
+172.233.223.84
 https://iroh-relay-us-central-canary.volt-cli.dev
 172.234.196.84
 ```
 
-It runs the JWT-only custom binary built from upstream commit `f2eb930dda3779c6d852b72f3712aacd6e573ab1` (`v1.0.3`) plus `relay-patch/iroh-relay-1.0.3-jwt-access.patch`. Its configured audience is `volt-iroh-relay-canary`. No production managed-credential relay is released from the current shared-service topology.
+Both run the JWT-only custom binary built from upstream commit `f2eb930dda3779c6d852b72f3712aacd6e573ab1` (`v1.0.3`) plus `relay-patch/iroh-relay-1.0.3-jwt-access.patch`. Production accepts only issuer `https://credentials.volt-cli.dev` and audience `volt-iroh-relay`; canary accepts only issuer `https://credentials-canary.volt-cli.dev` and audience `volt-iroh-relay-canary`.
 
 Build and validate the patch with pinned Rust, Zig, cargo-zigbuild, and LLVM versions:
 
@@ -244,7 +246,7 @@ Build and validate the patch with pinned Rust, Zig, cargo-zigbuild, and LLVM ver
 ./relay-patch/build.sh linux-x86_64 /tmp/iroh-relay-1.0.3-volt-jwt
 ```
 
-The Linux build writes a sidecar manifest containing source, patch/tool versions, and hashes. The deployed canary binary SHA-256 is `28eb14fbb323b0f74f8068317c263cb48fa19fe4c29dc834ceb397630e0e8cc8`. The binary and manifest are published in Artifact Registry package `iroh-relay`, version `1.0.3-volt-jwt-743a6202d57d`.
+The Linux build writes a sidecar manifest containing source, patch/tool versions, and hashes. The deployed production and canary binary SHA-256 is `e7dff08edd35abc7d66244682d3136e2cb4c3288ac455a2b424435646fe3e1ca`. The binary and manifest are published in Artifact Registry package `iroh-relay`, version `1.0.3-volt-jwt-f9462fa6ac39`.
 
 The relay access check requires one bearer JWT, selects one of at most eight configured Ed25519 keys by `kid`, validates issuer/audience/scope/time bounds, requires canonical `sub` equal to the proven endpoint ID, and enforces node/grant/global connection limits. It fails closed on malformed tokens, duplicate key IDs/public keys, or invalid access configuration. Configure rotation overlap with TOML array-of-table entries:
 
@@ -262,7 +264,7 @@ public_key = "<retiring-jwks-x>"
 
 The relay derives each `kid` from the public key using the broker's SHA-256 rule, preventing key-ID/public-key mismatches. The deployed canary uses this multi-key format with the active KMS public key.
 
-Relays built from the current patch verify locally instead of calling the credential service for each connection. At the verified JWT `exp` plus configured clock skew, the relay cancels the connection's complete traffic operation—including already-selected frame handling, queued or keepalive writes, and flushes—and drops the stream without a final flush, including under sustained traffic and backpressure. Ordinary shutdowns before that deadline still flush cleanly. Refreshing a token does not extend an existing connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path. The deployed canary artifact and hash above remain unchanged until this source revision is rolled out.
+Relays built from the current patch verify locally instead of calling the credential service for each connection. At the verified JWT `exp` plus configured clock skew, the relay cancels the connection's complete traffic operation—including already-selected frame handling, queued or keepalive writes, and flushes—and drops the stream without a final flush, including under sustained traffic and backpressure. Ordinary shutdowns before that deadline still flush cleanly. Refreshing a token does not extend an existing connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path. The exact strict-expiry artifact above is deployed to both managed relays.
 
 ## Canary deployment
 
@@ -279,7 +281,7 @@ cd services/relay-credential-broker
 
 Cloud Run is private by default. The deployed canary uses `VOLT_CREDENTIAL_CANARY_PUBLIC=1` after the original custom domain became certificate-ready and the single-instance public request budgets were active. Normal confirmed simulator enrollment, broker approval/exchange, relayed reconnect after app cold start, app endpoint revocation, and host grant revocation have passed against the deployed stack. The script never deletes infrastructure, rotates database authority, or changes DNS.
 
-Both `credentials.volt-cli.dev` and `credentials-canary.volt-cli.dev` currently map to this one canary Cloud Run service. Each broker revision has one scalar `VOLT_CREDENTIAL_ISSUER` and one scalar `VOLT_CREDENTIAL_AUDIENCE`; request hostname does not select claims, and dual issuer/audience operation is unsupported.
+`credentials-canary.volt-cli.dev` maps to the canary Cloud Run service. Authoritative DNS for `credentials.volt-cli.dev` points to the separate production HTTPS load balancer. Cloud Run retains a dormant production-hostname mapping to the canary service as rollback metadata, but it is not in the authoritative DNS path. Each broker revision still has one scalar `VOLT_CREDENTIAL_ISSUER` and one scalar `VOLT_CREDENTIAL_AUDIENCE`; request hostname does not select claims, and dual issuer/audience operation is unsupported.
 
 The canary authority cutover completed on 2026-08-23:
 
@@ -289,9 +291,19 @@ The canary authority cutover completed on 2026-08-23:
 - The canary relay retained the published binary and public keys, changed only `access.jwt.issuer`, and restarted from `/etc/iroh-relay/config.toml`. The prior config is `/etc/iroh-relay/config.toml.pre-issuer-cutover-20260823T033700Z`.
 - Fresh simulator enrollment passed App Check approval, broker exchange, node-bound 900-second EdDSA host JWT verification, explicit refresh, cold app reconnect, and grant revocation. The reset ended with zero active grants and endpoints.
 
-`credentials.volt-cli.dev` is now only a temporary rollback HTTP alias to this canary service: it also emits canary-issuer/canary-audience tokens and is not production authority. A token-authority rollback must restore both Cloud Run traffic to `relay-credential-broker-canary-kms-v2-retry-20260822` and the relay's backed-up issuer config. Remove the alias only after the client rollout, at least one access-token TTL plus the 30-second relay skew, and the agreed rollback window.
+A canary token-authority rollback still requires both sides of the authority pair: restore Cloud Run traffic to `relay-credential-broker-canary-kms-v2-retry-20260822`, restore the relay's backed-up issuer config, restart the relay, and reset credentials created after the rollback point. The dormant production-hostname Cloud Run mapping is not a valid production rollback after production grants exist.
 
-Keep production managed credentials disabled and unreleased. Before enabling them, deploy a separately configured production broker, remap `credentials.volt-cli.dev` to it, and verify that origin emits only the exact production issuer/audience and connects only to the production relay set.
+### Production authority cutover
+
+The production authority cutover completed on 2026-08-23:
+
+- Cloud Run revision `relay-credential-broker-production-prod-20260823044141` runs pinned image digest `sha256:c2914acca78db7adf5e92f081a7bb5b23f40b5a7e5a8c45e6852f72dac5380fe` with exact issuer `https://credentials.volt-cli.dev`, audience `volt-iroh-relay`, KMS version `relay-production/signing/1`, and numeric database secret version `1`.
+- Cloud SQL instance `volt-relay-credentials-production` is regional HA with point-in-time recovery, 14 retained backups, seven transaction-log days, and deletion protection. A point-in-time restore drill passed before admission; post-acceptance backup `1787464174160` completed with zero active grants and endpoints.
+- `credentials.volt-cli.dev` is a DNS-only A record to the Cloud Armor-protected external HTTPS load balancer at `34.13.74.69`. Its managed certificate is active, unknown hosts/routes/methods fail closed, direct `run.app` ingress is blocked, and the certificate DNS authorization remains for renewal.
+- The production relay runs strict-expiry artifact SHA-256 `e7dff08edd35abc7d66244682d3136e2cb4c3288ac455a2b424435646fe3e1ca` with only production issuer, audience, and KMS public key. Its prior binary and config are backed up with suffix `pre-production-authority-20260823T051350Z`.
+- Fresh simulator enrollment passed explicit identity confirmation, temporary App Check debug-token approval and revocation, broker approval/exchange, independently verified node-bound 900-second EdDSA JWT claims, explicit refresh, cold app relaunch with fresh authenticated RPC connections, app endpoint revocation, host grant revocation, revoked-refresh denial, and local authority cleanup.
+
+Production rollback must retain the production database and key authority. DNS rollback to the canary service or restoring the pre-strict relay binary is invalid after production grants exist.
 
 ### Canary monitoring
 

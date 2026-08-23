@@ -25,7 +25,7 @@ Managed deployment authority is an exact pair, not a shared Volt-wide broker all
 | Production | `https://iroh-relay-us-central.volt-cli.dev` | `https://credentials.volt-cli.dev` |
 | Canary | `https://iroh-relay-us-central-canary.volt-cli.dev` | `https://credentials-canary.volt-cli.dev` |
 
-Built-in clients reject a production/canary cross-binding or any other explicit broker origin. A custom relay set has no managed broker authority and remains self-managed. These are the target release bindings; production managed credentials remain disabled and unreleased until `credentials.volt-cli.dev` serves a separately configured production broker.
+Built-in clients reject a production/canary cross-binding or any other explicit broker origin. A custom relay set has no managed broker authority and remains self-managed. Both authority pairs are separately deployed as of 2026-08-23; managed credential client code remains unreleased until the normal product release workflow completes.
 
 The production design deliberately does not add accounts, OAuth, Redis, queues, token introspection, per-relay broker calls, device fingerprinting, or separate pairing, refresh, and signing services.
 
@@ -307,13 +307,21 @@ Staging remains canary-sized. It does not duplicate production HA infrastructure
 
 ### Canary authority cutover
 
-The canary authority cutover completed on 2026-08-23. `credentials-canary.volt-cli.dev` is certificate-ready, and the broker and relay now use that exact issuer with audience `volt-iroh-relay-canary`. Disposable old authority was reset before the switch. Fresh simulator enrollment, App Check approval, broker exchange, exact node-bound JWT claims, explicit refresh, cold reconnect, and grant revocation passed.
+The canary authority cutover completed on 2026-08-23. `credentials-canary.volt-cli.dev` is certificate-ready, and the broker and relay use that exact issuer with audience `volt-iroh-relay-canary`. Disposable old authority was reset before the switch. Fresh simulator enrollment, App Check approval, broker exchange, exact node-bound JWT claims, explicit refresh, cold reconnect, and grant revocation passed.
 
-Both `credentials.volt-cli.dev` and `credentials-canary.volt-cli.dev` still map to one canary Cloud Run service. A broker revision has one scalar `VOLT_CREDENTIAL_ISSUER` and one scalar `VOLT_CREDENTIAL_AUDIENCE`; it does not select claims by request hostname. Dual issuer/audience operation is unsupported. Therefore the old hostname currently emits canary tokens and is only a temporary rollback HTTP alias, not production authority.
+Authoritative DNS for `credentials-canary.volt-cli.dev` still maps to the canary Cloud Run service. Cloud Run retains a dormant production-hostname mapping to the canary service as rollback metadata, but authoritative production DNS no longer uses it. A broker revision has one scalar `VOLT_CREDENTIAL_ISSUER` and one scalar `VOLT_CREDENTIAL_AUDIENCE`; it does not select claims by request hostname. Dual issuer/audience operation remains unsupported.
 
-Rollback requires both sides of the authority pair: route Cloud Run back to `relay-credential-broker-canary-kms-v2-retry-20260822`, restore the relay's pre-cutover issuer config, restart the relay, and reset any credentials created after the rollback point. Remove the temporary shared-service alias only after the client rollout, at least one 15-minute access-token lifetime plus the configured 30-second relay skew, and the agreed rollback window.
+A canary rollback requires both sides of its authority pair: route Cloud Run back to `relay-credential-broker-canary-kms-v2-retry-20260822`, restore the relay's pre-cutover issuer config, restart the relay, and reset credentials created after the rollback point.
 
-Keep production managed credentials disabled and unreleased. Before enabling them, deploy a separately configured production broker, remap `credentials.volt-cli.dev` to it, and verify that origin emits only the exact production issuer/audience and connects only to the production relay set.
+### Production authority cutover
+
+The production authority cutover completed on 2026-08-23. `credentials.volt-cli.dev` is a DNS-only A record for an external managed HTTPS load balancer protected by enforced Cloud Armor host, route, method, and per-IP rate rules. The backend is private-ingress Cloud Run, and its direct `run.app` URL cannot bypass the edge.
+
+Production has a separate Cloud Run service, regional-HA Cloud SQL database with point-in-time recovery, Secret Manager database authority, service account, and software-protected Ed25519 KMS key. A point-in-time restore drill passed before admission. Fresh simulator enrollment then passed explicit identity confirmation, App Check approval, broker exchange, independent node-bound 900-second EdDSA JWT verification, explicit refresh, cold relaunch with fresh authenticated RPC connections, endpoint and grant revocation, revoked-refresh denial, and local cleanup. Final database state was zero active grants and endpoints; post-acceptance backup `1787464174160` completed successfully.
+
+Both managed relays run exact strict-expiry artifact SHA-256 `e7dff08edd35abc7d66244682d3136e2cb4c3288ac455a2b424435646fe3e1ca`, enforce a 900-second maximum token lifetime plus 30-second clock skew, and accept only their deployment-specific issuer, audience, and public key set. The pinned relay suite covers idle and sustained established connections plus blocked writes at expiry.
+
+Production rollback must retain the production database and key authority. DNS rollback to the canary service or restoring the pre-strict relay binary is invalid after production grants exist.
 
 ### Minimum abuse controls
 
@@ -346,8 +354,8 @@ Alert only on sustained 5xx responses, database/KMS unavailability, unexpected s
 3. **Completed:** replace in-memory broker state with PostgreSQL transactions and migrations.
 4. **Completed:** replace custom Firebase signature verification with the Firebase Admin Go verifier while retaining PostgreSQL `jti` consumption.
 5. **Completed:** add KMS signing and multi-key relay configuration.
-6. Deploy the canary to Cloud Run and single-zone Cloud SQL, then run crash, replay, rotation, revocation, and log-redaction tests.
-7. Add the production HTTPS edge, Cloud Armor, regional HA, alerts, and operator runbooks.
+6. **Partially completed:** the canary is deployed to Cloud Run and single-zone Cloud SQL, and revocation acceptance passed; crash, replay, rotation, and log-redaction drills remain.
+7. **Partially completed:** the production HTTPS edge, enforced Cloud Armor policy, private-ingress Cloud Run, regional-HA Cloud SQL, point-in-time restore drill, and end-to-end authority acceptance are complete; alert policies and operator runbooks remain.
 
 Infrastructure provisioning does not begin before steps 1 and 2 freeze the protocol clients must support.
 
