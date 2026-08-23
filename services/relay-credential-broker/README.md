@@ -251,7 +251,7 @@ public_key = "<retiring-jwks-x>"
 
 The relay derives each `kid` from the public key using the broker's SHA-256 rule, preventing key-ID/public-key mismatches. The deployed canary uses this multi-key format with the active KMS public key.
 
-Relays verify locally instead of calling the credential service for each connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path.
+Relays built from the current patch verify locally instead of calling the credential service for each connection. At the verified JWT `exp` plus configured clock skew, the relay cancels the connection's complete traffic operation—including already-selected frame handling, queued or keepalive writes, and flushes—and drops the stream without a final flush, including under sustained traffic and backpressure. Ordinary shutdowns before that deadline still flush cleanly. Refreshing a token does not extend an existing connection. Short access-token lifetimes bound revocation delay and keep the broker out of the relay data path. The deployed canary artifact and hash above remain unchanged until this source revision is rolled out.
 
 ## Canary deployment
 

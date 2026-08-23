@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 6d6686743..2cd71e184 100644
+index 6d6686743636acd4365092763b8b040633d4c227..2cd71e1843e417942e8db68069442dff881f7870 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -2479,6 +2479,7 @@ dependencies = [
@@ -11,7 +11,7 @@ index 6d6686743..2cd71e184 100644
   "strum",
   "test-strategy",
 diff --git a/iroh-relay/Cargo.toml b/iroh-relay/Cargo.toml
-index a9815c227..d8eb56e4c 100644
+index a9815c227f1f26171540b1d850df3d32758ce85b..d8eb56e4cf7c681f8e2f655cac749719010e31b9 100644
 --- a/iroh-relay/Cargo.toml
 +++ b/iroh-relay/Cargo.toml
 @@ -80,6 +80,7 @@ tokio-rustls-acme = { version = "0.9", optional = true }
@@ -32,14 +32,14 @@ index a9815c227..d8eb56e4c 100644
      "dep:tracing-subscriber",
 diff --git a/iroh-relay/src/jwt_access.rs b/iroh-relay/src/jwt_access.rs
 new file mode 100644
-index 000000000..35ed41377
+index 0000000000000000000000000000000000000000..509c7947ac0a19e0d6d2a5382ba0f58861c88ae2
 --- /dev/null
 +++ b/iroh-relay/src/jwt_access.rs
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,1121 @@
 +use std::{
 +    collections::{HashMap, HashSet},
 +    sync::Mutex,
-+    time::{SystemTime, UNIX_EPOCH},
++    time::{Duration, SystemTime, UNIX_EPOCH},
 +};
 +
 +use data_encoding::BASE64URL_NOPAD;
@@ -48,7 +48,7 @@ index 000000000..35ed41377
 +use iroh_relay::server::{Access, AccessControl, ClientRequest, ConnectionId};
 +use serde::{Deserialize, Serialize};
 +use sha2::{Digest, Sha256};
-+use tokio::sync::Semaphore;
++use tokio::{sync::Semaphore, time::Instant};
 +use tracing::{debug, warn};
 +
 +const MAX_JWT_BYTES: usize = 8 * 1024;
@@ -159,11 +159,19 @@ index 000000000..35ed41377
 +struct ConnectionAuthority {
 +    endpoint_id: EndpointId,
 +    grant_id: String,
++    deadline: Instant,
 +}
 +
 +#[derive(Debug)]
 +struct VerifiedAuthority {
 +    grant_id: String,
++    deadline: Instant,
++}
++
++#[derive(Debug)]
++struct VerifiedClaims {
++    grant_id: String,
++    expires_at_unix_seconds: i64,
 +}
 +
 +#[derive(Debug, Deserialize)]
@@ -297,6 +305,7 @@ index 000000000..35ed41377
 +            ConnectionAuthority {
 +                endpoint_id: request.endpoint_id(),
 +                grant_id: authority.grant_id,
++                deadline: authority.deadline,
 +            },
 +        );
 +        Ok(())
@@ -326,6 +335,24 @@ index 000000000..35ed41377
 +        }
 +    }
 +
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant> {
++        let Ok(state) = self.state.lock() else {
++            warn!(%connection_id, "relay JWT connection state lock poisoned while reading expiry");
++            return Some(Instant::now());
++        };
++        match state.connections.get(&connection_id) {
++            Some(authority) if authority.endpoint_id == endpoint_id => Some(authority.deadline),
++            _ => {
++                warn!(%connection_id, "relay JWT admitted connection had no matching expiry");
++                Some(Instant::now())
++            }
++        }
++    }
++
 +    fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
 +        let Ok(mut state) = self.state.lock() else {
 +            warn!(%connection_id, "relay JWT connection state lock poisoned during disconnect");
@@ -349,21 +376,35 @@ index 000000000..35ed41377
 +
 +impl JwtVerifier {
 +    fn verify(&self, request: &ClientRequest) -> Result<VerifiedAuthority, &'static str> {
++        let observed_at = Instant::now();
++        let system_now = SystemTime::now();
 +        let now = i64::try_from(
-+            SystemTime::now()
++            system_now
 +                .duration_since(UNIX_EPOCH)
 +                .map_err(|_| "system clock is before Unix epoch")?
 +                .as_secs(),
 +        )
 +        .map_err(|_| "system clock is out of range")?;
-+        self.verify_at(request, now)
++        let verified = self.verify_at(request, now)?;
++        let expires_at = UNIX_EPOCH
++            .checked_add(Duration::from_secs(
++                u64::try_from(verified.expires_at_unix_seconds)
++                    .map_err(|_| "JWT expiry is before Unix epoch")?,
++            ))
++            .ok_or("JWT expiry is out of range")?;
++        let remaining = expires_at
++            .duration_since(system_now)
++            .map_err(|_| "JWT expired")?;
++        let deadline = observed_at
++            .checked_add(remaining)
++            .ok_or("JWT expiry is out of range")?;
++        Ok(VerifiedAuthority {
++            grant_id: verified.grant_id,
++            deadline,
++        })
 +    }
 +
-+    fn verify_at(
-+        &self,
-+        request: &ClientRequest,
-+        now: i64,
-+    ) -> Result<VerifiedAuthority, &'static str> {
++    fn verify_at(&self, request: &ClientRequest, now: i64) -> Result<VerifiedClaims, &'static str> {
 +        if request.query_pairs().any(|(name, _)| name == "token") {
 +            return Err("query token is forbidden");
 +        }
@@ -445,7 +486,11 @@ index 000000000..35ed41377
 +        if claims.iat > now.saturating_add(self.clock_skew_seconds) {
 +            return Err("JWT issued in the future");
 +        }
-+        if claims.exp <= now.saturating_sub(self.clock_skew_seconds) {
++        let expires_at_unix_seconds = claims
++            .exp
++            .checked_add(self.clock_skew_seconds)
++            .ok_or("JWT expiry overflow")?;
++        if expires_at_unix_seconds <= now {
 +            return Err("JWT expired");
 +        }
 +        let lifetime = claims
@@ -459,8 +504,9 @@ index 000000000..35ed41377
 +            return Err("JWT identifier is invalid");
 +        }
 +
-+        Ok(VerifiedAuthority {
++        Ok(VerifiedClaims {
 +            grant_id: claims.grant_id,
++            expires_at_unix_seconds,
 +        })
 +    }
 +}
@@ -506,10 +552,37 @@ index 000000000..35ed41377
 +
 +#[cfg(test)]
 +mod tests {
++    use std::{
++        net::Ipv4Addr,
++        pin::Pin,
++        sync::{
++            Arc, Mutex,
++            atomic::{AtomicUsize, Ordering},
++        },
++        task::{Context, Poll},
++    };
++
++    use bytes::Bytes;
 +    use http::{Request, header::HeaderValue};
-+    use iroh_base::SecretKey;
-+    use iroh_relay::http::ProtocolVersion;
++    use iroh_base::{RelayUrl, SecretKey};
++    use iroh_dns::dns::DnsResolver;
++    use iroh_relay::{
++        KeyCache,
++        client::{Client, ClientBuilder},
++        http::ProtocolVersion,
++        protos::{
++            relay::{ClientToRelayMsg, RelayToClientMsg},
++            streams::StreamError,
++        },
++        server::{
++            Metrics, OnDisconnectGuard, RelayConfig, Server, ServerConfig,
++            client::Config as ClientConfig, clients::Clients, streams::RelayedStream,
++        },
++        tls::{CaTlsConfig, default_provider},
++    };
++    use n0_future::{Sink, SinkExt, Stream, StreamExt};
 +    use serde_json::json;
++    use tokio::sync::oneshot;
 +
 +    use super::*;
 +
@@ -601,6 +674,136 @@ index 000000000..35ed41377
 +        ClientRequest::new(endpoint_id, ProtocolVersion::default(), parts)
 +    }
 +
++    #[derive(Debug)]
++    struct TrackingAccess {
++        inner: JwtAccess,
++        disconnected: Mutex<Option<oneshot::Sender<Instant>>>,
++    }
++
++    impl AccessControl for TrackingAccess {
++        async fn on_connect(&self, request: &ClientRequest) -> Access {
++            self.inner.on_connect(request).await
++        }
++
++        fn connection_deadline(
++            &self,
++            endpoint_id: EndpointId,
++            connection_id: ConnectionId,
++        ) -> Option<Instant> {
++            self.inner.connection_deadline(endpoint_id, connection_id)
++        }
++
++        fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
++            self.inner.on_disconnect(endpoint_id, connection_id);
++            if let Some(disconnected) = self.disconnected.lock().unwrap().take() {
++                let _ = disconnected.send(Instant::now());
++            }
++        }
++    }
++
++    struct ControlledSink {
++        block_writes: bool,
++        write_selected: Option<oneshot::Sender<Instant>>,
++        dropped: Option<oneshot::Sender<Instant>>,
++        flushes: Arc<AtomicUsize>,
++    }
++
++    impl Drop for ControlledSink {
++        fn drop(&mut self) {
++            if let Some(dropped) = self.dropped.take() {
++                let _ = dropped.send(Instant::now());
++            }
++        }
++    }
++
++    impl Stream for ControlledSink {
++        type Item = Result<Bytes, StreamError>;
++
++        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++            Poll::Pending
++        }
++    }
++
++    impl Sink<Bytes> for ControlledSink {
++        type Error = StreamError;
++
++        fn poll_ready(
++            mut self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++        ) -> Poll<Result<(), Self::Error>> {
++            if self.block_writes {
++                if let Some(write_selected) = self.write_selected.take() {
++                    let _ = write_selected.send(Instant::now());
++                }
++                Poll::Pending
++            } else {
++                Poll::Ready(Ok(()))
++            }
++        }
++
++        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
++            Ok(())
++        }
++
++        fn poll_flush(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++        ) -> Poll<Result<(), Self::Error>> {
++            self.flushes.fetch_add(1, Ordering::SeqCst);
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_close(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++        ) -> Poll<Result<(), Self::Error>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    async fn connect_expiring_client(clock_skew_seconds: u64) -> (Server, Client, Instant) {
++        let secret_key = endpoint_key();
++        let endpoint_id = secret_key.public();
++        let mut jwt_config = config();
++        jwt_config.clock_skew_seconds = clock_skew_seconds;
++        let access = Arc::new(JwtAccess::new(jwt_config).unwrap());
++
++        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
++        relay.key_cache_capacity = Some(1024);
++        relay.access = access.clone();
++        let mut server_config = ServerConfig::default();
++        server_config.relay = Some(relay);
++        let server = Server::spawn(server_config).await.unwrap();
++        let relay_url: RelayUrl = format!("http://{}", server.http_addr().unwrap())
++            .parse()
++            .unwrap();
++        let client_config = CaTlsConfig::default()
++            .client_config(default_provider())
++            .unwrap();
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let jwt = token(endpoint_id, json!({"iat": now, "exp": now + 2}));
++        let client = ClientBuilder::new(relay_url, secret_key, DnsResolver::new())
++            .tls_client_config(client_config)
++            .auth_token(jwt)
++            .connect()
++            .await
++            .unwrap();
++        let deadline = access
++            .state
++            .lock()
++            .unwrap()
++            .connections
++            .values()
++            .next()
++            .expect("connected client must have an authorization deadline")
++            .deadline;
++
++        (server, client, deadline)
++    }
++
 +    #[tokio::test]
 +    async fn accepts_node_bound_jwt_and_releases_connection_limit() {
 +        let access = JwtAccess::new(config()).unwrap();
@@ -617,6 +820,203 @@ index 000000000..35ed41377
 +        access.on_disconnect(endpoint_id, first.connection_id());
 +        let third = request(endpoint_id, &token(endpoint_id, json!({})));
 +        assert_eq!(access.on_connect(&third).await, Access::Allow);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn expiry_preempts_a_selected_blocked_write_and_releases_the_connection_slot() {
++        let endpoint_id = endpoint_key().public();
++        let mut jwt_config = config();
++        jwt_config.clock_skew_seconds = 0;
++        let (disconnected_send, disconnected_recv) = oneshot::channel();
++        let access = Arc::new(TrackingAccess {
++            inner: JwtAccess::new(jwt_config).unwrap(),
++            disconnected: Mutex::new(Some(disconnected_send)),
++        });
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let jwt = token(endpoint_id, json!({"iat": now, "exp": now + 2}));
++        let first = request(endpoint_id, &jwt);
++        let first_connection_id = first.connection_id();
++        assert_eq!(access.on_connect(&first).await, Access::Allow);
++        let deadline = access
++            .connection_deadline(endpoint_id, first_connection_id)
++            .unwrap();
++        let guard = OnDisconnectGuard::for_access_control(access.clone(), &first);
++
++        let clients = Clients::default();
++        let metrics = Arc::new(Metrics::default());
++        let blocked_flushes = Arc::new(AtomicUsize::new(0));
++        let normal_flushes = Arc::new(AtomicUsize::new(0));
++        let (write_selected_send, write_selected_recv) = oneshot::channel();
++        let (stream_dropped_send, stream_dropped_recv) = oneshot::channel();
++        let blocked_stream = ControlledSink {
++            block_writes: true,
++            write_selected: Some(write_selected_send),
++            dropped: Some(stream_dropped_send),
++            flushes: blocked_flushes.clone(),
++        };
++        let mut blocked_config = ClientConfig::new(
++            guard,
++            RelayedStream::new(blocked_stream, KeyCache::new(0)),
++            ProtocolVersion::default(),
++        );
++        blocked_config.write_timeout = Duration::from_secs(60);
++        clients.register(blocked_config, metrics.clone());
++
++        // Replacing the active connection queues a status frame for the expiring actor.
++        // Its sink reports when that work has been selected, then holds the write pending.
++        let normal_stream = ControlledSink {
++            block_writes: false,
++            write_selected: None,
++            dropped: None,
++            flushes: normal_flushes.clone(),
++        };
++        let normal_config = ClientConfig::new(
++            OnDisconnectGuard::empty(endpoint_id),
++            RelayedStream::new(normal_stream, KeyCache::new(0)),
++            ProtocolVersion::default(),
++        );
++        clients.register(normal_config, metrics);
++        let write_selected_at =
++            tokio::time::timeout(Duration::from_millis(50), write_selected_recv)
++                .await
++                .expect("actor did not select the queued write before expiry")
++                .expect("blocked sink dropped before selecting the queued write");
++        assert!(write_selected_at < deadline);
++
++        let competing = request(endpoint_id, &jwt);
++        assert_eq!(
++            access.on_connect(&competing).await,
++            Access::Deny { reason: None },
++            "the first connection must hold its per-node slot before expiry"
++        );
++
++        tokio::time::sleep_until(deadline).await;
++        let close_bound = deadline + Duration::from_millis(10);
++        let (disconnected_at, stream_dropped_at) = tokio::time::timeout_at(close_bound, async {
++            let disconnected_at = disconnected_recv
++                .await
++                .expect("disconnect guard dropped without reporting release");
++            let stream_dropped_at = stream_dropped_recv
++                .await
++                .expect("blocked relay stream did not report closure");
++            (disconnected_at, stream_dropped_at)
++        })
++        .await
++        .expect("blocked actor remained alive past the authorization deadline");
++        assert!(disconnected_at <= close_bound);
++        assert!(stream_dropped_at <= close_bound);
++        assert_eq!(
++            blocked_flushes.load(Ordering::SeqCst),
++            0,
++            "expiry must drop the blocked stream without flushing"
++        );
++        assert!(
++            !clients.disconnect(endpoint_id, Some(first_connection_id)),
++            "expired actor remained registered after its stream was dropped"
++        );
++
++        let recovered = request(endpoint_id, &jwt);
++        assert_eq!(
++            access.on_connect(&recovered).await,
++            Access::Allow,
++            "expiry did not release the per-node connection slot"
++        );
++        access.on_disconnect(endpoint_id, recovered.connection_id());
++
++        clients.shutdown().await;
++        assert!(
++            normal_flushes.load(Ordering::SeqCst) > 0,
++            "ordinary clean shutdown must still flush its stream"
++        );
++    }
++
++    #[tokio::test]
++    async fn idle_established_connection_is_closed_at_jwt_expiry_with_clock_skew() {
++        let (server, mut client, deadline) = connect_expiring_client(1).await;
++
++        client.send(ClientToRelayMsg::Ping([1; 8])).await.unwrap();
++        assert!(matches!(
++            client.next().await,
++            Some(Ok(RelayToClientMsg::Pong { .. }))
++        ));
++
++        tokio::time::timeout_at(deadline + Duration::from_secs(1), async {
++            loop {
++                match client.next().await {
++                    Some(Ok(_)) => continue,
++                    Some(Err(_)) | None => break,
++                }
++            }
++        })
++        .await
++        .expect("relay kept an idle client open past JWT exp plus clock skew");
++
++        server.shutdown().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn sustained_ping_traffic_stops_at_jwt_expiry() {
++        const POST_DEADLINE_PING: [u8; 8] = [u8::MAX; 8];
++
++        let (server, client, deadline) = connect_expiring_client(0).await;
++        let (mut incoming, mut outgoing) = client.split();
++        let traffic = tokio::spawn(async move {
++            let mut sequence = 0u64;
++            loop {
++                let after_deadline = Instant::now() >= deadline;
++                sequence = sequence.wrapping_add(1);
++                let data = if after_deadline {
++                    POST_DEADLINE_PING
++                } else {
++                    sequence.to_be_bytes()
++                };
++                let failed = outgoing.send(ClientToRelayMsg::Ping(data)).await.is_err();
++                if failed && after_deadline {
++                    break (sequence, Instant::now());
++                }
++                if failed {
++                    tokio::time::sleep_until(deadline).await;
++                } else {
++                    tokio::task::yield_now().await;
++                }
++            }
++        });
++
++        let pong_count = tokio::time::timeout_at(deadline + Duration::from_secs(1), async {
++            let mut pong_count = 0usize;
++            loop {
++                match incoming.next().await {
++                    Some(Ok(RelayToClientMsg::Pong(data))) => {
++                        assert_ne!(
++                            data, POST_DEADLINE_PING,
++                            "relay emitted a pong for a post-deadline ping"
++                        );
++                        pong_count += 1;
++                    }
++                    Some(Ok(_)) => continue,
++                    Some(Err(_)) | None => break,
++                }
++            }
++            pong_count
++        })
++        .await
++        .expect("sustained traffic kept the client open past the bounded expiry window");
++        let (sent_count, traffic_stopped_at) =
++            tokio::time::timeout(Duration::from_secs(1), traffic)
++                .await
++                .expect("traffic sender did not stop after relay closure")
++                .expect("traffic sender task failed");
++
++        assert!(pong_count > 1, "test did not sustain ping traffic");
++        assert!(sent_count > pong_count as u64);
++        assert!(
++            traffic_stopped_at >= deadline,
++            "test traffic stopped before the authorization deadline"
++        );
++        server.shutdown().await.unwrap();
 +    }
 +
 +    #[tokio::test]
@@ -758,7 +1158,7 @@ index 000000000..35ed41377
 +    }
 +}
 diff --git a/iroh-relay/src/main.rs b/iroh-relay/src/main.rs
-index 2ca043df0..7b798c6ba 100644
+index 2ca043df0229521f2232e24c299986b2ba20464b..7b798c6ba84e265643e05affab92082dddba8499 100644
 --- a/iroh-relay/src/main.rs
 +++ b/iroh-relay/src/main.rs
 @@ -3,6 +3,8 @@
@@ -969,8 +1369,288 @@ index 2ca043df0..7b798c6ba 100644
 +        assert!(validate_access_mode(&dev, &open_config).is_ok());
 +    }
  }
+diff --git a/iroh-relay/src/server.rs b/iroh-relay/src/server.rs
+index 13d947edf1536d162f5cb29b18cbe82c4e62cf93..9bd52296264806ead778c4d9d6665d706b2155fe 100644
+--- a/iroh-relay/src/server.rs
++++ b/iroh-relay/src/server.rs
+@@ -46,6 +46,7 @@ use serde::Serialize;
+ use tokio::{
+     net::TcpListener,
+     task::{JoinError, JoinSet},
++    time::Instant,
+ };
+ use tokio_rustls_acme::{
+     acme::{LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY},
+@@ -292,6 +293,19 @@ pub trait AccessControl: std::fmt::Debug + Send + Sync + 'static {
+     /// Can be implemented as `async fn on_connect(&self, request: &ClientRequest) -> Access`.
+     fn on_connect(&self, request: &ClientRequest) -> impl Future<Output = Access> + Send;
+ 
++    /// Returns the monotonic deadline for an admitted connection, if it has one.
++    ///
++    /// Called immediately after [`Self::on_connect`] returns [`Access::Allow`]. Once the
++    /// deadline is reached, the server closes the connection without waiting for the client.
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant> {
++        let _ = (endpoint_id, connection_id);
++        None
++    }
++
+     /// Notifies that a connection has ended.
+     ///
+     /// Called once for every connection that [`Self::on_connect`] admitted,
+@@ -316,6 +330,13 @@ pub trait DynAccessControl: std::fmt::Debug + Send + Sync + 'static {
+         request: &'a ClientRequest,
+     ) -> Pin<Box<dyn Future<Output = Access> + Send + 'a>>;
+ 
++    /// See [`AccessControl::connection_deadline`].
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant>;
++
+     /// See [`AccessControl::on_disconnect`].
+     fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId);
+ }
+@@ -328,6 +349,14 @@ impl<T: AccessControl> DynAccessControl for T {
+         Box::pin(<Self as AccessControl>::on_connect(self, request))
+     }
+ 
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant> {
++        <Self as AccessControl>::connection_deadline(self, endpoint_id, connection_id)
++    }
++
+     fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
+         <Self as AccessControl>::on_disconnect(self, endpoint_id, connection_id)
+     }
+@@ -377,6 +406,7 @@ pub struct OnDisconnectGuard {
+     access: Option<Arc<dyn DynAccessControl>>,
+     endpoint_id: EndpointId,
+     connection_id: ConnectionId,
++    deadline: Option<Instant>,
+ }
+ 
+ impl OnDisconnectGuard {
+@@ -386,10 +416,14 @@ impl OnDisconnectGuard {
+     /// with the request's [`EndpointId`] and [`ConnectionId`]. Create it only
+     /// once [`AccessControl::on_connect`] has admitted the connection.
+     pub fn for_access_control(access: Arc<dyn DynAccessControl>, request: &ClientRequest) -> Self {
++        let endpoint_id = request.endpoint_id();
++        let connection_id = request.connection_id();
++        let deadline = access.connection_deadline(endpoint_id, connection_id);
+         Self {
+             access: Some(access),
+-            endpoint_id: request.endpoint_id(),
+-            connection_id: request.connection_id(),
++            endpoint_id,
++            connection_id,
++            deadline,
+         }
+     }
+ 
+@@ -402,6 +436,7 @@ impl OnDisconnectGuard {
+             access: None,
+             endpoint_id,
+             connection_id: ConnectionId::next(),
++            deadline: None,
+         }
+     }
+ 
+@@ -414,6 +449,11 @@ impl OnDisconnectGuard {
+     pub fn connection_id(&self) -> ConnectionId {
+         self.connection_id
+     }
++
++    /// Returns the monotonic deadline after which this connection must be closed.
++    pub fn deadline(&self) -> Option<Instant> {
++        self.deadline
++    }
+ }
+ 
+ impl Drop for OnDisconnectGuard {
+diff --git a/iroh-relay/src/server/client.rs b/iroh-relay/src/server/client.rs
+index 7d59088516ce98c3da06bc30a451151701fe674c..9170ff77be7671e7ca006cee30bffdfffcc07561 100644
+--- a/iroh-relay/src/server/client.rs
++++ b/iroh-relay/src/server/client.rs
+@@ -333,6 +333,15 @@ where
+     }
+ 
+     async fn run_inner(&mut self, done: CancellationToken) -> Result<(), RunError> {
++        let deadline = self.guard.deadline();
++        let expiry = async move {
++            match deadline {
++                Some(deadline) => tokio::time::sleep_until(deadline).await,
++                None => std::future::pending().await,
++            }
++        };
++        tokio::pin!(expiry);
++
+         // Add some jitter to ping pong interactions, to avoid all pings being sent at the same time
+         let next_interval = || {
+             let random_secs = rand::rng().random_range(1..=5);
+@@ -344,57 +353,107 @@ where
+         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+         ping_interval.tick().await;
+ 
+-        loop {
+-            tokio::select! {
+-                biased;
++        let authorization_expired =
++            || deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+ 
+-                _ = done.cancelled() => {
+-                    trace!("actor loop cancelled, exiting");
+-                    // final flush
+-                    self.stream.flush().await.map_err(|_| e!(RunError::Flush))?;
+-                    break;
+-                }
+-                maybe_frame = self.stream.next() => {
+-                    self
+-                        .handle_frame(maybe_frame)
+-                        .await?;
+-                    // reset the ping interval, we just received a message
+-                    ping_interval.reset();
+-                }
+-                // Second priority, sending regular packets
+-                packet = self.packet_send_queue.recv() => {
+-                    let packet = packet.ok_or_else(|| e!(RunError::HandleDropped))?;
+-                    self.send_packet(packet)
+-                        .await
+-                        .map_err(|err| e!(RunError::PacketSend, err))?;
+-                }
+-                // Last priority, sending other message
+-                message = self.message_send_queue.recv() => {
+-                    let message = message.ok_or_else(|| e!(RunError::HandleDropped))?;
+-                    trace!("send {message:?}");
+-                    self.write_frame(message)
++        loop {
++            let traffic_operation = async {
++                let should_exit = tokio::select! {
++                    biased;
++
++                    _ = done.cancelled() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without flushing");
++                            return Ok(true);
++                        }
++                        trace!("actor loop cancelled, exiting");
++                        // final flush
++                        self.stream.flush().await.map_err(|_| e!(RunError::Flush))?;
++                        true
++                    }
++                    maybe_frame = self.stream.next() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without handling frame");
++                            return Ok(true);
++                        }
++                        self
++                            .handle_frame(maybe_frame)
++                            .await?;
++                        // reset the ping interval, we just received a message
++                        ping_interval.reset();
++                        false
++                    }
++                    // Second priority, sending regular packets
++                    packet = self.packet_send_queue.recv() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without sending packet");
++                            return Ok(true);
++                        }
++                        let packet = packet.ok_or_else(|| e!(RunError::HandleDropped))?;
++                        self.send_packet(packet)
++                            .await
++                            .map_err(|err| e!(RunError::PacketSend, err))?;
++                        false
++                    }
++                    // Last priority, sending other message
++                    message = self.message_send_queue.recv() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without sending message");
++                            return Ok(true);
++                        }
++                        let message = message.ok_or_else(|| e!(RunError::HandleDropped))?;
++                        trace!("send {message:?}");
++                        self.write_frame(message)
++                            .await
++                            .map_err(|err| e!(RunError::WriteFrame, err))?;
++                        false
++                    }
++                    _ = self.ping_tracker.timeout() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection");
++                        } else {
++                            trace!("pong timed out");
++                        }
++                        true
++                    }
++                    _ = ping_interval.tick() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without keepalive");
++                            return Ok(true);
++                        }
++                        trace!("keep alive ping");
++                        // new interval
++                        ping_interval.reset_after(next_interval());
++                        let data = self.ping_tracker.new_ping();
++                        self.write_frame(RelayToClientMsg::Ping(data))
++                            .await
++                            .map_err(|err| e!(RunError::WriteFrame, err))?;
++                        false
++                    }
++                };
++
++                if !should_exit {
++                    self.stream
++                        .flush()
+                         .await
+-                        .map_err(|err| e!(RunError::WriteFrame, err))?;
++                        .map_err(|_| e!(RunError::TickFlush))?;
+                 }
+-                _ = self.ping_tracker.timeout() => {
+-                    trace!("pong timed out");
+-                    break;
+-                }
+-                _ = ping_interval.tick() => {
+-                    trace!("keep alive ping");
+-                    // new interval
+-                    ping_interval.reset_after(next_interval());
+-                    let data = self.ping_tracker.new_ping();
+-                    self.write_frame(RelayToClientMsg::Ping(data))
+-                        .await
+-                        .map_err(|err| e!(RunError::WriteFrame, err))?;
++                Ok::<_, RunError>(should_exit)
++            };
++            tokio::pin!(traffic_operation);
++
++            let should_exit = tokio::select! {
++                biased;
++
++                _ = &mut expiry => {
++                    debug!("connection authorization expired, dropping connection without flushing");
++                    return Ok(());
+                 }
++                result = &mut traffic_operation => result?,
++            };
++            if should_exit {
++                break;
+             }
+-
+-            self.stream
+-                .flush()
+-                .await
+-                .map_err(|_| e!(RunError::TickFlush))?;
+         }
+         Ok(())
+     }
 diff --git a/iroh-relay/src/server/http_server.rs b/iroh-relay/src/server/http_server.rs
-index 22384ebfb..374a3115a 100644
+index 22384ebfb085f06b40c67c93596863ffa9b11589..374a3115aaad7d183fb046be030989699c22309e 100644
 --- a/iroh-relay/src/server/http_server.rs
 +++ b/iroh-relay/src/server/http_server.rs
 @@ -25,7 +25,7 @@ use n0_error::{e, ensure, stack_error};

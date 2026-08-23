@@ -46,6 +46,7 @@ import {
 } from "../src/daemon/iroh-stream-lifecycle.ts";
 import { runVoltDaemon } from "../src/daemon/main.ts";
 import { getDaemonPaths } from "../src/daemon/paths.ts";
+import type { IrohManagedRelayCredential } from "../src/daemon/relay-credential.ts";
 import { type DaemonProbeResult, probeDaemon } from "../src/daemon/spawn.ts";
 import { readLineFromIroh } from "../src/daemon/workspace-streams.ts";
 
@@ -98,6 +99,106 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
+async function waitForHealthyDaemon(agentDir: string): Promise<DaemonProbeResult> {
+	let status = await probeDaemon(agentDir);
+	for (let attempt = 0; !status.healthy && attempt < 100; attempt++) {
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		status = await probeDaemon(agentDir);
+	}
+	expect(status.healthy).toBe(true);
+	return status;
+}
+
+async function expectIrohEndpointReady(control: DaemonClient): Promise<void> {
+	const response = await control.request({ type: "client_revoke", clientNodeId: "f".repeat(64) });
+	expect(response).toMatchObject({ type: "error", code: "not_found" });
+}
+
+function withRecordedRelayCredentialInstall(
+	endpoint: IrohEndpointLike,
+	insertions: IrohRelayConfigLike[],
+	onClose: () => void,
+	removals?: string[],
+): IrohEndpointLike {
+	return {
+		id: () => endpoint.id(),
+		addr: () => endpoint.addr(),
+		online: () => Promise.resolve(),
+		insertRelay: async (config) => {
+			insertions.push(config);
+		},
+		removeRelay: async (url) => {
+			removals?.push(url);
+			return (await endpoint.removeRelay?.(url)) ?? false;
+		},
+		acceptNext: () => endpoint.acceptNext(),
+		secretKey: () => endpoint.secretKey(),
+		async close() {
+			onClose();
+			await endpoint.close();
+		},
+	};
+}
+
+async function provisionManagedRelayCredentialState(
+	agentDir: string,
+	accessTokenLifetimeMs: number,
+): Promise<IrohManagedRelayCredential> {
+	let hostNodeId: string | undefined;
+	let control: DaemonClient | undefined;
+	let daemonStopped = false;
+	const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+		createIrohDaemonService(
+			{ relayMode: "disabled" },
+			{
+				decorateEndpoint: (endpoint) => {
+					hostNodeId = endpoint.id().toString();
+					return endpoint;
+				},
+			},
+		),
+	]);
+	try {
+		const status = await waitForHealthyDaemon(agentDir);
+		control = createDaemonClient({
+			socketPath: status.socketPath,
+			client: "cli",
+			version: "test",
+			authToken: status.authToken,
+			reconnect: false,
+		});
+		await expectIrohEndpointReady(control);
+		expect(hostNodeId).toMatch(/^[0-9a-f]{64}$/);
+		expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+		await daemon;
+		daemonStopped = true;
+	} finally {
+		if (!daemonStopped) {
+			await control?.request({ type: "shutdown" }).catch(() => {});
+			await daemon;
+		}
+		await control?.close();
+	}
+	if (hostNodeId === undefined) throw new Error("provisioned Iroh endpoint identity is missing");
+	const credential: IrohManagedRelayCredential = {
+		schemaVersion: 2,
+		serviceUrl: VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
+		relayUrls: [...VOLT_PRODUCTION_RELAY_URLS],
+		endpointNodeId: hostNodeId,
+		endpointId: "endpoint-unit-test",
+		grantId: "grant-unit-test-id",
+		accessToken: "header.payload.signature",
+		accessTokenExpiresAt: Date.now() + accessTokenLifetimeMs,
+		refreshToken: `vrr_${"r".repeat(43)}`,
+	};
+	const statePath = getDaemonPaths(agentDir).statePath;
+	const state = JSON.parse(readFileSync(statePath, "utf8")) as { settings: Record<string, unknown> };
+	state.settings.relayCredential = credential;
+	delete state.settings.relayAuthToken;
+	writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+	return credential;
+}
+
 async function createPhoneEndpoint(): Promise<PhoneEndpoint> {
 	const iroh = native.iroh;
 	if (!iroh) {
@@ -138,6 +239,8 @@ function withStalledOnline(
 			onlineStarted();
 			await onlineGate;
 		},
+		...(endpoint.insertRelay === undefined ? {} : { insertRelay: endpoint.insertRelay.bind(endpoint) }),
+		...(endpoint.removeRelay === undefined ? {} : { removeRelay: endpoint.removeRelay.bind(endpoint) }),
 		acceptNext: () => endpoint.acceptNext(),
 		secretKey: () => endpoint.secretKey(),
 		close: () => endpoint.close(),
@@ -1446,7 +1549,551 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 	}, 30_000);
 });
 
+describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () => {
+	it("keeps host revocation authoritative over an admitted claim installer and restart", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-revoke-race-"));
+		const restartAgentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-revoke-restart-"));
+		const originalCredential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		const exchangedAccessToken = "exchanged.payload.signature";
+		const claimId = "claimabcdefghijklmnopqrs";
+		const appEndpointId = "appendpointabcdefghijklm";
+		const appNodeId = "b".repeat(64);
+		const insertGate = createDeferred();
+		const brokerRevokeGate = createDeferred();
+		const relayInsertions: IrohRelayConfigLike[] = [];
+		const relayRemovals: string[] = [];
+		const restartRelayInsertions: IrohRelayConfigLike[] = [];
+		let insertStarted = false;
+		let relayWatchStarted = false;
+		let relayWatchStopped = false;
+		let brokerRevokeRequests = 0;
+		let daemonStopped = false;
+		let restartDaemonStopped = false;
+		let control: DaemonClient | undefined;
+		let restartControl: DaemonClient | undefined;
+		let restartDaemon: Promise<number> | undefined;
+		let revocationRequest: ReturnType<DaemonClient["request"]> | undefined;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims`) {
+				return new Response(
+					JSON.stringify({ claimId, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() }),
+					{ status: 201, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims/${claimId}/exchange`) {
+				return new Response(
+					JSON.stringify({
+						grantId: originalCredential.grantId,
+						endpointId: originalCredential.endpointId,
+						hostNodeId: originalCredential.endpointNodeId,
+						appEndpointId,
+						appNodeId,
+						credential: {
+							accessToken: exchangedAccessToken,
+							accessTokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+							tokenType: "Bearer",
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/grant/revoke`) {
+				brokerRevokeRequests++;
+				await brokerRevokeGate.promise;
+				return new Response(null, { status: 204 });
+			}
+			throw new Error(`unexpected managed relay credential request: ${url}`);
+		});
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{},
+				{
+					relayWatchApiSafe: true,
+					decorateEndpoint: (endpoint) => ({
+						id: () => endpoint.id(),
+						addr: () => endpoint.addr(),
+						online: () => Promise.resolve(),
+						async insertRelay(config) {
+							relayInsertions.push(config);
+							insertStarted = true;
+							await insertGate.promise;
+						},
+						async removeRelay(url) {
+							relayRemovals.push(url);
+							return true;
+						},
+						watchHomeRelay: () => {
+							relayWatchStarted = true;
+							return {
+								async stop() {
+									relayWatchStopped = true;
+								},
+							};
+						},
+						acceptNext: () => endpoint.acceptNext(),
+						secretKey: () => endpoint.secretKey(),
+						close: () => endpoint.close(),
+					}),
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expectIrohEndpointReady(control);
+			expect(relayWatchStarted).toBe(true);
+			expect(await control.request({ type: "pair_request" })).toMatchObject({ type: "pair_started" });
+			await expect.poll(() => insertStarted, { timeout: 5_000 }).toBe(true);
+
+			revocationRequest = control.request({ type: "relay_credential_revoke" });
+			void revocationRequest.catch(() => {});
+			await expect.poll(() => relayWatchStopped, { timeout: 5_000 }).toBe(true);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			insertGate.resolve();
+			await expect.poll(() => brokerRevokeRequests, { timeout: 5_000 }).toBe(1);
+
+			const statePath = getDaemonPaths(agentDir).statePath;
+			const intermediateState = JSON.parse(readFileSync(statePath, "utf8")) as {
+				settings: {
+					relayAuthToken?: string;
+					relayCredential?: IrohManagedRelayCredential;
+					relayCredentialClaim?: unknown;
+					relayCredentialRevocation?: IrohManagedRelayCredential;
+				};
+			};
+			expect(intermediateState.settings.relayCredentialRevocation).toEqual(originalCredential);
+			expect(intermediateState.settings.relayAuthToken).toBeUndefined();
+			expect(intermediateState.settings.relayCredential).toBeUndefined();
+			expect(intermediateState.settings.relayCredentialClaim).toBeUndefined();
+			expect(relayInsertions).toEqual([{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: exchangedAccessToken }]);
+			expect(relayRemovals).toContain(VOLT_PRODUCTION_RELAY_URLS[0]);
+
+			const restartPaths = getDaemonPaths(restartAgentDir);
+			mkdirSync(restartPaths.daemonDir, { recursive: true });
+			writeFileSync(restartPaths.statePath, `${JSON.stringify(intermediateState, null, 2)}\n`);
+			restartDaemon = runVoltDaemon({ agentDir: restartAgentDir, foreground: false }, [
+				createIrohDaemonService(
+					{},
+					{
+						decorateEndpoint: (endpoint) =>
+							withRecordedRelayCredentialInstall(endpoint, restartRelayInsertions, () => {}),
+					},
+				),
+			]);
+			const restartStatus = await waitForHealthyDaemon(restartAgentDir);
+			restartControl = createDaemonClient({
+				socketPath: restartStatus.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: restartStatus.authToken,
+				reconnect: false,
+			});
+			await expect.poll(() => brokerRevokeRequests, { timeout: 5_000 }).toBe(2);
+			const restartIntermediateState = JSON.parse(readFileSync(restartPaths.statePath, "utf8")) as {
+				settings: {
+					relayAuthToken?: string;
+					relayCredential?: IrohManagedRelayCredential;
+					relayCredentialClaim?: unknown;
+					relayCredentialRevocation?: IrohManagedRelayCredential;
+				};
+			};
+			expect(restartIntermediateState.settings.relayCredentialRevocation).toEqual(originalCredential);
+			expect(restartIntermediateState.settings.relayAuthToken).toBeUndefined();
+			expect(restartIntermediateState.settings.relayCredential).toBeUndefined();
+			expect(restartIntermediateState.settings.relayCredentialClaim).toBeUndefined();
+			expect(restartRelayInsertions).toEqual([]);
+
+			brokerRevokeGate.resolve();
+			await expect(revocationRequest).resolves.toMatchObject({ type: "ok" });
+			await expectIrohEndpointReady(restartControl);
+			expect(restartRelayInsertions).toEqual([]);
+			const finalState = JSON.parse(readFileSync(statePath, "utf8")) as {
+				settings: Record<string, unknown>;
+			};
+			expect(finalState.settings.relayAuthToken).toBeUndefined();
+			expect(finalState.settings.relayCredential).toBeUndefined();
+			expect(finalState.settings.relayCredentialClaim).toBeUndefined();
+			expect(finalState.settings.relayCredentialRevocation).toBeUndefined();
+
+			expect((await restartControl.request({ type: "shutdown" })).type).toBe("ok");
+			await restartDaemon;
+			restartDaemonStopped = true;
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await daemon;
+			daemonStopped = true;
+		} finally {
+			insertGate.resolve();
+			brokerRevokeGate.resolve();
+			await revocationRequest?.catch(() => {});
+			if (!restartDaemonStopped && restartDaemon !== undefined) {
+				await restartControl?.request({ type: "shutdown" }).catch(() => {});
+				await restartDaemon;
+			}
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await restartControl?.close();
+			await control?.close();
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+			rmSync(restartAgentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("starts degraded with an expired JWT and installs a refreshed credential after broker recovery", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-startup-expired-"));
+		const originalCredential = await provisionManagedRelayCredentialState(agentDir, -60_000);
+		const refreshedAccessToken = "refreshed.payload.signature";
+		const relayInsertions: IrohRelayConfigLike[] = [];
+		let brokerAvailable = false;
+		let refreshRequests = 0;
+		let endpointDecorations = 0;
+		let endpointCloseCalls = 0;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url !== `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/tokens/refresh`) {
+				throw new Error(`unexpected managed relay credential request: ${url}`);
+			}
+			refreshRequests++;
+			if (!brokerAvailable) throw new Error("managed relay broker unavailable");
+			return new Response(
+				JSON.stringify({
+					accessToken: refreshedAccessToken,
+					accessTokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+					tokenType: "Bearer",
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{},
+				{
+					decorateEndpoint: (endpoint) => {
+						endpointDecorations++;
+						return withRecordedRelayCredentialInstall(endpoint, relayInsertions, () => {
+							endpointCloseCalls++;
+						});
+					},
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expectIrohEndpointReady(control);
+			await expect.poll(() => refreshRequests, { timeout: 5_000 }).toBeGreaterThanOrEqual(1);
+			expect(relayInsertions).toEqual([]);
+
+			brokerAvailable = true;
+			await expect
+				.poll(() => relayInsertions, { timeout: 5_000 })
+				.toEqual([{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: refreshedAccessToken }]);
+			const statePath = getDaemonPaths(agentDir).statePath;
+			await expect
+				.poll(() => {
+					const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+						settings: { relayCredential?: IrohManagedRelayCredential };
+					};
+					return state.settings.relayCredential?.accessToken;
+				})
+				.toBe(refreshedAccessToken);
+			expect(endpointDecorations).toBe(1);
+			expect(endpointCloseCalls).toBe(0);
+			expect(originalCredential.accessTokenExpiresAt).toBeLessThan(Date.now());
+		} finally {
+			brokerAvailable = true;
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+				daemonStopped = true;
+			}
+			await control?.close();
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("refreshes and becomes ready when online stalls past the persisted JWT expiry", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-startup-valid-"));
+		const originalCredential = await provisionManagedRelayCredentialState(agentDir, 1_500);
+		const onlineGate = createDeferred();
+		const relayInsertions: IrohRelayConfigLike[] = [];
+		const relayRemovals: string[] = [];
+		const refreshedAccessTokens: string[] = [];
+		let brokerAvailable = false;
+		let refreshRequests = 0;
+		let onlineStarted = false;
+		let onlineReleased = false;
+		let endpointDecorations = 0;
+		let endpointCloseCalls = 0;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url !== `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/tokens/refresh`) {
+				throw new Error(`unexpected managed relay credential request: ${url}`);
+			}
+			refreshRequests++;
+			if (!brokerAvailable) throw new Error("managed relay broker unavailable");
+			const accessToken = `refreshed${refreshedAccessTokens.length + 1}.payload.signature`;
+			refreshedAccessTokens.push(accessToken);
+			return new Response(
+				JSON.stringify({
+					accessToken,
+					accessTokenExpiresAt: new Date(Date.now() + 31_000).toISOString(),
+					tokenType: "Bearer",
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		expect(originalCredential.accessTokenExpiresAt).toBeGreaterThan(Date.now());
+		const daemon = runVoltDaemon({ agentDir, foreground: false, extensionDisposeTimeoutMs: 50 }, [
+			createIrohDaemonService(
+				{},
+				{
+					decorateEndpoint: (endpoint) => {
+						endpointDecorations++;
+						return withStalledOnline(
+							withRecordedRelayCredentialInstall(
+								endpoint,
+								relayInsertions,
+								() => {
+									endpointCloseCalls++;
+								},
+								relayRemovals,
+							),
+							() => {
+								onlineStarted = true;
+							},
+							onlineGate.promise,
+						);
+					},
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expectIrohEndpointReady(control);
+			await expect.poll(() => onlineStarted, { timeout: 5_000 }).toBe(true);
+			await expect.poll(() => refreshRequests, { timeout: 5_000 }).toBeGreaterThanOrEqual(1);
+			await expect
+				.poll(() => Date.now(), { timeout: 5_000 })
+				.toBeGreaterThanOrEqual(originalCredential.accessTokenExpiresAt);
+			await expect.poll(() => relayRemovals, { timeout: 5_000 }).toContain(VOLT_PRODUCTION_RELAY_URLS[0]);
+			expect(relayInsertions).toEqual([]);
+			expect(onlineReleased).toBe(false);
+
+			brokerAvailable = true;
+			await expect.poll(() => relayInsertions.length, { timeout: 8_000 }).toBeGreaterThanOrEqual(2);
+			expect(refreshRequests).toBeGreaterThanOrEqual(3);
+			expect(
+				relayInsertions.every(
+					(config) =>
+						config.authToken !== originalCredential.accessToken &&
+						config.authToken !== undefined &&
+						refreshedAccessTokens.includes(config.authToken),
+				),
+			).toBe(true);
+			const latestInsertedToken = relayInsertions[relayInsertions.length - 1]?.authToken;
+			await expect
+				.poll(() => {
+					const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+						settings: { relayCredential?: IrohManagedRelayCredential };
+					};
+					return state.settings.relayCredential?.accessToken;
+				})
+				.toBe(latestInsertedToken);
+			expect(endpointDecorations).toBe(1);
+			expect(endpointCloseCalls).toBe(0);
+			expect(onlineReleased).toBe(false);
+
+			const shutdownStartedAt = Date.now();
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await expect(daemon).resolves.toBe(0);
+			daemonStopped = true;
+			expect(Date.now() - shutdownStartedAt).toBeLessThan(2_000);
+			expect(endpointCloseCalls).toBe(1);
+			expect(readFileSync(getDaemonPaths(agentDir).logPath, "utf8")).toContain(
+				"extension dispose deadline exceeded after 50ms",
+			);
+			expect(onlineReleased).toBe(false);
+		} finally {
+			brokerAvailable = true;
+			if (!daemonStopped) {
+				onlineReleased = true;
+				onlineGate.resolve();
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+				daemonStopped = true;
+			}
+			onlineReleased = true;
+			onlineGate.resolve();
+			await control?.close();
+			fetchSpy.mockRestore();
+			const logPath = getDaemonPaths(agentDir).logPath;
+			if (existsSync(logPath)) {
+				await expect
+					.poll(() => readFileSync(logPath, "utf8").includes("iroh service stopped"), { timeout: 5_000 })
+					.toBe(true);
+			}
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
 describe.skipIf(!nativeAvailable)("voltd iroh startup ownership", () => {
+	it("keeps expired managed-claim cleanup inside startup admission during shutdown", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-expired-claim-shutdown-"));
+		const credential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		const statePath = getDaemonPaths(agentDir).statePath;
+		const persistedState = JSON.parse(readFileSync(statePath, "utf8")) as {
+			settings: Record<string, unknown>;
+		};
+		delete persistedState.settings.relayAuthToken;
+		delete persistedState.settings.relayCredential;
+		persistedState.settings.relayCredentialClaim = {
+			schemaVersion: 1,
+			serviceUrl: credential.serviceUrl,
+			relayUrls: credential.relayUrls,
+			hostNodeId: credential.endpointNodeId,
+			claimSecret: `vpc_${"c".repeat(43)}`,
+			bootstrapRefreshToken: `vrr_${"d".repeat(43)}`,
+			claimId: "abcdefghijklmnopqrstuvwx",
+			expiresAt: Date.now() - 60_000,
+		};
+		writeFileSync(statePath, `${JSON.stringify(persistedState, null, 2)}\n`);
+		const startupLogOffset = readFileSync(getDaemonPaths(agentDir).logPath, "utf8").length;
+
+		const cleanupFlushGate = createDeferred();
+		let cleanupFlushStarted = false;
+		let cleanupFlushFinished = false;
+		let shutdownReachedIroh = false;
+		let acceptNextCalls = 0;
+		let onlineCalls = 0;
+		let endpointCloseCalls = 0;
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			(services) => {
+				const flush = services.state.flush.bind(services.state);
+				services.state.flush = async () => {
+					if (!cleanupFlushStarted && services.state.state.settings.relayCredentialClaim === undefined) {
+						cleanupFlushStarted = true;
+						await cleanupFlushGate.promise;
+						await flush();
+						cleanupFlushFinished = true;
+						return;
+					}
+					await flush();
+				};
+				return {
+					async quiesce() {
+						shutdownReachedIroh = true;
+					},
+				};
+			},
+			createIrohDaemonService(
+				{},
+				{
+					decorateEndpoint: (endpoint) => ({
+						id: () => endpoint.id(),
+						addr: () => endpoint.addr(),
+						async online() {
+							onlineCalls++;
+							await endpoint.online();
+						},
+						...(endpoint.insertRelay === undefined ? {} : { insertRelay: endpoint.insertRelay.bind(endpoint) }),
+						...(endpoint.removeRelay === undefined ? {} : { removeRelay: endpoint.removeRelay.bind(endpoint) }),
+						acceptNext() {
+							acceptNextCalls++;
+							return endpoint.acceptNext();
+						},
+						secretKey: () => endpoint.secretKey(),
+						async close() {
+							endpointCloseCalls++;
+							await endpoint.close();
+						},
+					}),
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expect.poll(() => cleanupFlushStarted, { timeout: 5_000 }).toBe(true);
+			expect(cleanupFlushFinished).toBe(false);
+			expect(acceptNextCalls).toBe(0);
+
+			let daemonSettled = false;
+			void daemon.then(() => {
+				daemonSettled = true;
+			});
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await expect.poll(() => shutdownReachedIroh, { timeout: 5_000 }).toBe(true);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(cleanupFlushFinished).toBe(false);
+			expect(daemonSettled).toBe(false);
+			expect(acceptNextCalls).toBe(0);
+
+			cleanupFlushGate.resolve();
+			await expect(daemon).resolves.toBe(0);
+			daemonStopped = true;
+			expect(cleanupFlushFinished).toBe(true);
+			expect(acceptNextCalls).toBe(0);
+			expect(onlineCalls).toBe(0);
+			expect(endpointCloseCalls).toBe(1);
+			expect(readFileSync(getDaemonPaths(agentDir).logPath, "utf8").slice(startupLogOffset)).not.toContain(
+				"iroh endpoint online",
+			);
+			const finalState = JSON.parse(readFileSync(statePath, "utf8")) as {
+				settings: { relayCredentialClaim?: unknown };
+			};
+			expect(finalState.settings.relayCredentialClaim).toBeUndefined();
+		} finally {
+			cleanupFlushGate.resolve();
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await control?.close();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	it("bounds a native online tail without holding the durable quiesce barrier", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-startup-"));
 		const onlineGate = createDeferred();
