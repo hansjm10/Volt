@@ -101,7 +101,7 @@
 		}
 	},
 	"optionalDependencies": {
-		"@number0/iroh": "1.0.0"
+		"@hansjm10/volt-iroh": "1.1.1-volt.2"
 	},
 	"devDependencies": {
 		"@types/cross-spawn": "6.0.6",

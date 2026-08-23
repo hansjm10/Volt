@@ -808,7 +808,7 @@ export async function handleRemoteControlCommand(
 	}
 	if (options.isStandaloneBinary) {
 		console.error("Error: volt remote is not available from the standalone binary release.");
-		console.error("Use a Node.js npm install or a source checkout with optional @number0/iroh dependencies.");
+		console.error("Use a Node.js npm install or a source checkout with optional @hansjm10/volt-iroh dependencies.");
 		process.exitCode = 1;
 		return true;
 	}

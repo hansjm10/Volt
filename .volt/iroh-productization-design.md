@@ -9,7 +9,7 @@ Move Volt Iroh remote access from experimental proof of concept to a supported p
 The current implementation is functional and has strong core plumbing:
 
 - `volt remote host` exists and launches `packages/coding-agent/src/remote/iroh-host.mjs`.
-- Iroh native loading is isolated in `packages/coding-agent/src/remote/iroh-native-adapter.cjs` through optional `@number0/iroh`.
+- Iroh native loading is isolated in `packages/coding-agent/src/remote/iroh-native-adapter.cjs` through optional `@hansjm10/volt-iroh`.
 - The host can run Volt in-process through `runIrohRemoteRpcMode()`.
 - The host can also spawn a Volt RPC child or fake RPC child for compatibility and scenario tests.
 - RPC mode uses a transport abstraction, and Iroh streams are adapted through `createIrohRpcTransport()`.
@@ -200,7 +200,7 @@ Do not implement these as part of this graduation effort unless the user explici
 The first non-experimental release should support:
 
 - Node.js package install and source checkout only.
-- Optional `@number0/iroh` native adapter.
+- Optional `@hansjm10/volt-iroh` native adapter.
 - One client connection maps to one active Volt runtime at a time.
 - One workspace per remote runtime.
 - Read-only tools by default.
@@ -213,7 +213,7 @@ The Bun binary should continue to reject `volt remote host` with a clear message
 
 ### Native dependency isolation
 
-Keep `@number0/iroh` loading isolated to `src/remote/iroh-native-adapter.cjs` and `src/remote/iroh-host.mjs`. Do not import the native adapter from core modules or normal CLI startup code.
+Keep `@hansjm10/volt-iroh` loading isolated to `src/remote/iroh-native-adapter.cjs` and `src/remote/iroh-host.mjs`. Do not import the native adapter from core modules or normal CLI startup code.
 
 ### Core remains structurally typed
 
@@ -388,7 +388,7 @@ The current ticket includes `irohTicket`, which is produced from the bound endpo
 
 Preferred approach: running-host control socket if feasible, short-lived pair endpoint if not. Do not ship a misleading offline pair command.
 
-Resolved 2026-06-21: Offline pairing from persisted host state is not supported. Direct `@number0/iroh` evidence: `EndpointTicket.fromAddr()` wraps an `EndpointAddr`; an ID-only `EndpointAddr` created from a persisted secret key produced a ticket with zero direct addresses and no relay URL, and a native connect attempt failed with `No addressing information available` / `No address lookup configured`; a bound endpoint ticket included a direct address. Decision: implement `volt remote pair` as a running-host-mediated command. The CLI will contact the live host's local control channel, and the host will create the ticket from its current bound endpoint address, persist/audit the pending pairing ticket, and return the ticket to stdout. If no live host/control channel is available, the workspace is missing or ambiguous, unsafe tools are not accepted, or endpoint-ticket creation fails, the command fails with diagnostics on stderr and no ticket on stdout. Security implications: pairing remains a local management action, raw secrets appear only in the returned ticket, persisted state stores only hashes and non-secret metadata, and pair-time tools/TTL/label policy are owned by the host. A short-lived pair endpoint is deferred as a fallback only if the control channel becomes impractical; no offline pair command should be shipped.
+Resolved 2026-06-21: Offline pairing from persisted host state is not supported. Direct `@hansjm10/volt-iroh` evidence: `EndpointTicket.fromAddr()` wraps an `EndpointAddr`; an ID-only `EndpointAddr` created from a persisted secret key produced a ticket with zero direct addresses and no relay URL, and a native connect attempt failed with `No addressing information available` / `No address lookup configured`; a bound endpoint ticket included a direct address. Decision: implement `volt remote pair` as a running-host-mediated command. The CLI will contact the live host's local control channel, and the host will create the ticket from its current bound endpoint address, persist/audit the pending pairing ticket, and return the ticket to stdout. If no live host/control channel is available, the workspace is missing or ambiguous, unsafe tools are not accepted, or endpoint-ticket creation fails, the command fails with diagnostics on stderr and no ticket on stdout. Security implications: pairing remains a local management action, raw secrets appear only in the returned ticket, persisted state stores only hashes and non-secret metadata, and pair-time tools/TTL/label policy are owned by the host. A short-lived pair endpoint is deferred as a fallback only if the control channel becomes impractical; no offline pair command should be shipped.
 
 Resolved 2026-06-21: Core/host pairing ticket lifecycle now supports pair-time `allowedTools`, label hints, TTL, relay hints in ticket payloads, saved-workspace binding, one-time consumption, and cross-workspace rejection. Pending state remains hash-only plus non-secret metadata, and authorization applies a label hint only when the client does not provide a label.
 
@@ -416,7 +416,7 @@ Required changes:
 
 Preferred preview acceptance: active connections are closed within one second of revocation when host and management command coordinate through a control socket or shared revocation watcher.
 
-Resolved 2026-06-21: Preview revocation will use live host coordination when available. `volt remote revoke <node-id>` must always remove the client from persisted state first so future authorization fails; it must also send a local control-channel revoke request to any running host for the same state path. The running host will keep an active connection registry keyed by authoritative Iroh remote node ID and workspace, close matching native `Connection` handles, let the existing connection cleanup stop the RPC child/runtime, and audit `active_connection_revoked`. Direct `@number0/iroh` API evidence: `Connection.close(errorCode, reason)` and `Connection.closed()` are available for active QUIC connections, with `RecvStream.stop()` and `SendStream.reset()` available if stream-level cleanup is needed. Lifecycle guarantee for C.3: if a live host acknowledges a matching active client, the connection is closed within one second with reason `revoked`; if no host is reachable, the command still succeeds for persisted revocation and reports that active live revocation was not available.
+Resolved 2026-06-21: Preview revocation will use live host coordination when available. `volt remote revoke <node-id>` must always remove the client from persisted state first so future authorization fails; it must also send a local control-channel revoke request to any running host for the same state path. The running host will keep an active connection registry keyed by authoritative Iroh remote node ID and workspace, close matching native `Connection` handles, let the existing connection cleanup stop the RPC child/runtime, and audit `active_connection_revoked`. Direct `@hansjm10/volt-iroh` API evidence: `Connection.close(errorCode, reason)` and `Connection.closed()` are available for active QUIC connections, with `RecvStream.stop()` and `SendStream.reset()` available if stream-level cleanup is needed. Lifecycle guarantee for C.3: if a live host acknowledges a matching active client, the connection is closed within one second with reason `revoked`; if no host is reachable, the command still succeeds for persisted revocation and reports that active live revocation was not available.
 
 Resolved 2026-06-21: `volt remote revoke <node-id>` and the host-script management path now remove the client from persisted state, audit `client_revoked`, send a local control-channel revoke request to the running host, and close active native Iroh connections with reason `revoked` when present. Running hosts track active authorized connections by authoritative remote node ID, audit `active_connection_revoked`, and report when no matching active connection exists. CLI and sidecar scenario tests cover control-channel active revocation, persisted reconnect denial remains covered by the revocation scenario, and no-host revocation remains a successful persisted-state operation with an active-live-unavailable diagnostic.
 
@@ -825,7 +825,7 @@ Acceptance criteria:
 Tasks:
 
 1. Run and document `--relay default` validation across two networks.
-2. Add troubleshooting docs for native adapter install failures. Resolved 2026-06-21: F.1 documents optional `@number0/iroh` reinstall guidance and the host startup missing-adapter failure surface.
+2. Add troubleshooting docs for native adapter install failures. Resolved 2026-06-21: F.1 documents optional `@hansjm10/volt-iroh` reinstall guidance and the host startup missing-adapter failure surface.
 3. Update README and `docs/usage.md` to remove or narrow experimental language only after all acceptance criteria pass. Resolved 2026-06-21: F.1 documents Iroh remote as preview with explicit unsupported boundaries instead of generic experimental language.
 4. Document Bun binary limitation. Resolved 2026-06-21: F.1 documents Node.js npm/source support and Bun binary remote-host rejection.
 5. Document security model prominently. Resolved 2026-06-21: F.1 adds prominent README/usage/security/sidecar warnings for opt-in hosting, read-only defaults, unsafe tools, project trust, revocation, state/audit paths, and workspace boundaries.
@@ -967,7 +967,7 @@ These must be resolved during implementation:
 4. Resolved 2026-06-21: supported preview does not include an in-place client policy update command. Users should revoke and re-pair a client to change its `allowedTools` or label/workspace policy; this avoids silent policy broadening and keeps each grant auditable through pairing and revocation events.
 5. Resolved 2026-06-21: Active revocation should use the running host control channel in preview; persisted-state revocation remains the fallback when no live host is reachable.
 6. Resolved 2026-06-21: the preview host does not store relay mode in persisted state for status defaults. The running host owns the live relay mode, tickets include a relay hint, `volt remote pair --relay <disabled|default>` can assert an expected live host mode, and `volt remote status` remains a persisted-state-only view that does not imply live relay status.
-7. Resolved 2026-06-21: supported preview is explicitly Node.js npm install/source-checkout only. Bun binary remote-host support remains unsupported until a bundling or native sidecar strategy is implemented; docs and the CLI error point users to Node/source installs with optional `@number0/iroh`.
+7. Resolved 2026-06-21: supported preview is explicitly Node.js npm install/source-checkout only. Bun binary remote-host support remains unsupported until a bundling or native sidecar strategy is implemented; docs and the CLI error point users to Node/source installs with optional `@hansjm10/volt-iroh`.
 
 ## Recommended First PR
 
