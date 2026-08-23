@@ -1,11 +1,7 @@
 import type { IrohBiStreamLike } from "../core/rpc/iroh-transport.ts";
 import nativeAdapter from "../remote/iroh-native-adapter.cjs";
 
-/**
- * Minimal structural typings for the @number0/iroh surface the daemon touches.
- * The native module ships without TypeScript types; these interfaces mirror the
- * members exercised by the dissolved iroh-host.mjs.
- */
+/** Minimal structural typings for the Volt-owned Iroh binding surface. */
 
 export interface IrohNodeIdLike {
 	toString(): string;
@@ -27,6 +23,7 @@ export interface IrohEndpointLike {
 	online(): Promise<void>;
 	close(): Promise<void>;
 	insertRelay?(config: IrohRelayConfigLike): Promise<void>;
+	reconnectRelay?(config: IrohRelayConfigLike): Promise<void>;
 	removeRelay?(url: string): Promise<boolean>;
 	watchHomeRelay?(callback: IrohHomeRelayWatchCallback): IrohWatchHandleLike;
 	acceptNext(): Promise<IrohIncomingLike | null | undefined>;
@@ -67,7 +64,13 @@ export interface IrohRelayMapLike {
 	insert(config: IrohRelayConfigLike): void;
 }
 
+export interface IrohBindingCapabilities {
+	connectedHomeRelayWatch: boolean;
+	reconnectRelay: boolean;
+}
+
 export interface IrohModuleLike {
+	bindingCapabilities(): IrohBindingCapabilities;
 	Endpoint: { builder(): IrohEndpointBuilderLike };
 	EndpointTicket: { fromAddr(addr: unknown): { toString(): string } };
 	RelayMap: { empty(): IrohRelayMapLike };
@@ -80,16 +83,8 @@ export interface IrohModuleLike {
 export interface IrohNativeLoadResult {
 	iroh?: IrohModuleLike;
 	packageVersion?: string;
-	watchApiSafe?: boolean;
+	capabilities?: IrohBindingCapabilities;
 	error?: unknown;
-}
-
-/** PR #281 fixes sync watcher registration starting with the next release after 1.1.0. */
-export function isIrohWatchApiSafe(version: string | undefined): boolean {
-	const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/.exec(version ?? "");
-	if (!match) return false;
-	const [major, minor, patch] = match.slice(1).map(Number);
-	return major > 1 || (major === 1 && (minor > 1 || (minor === 1 && patch >= 1)));
 }
 
 export function loadIrohModule(): IrohNativeLoadResult {
@@ -101,18 +96,32 @@ export function loadIrohModule(): IrohNativeLoadResult {
 	if (!iroh) {
 		return { error: irohLoadError };
 	}
+	const typedIroh = iroh as IrohModuleLike;
+	let capabilities: IrohBindingCapabilities;
+	try {
+		capabilities = typedIroh.bindingCapabilities();
+	} catch (error) {
+		return {
+			error: new Error("the installed Volt Iroh binding does not expose relay recovery capabilities", {
+				cause: error,
+			}),
+		};
+	}
+	if (!capabilities.connectedHomeRelayWatch || !capabilities.reconnectRelay) {
+		return { error: new Error("the installed Volt Iroh binding lacks required relay recovery capabilities") };
+	}
 	const packageVersion = typeof irohPackageVersion === "string" ? irohPackageVersion : undefined;
 	return {
-		iroh: iroh as IrohModuleLike,
+		iroh: typedIroh,
+		capabilities,
 		...(packageVersion === undefined ? {} : { packageVersion }),
-		watchApiSafe: isIrohWatchApiSafe(packageVersion),
 	};
 }
 
 export function formatIrohLoadError(error: unknown): string {
 	const detail = error instanceof Error ? error.message : error ? String(error) : "unknown native adapter error";
 	return [
-		"The optional @number0/iroh native adapter is not available.",
+		"The optional @hansjm10/volt-iroh native adapter is not available.",
 		`Native adapter error: ${detail}`,
 		"Install Volt with optional dependencies enabled for this platform, then retry.",
 		"If optional dependencies were omitted, reinstall without `--omit=optional`.",

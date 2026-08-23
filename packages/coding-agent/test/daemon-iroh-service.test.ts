@@ -25,7 +25,6 @@ import {
 	type IrohHomeRelayWatchCallback,
 	type IrohIncomingLike,
 	type IrohRelayConfigLike,
-	isIrohWatchApiSafe,
 	loadIrohModule,
 } from "../src/daemon/iroh-native.ts";
 import { DEFAULT_IROH_REMOTE_RESOURCE_LIMITS } from "../src/daemon/iroh-resource-guard.ts";
@@ -61,12 +60,8 @@ describe("native Iroh test prerequisite", () => {
 		}
 	});
 
-	it("enables watcher calls only for releases containing upstream PR #281", () => {
-		expect(isIrohWatchApiSafe(undefined)).toBe(false);
-		expect(isIrohWatchApiSafe("1.1.0")).toBe(false);
-		expect(isIrohWatchApiSafe("1.1.1")).toBe(true);
-		expect(isIrohWatchApiSafe("1.2.0")).toBe(true);
-		expect(native.watchApiSafe).toBe(isIrohWatchApiSafe(native.packageVersion));
+	it("loads explicit connected-watcher and relay-reconnect capabilities", () => {
+		expect(native.capabilities).toEqual({ connectedHomeRelayWatch: true, reconnectRelay: true });
 	});
 });
 
@@ -116,23 +111,36 @@ async function expectIrohEndpointReady(control: DaemonClient): Promise<void> {
 
 function withRecordedRelayCredentialInstall(
 	endpoint: IrohEndpointLike,
-	insertions: IrohRelayConfigLike[],
+	reconnects: IrohRelayConfigLike[],
 	onClose: () => void,
 	removals?: string[],
 	mutations?: string[],
+	beforeReconnect?: () => void,
 ): IrohEndpointLike {
+	let watcher: IrohHomeRelayWatchCallback | undefined;
 	return {
 		id: () => endpoint.id(),
 		addr: () => endpoint.addr(),
 		online: () => Promise.resolve(),
-		insertRelay: async (config) => {
-			mutations?.push(`insert:${config.url}`);
-			insertions.push(config);
+		insertRelay: (config) => endpoint.insertRelay?.(config) ?? Promise.resolve(),
+		reconnectRelay: async (config) => {
+			beforeReconnect?.();
+			mutations?.push(`reconnect:${config.url}`);
+			reconnects.push(config);
+			watcher?.(null, [config.url]);
 		},
 		removeRelay: async (url) => {
 			mutations?.push(`remove:${url}`);
 			removals?.push(url);
 			return (await endpoint.removeRelay?.(url)) ?? false;
+		},
+		watchHomeRelay: (callback) => {
+			watcher = callback;
+			return {
+				async stop() {
+					watcher = undefined;
+				},
+			};
 		},
 		acceptNext: () => endpoint.acceptNext(),
 		secretKey: () => endpoint.secretKey(),
@@ -325,7 +333,9 @@ function withStalledOnline(
 			await onlineGate;
 		},
 		...(endpoint.insertRelay === undefined ? {} : { insertRelay: endpoint.insertRelay.bind(endpoint) }),
+		...(endpoint.reconnectRelay === undefined ? {} : { reconnectRelay: endpoint.reconnectRelay.bind(endpoint) }),
 		...(endpoint.removeRelay === undefined ? {} : { removeRelay: endpoint.removeRelay.bind(endpoint) }),
+		...(endpoint.watchHomeRelay === undefined ? {} : { watchHomeRelay: endpoint.watchHomeRelay.bind(endpoint) }),
 		acceptNext: () => endpoint.acceptNext(),
 		secretKey: () => endpoint.secretKey(),
 		close: () => endpoint.close(),
@@ -575,8 +585,7 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-relay-recovery-"));
 		const relayUrl = "https://relay-recovery.example.com";
 		const relayAuthToken = "unit-test-relay-token";
-		const relayInsertions: IrohRelayConfigLike[] = [];
-		const relayRemovals: string[] = [];
+		const relayReconnects: IrohRelayConfigLike[] = [];
 		const controlEvents: ControlEvent[] = [];
 		let emitRelayUrl: ((url: string | null) => void) | undefined;
 		let endpointCloseCalls = 0;
@@ -588,8 +597,10 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 				{ relayUrls: [relayUrl], relayAuthToken },
 				{
 					relayWatchApiSafe: true,
+					relayReconnectApiSafe: true,
 					relayRecoveryDelayMs: 20,
 					relayRecoveryRetryMs: 20,
+					relayRecoveryConfirmationTimeoutMs: 20,
 					decorateEndpoint: (endpoint) => {
 						let watcher: IrohHomeRelayWatchCallback | undefined;
 						emitRelayUrl = (url) => watcher?.(null, url === null ? [] : [url]);
@@ -597,13 +608,9 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 							id: () => endpoint.id(),
 							addr: () => endpoint.addr(),
 							online: () => Promise.resolve(),
-							insertRelay: async (config) => {
-								relayInsertions.push(config);
+							reconnectRelay: async (config) => {
+								relayReconnects.push(config);
 								watcher?.(null, [config.url]);
-							},
-							removeRelay: async (url) => {
-								relayRemovals.push(url);
-								return true;
 							},
 							watchHomeRelay: (callback) => {
 								watcher = callback;
@@ -668,9 +675,8 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 			const nodeIdBeforeLoss = await pairAndReadNodeId();
 			emitRelayUrl?.(relayUrl);
 			emitRelayUrl?.(null);
-			await expect.poll(() => relayInsertions.length).toBe(1);
-			expect(relayRemovals).toEqual([relayUrl]);
-			expect(relayInsertions).toEqual([{ url: relayUrl, authToken: relayAuthToken }]);
+			await expect.poll(() => relayReconnects.length).toBe(1);
+			expect(relayReconnects).toEqual([{ url: relayUrl, authToken: relayAuthToken }]);
 			expect(endpointCloseCalls).toBe(0);
 			expect(await pairAndReadNodeId()).toBe(nodeIdBeforeLoss);
 			const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
@@ -678,7 +684,7 @@ describe.skipIf(!nativeAvailable)("voltd Iroh relay restart recovery", () => {
 			};
 			expect(state.settings.relayAuthToken).toBe(relayAuthToken);
 			await new Promise((resolve) => setTimeout(resolve, 80));
-			expect(relayInsertions).toHaveLength(1);
+			expect(relayReconnects).toHaveLength(1);
 			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
 			await daemon;
 			daemonStopped = true;
@@ -1806,12 +1812,12 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 		const claimId = "claimabcdefghijklmnopqrs";
 		const appEndpointId = "appendpointabcdefghijklm";
 		const appNodeId = "b".repeat(64);
-		const insertGate = createDeferred();
+		const reconnectGate = createDeferred();
 		const brokerRevokeGate = createDeferred();
-		const relayInsertions: IrohRelayConfigLike[] = [];
+		const relayReconnects: IrohRelayConfigLike[] = [];
 		const relayRemovals: string[] = [];
-		const restartRelayInsertions: IrohRelayConfigLike[] = [];
-		let insertStarted = false;
+		const restartRelayReconnects: IrohRelayConfigLike[] = [];
+		let reconnectStarted = false;
 		let relayWatchStarted = false;
 		let relayWatchStopped = false;
 		let brokerRevokeRequests = 0;
@@ -1853,28 +1859,33 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 			}
 			throw new Error(`unexpected managed relay credential request: ${url}`);
 		});
+		let relayWatcher: IrohHomeRelayWatchCallback | undefined;
 		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
 			createIrohDaemonService(
 				{},
 				{
 					relayWatchApiSafe: true,
+					relayReconnectApiSafe: true,
 					decorateEndpoint: (endpoint) => ({
 						id: () => endpoint.id(),
 						addr: () => endpoint.addr(),
 						online: () => Promise.resolve(),
-						async insertRelay(config) {
-							relayInsertions.push(config);
-							insertStarted = true;
-							await insertGate.promise;
+						async reconnectRelay(config) {
+							relayReconnects.push(config);
+							reconnectStarted = true;
+							await reconnectGate.promise;
+							relayWatcher?.(null, [config.url]);
 						},
 						async removeRelay(url) {
 							relayRemovals.push(url);
 							return true;
 						},
-						watchHomeRelay: () => {
+						watchHomeRelay: (callback) => {
 							relayWatchStarted = true;
+							relayWatcher = callback;
 							return {
 								async stop() {
+									relayWatcher = undefined;
 									relayWatchStopped = true;
 								},
 							};
@@ -1899,13 +1910,13 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 			await expectIrohEndpointReady(control);
 			expect(relayWatchStarted).toBe(true);
 			expect(await control.request({ type: "pair_request" })).toMatchObject({ type: "pair_started" });
-			await expect.poll(() => insertStarted, { timeout: 5_000 }).toBe(true);
+			await expect.poll(() => reconnectStarted, { timeout: 5_000 }).toBe(true);
 
 			revocationRequest = control.request({ type: "relay_credential_revoke" });
 			void revocationRequest.catch(() => {});
 			await expect.poll(() => relayWatchStopped, { timeout: 5_000 }).toBe(true);
 			await new Promise<void>((resolve) => setImmediate(resolve));
-			insertGate.resolve();
+			reconnectGate.resolve();
 			await expect.poll(() => brokerRevokeRequests, { timeout: 5_000 }).toBe(1);
 
 			const statePath = getDaemonPaths(agentDir).statePath;
@@ -1917,11 +1928,17 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 					relayCredentialRevocation?: IrohManagedRelayCredential;
 				};
 			};
-			expect(intermediateState.settings.relayCredentialRevocation).toEqual(originalCredential);
+			expect(intermediateState.settings.relayCredentialRevocation).toEqual(
+				expect.objectContaining({
+					...originalCredential,
+					accessToken: exchangedAccessToken,
+					accessTokenExpiresAt: expect.any(Number),
+				}),
+			);
 			expect(intermediateState.settings.relayAuthToken).toBeUndefined();
 			expect(intermediateState.settings.relayCredential).toBeUndefined();
 			expect(intermediateState.settings.relayCredentialClaim).toBeUndefined();
-			expect(relayInsertions).toEqual([{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: exchangedAccessToken }]);
+			expect(relayReconnects).toEqual([{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: exchangedAccessToken }]);
 			expect(relayRemovals).toContain(VOLT_PRODUCTION_RELAY_URLS[0]);
 
 			const restartPaths = getDaemonPaths(restartAgentDir);
@@ -1932,7 +1949,7 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 					{},
 					{
 						decorateEndpoint: (endpoint) =>
-							withRecordedRelayCredentialInstall(endpoint, restartRelayInsertions, () => {}),
+							withRecordedRelayCredentialInstall(endpoint, restartRelayReconnects, () => {}),
 					},
 				),
 			]);
@@ -1953,16 +1970,22 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 					relayCredentialRevocation?: IrohManagedRelayCredential;
 				};
 			};
-			expect(restartIntermediateState.settings.relayCredentialRevocation).toEqual(originalCredential);
+			expect(restartIntermediateState.settings.relayCredentialRevocation).toEqual(
+				expect.objectContaining({
+					...originalCredential,
+					accessToken: exchangedAccessToken,
+					accessTokenExpiresAt: expect.any(Number),
+				}),
+			);
 			expect(restartIntermediateState.settings.relayAuthToken).toBeUndefined();
 			expect(restartIntermediateState.settings.relayCredential).toBeUndefined();
 			expect(restartIntermediateState.settings.relayCredentialClaim).toBeUndefined();
-			expect(restartRelayInsertions).toEqual([]);
+			expect(restartRelayReconnects).toEqual([]);
 
 			brokerRevokeGate.resolve();
 			await expect(revocationRequest).resolves.toMatchObject({ type: "ok" });
 			await expectIrohEndpointReady(restartControl);
-			expect(restartRelayInsertions).toEqual([]);
+			expect(restartRelayReconnects).toEqual([]);
 			const finalState = JSON.parse(readFileSync(statePath, "utf8")) as {
 				settings: Record<string, unknown>;
 			};
@@ -1978,7 +2001,7 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 			await daemon;
 			daemonStopped = true;
 		} finally {
-			insertGate.resolve();
+			reconnectGate.resolve();
 			brokerRevokeGate.resolve();
 			await revocationRequest?.catch(() => {});
 			if (!restartDaemonStopped && restartDaemon !== undefined) {
@@ -1997,13 +2020,13 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 		}
 	}, 30_000);
 
-	it("recycles the live relay registration when refreshing a valid JWT", async () => {
-		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-refresh-recycle-"));
+	it("durably installs and confirms a live relay reconnect when refreshing a valid JWT", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-refresh-reconnect-"));
 		const originalCredential = await provisionManagedRelayCredentialState(agentDir, 31_000);
 		const refreshedAccessToken = "refreshed.payload.signature";
-		const relayInsertions: IrohRelayConfigLike[] = [];
-		const relayRemovals: string[] = [];
+		const relayReconnects: IrohRelayConfigLike[] = [];
 		const relayMutations: string[] = [];
+		let credentialWasDurableBeforeReconnect = false;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
 			const url = input instanceof Request ? input.url : String(input);
 			if (url !== `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/tokens/refresh`) {
@@ -2027,10 +2050,17 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 					decorateEndpoint: (endpoint) =>
 						withRecordedRelayCredentialInstall(
 							endpoint,
-							relayInsertions,
+							relayReconnects,
 							() => {},
-							relayRemovals,
+							undefined,
 							relayMutations,
+							() => {
+								const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+									settings: { relayCredential?: IrohManagedRelayCredential };
+								};
+								credentialWasDurableBeforeReconnect =
+									state.settings.relayCredential?.accessToken === refreshedAccessToken;
+							},
 						),
 				},
 			),
@@ -2047,14 +2077,11 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 			});
 			await expectIrohEndpointReady(control);
 			await expect
-				.poll(() => relayInsertions, { timeout: 5_000 })
+				.poll(() => relayReconnects, { timeout: 5_000 })
 				.toEqual([{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: refreshedAccessToken }]);
 			expect(Date.now()).toBeLessThan(originalCredential.accessTokenExpiresAt);
-			expect(relayRemovals).toEqual(VOLT_PRODUCTION_RELAY_URLS);
-			expect(relayMutations).toEqual([
-				`remove:${VOLT_PRODUCTION_RELAY_URLS[0]}`,
-				`insert:${VOLT_PRODUCTION_RELAY_URLS[0]}`,
-			]);
+			expect(credentialWasDurableBeforeReconnect).toBe(true);
+			expect(relayMutations).toEqual([`reconnect:${VOLT_PRODUCTION_RELAY_URLS[0]}`]);
 			const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
 				settings: { relayCredential?: IrohManagedRelayCredential };
 			};
@@ -2354,7 +2381,13 @@ describe.skipIf(!nativeAvailable)("voltd iroh startup ownership", () => {
 							await endpoint.online();
 						},
 						...(endpoint.insertRelay === undefined ? {} : { insertRelay: endpoint.insertRelay.bind(endpoint) }),
+						...(endpoint.reconnectRelay === undefined
+							? {}
+							: { reconnectRelay: endpoint.reconnectRelay.bind(endpoint) }),
 						...(endpoint.removeRelay === undefined ? {} : { removeRelay: endpoint.removeRelay.bind(endpoint) }),
+						...(endpoint.watchHomeRelay === undefined
+							? {}
+							: { watchHomeRelay: endpoint.watchHomeRelay.bind(endpoint) }),
 						acceptNext() {
 							acceptNextCalls++;
 							return endpoint.acceptNext();

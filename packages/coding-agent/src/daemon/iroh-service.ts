@@ -314,10 +314,12 @@ export interface IrohDaemonServiceDependencies {
 		kind: "conversation" | "workspace_discovery" | "workspace_management" | "worktree_management" | "relay",
 		authorization: IrohRemoteClientAuthorizationSuccess,
 	): void | Promise<void>;
-	/** Override native watcher safety and recovery timing (test-only). */
+	/** Override native relay-recovery capabilities and timing (test-only). */
 	relayWatchApiSafe?: boolean;
+	relayReconnectApiSafe?: boolean;
 	relayRecoveryDelayMs?: number;
 	relayRecoveryRetryMs?: number;
+	relayRecoveryConfirmationTimeoutMs?: number;
 }
 
 export interface ResolvedIrohRelayConfig {
@@ -673,7 +675,14 @@ export function createIrohDaemonService(
 			};
 		}
 
-		const service = new IrohDaemonService(loaded.iroh, services, config, loaded.watchApiSafe === true, dependencies);
+		const service = new IrohDaemonService(
+			loaded.iroh,
+			services,
+			config,
+			loaded.capabilities?.connectedHomeRelayWatch === true,
+			loaded.capabilities?.reconnectRelay === true,
+			dependencies,
+		);
 		service.start();
 		return {
 			handleRequest: (connection, request) => service.handleRequest(connection, request),
@@ -696,6 +705,7 @@ class IrohDaemonService {
 	private readonly relayMode: IrohRelayMode;
 	private readonly relayUrls: string[];
 	private readonly relayWatchApiSafe: boolean;
+	private readonly relayReconnectApiSafe: boolean;
 	private relayAuthToken: string | undefined;
 	private managedRelayCredential: IrohManagedRelayCredential | undefined;
 	private managedRelayCredentialClaim: IrohManagedRelayCredentialClaim | undefined;
@@ -751,12 +761,14 @@ class IrohDaemonService {
 		services: VoltdRuntimeServices,
 		config: IrohDaemonServiceConfig,
 		nativeWatchApiSafe: boolean,
+		nativeReconnectApiSafe: boolean,
 		dependencies: IrohDaemonServiceDependencies,
 	) {
 		this.iroh = iroh;
 		this.services = services;
 		this.dependencies = dependencies;
 		this.relayWatchApiSafe = dependencies.relayWatchApiSafe ?? nativeWatchApiSafe;
+		this.relayReconnectApiSafe = dependencies.relayReconnectApiSafe ?? nativeReconnectApiSafe;
 		const persistedRevocation = services.state.state.settings.relayCredentialRevocation;
 		this.managedRelayCredentialRevocation =
 			persistedRevocation === undefined ? undefined : parseIrohManagedRelayCredential(persistedRevocation);
@@ -1188,29 +1200,23 @@ class IrohDaemonService {
 		return this.relayAuthToken;
 	}
 
-	private ensureRelayRecoveryMonitor(): void {
+	private ensureRelayRecoveryMonitor(): IrohRelayRecoveryMonitor | undefined {
+		if (this.relayRecoveryMonitor !== undefined) return this.relayRecoveryMonitor;
 		if (
-			this.relayRecoveryMonitor !== undefined ||
 			this.relayMode !== "production" ||
 			(this.relayCredentialServiceUrl !== undefined && this.currentRelayAuthToken() === undefined)
 		) {
-			return;
+			return undefined;
 		}
-		if (!this.relayWatchApiSafe) {
+		if (!this.relayWatchApiSafe || !this.relayReconnectApiSafe) {
 			if (!this.relayRecoveryUnsupportedLogged) {
 				this.relayRecoveryUnsupportedLogged = true;
-				this.log("warn", "installed Iroh binding cannot safely monitor relay registration; update @number0/iroh");
+				this.log("warn", "installed Volt Iroh binding lacks required relay reconnect capabilities");
 			}
-			return;
+			return undefined;
 		}
 		const endpoint = this.endpoint;
-		if (
-			endpoint?.watchHomeRelay === undefined ||
-			endpoint.insertRelay === undefined ||
-			endpoint.removeRelay === undefined
-		) {
-			return;
-		}
+		if (endpoint?.watchHomeRelay === undefined || endpoint.reconnectRelay === undefined) return undefined;
 		const watchHomeRelay = endpoint.watchHomeRelay.bind(endpoint);
 		const monitor = new IrohRelayRecoveryMonitor({
 			watchHomeRelay,
@@ -1220,20 +1226,17 @@ class IrohDaemonService {
 					const authToken = this.currentRelayAuthToken();
 					if (this.relayCredentialServiceUrl !== undefined && authToken === undefined) return;
 					for (const url of this.relayUrls) {
-						try {
-							await endpoint.removeRelay?.(url);
-						} catch {
-							// Replacement below is authoritative even if the stale entry was already absent.
-						}
-						await endpoint.insertRelay?.({ url, ...(authToken === undefined ? {} : { authToken }) });
+						await endpoint.reconnectRelay?.({ url, ...(authToken === undefined ? {} : { authToken }) });
 					}
 				}),
 			log: (level, message, details) => this.log(level, message, details),
 			recoveryDelayMs: this.dependencies.relayRecoveryDelayMs,
 			retryDelayMs: this.dependencies.relayRecoveryRetryMs,
+			confirmationTimeoutMs: this.dependencies.relayRecoveryConfirmationTimeoutMs,
 		});
 		this.relayRecoveryMonitor = monitor;
 		monitor.start();
+		return monitor;
 	}
 
 	private async stopRelayRecoveryMonitor(): Promise<void> {
@@ -1441,8 +1444,8 @@ class IrohDaemonService {
 			if (endpoint.id().toString() !== credential.endpointNodeId) {
 				throw new Error("managed relay credential does not match the persistent Iroh endpoint identity");
 			}
-			if (endpoint.insertRelay === undefined || endpoint.removeRelay === undefined) {
-				throw new Error("the installed Iroh binding cannot safely rotate a live relay credential");
+			if (endpoint.reconnectRelay === undefined || !this.relayReconnectApiSafe) {
+				throw new Error("the installed Volt Iroh binding cannot reconnect a live relay credential");
 			}
 		}
 		let installed = false;
@@ -1458,81 +1461,55 @@ class IrohDaemonService {
 			if (credential.accessTokenExpiresAt <= Date.now()) {
 				throw new Error("managed relay credential expired before installation");
 			}
-			const insertedRelayUrls: string[] = [];
-			const removeInsertedCredential = async () => {
-				if (endpoint?.removeRelay === undefined) return;
-				for (const url of insertedRelayUrls) {
-					try {
-						await endpoint.removeRelay(url);
-					} catch {}
-				}
-			};
-			try {
-				if (endpoint?.insertRelay !== undefined) {
-					for (const url of this.relayUrls) {
-						if (
-							!this.admission.isOpen ||
-							this.relayCredentialIsRevoking ||
-							expectedEpoch !== this.relayCredentialEpoch
-						) {
-							return;
-						}
-						if (credential.accessTokenExpiresAt <= Date.now()) {
-							throw new Error("managed relay credential expired before installation");
-						}
-						// Replacing a relay config does not reauthenticate an existing relay
-						// connection. Remove it first so the refreshed JWT owns a fresh
-						// registration before the old connection reaches strict expiry.
-						await endpoint.removeRelay?.(url);
-						await endpoint.insertRelay({ url, authToken: credential.accessToken });
-						insertedRelayUrls.push(url);
-						if (credential.accessTokenExpiresAt <= Date.now()) {
-							throw new Error("managed relay credential expired during installation");
-						}
-					}
-				}
-				const nextAppEndpoints =
-					approvedAppEndpoint === undefined
-						? this.managedRelayAppEndpoints
-						: [
-								...this.managedRelayAppEndpoints.filter(
-									(endpoint) => endpoint.endpointId !== approvedAppEndpoint.endpointId,
-								),
-								approvedAppEndpoint,
-							];
-				this.services.state.updateSettings({
-					relayAuthToken: undefined,
-					relayCredential: credential,
-					...(exchangedClaim === undefined ? {} : { relayCredentialClaim: undefined }),
-					...(approvedAppEndpoint === undefined ? {} : { relayCredentialAppEndpoints: nextAppEndpoints }),
-					relayCredentialRevocation: undefined,
-				});
-				await this.services.state.flush();
-				if (
-					!this.admission.isOpen ||
-					this.relayCredentialIsRevoking ||
-					expectedEpoch !== this.relayCredentialEpoch ||
-					credential.accessTokenExpiresAt <= Date.now()
-				) {
-					if (credential.accessTokenExpiresAt <= Date.now()) {
-						throw new Error("managed relay credential expired during installation");
-					}
-					await removeInsertedCredential();
-					return;
-				}
-				this.managedRelayCredential = credential;
-				this.managedRelayAppEndpoints = nextAppEndpoints;
-				this.relayAuthToken = credential.accessToken;
-				if (exchangedClaim !== undefined) {
-					this.managedRelayCredentialClaim = undefined;
-				}
-				this.scheduleManagedRelayCredentialExpiryFence();
-				this.ensureRelayRecoveryMonitor();
-				installed = true;
-			} catch (error) {
-				await removeInsertedCredential();
-				throw error;
+			const nextAppEndpoints =
+				approvedAppEndpoint === undefined
+					? this.managedRelayAppEndpoints
+					: [
+							...this.managedRelayAppEndpoints.filter(
+								(endpoint) => endpoint.endpointId !== approvedAppEndpoint.endpointId,
+							),
+							approvedAppEndpoint,
+						];
+			// The durable credential becomes authoritative before the live actor
+			// reconnects. A crash at any later point restarts with this token rather
+			// than reviving the connection whose strict expiry triggered recovery.
+			this.services.state.updateSettings({
+				relayAuthToken: undefined,
+				relayCredential: credential,
+				...(exchangedClaim === undefined ? {} : { relayCredentialClaim: undefined }),
+				...(approvedAppEndpoint === undefined ? {} : { relayCredentialAppEndpoints: nextAppEndpoints }),
+				relayCredentialRevocation: undefined,
+			});
+			await this.services.state.flush();
+			if (!this.admission.isOpen || this.relayCredentialIsRevoking || expectedEpoch !== this.relayCredentialEpoch) {
+				return;
 			}
+			if (credential.accessTokenExpiresAt <= Date.now()) {
+				throw new Error("managed relay credential expired during installation");
+			}
+			this.managedRelayCredential = credential;
+			this.managedRelayAppEndpoints = nextAppEndpoints;
+			this.relayAuthToken = credential.accessToken;
+			if (exchangedClaim !== undefined) this.managedRelayCredentialClaim = undefined;
+			this.scheduleManagedRelayCredentialExpiryFence();
+			if (endpoint !== undefined) {
+				const monitor = this.ensureRelayRecoveryMonitor();
+				const reconnectRelay = endpoint.reconnectRelay?.bind(endpoint);
+				if (monitor === undefined || reconnectRelay === undefined) {
+					throw new Error("the installed Volt Iroh binding cannot confirm relay credential reconnect");
+				}
+				for (const url of this.relayUrls) {
+					if (
+						!this.admission.isOpen ||
+						this.relayCredentialIsRevoking ||
+						expectedEpoch !== this.relayCredentialEpoch
+					) {
+						return;
+					}
+					await monitor.confirmReconnect(() => reconnectRelay({ url, authToken: credential.accessToken }));
+				}
+			}
+			installed = true;
 		});
 		return installed;
 	}
@@ -1876,8 +1853,13 @@ class IrohDaemonService {
 			) {
 				throw new Error("managed relay credential does not match the persistent Iroh endpoint identity");
 			}
-			if (isManagedRelayEndpoint && (endpoint.insertRelay === undefined || endpoint.removeRelay === undefined)) {
-				throw new Error("the installed Iroh binding cannot safely rotate a live relay credential");
+			if (
+				isManagedRelayEndpoint &&
+				(endpoint.reconnectRelay === undefined ||
+					endpoint.watchHomeRelay === undefined ||
+					!this.relayReconnectApiSafe)
+			) {
+				throw new Error("the installed Volt Iroh binding cannot rotate and confirm live relay credentials");
 			}
 			this.scheduleManagedRelayCredentialExpiryFence();
 			if (!startupAdmission.isCurrent()) {
