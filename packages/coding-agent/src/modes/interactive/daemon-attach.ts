@@ -701,6 +701,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			const contextChanged = workspaceName !== previousWorkspaceName || resolvedWorktreeId !== previousWorktreeId;
 			const sourceLeaseConnectionGeneration = connectionGeneration;
 			let targetLeasePreacquired = false;
+			let targetLeaseHandoff: "cold" | "warm" | "none" = "none";
 			let targetLeaseConnectionGeneration: number | undefined;
 			const preacquireTargetLease = async (): Promise<void> => {
 				if (!activeClient || !workspaceName || state !== "connected") {
@@ -728,7 +729,8 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								: "replacement session lease was not acquired",
 						);
 					}
-					if (targetAcquire.kind === "pending") await targetAcquire.granted;
+					targetLeaseHandoff =
+						targetAcquire.kind === "pending" ? (await targetAcquire.granted).handoff : targetAcquire.handoff;
 					targetLeasePreacquired = true;
 					targetLeaseConnectionGeneration = connectionGeneration;
 				} catch (error) {
@@ -842,7 +844,10 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							if (outcome.kind === "denied" || outcome.kind === "noop") {
 								throw new Error("replacement session lease could not be reacquired");
 							}
-							if (outcome.kind === "pending") await outcome.granted;
+							const reacquired = outcome.kind === "pending" ? await outcome.granted : outcome;
+							if (targetLeaseHandoff === "none") {
+								targetLeaseHandoff = reacquired.handoff;
+							}
 							targetLeaseConnectionGeneration = connectionGeneration;
 						}
 						const bindClient = client;
@@ -875,7 +880,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								// The old connection may already have released this lease.
 							}
 							if (targetLeasePreacquired) {
-								const outcome: AcquireOutcome = { kind: "granted", handoff: "none" };
+								const outcome: AcquireOutcome = { kind: "granted", handoff: targetLeaseHandoff };
 								trackAcquireOutcome(newSessionId, outcome);
 								reacquiredHandler?.(newSessionId, outcome);
 							} else {

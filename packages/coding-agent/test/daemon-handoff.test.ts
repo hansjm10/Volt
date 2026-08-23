@@ -366,7 +366,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		expect(daemon.broker.lookup("ws", "fresh-new")?.state).toBe("tui-owned");
 	}, 20_000);
 
-	it("switches to an existing daemon-owned conversation through a warm takeover", async () => {
+	it("preserves a drained target's warm handoff when switching to an existing daemon-owned conversation", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-"));
 		const cwd = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-ws-"));
 		cleanups.push(() => {
@@ -377,13 +377,17 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		ensureDaemonDirs(paths);
 		const daemon = await startDaemonHalf(paths.socketPath, { workspaces: [{ name: "ws", path: cwd }] });
 		cleanups.push(() => daemon.close());
+		daemon.session.isStreaming = true;
 		const runtimeOwner = publishDaemonRuntime(daemon.broker, "ws", "phone-session");
 		daemon.broker.onDaemonRuntimeStreamCountChanged(runtimeOwner, "ws", "phone-session", 0);
 
 		const tui = await startTuiHalf(agentDir, cwd);
 		expect(await tui.attach.acquire("old")).toMatchObject({ kind: "granted" });
 
-		const transaction = await tui.attach.prepareRekey("old", "phone-session");
+		const preparing = tui.attach.prepareRekey("old", "phone-session");
+		await vi.waitFor(() => expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("daemon-draining"));
+		daemon.session.endTurn();
+		const transaction = await preparing;
 		expect(transaction).toBeDefined();
 		expect(daemon.disposed).toEqual([{ reason: "lease_transferred_to_tui" }]);
 		expect(daemon.closedStreams).toEqual([{ reason: "lease_transferred" }]);
@@ -391,6 +395,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("tui-owned");
 
 		await transaction?.commit();
+		expect(tui.reacquired).toEqual([{ sessionId: "phone-session", outcome: { kind: "granted", handoff: "warm" } }]);
 		expect(daemon.broker.lookup("ws", "old")).toBeUndefined();
 		expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("tui-owned");
 	}, 20_000);
