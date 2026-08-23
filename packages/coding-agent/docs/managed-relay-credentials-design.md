@@ -18,6 +18,15 @@ iOS / voltd
 Iroh relays verify short-lived JWTs locally from a deployment-managed public key set.
 ```
 
+Managed deployment authority is an exact pair, not a shared Volt-wide broker allowlist:
+
+| Deployment | Exact relay set | Exact broker origin / JWT issuer |
+| --- | --- | --- |
+| Production | `https://iroh-relay-us-central.volt-cli.dev` | `https://credentials.volt-cli.dev` |
+| Canary | `https://iroh-relay-us-central-canary.volt-cli.dev` | `https://credentials-canary.volt-cli.dev` |
+
+Built-in clients reject a production/canary cross-binding or any other explicit broker origin. A custom relay set has no managed broker authority and remains self-managed. These are the target release bindings; production managed credentials remain disabled and unreleased until `credentials.volt-cli.dev` serves a separately configured production broker.
+
 The production design deliberately does not add accounts, OAuth, Redis, queues, token introspection, per-relay broker calls, device fingerprinting, or separate pairing, refresh, and signing services.
 
 The protocol is replaced in place before production. There are no users and no compatibility path is required for the POC exchange files or Debug-only canary bootstrap.
@@ -163,12 +172,12 @@ Returns `claimId` and `expiresAt`. The daemon includes this one-time object in t
 {
   "relayCredentialClaim": {
     "claimId": "<public-claim-id>",
-    "serviceUrl": "https://credentials.volt-cli.dev"
+    "serviceUrl": "https://credentials-canary.volt-cli.dev"
   }
 }
 ```
 
-The service origin is deployment metadata, not authority. iOS accepts Volt-controlled HTTPS origins and the exact local Debug POC origin only; sanitized reconnect tickets remove the complete claim object.
+The example is for the canary relay set. The service origin is deployment metadata constrained by the exact relay-to-broker pair above, not ticket-provided authority. iOS accepts only the broker origin paired with the selected built-in relay set (plus the exact local Debug POC origin for local testing); sanitized reconnect tickets remove the complete claim object.
 
 ### Create claim for an existing grant
 
@@ -258,7 +267,7 @@ Required behavior:
 - App and daemon revocation outboxes are keyed by endpoint ID rather than represented by one global tombstone; replacing a saved host durably queues the retired endpoint before discarding its refresh authority.
 - Normal confirmed pairing, not Debug launch arguments, owns claim approval and credential promotion.
 
-The daemon owns claim creation and exchange directly. Built-in production and canary relay sets resolve to their broker origins; custom relay sets remain self-managed. The normal path has removed `VOLT_IROH_RELAY_CREDENTIAL_FILE`, `VOLT_IROH_RELAY_CREDENTIAL_SERVICE`, and the source-file-removal state used by the old canary bootstrap.
+The daemon owns claim creation and exchange directly. The built-in production and canary relay sets resolve only to their exact broker origins above and reject an explicit conflicting origin; custom relay sets remain self-managed with no broker. The normal path has removed `VOLT_IROH_RELAY_CREDENTIAL_FILE`, `VOLT_IROH_RELAY_CREDENTIAL_SERVICE`, and the source-file-removal state used by the old canary bootstrap.
 
 ## Signing and relay verification
 
@@ -295,6 +304,16 @@ The broker's JWKS endpoint publishes the same active and retiring public set for
 - Expected low-traffic fixed cost: approximately $135-160/month in `us-central1`.
 
 Staging remains canary-sized. It does not duplicate production HA infrastructure.
+
+### Canary authority cutover
+
+The canary authority cutover completed on 2026-08-23. `credentials-canary.volt-cli.dev` is certificate-ready, and the broker and relay now use that exact issuer with audience `volt-iroh-relay-canary`. Disposable old authority was reset before the switch. Fresh simulator enrollment, App Check approval, broker exchange, exact node-bound JWT claims, explicit refresh, cold reconnect, and grant revocation passed.
+
+Both `credentials.volt-cli.dev` and `credentials-canary.volt-cli.dev` still map to one canary Cloud Run service. A broker revision has one scalar `VOLT_CREDENTIAL_ISSUER` and one scalar `VOLT_CREDENTIAL_AUDIENCE`; it does not select claims by request hostname. Dual issuer/audience operation is unsupported. Therefore the old hostname currently emits canary tokens and is only a temporary rollback HTTP alias, not production authority.
+
+Rollback requires both sides of the authority pair: route Cloud Run back to `relay-credential-broker-canary-kms-v2-retry-20260822`, restore the relay's pre-cutover issuer config, restart the relay, and reset any credentials created after the rollback point. Remove the temporary shared-service alias only after the client rollout, at least one 15-minute access-token lifetime plus the configured 30-second relay skew, and the agreed rollback window.
+
+Keep production managed credentials disabled and unreleased. Before enabling them, deploy a separately configured production broker, remap `credentials.volt-cli.dev` to it, and verify that origin emits only the exact production issuer/audience and connects only to the production relay set.
 
 ### Minimum abuse controls
 

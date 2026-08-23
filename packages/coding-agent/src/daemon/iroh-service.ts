@@ -278,7 +278,7 @@ export type IrohRelayMode = "disabled" | "development" | "production";
 export const VOLT_PRODUCTION_RELAY_URLS = ["https://iroh-relay-us-central.volt-cli.dev"];
 export const VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL = "https://credentials.volt-cli.dev";
 export const VOLT_CANARY_RELAY_URLS = ["https://iroh-relay-us-central-canary.volt-cli.dev"];
-export const VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL = "https://credentials.volt-cli.dev";
+export const VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL = "https://credentials-canary.volt-cli.dev";
 
 export interface IrohDaemonServiceConfig {
 	relayMode?: IrohRelayMode;
@@ -297,7 +297,7 @@ export interface IrohDaemonServiceConfig {
 	relayAuthToken?: string;
 	/** Refreshable node-bound credential for a Volt-managed JWT relay. */
 	relayCredential?: IrohManagedRelayCredential;
-	/** Explicit broker origin for tests/staging; built-in production/canary relay sets resolve automatically. */
+	/** Explicit broker origin for tests/staging; it must match any built-in relay deployment exactly. */
 	relayCredentialServiceUrl?: string;
 	pushRelayUrl?: string;
 	pushRelayAuthToken?: string;
@@ -364,12 +364,18 @@ export function resolveIrohRelayCredentialServiceUrl(
 	const isProductionDeployment = sameStringSet(normalized, [...VOLT_PRODUCTION_RELAY_URLS].sort());
 	const isCanaryDeployment = sameStringSet(normalized, [...VOLT_CANARY_RELAY_URLS].sort());
 	if (!isProductionDeployment && !isCanaryDeployment) return undefined;
-	if (explicitServiceUrl !== undefined) {
-		return normalizeIrohCredentialServiceUrl(explicitServiceUrl);
-	}
-	return isProductionDeployment
+	const deploymentServiceUrl = isProductionDeployment
 		? VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL
 		: VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL;
+	if (explicitServiceUrl !== undefined) {
+		const normalizedServiceUrl = normalizeIrohCredentialServiceUrl(explicitServiceUrl);
+		if (normalizedServiceUrl !== deploymentServiceUrl) {
+			throw new Error(
+				`explicit managed relay credential service URL conflicts with the ${isProductionDeployment ? "production" : "canary"} relay deployment`,
+			);
+		}
+	}
+	return deploymentServiceUrl;
 }
 
 function sameStringSet(left: string[], right: string[]): boolean {
@@ -787,15 +793,39 @@ class IrohDaemonService {
 		) {
 			throw new Error("managed relay app endpoint state contains duplicates");
 		}
+		const builtInRelayCredentialServiceUrl = resolveIrohRelayCredentialServiceUrl(
+			this.relayMode,
+			this.relayUrls,
+			config.relayCredentialServiceUrl,
+		);
+		if (builtInRelayCredentialServiceUrl !== undefined) {
+			for (const [authority, state] of [
+				["credential", this.managedRelayCredential],
+				["revocation", this.managedRelayCredentialRevocation],
+				["claim", this.managedRelayCredentialClaim],
+			] as const) {
+				if (state !== undefined && state.serviceUrl !== builtInRelayCredentialServiceUrl) {
+					throw new Error(
+						`managed relay ${authority} authority service URL ${state.serviceUrl} conflicts with the built-in relay deployment broker ${builtInRelayCredentialServiceUrl}`,
+					);
+				}
+			}
+		}
 		this.relayCredentialServiceUrl =
+			builtInRelayCredentialServiceUrl ??
 			this.managedRelayCredential?.serviceUrl ??
-			this.managedRelayCredentialClaim?.serviceUrl ??
-			resolveIrohRelayCredentialServiceUrl(this.relayMode, this.relayUrls, config.relayCredentialServiceUrl);
+			this.managedRelayCredentialClaim?.serviceUrl;
 		const configuredRelayOrigins = this.relayUrls.map((url) => new URL(url).origin).sort();
 		if (this.managedRelayCredential !== undefined) {
 			const credentialRelayOrigins = [...this.managedRelayCredential.relayUrls].sort();
 			if (!sameStringSet(configuredRelayOrigins, credentialRelayOrigins)) {
 				throw new Error("managed relay credential is scoped to a different relay origin set");
+			}
+		}
+		if (this.managedRelayCredentialRevocation !== undefined) {
+			const revocationRelayOrigins = [...this.managedRelayCredentialRevocation.relayUrls].sort();
+			if (!sameStringSet(configuredRelayOrigins, revocationRelayOrigins)) {
+				throw new Error("managed relay credential revocation is scoped to a different relay origin set");
 			}
 		}
 		if (this.managedRelayCredentialClaim !== undefined) {

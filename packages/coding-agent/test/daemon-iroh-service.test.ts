@@ -199,6 +199,88 @@ async function provisionManagedRelayCredentialState(
 	return credential;
 }
 
+function persistCanaryManagedRelayAuthority(
+	agentDir: string,
+	credential: IrohManagedRelayCredential,
+	authority: "credential" | "claim" | "revocation",
+	serviceUrl: string,
+): void {
+	const statePath = getDaemonPaths(agentDir).statePath;
+	const state = JSON.parse(readFileSync(statePath, "utf8")) as { settings: Record<string, unknown> };
+	delete state.settings.relayAuthToken;
+	delete state.settings.relayCredential;
+	delete state.settings.relayCredentialClaim;
+	delete state.settings.relayCredentialRevocation;
+	const canaryCredential = {
+		...credential,
+		serviceUrl,
+		relayUrls: [...VOLT_CANARY_RELAY_URLS],
+	};
+	if (authority === "credential") {
+		state.settings.relayCredential = canaryCredential;
+	} else if (authority === "revocation") {
+		state.settings.relayCredentialRevocation = canaryCredential;
+	} else {
+		state.settings.relayCredentialClaim = {
+			schemaVersion: 1,
+			serviceUrl,
+			relayUrls: [...VOLT_CANARY_RELAY_URLS],
+			hostNodeId: credential.endpointNodeId,
+			claimSecret: `vpc_${"c".repeat(43)}`,
+			bootstrapRefreshToken: credential.refreshToken,
+			claimId: "claimabcdefghijklmnopqrs",
+			expiresAt: Date.now() + 10 * 60_000,
+		};
+	}
+	writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+async function captureIrohStartupError(
+	agentDir: string,
+	config: Parameters<typeof createIrohDaemonService>[0] = {},
+): Promise<{ error: string | undefined; endpointDecorations: number }> {
+	let startupError: string | undefined;
+	let endpointDecorations = 0;
+	let daemonStopped = false;
+	let control: DaemonClient | undefined;
+	const irohService = createIrohDaemonService(config, {
+		decorateEndpoint: (endpoint) => {
+			endpointDecorations++;
+			return withRecordedRelayCredentialInstall(endpoint, [], () => {});
+		},
+	});
+	const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+		(services) => {
+			try {
+				return irohService(services);
+			} catch (error) {
+				startupError = error instanceof Error ? error.message : String(error);
+				return {};
+			}
+		},
+	]);
+	try {
+		const status = await waitForHealthyDaemon(agentDir);
+		control = createDaemonClient({
+			socketPath: status.socketPath,
+			client: "cli",
+			version: "test",
+			authToken: status.authToken,
+			reconnect: false,
+		});
+		await control.request({ type: "shutdown" });
+		await daemon;
+		daemonStopped = true;
+		return { error: startupError, endpointDecorations };
+	} finally {
+		if (!daemonStopped) {
+			await control?.request({ type: "shutdown" }).catch(() => {});
+			await daemon;
+		}
+		await control?.close();
+	}
+}
+
 async function createPhoneEndpoint(): Promise<PhoneEndpoint> {
 	const iroh = native.iroh;
 	if (!iroh) {
@@ -371,20 +453,62 @@ describe("relay config resolution", () => {
 		});
 	});
 
-	it("resolves managed broker origins only for the built-in relay deployments", () => {
+	it("binds each built-in relay deployment to its exact managed broker origin", () => {
+		expect(VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL).toBe("https://credentials.volt-cli.dev");
+		expect(VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL).toBe("https://credentials-canary.volt-cli.dev");
 		expect(resolveIrohRelayCredentialServiceUrl("production", VOLT_PRODUCTION_RELAY_URLS)).toBe(
 			VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
 		);
 		expect(resolveIrohRelayCredentialServiceUrl("production", VOLT_CANARY_RELAY_URLS)).toBe(
 			VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
 		);
-		expect(VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL).toBe("https://credentials.volt-cli.dev");
+		expect(
+			resolveIrohRelayCredentialServiceUrl(
+				"production",
+				VOLT_PRODUCTION_RELAY_URLS,
+				`${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/`,
+			),
+		).toBe(VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL);
+		expect(
+			resolveIrohRelayCredentialServiceUrl(
+				"production",
+				VOLT_CANARY_RELAY_URLS,
+				VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
+			),
+		).toBe(VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL);
+	});
+
+	it("rejects explicit broker origins that conflict with a built-in relay deployment", () => {
+		expect(() =>
+			resolveIrohRelayCredentialServiceUrl(
+				"production",
+				VOLT_PRODUCTION_RELAY_URLS,
+				VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
+			),
+		).toThrowError("explicit managed relay credential service URL conflicts with the production relay deployment");
+		expect(() =>
+			resolveIrohRelayCredentialServiceUrl(
+				"production",
+				VOLT_CANARY_RELAY_URLS,
+				VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
+			),
+		).toThrowError("explicit managed relay credential service URL conflicts with the canary relay deployment");
+		expect(() =>
+			resolveIrohRelayCredentialServiceUrl(
+				"production",
+				VOLT_PRODUCTION_RELAY_URLS,
+				"https://credentials.volt-cli.dev:8443",
+			),
+		).toThrowError("explicit managed relay credential service URL conflicts with the production relay deployment");
+	});
+
+	it("does not assign a managed broker to self-managed or disabled relay sets", () => {
 		expect(resolveIrohRelayCredentialServiceUrl("production", ["https://self-managed.example.com"])).toBeUndefined();
 		expect(
 			resolveIrohRelayCredentialServiceUrl(
 				"production",
 				["https://self-managed.example.com"],
-				"https://credentials.volt-cli.dev",
+				VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
 			),
 		).toBeUndefined();
 		expect(resolveIrohRelayCredentialServiceUrl("disabled", VOLT_PRODUCTION_RELAY_URLS)).toBeUndefined();
@@ -1550,6 +1674,127 @@ describe.skipIf(!nativeAvailable)("voltd iroh live workspace unregister", () => 
 });
 
 describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () => {
+	it("rejects an old canary persisted credential authority before network use", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-old-canary-credential-"));
+		const credential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		persistCanaryManagedRelayAuthority(
+			agentDir,
+			credential,
+			"credential",
+			VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
+		try {
+			const result = await captureIrohStartupError(agentDir);
+			expect(result.error).toBe(
+				`managed relay credential authority service URL ${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL} conflicts with the built-in relay deployment broker ${VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL}`,
+			);
+			expect(result.endpointDecorations).toBe(0);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("rejects an old canary pending claim authority before network use", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-old-canary-claim-"));
+		const credential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		persistCanaryManagedRelayAuthority(agentDir, credential, "claim", VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
+		try {
+			const result = await captureIrohStartupError(agentDir);
+			expect(result.error).toBe(
+				`managed relay claim authority service URL ${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL} conflicts with the built-in relay deployment broker ${VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL}`,
+			);
+			expect(result.endpointDecorations).toBe(0);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("rejects old canary revocation state under an explicit production relay override before network use", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-old-canary-revocation-"));
+		const credential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		persistCanaryManagedRelayAuthority(
+			agentDir,
+			credential,
+			"revocation",
+			VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
+		try {
+			const result = await captureIrohStartupError(agentDir, {
+				relayMode: "production",
+				relayUrls: [...VOLT_PRODUCTION_RELAY_URLS],
+				relayCredentialServiceUrl: VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
+			});
+			expect(result.error).toBe("managed relay credential revocation is scoped to a different relay origin set");
+			expect(result.endpointDecorations).toBe(0);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("accepts a persisted canary credential scoped to the new canary broker", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-new-canary-credential-"));
+		const credential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		persistCanaryManagedRelayAuthority(agentDir, credential, "credential", VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
+		const relayInsertions: IrohRelayConfigLike[] = [];
+		let endpointDecorations = 0;
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{},
+				{
+					decorateEndpoint: (endpoint) => {
+						endpointDecorations++;
+						return withRecordedRelayCredentialInstall(endpoint, relayInsertions, () => {});
+					},
+				},
+			),
+		]);
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expectIrohEndpointReady(control);
+			expect(endpointDecorations).toBe(1);
+			expect(relayInsertions).toEqual([]);
+			const persistedState = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+				settings: { relayCredential?: IrohManagedRelayCredential };
+			};
+			expect(persistedState.settings.relayCredential).toMatchObject({
+				serviceUrl: VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL,
+				relayUrls: VOLT_CANARY_RELAY_URLS,
+				accessToken: credential.accessToken,
+			});
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await daemon;
+			daemonStopped = true;
+		} finally {
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await control?.close();
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	it("keeps host revocation authoritative over an admitted claim installer and restart", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-revoke-race-"));
 		const restartAgentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-revoke-restart-"));
