@@ -352,6 +352,39 @@ describe("Iroh remote core helpers", () => {
 		);
 	});
 
+	test("strips one-time relay credential claims from reconnect tickets", () => {
+		const payload: IrohRemoteTicketPayload = {
+			alpn: IROH_REMOTE_ALPN,
+			expiresAt: 1000,
+			irohTicket: "iroh-endpoint-ticket",
+			nodeId: "host-node",
+			relayCredentialClaim: {
+				claimId: "abcdefghijklmnopqrstuvwx",
+				serviceUrl: "https://credentials.volt-cli.dev",
+			},
+			relayMode: "production",
+			relayUrls: ["https://relay.example.com"],
+			secret: "pairing-secret",
+			workspace: "volt",
+		};
+
+		expect(decodeIrohRemoteTicketPayload(encodeIrohRemoteTicketPayload(payload))).toEqual(payload);
+		expect(createIrohRemoteSanitizedReconnectTicketPayload(payload)).toEqual({
+			alpn: IROH_REMOTE_ALPN,
+			irohTicket: "iroh-endpoint-ticket",
+			nodeId: "host-node",
+			relayMode: "production",
+			relayUrls: ["https://relay.example.com"],
+			workspace: "volt",
+		});
+		expect(() => parseIrohRemoteTicketPayload({ ...payload, relayMode: "development" })).toThrow(
+			"ticket relay credential claim requires production relay mode",
+		);
+		expect(() => parseIrohRemoteTicketPayload({ ...payload, relayAuthToken: "host-token" })).toThrow(
+			"ticket relay credential claim cannot include a host relay token",
+		);
+	});
+
 	test("creates sanitized reconnect tickets and verifies ticket host identity", () => {
 		const payload: IrohRemoteTicketPayload = {
 			alpn: IROH_REMOTE_ALPN,
@@ -1670,6 +1703,40 @@ describe("Iroh remote core helpers", () => {
 			outcome: "workspace_unregistered",
 			pairingSecretExpired: false,
 		});
+	});
+
+	test("managed relay pairing authorizes only the broker-approved app node", async () => {
+		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });
+		const hostEngine = new IrohRemoteHostEngine({
+			authorizeRelayCredentialPairing: async (_claimId, remoteNodeId) => remoteNodeId === "approved-client",
+			hostNodeId: "host-node",
+			now: () => 100,
+			stateManager,
+			workspace: { name: "volt", path: "/workspace" },
+		});
+		await hostEngine.pair({
+			irohTicket: "iroh-endpoint-ticket",
+			nodeId: "host-node",
+			relayCredentialClaim: {
+				claimId: "abcdefghijklmnopqrstuvwx",
+				serviceUrl: "https://credentials.volt-cli.dev",
+			},
+			relayMode: "production",
+			relayUrls: ["https://iroh-relay-us-central.volt-cli.dev"],
+			secret: "secret",
+			ttlMs: 1000,
+		});
+
+		await expect(hostEngine.authorizeHello(makeHello("volt", "secret"), "racing-client")).resolves.toMatchObject({
+			ok: false,
+			outcome: "client_unknown",
+		});
+		expect(await hostEngine.listClients()).toEqual([]);
+		await expect(hostEngine.authorizeHello(makeHello("volt", "secret"), "approved-client")).resolves.toMatchObject({
+			ok: true,
+			paired: true,
+		});
+		expect((await hostEngine.listClients()).map((client) => client.nodeId)).toEqual(["approved-client"]);
 	});
 
 	test("host state manager and engines pair, authorize, list, revoke, and audit clients", async () => {

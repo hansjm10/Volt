@@ -115,6 +115,7 @@ export type ControlRequest =
 	| ({ type: "pair_request"; id: string; workspaceName?: string } & ControlAccessSelection) // progress arrives as pairing_progress events
 	| { type: "pair_cancel"; id: string; requestId: string }
 	| { type: "clients_list"; id: string }
+	| { type: "relay_credential_revoke"; id: string }
 	| ({
 			type: "client_access_update";
 			id: string;
@@ -646,6 +647,7 @@ export function isControlRequest(value: unknown): value is ControlRequest {
 		case "status":
 		case "shutdown":
 		case "clients_list":
+		case "relay_credential_revoke":
 			return true;
 		case "pair_request":
 			return (

@@ -90,6 +90,8 @@ export interface IrohRemotePendingPairingTicket {
 	expiresAt: number;
 	createdAt: number;
 	labelHint?: string;
+	/** One-time managed relay claim that must approve the consuming client node. */
+	relayCredentialClaimId?: string;
 }
 
 export type IrohRemoteGrantedPendingPairingTicket = IrohRemotePendingPairingTicket & {
@@ -409,6 +411,13 @@ export function parseIrohRemotePendingPairingTicket(
 ): IrohRemotePendingPairingTicket {
 	const ticket = expectRecord(value, "Iroh remote pending pairing ticket");
 	const labelHint = expectOptionalString(ticket.labelHint, "pending pairing ticket labelHint");
+	const relayCredentialClaimId = expectOptionalString(
+		ticket.relayCredentialClaimId,
+		"pending pairing ticket relayCredentialClaimId",
+	);
+	if (relayCredentialClaimId !== undefined && !/^[A-Za-z0-9_-]{24}$/.test(relayCredentialClaimId)) {
+		throw new Error("pending pairing ticket relayCredentialClaimId is invalid");
+	}
 	const allowedTools = canonicalizePersistedIrohRemoteAllowTools(
 		expectOptionalAllowTools(ticket.allowedTools, "pending pairing ticket allowedTools"),
 		options?.defaultAllowTools,
@@ -421,6 +430,7 @@ export function parseIrohRemotePendingPairingTicket(
 		expiresAt: expectNumber(ticket.expiresAt, "pending pairing ticket expiresAt"),
 		createdAt: expectNumber(ticket.createdAt, "pending pairing ticket createdAt"),
 		...(labelHint === undefined ? {} : { labelHint }),
+		...(relayCredentialClaimId === undefined ? {} : { relayCredentialClaimId }),
 	};
 }
 

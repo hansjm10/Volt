@@ -58,6 +58,51 @@ jobs:
           VOLT_TEST_REQUIRE_NATIVE_IROH: '1'
         run: npm test
 
+  relay-credential-broker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_DB: volt_relay_credential_broker_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d volt_relay_credential_broker_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      VOLT_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/volt_relay_credential_broker_test?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: services/relay-credential-broker/go.sum
+
+      - name: Test relay credential broker
+        working-directory: services/relay-credential-broker
+        run: go test ./...
+
+      - name: Race test relay credential broker
+        working-directory: services/relay-credential-broker
+        run: go test -race ./...
+
+      - name: Vet relay credential broker
+        working-directory: services/relay-credential-broker
+        run: go vet ./...
+
   test-windows:
     runs-on: windows-latest
     timeout-minutes: 45

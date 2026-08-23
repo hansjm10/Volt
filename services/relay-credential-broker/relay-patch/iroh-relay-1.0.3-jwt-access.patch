@@ -1,0 +1,1719 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6d6686743636acd4365092763b8b040633d4c227..2cd71e1843e417942e8db68069442dff881f7870 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2479,6 +2479,7 @@ dependencies = [
+  "serde_bytes",
+  "serde_json",
+  "sha1 0.11.0",
++ "sha2",
+  "simdutf8",
+  "strum",
+  "test-strategy",
+diff --git a/iroh-relay/Cargo.toml b/iroh-relay/Cargo.toml
+index a9815c227f1f26171540b1d850df3d32758ce85b..d8eb56e4cf7c681f8e2f655cac749719010e31b9 100644
+--- a/iroh-relay/Cargo.toml
++++ b/iroh-relay/Cargo.toml
+@@ -80,6 +80,7 @@ tokio-rustls-acme = { version = "0.9", optional = true }
+ tokio-websockets = { version = "0.13", features = ["rustls-bring-your-own-connector", "getrandom", "rand", "server", "sha1_smol"], optional = true } # server-side websocket implementation
+ simdutf8 = { version = "0.1.5", optional = true } # minimal version fix
+ sha1 = { version = "0.11.0", optional = true }
++sha2 = { version = "0.11.0", optional = true }
+ toml = { version = "1.0", optional = true }
+ serde_json = { version = "1", optional = true }
+ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+@@ -145,6 +146,7 @@ server = [
+     "dep:tokio-websockets",
+     "dep:simdutf8",
+     "dep:sha1",
++    "dep:sha2",
+     "dep:toml",
+     "dep:serde_json",
+     "dep:tracing-subscriber",
+diff --git a/iroh-relay/src/jwt_access.rs b/iroh-relay/src/jwt_access.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..509c7947ac0a19e0d6d2a5382ba0f58861c88ae2
+--- /dev/null
++++ b/iroh-relay/src/jwt_access.rs
+@@ -0,0 +1,1121 @@
++use std::{
++    collections::{HashMap, HashSet},
++    sync::Mutex,
++    time::{Duration, SystemTime, UNIX_EPOCH},
++};
++
++use data_encoding::BASE64URL_NOPAD;
++use http::header::AUTHORIZATION;
++use iroh_base::{EndpointId, PublicKey, Signature};
++use iroh_relay::server::{Access, AccessControl, ClientRequest, ConnectionId};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use tokio::{sync::Semaphore, time::Instant};
++use tracing::{debug, warn};
++
++const MAX_JWT_BYTES: usize = 8 * 1024;
++const MAX_VERIFICATION_KEYS: usize = 8;
++const MAX_AUTHORITY_BYTES: usize = 512;
++const MAX_IDENTIFIER_BYTES: usize = 128;
++const MIN_IDENTIFIER_BYTES: usize = 16;
++const HARD_MAX_TOKEN_LIFETIME_SECONDS: u64 = 60 * 60;
++const HARD_MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
++const HARD_MAX_GLOBAL_CONNECTIONS: usize = 100_000;
++const HARD_MAX_NODE_CONNECTIONS: usize = 64;
++const HARD_MAX_GRANT_CONNECTIONS: usize = 128;
++const HARD_MAX_CONCURRENT_VERIFICATIONS: usize = 256;
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct JwtAccessConfig {
++    /// Active and retiring Ed25519 public keys accepted by `kid` during rotation.
++    pub(crate) keys: Vec<JwtVerificationKey>,
++    /// Exact JWT issuer.
++    pub(crate) issuer: String,
++    /// Exact JWT audience.
++    pub(crate) audience: String,
++    /// Maximum accepted `exp - iat`, independently capped at one hour.
++    #[serde(default = "default_max_token_lifetime_seconds")]
++    pub(crate) max_token_lifetime_seconds: u64,
++    /// Clock skew accepted for `iat` and `exp`, capped at five minutes.
++    #[serde(default = "default_clock_skew_seconds")]
++    pub(crate) clock_skew_seconds: u64,
++    /// Maximum concurrent admitted relay connections.
++    #[serde(default = "default_max_global_connections")]
++    pub(crate) max_global_connections: usize,
++    /// Maximum concurrent connections for one proven Iroh endpoint ID.
++    #[serde(default = "default_max_node_connections")]
++    pub(crate) max_node_connections: usize,
++    /// Maximum concurrent connections sharing one anonymous pairing grant.
++    #[serde(default = "default_max_grant_connections")]
++    pub(crate) max_grant_connections: usize,
++    /// Maximum simultaneous JWT signature verifications.
++    #[serde(default = "default_max_concurrent_verifications")]
++    pub(crate) max_concurrent_verifications: usize,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct JwtVerificationKey {
++    /// Ed25519 public key as unpadded base64url (the JWKS `x` value). The `kid`
++    /// is derived as base64url(SHA-256(public_key)[0..12]), matching the broker.
++    pub(crate) public_key: String,
++}
++
++const fn default_max_token_lifetime_seconds() -> u64 {
++    HARD_MAX_TOKEN_LIFETIME_SECONDS
++}
++
++const fn default_clock_skew_seconds() -> u64 {
++    30
++}
++
++const fn default_max_global_connections() -> usize {
++    4096
++}
++
++const fn default_max_node_connections() -> usize {
++    8
++}
++
++const fn default_max_grant_connections() -> usize {
++    32
++}
++
++const fn default_max_concurrent_verifications() -> usize {
++    32
++}
++
++#[derive(Debug)]
++pub(crate) struct JwtAccess {
++    verifier: JwtVerifier,
++    limits: ConnectionLimits,
++    verification_semaphore: Semaphore,
++    state: Mutex<ConnectionState>,
++}
++
++#[derive(Debug)]
++struct JwtVerifier {
++    public_keys: HashMap<String, PublicKey>,
++    issuer: String,
++    audience: String,
++    max_token_lifetime_seconds: i64,
++    clock_skew_seconds: i64,
++}
++
++#[derive(Debug)]
++struct ConnectionLimits {
++    global: usize,
++    per_node: usize,
++    per_grant: usize,
++}
++
++#[derive(Debug, Default)]
++struct ConnectionState {
++    connections: HashMap<ConnectionId, ConnectionAuthority>,
++    by_node: HashMap<EndpointId, usize>,
++    by_grant: HashMap<String, usize>,
++}
++
++#[derive(Debug)]
++struct ConnectionAuthority {
++    endpoint_id: EndpointId,
++    grant_id: String,
++    deadline: Instant,
++}
++
++#[derive(Debug)]
++struct VerifiedAuthority {
++    grant_id: String,
++    deadline: Instant,
++}
++
++#[derive(Debug)]
++struct VerifiedClaims {
++    grant_id: String,
++    expires_at_unix_seconds: i64,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct JwtHeader {
++    alg: String,
++    kid: String,
++    typ: String,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct JwtClaims {
++    iss: String,
++    aud: String,
++    sub: String,
++    exp: i64,
++    iat: i64,
++    jti: String,
++    scope: String,
++    endpoint_kind: String,
++    grant_id: String,
++}
++
++impl JwtAccess {
++    pub(crate) fn new(config: JwtAccessConfig) -> Result<Self, &'static str> {
++        if config.keys.is_empty() || config.keys.len() > MAX_VERIFICATION_KEYS {
++            return Err("access.jwt.keys must contain between one and eight keys");
++        }
++        if !valid_authority(&config.issuer) || !valid_authority(&config.audience) {
++            return Err("access.jwt issuer or audience is invalid");
++        }
++        if config.max_token_lifetime_seconds == 0
++            || config.max_token_lifetime_seconds > HARD_MAX_TOKEN_LIFETIME_SECONDS
++        {
++            return Err("access.jwt.max_token_lifetime_seconds must be between 1 and 3600");
++        }
++        if config.clock_skew_seconds > HARD_MAX_CLOCK_SKEW_SECONDS {
++            return Err("access.jwt.clock_skew_seconds must not exceed 300");
++        }
++        if config.max_global_connections == 0
++            || config.max_global_connections > HARD_MAX_GLOBAL_CONNECTIONS
++            || config.max_node_connections == 0
++            || config.max_node_connections > HARD_MAX_NODE_CONNECTIONS
++            || config.max_grant_connections == 0
++            || config.max_grant_connections > HARD_MAX_GRANT_CONNECTIONS
++            || config.max_concurrent_verifications == 0
++            || config.max_concurrent_verifications > HARD_MAX_CONCURRENT_VERIFICATIONS
++            || config.max_node_connections > config.max_global_connections
++            || config.max_grant_connections > config.max_global_connections
++        {
++            return Err("access.jwt connection limits are invalid");
++        }
++
++        let mut public_keys = HashMap::with_capacity(config.keys.len());
++        let mut public_key_bytes = HashSet::with_capacity(config.keys.len());
++        for key in config.keys {
++            let key_bytes = decode_array::<32>(&key.public_key).map_err(
++                |_| "access.jwt.keys[].public_key must be a canonical 32-byte unpadded base64url value",
++            )?;
++            let public_key = PublicKey::from_bytes(&key_bytes)
++                .map_err(|_| "access.jwt.keys[].public_key is not a valid Ed25519 key")?;
++            if public_keys
++                .insert(key_id_for(&key_bytes), public_key)
++                .is_some()
++                || !public_key_bytes.insert(key_bytes)
++            {
++                return Err("access.jwt.keys must have unique public keys and derived key IDs");
++            }
++        }
++
++        Ok(Self {
++            verifier: JwtVerifier {
++                public_keys,
++                issuer: config.issuer,
++                audience: config.audience,
++                max_token_lifetime_seconds: config.max_token_lifetime_seconds as i64,
++                clock_skew_seconds: config.clock_skew_seconds as i64,
++            },
++            limits: ConnectionLimits {
++                global: config.max_global_connections,
++                per_node: config.max_node_connections,
++                per_grant: config.max_grant_connections,
++            },
++            verification_semaphore: Semaphore::new(config.max_concurrent_verifications),
++            state: Mutex::new(ConnectionState::default()),
++        })
++    }
++
++    fn admit(
++        &self,
++        request: &ClientRequest,
++        authority: VerifiedAuthority,
++    ) -> Result<(), &'static str> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| "connection state lock poisoned")?;
++        if state.connections.len() >= self.limits.global {
++            return Err("global connection limit reached");
++        }
++        if state
++            .by_node
++            .get(&request.endpoint_id())
++            .copied()
++            .unwrap_or_default()
++            >= self.limits.per_node
++        {
++            return Err("endpoint connection limit reached");
++        }
++        if state
++            .by_grant
++            .get(&authority.grant_id)
++            .copied()
++            .unwrap_or_default()
++            >= self.limits.per_grant
++        {
++            return Err("grant connection limit reached");
++        }
++        if state.connections.contains_key(&request.connection_id()) {
++            return Err("duplicate connection ID");
++        }
++
++        *state.by_node.entry(request.endpoint_id()).or_default() += 1;
++        *state
++            .by_grant
++            .entry(authority.grant_id.clone())
++            .or_default() += 1;
++        state.connections.insert(
++            request.connection_id(),
++            ConnectionAuthority {
++                endpoint_id: request.endpoint_id(),
++                grant_id: authority.grant_id,
++                deadline: authority.deadline,
++            },
++        );
++        Ok(())
++    }
++}
++
++impl AccessControl for JwtAccess {
++    async fn on_connect(&self, request: &ClientRequest) -> Access {
++        let result = match self.verification_semaphore.try_acquire() {
++            Ok(_permit) => self
++                .verifier
++                .verify(request)
++                .and_then(|authority| self.admit(request, authority)),
++            Err(_) => Err("JWT verification concurrency limit reached"),
++        };
++        match result {
++            Ok(()) => Access::Allow,
++            Err(reason) => {
++                debug!(
++                    endpoint_id = %request.endpoint_id().fmt_short(),
++                    connection_id = %request.connection_id(),
++                    reason,
++                    "denied relay JWT access"
++                );
++                Access::Deny { reason: None }
++            }
++        }
++    }
++
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant> {
++        let Ok(state) = self.state.lock() else {
++            warn!(%connection_id, "relay JWT connection state lock poisoned while reading expiry");
++            return Some(Instant::now());
++        };
++        match state.connections.get(&connection_id) {
++            Some(authority) if authority.endpoint_id == endpoint_id => Some(authority.deadline),
++            _ => {
++                warn!(%connection_id, "relay JWT admitted connection had no matching expiry");
++                Some(Instant::now())
++            }
++        }
++    }
++
++    fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
++        let Ok(mut state) = self.state.lock() else {
++            warn!(%connection_id, "relay JWT connection state lock poisoned during disconnect");
++            return;
++        };
++        let Some(authority) = state.connections.remove(&connection_id) else {
++            return;
++        };
++        if authority.endpoint_id != endpoint_id {
++            warn!(
++                %connection_id,
++                expected_endpoint_id = %authority.endpoint_id.fmt_short(),
++                observed_endpoint_id = %endpoint_id.fmt_short(),
++                "relay JWT disconnect endpoint did not match admitted authority"
++            );
++        }
++        decrement_count(&mut state.by_node, &authority.endpoint_id);
++        decrement_count(&mut state.by_grant, &authority.grant_id);
++    }
++}
++
++impl JwtVerifier {
++    fn verify(&self, request: &ClientRequest) -> Result<VerifiedAuthority, &'static str> {
++        let observed_at = Instant::now();
++        let system_now = SystemTime::now();
++        let now = i64::try_from(
++            system_now
++                .duration_since(UNIX_EPOCH)
++                .map_err(|_| "system clock is before Unix epoch")?
++                .as_secs(),
++        )
++        .map_err(|_| "system clock is out of range")?;
++        let verified = self.verify_at(request, now)?;
++        let expires_at = UNIX_EPOCH
++            .checked_add(Duration::from_secs(
++                u64::try_from(verified.expires_at_unix_seconds)
++                    .map_err(|_| "JWT expiry is before Unix epoch")?,
++            ))
++            .ok_or("JWT expiry is out of range")?;
++        let remaining = expires_at
++            .duration_since(system_now)
++            .map_err(|_| "JWT expired")?;
++        let deadline = observed_at
++            .checked_add(remaining)
++            .ok_or("JWT expiry is out of range")?;
++        Ok(VerifiedAuthority {
++            grant_id: verified.grant_id,
++            deadline,
++        })
++    }
++
++    fn verify_at(&self, request: &ClientRequest, now: i64) -> Result<VerifiedClaims, &'static str> {
++        if request.query_pairs().any(|(name, _)| name == "token") {
++            return Err("query token is forbidden");
++        }
++        let mut authorization_values = request.headers().get_all(AUTHORIZATION).iter();
++        let authorization = authorization_values
++            .next()
++            .ok_or("authorization header missing")?;
++        if authorization_values.next().is_some() {
++            return Err("duplicate authorization header");
++        }
++        let authorization = authorization
++            .to_str()
++            .map_err(|_| "authorization header is not UTF-8")?;
++        if authorization.trim() != authorization || authorization.contains(',') {
++            return Err("authorization header is ambiguous");
++        }
++        let (scheme, token) = authorization
++            .split_once(' ')
++            .ok_or("authorization scheme missing")?;
++        if !scheme.eq_ignore_ascii_case("Bearer")
++            || token.is_empty()
++            || token.len() > MAX_JWT_BYTES
++            || token
++                .bytes()
++                .any(|byte| byte.is_ascii_whitespace() || byte == b',')
++        {
++            return Err("bearer token is invalid");
++        }
++
++        let mut parts = token.split('.');
++        let encoded_header = parts.next().ok_or("JWT header missing")?;
++        let encoded_claims = parts.next().ok_or("JWT claims missing")?;
++        let encoded_signature = parts.next().ok_or("JWT signature missing")?;
++        if parts.next().is_some()
++            || encoded_header.is_empty()
++            || encoded_claims.is_empty()
++            || encoded_signature.is_empty()
++        {
++            return Err("JWT shape is invalid");
++        }
++
++        let header_bytes = BASE64URL_NOPAD
++            .decode(encoded_header.as_bytes())
++            .map_err(|_| "JWT header is not canonical base64url")?;
++        let header: JwtHeader =
++            serde_json::from_slice(&header_bytes).map_err(|_| "JWT header JSON is invalid")?;
++        if header.alg != "EdDSA" || header.typ != "JWT" {
++            return Err("JWT header authority is invalid");
++        }
++        let public_key = self
++            .public_keys
++            .get(&header.kid)
++            .ok_or("JWT signing key is not accepted")?;
++
++        let signature_bytes = decode_array::<64>(encoded_signature)
++            .map_err(|_| "JWT signature encoding is invalid")?;
++        let signature = Signature::from_bytes(&signature_bytes);
++        let signing_input = format!("{encoded_header}.{encoded_claims}");
++        public_key
++            .verify(signing_input.as_bytes(), &signature)
++            .map_err(|_| "JWT signature is invalid")?;
++
++        let claims_bytes = BASE64URL_NOPAD
++            .decode(encoded_claims.as_bytes())
++            .map_err(|_| "JWT claims are not canonical base64url")?;
++        let claims: JwtClaims =
++            serde_json::from_slice(&claims_bytes).map_err(|_| "JWT claims JSON is invalid")?;
++
++        if claims.iss != self.issuer
++            || claims.aud != self.audience
++            || claims.scope != "relay:connect"
++            || (claims.endpoint_kind != "app" && claims.endpoint_kind != "host")
++        {
++            return Err("JWT claim authority is invalid");
++        }
++        if claims.sub != request.endpoint_id().to_string() {
++            return Err("JWT subject does not match proven endpoint ID");
++        }
++        if claims.iat > now.saturating_add(self.clock_skew_seconds) {
++            return Err("JWT issued in the future");
++        }
++        let expires_at_unix_seconds = claims
++            .exp
++            .checked_add(self.clock_skew_seconds)
++            .ok_or("JWT expiry overflow")?;
++        if expires_at_unix_seconds <= now {
++            return Err("JWT expired");
++        }
++        let lifetime = claims
++            .exp
++            .checked_sub(claims.iat)
++            .ok_or("JWT lifetime overflow")?;
++        if lifetime <= 0 || lifetime > self.max_token_lifetime_seconds {
++            return Err("JWT lifetime exceeds relay policy");
++        }
++        if !valid_identifier(&claims.jti) || !valid_identifier(&claims.grant_id) {
++            return Err("JWT identifier is invalid");
++        }
++
++        Ok(VerifiedClaims {
++            grant_id: claims.grant_id,
++            expires_at_unix_seconds,
++        })
++    }
++}
++
++fn key_id_for(public_key: &[u8; 32]) -> String {
++    BASE64URL_NOPAD.encode(&Sha256::digest(public_key)[..12])
++}
++
++fn valid_authority(value: &str) -> bool {
++    !value.is_empty()
++        && value.len() <= MAX_AUTHORITY_BYTES
++        && value.trim() == value
++        && !value.bytes().any(|byte| byte.is_ascii_control())
++}
++
++fn valid_identifier(value: &str) -> bool {
++    (MIN_IDENTIFIER_BYTES..=MAX_IDENTIFIER_BYTES).contains(&value.len())
++        && value
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
++}
++
++fn decode_array<const N: usize>(value: &str) -> Result<[u8; N], ()> {
++    let decoded = BASE64URL_NOPAD.decode(value.as_bytes()).map_err(|_| ())?;
++    let bytes: [u8; N] = decoded.try_into().map_err(|_| ())?;
++    if BASE64URL_NOPAD.encode(&bytes) != value {
++        return Err(());
++    }
++    Ok(bytes)
++}
++
++fn decrement_count<K>(counts: &mut HashMap<K, usize>, key: &K)
++where
++    K: std::hash::Hash + Eq,
++{
++    if let Some(count) = counts.get_mut(key) {
++        *count -= 1;
++        if *count == 0 {
++            counts.remove(key);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        net::Ipv4Addr,
++        pin::Pin,
++        sync::{
++            Arc, Mutex,
++            atomic::{AtomicUsize, Ordering},
++        },
++        task::{Context, Poll},
++    };
++
++    use bytes::Bytes;
++    use http::{Request, header::HeaderValue};
++    use iroh_base::{RelayUrl, SecretKey};
++    use iroh_dns::dns::DnsResolver;
++    use iroh_relay::{
++        KeyCache,
++        client::{Client, ClientBuilder},
++        http::ProtocolVersion,
++        protos::{
++            relay::{ClientToRelayMsg, RelayToClientMsg},
++            streams::StreamError,
++        },
++        server::{
++            Metrics, OnDisconnectGuard, RelayConfig, Server, ServerConfig,
++            client::Config as ClientConfig, clients::Clients, streams::RelayedStream,
++        },
++        tls::{CaTlsConfig, default_provider},
++    };
++    use n0_future::{Sink, SinkExt, Stream, StreamExt};
++    use serde_json::json;
++    use tokio::sync::oneshot;
++
++    use super::*;
++
++    const ISSUER: &str = "https://credentials.volt.test";
++    const AUDIENCE: &str = "volt-iroh-relay-canary";
++
++    fn signing_key() -> SecretKey {
++        SecretKey::from_bytes(&[7; 32])
++    }
++
++    fn retiring_signing_key() -> SecretKey {
++        SecretKey::from_bytes(&[8; 32])
++    }
++
++    fn endpoint_key() -> SecretKey {
++        SecretKey::from_bytes(&[9; 32])
++    }
++
++    fn verification_key(signing_key: &SecretKey) -> JwtVerificationKey {
++        JwtVerificationKey {
++            public_key: BASE64URL_NOPAD.encode(signing_key.public().as_bytes()),
++        }
++    }
++
++    fn config() -> JwtAccessConfig {
++        JwtAccessConfig {
++            keys: vec![verification_key(&signing_key())],
++            issuer: ISSUER.to_string(),
++            audience: AUDIENCE.to_string(),
++            max_token_lifetime_seconds: 3600,
++            clock_skew_seconds: 30,
++            max_global_connections: 4,
++            max_node_connections: 1,
++            max_grant_connections: 2,
++            max_concurrent_verifications: 2,
++        }
++    }
++
++    fn token(endpoint_id: EndpointId, overrides: serde_json::Value) -> String {
++        token_with_key(endpoint_id, overrides, &signing_key())
++    }
++
++    fn token_with_key(
++        endpoint_id: EndpointId,
++        overrides: serde_json::Value,
++        signing_key: &SecretKey,
++    ) -> String {
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let header = json!({
++            "alg":"EdDSA",
++            "kid":key_id_for(signing_key.public().as_bytes()),
++            "typ":"JWT"
++        });
++        let mut claims = json!({
++            "iss": ISSUER,
++            "aud": AUDIENCE,
++            "sub": endpoint_id.to_string(),
++            "exp": now + 900,
++            "iat": now,
++            "jti": "jwt_identifier_one",
++            "scope": "relay:connect",
++            "endpoint_kind": "host",
++            "grant_id": "grant_identifier_one"
++        });
++        let claims_object = claims.as_object_mut().unwrap();
++        for (key, value) in overrides.as_object().unwrap() {
++            claims_object.insert(key.clone(), value.clone());
++        }
++        let encoded_header = BASE64URL_NOPAD.encode(&serde_json::to_vec(&header).unwrap());
++        let encoded_claims = BASE64URL_NOPAD.encode(&serde_json::to_vec(&claims).unwrap());
++        let signing_input = format!("{encoded_header}.{encoded_claims}");
++        let signature = signing_key.sign(signing_input.as_bytes());
++        format!(
++            "{signing_input}.{}",
++            BASE64URL_NOPAD.encode(&signature.to_bytes())
++        )
++    }
++
++    fn request(endpoint_id: EndpointId, token: &str) -> ClientRequest {
++        let request = Request::builder()
++            .uri("/relay")
++            .header(AUTHORIZATION, format!("Bearer {token}"))
++            .body(())
++            .unwrap();
++        let (parts, _) = request.into_parts();
++        ClientRequest::new(endpoint_id, ProtocolVersion::default(), parts)
++    }
++
++    #[derive(Debug)]
++    struct TrackingAccess {
++        inner: JwtAccess,
++        disconnected: Mutex<Option<oneshot::Sender<Instant>>>,
++    }
++
++    impl AccessControl for TrackingAccess {
++        async fn on_connect(&self, request: &ClientRequest) -> Access {
++            self.inner.on_connect(request).await
++        }
++
++        fn connection_deadline(
++            &self,
++            endpoint_id: EndpointId,
++            connection_id: ConnectionId,
++        ) -> Option<Instant> {
++            self.inner.connection_deadline(endpoint_id, connection_id)
++        }
++
++        fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
++            self.inner.on_disconnect(endpoint_id, connection_id);
++            if let Some(disconnected) = self.disconnected.lock().unwrap().take() {
++                let _ = disconnected.send(Instant::now());
++            }
++        }
++    }
++
++    struct ControlledSink {
++        block_writes: bool,
++        write_selected: Option<oneshot::Sender<Instant>>,
++        dropped: Option<oneshot::Sender<Instant>>,
++        flushes: Arc<AtomicUsize>,
++    }
++
++    impl Drop for ControlledSink {
++        fn drop(&mut self) {
++            if let Some(dropped) = self.dropped.take() {
++                let _ = dropped.send(Instant::now());
++            }
++        }
++    }
++
++    impl Stream for ControlledSink {
++        type Item = Result<Bytes, StreamError>;
++
++        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++            Poll::Pending
++        }
++    }
++
++    impl Sink<Bytes> for ControlledSink {
++        type Error = StreamError;
++
++        fn poll_ready(
++            mut self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++        ) -> Poll<Result<(), Self::Error>> {
++            if self.block_writes {
++                if let Some(write_selected) = self.write_selected.take() {
++                    let _ = write_selected.send(Instant::now());
++                }
++                Poll::Pending
++            } else {
++                Poll::Ready(Ok(()))
++            }
++        }
++
++        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
++            Ok(())
++        }
++
++        fn poll_flush(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++        ) -> Poll<Result<(), Self::Error>> {
++            self.flushes.fetch_add(1, Ordering::SeqCst);
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_close(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++        ) -> Poll<Result<(), Self::Error>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    async fn connect_expiring_client(clock_skew_seconds: u64) -> (Server, Client, Instant) {
++        let secret_key = endpoint_key();
++        let endpoint_id = secret_key.public();
++        let mut jwt_config = config();
++        jwt_config.clock_skew_seconds = clock_skew_seconds;
++        let access = Arc::new(JwtAccess::new(jwt_config).unwrap());
++
++        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
++        relay.key_cache_capacity = Some(1024);
++        relay.access = access.clone();
++        let mut server_config = ServerConfig::default();
++        server_config.relay = Some(relay);
++        let server = Server::spawn(server_config).await.unwrap();
++        let relay_url: RelayUrl = format!("http://{}", server.http_addr().unwrap())
++            .parse()
++            .unwrap();
++        let client_config = CaTlsConfig::default()
++            .client_config(default_provider())
++            .unwrap();
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let jwt = token(endpoint_id, json!({"iat": now, "exp": now + 2}));
++        let client = ClientBuilder::new(relay_url, secret_key, DnsResolver::new())
++            .tls_client_config(client_config)
++            .auth_token(jwt)
++            .connect()
++            .await
++            .unwrap();
++        let deadline = access
++            .state
++            .lock()
++            .unwrap()
++            .connections
++            .values()
++            .next()
++            .expect("connected client must have an authorization deadline")
++            .deadline;
++
++        (server, client, deadline)
++    }
++
++    #[tokio::test]
++    async fn accepts_node_bound_jwt_and_releases_connection_limit() {
++        let access = JwtAccess::new(config()).unwrap();
++        let endpoint_id = endpoint_key().public();
++        let first = request(endpoint_id, &token(endpoint_id, json!({})));
++        assert_eq!(access.on_connect(&first).await, Access::Allow);
++
++        let second = request(endpoint_id, &token(endpoint_id, json!({})));
++        assert_eq!(
++            access.on_connect(&second).await,
++            Access::Deny { reason: None }
++        );
++
++        access.on_disconnect(endpoint_id, first.connection_id());
++        let third = request(endpoint_id, &token(endpoint_id, json!({})));
++        assert_eq!(access.on_connect(&third).await, Access::Allow);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn expiry_preempts_a_selected_blocked_write_and_releases_the_connection_slot() {
++        let endpoint_id = endpoint_key().public();
++        let mut jwt_config = config();
++        jwt_config.clock_skew_seconds = 0;
++        let (disconnected_send, disconnected_recv) = oneshot::channel();
++        let access = Arc::new(TrackingAccess {
++            inner: JwtAccess::new(jwt_config).unwrap(),
++            disconnected: Mutex::new(Some(disconnected_send)),
++        });
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let jwt = token(endpoint_id, json!({"iat": now, "exp": now + 2}));
++        let first = request(endpoint_id, &jwt);
++        let first_connection_id = first.connection_id();
++        assert_eq!(access.on_connect(&first).await, Access::Allow);
++        let deadline = access
++            .connection_deadline(endpoint_id, first_connection_id)
++            .unwrap();
++        let guard = OnDisconnectGuard::for_access_control(access.clone(), &first);
++
++        let clients = Clients::default();
++        let metrics = Arc::new(Metrics::default());
++        let blocked_flushes = Arc::new(AtomicUsize::new(0));
++        let normal_flushes = Arc::new(AtomicUsize::new(0));
++        let (write_selected_send, write_selected_recv) = oneshot::channel();
++        let (stream_dropped_send, stream_dropped_recv) = oneshot::channel();
++        let blocked_stream = ControlledSink {
++            block_writes: true,
++            write_selected: Some(write_selected_send),
++            dropped: Some(stream_dropped_send),
++            flushes: blocked_flushes.clone(),
++        };
++        let mut blocked_config = ClientConfig::new(
++            guard,
++            RelayedStream::new(blocked_stream, KeyCache::new(0)),
++            ProtocolVersion::default(),
++        );
++        blocked_config.write_timeout = Duration::from_secs(60);
++        clients.register(blocked_config, metrics.clone());
++
++        // Replacing the active connection queues a status frame for the expiring actor.
++        // Its sink reports when that work has been selected, then holds the write pending.
++        let normal_stream = ControlledSink {
++            block_writes: false,
++            write_selected: None,
++            dropped: None,
++            flushes: normal_flushes.clone(),
++        };
++        let normal_config = ClientConfig::new(
++            OnDisconnectGuard::empty(endpoint_id),
++            RelayedStream::new(normal_stream, KeyCache::new(0)),
++            ProtocolVersion::default(),
++        );
++        clients.register(normal_config, metrics);
++        let write_selected_at =
++            tokio::time::timeout(Duration::from_millis(50), write_selected_recv)
++                .await
++                .expect("actor did not select the queued write before expiry")
++                .expect("blocked sink dropped before selecting the queued write");
++        assert!(write_selected_at < deadline);
++
++        let competing = request(endpoint_id, &jwt);
++        assert_eq!(
++            access.on_connect(&competing).await,
++            Access::Deny { reason: None },
++            "the first connection must hold its per-node slot before expiry"
++        );
++
++        tokio::time::sleep_until(deadline).await;
++        let close_bound = deadline + Duration::from_millis(10);
++        let (disconnected_at, stream_dropped_at) = tokio::time::timeout_at(close_bound, async {
++            let disconnected_at = disconnected_recv
++                .await
++                .expect("disconnect guard dropped without reporting release");
++            let stream_dropped_at = stream_dropped_recv
++                .await
++                .expect("blocked relay stream did not report closure");
++            (disconnected_at, stream_dropped_at)
++        })
++        .await
++        .expect("blocked actor remained alive past the authorization deadline");
++        assert!(disconnected_at <= close_bound);
++        assert!(stream_dropped_at <= close_bound);
++        assert_eq!(
++            blocked_flushes.load(Ordering::SeqCst),
++            0,
++            "expiry must drop the blocked stream without flushing"
++        );
++        assert!(
++            !clients.disconnect(endpoint_id, Some(first_connection_id)),
++            "expired actor remained registered after its stream was dropped"
++        );
++
++        let recovered = request(endpoint_id, &jwt);
++        assert_eq!(
++            access.on_connect(&recovered).await,
++            Access::Allow,
++            "expiry did not release the per-node connection slot"
++        );
++        access.on_disconnect(endpoint_id, recovered.connection_id());
++
++        clients.shutdown().await;
++        assert!(
++            normal_flushes.load(Ordering::SeqCst) > 0,
++            "ordinary clean shutdown must still flush its stream"
++        );
++    }
++
++    #[tokio::test]
++    async fn idle_established_connection_is_closed_at_jwt_expiry_with_clock_skew() {
++        let (server, mut client, deadline) = connect_expiring_client(1).await;
++
++        client.send(ClientToRelayMsg::Ping([1; 8])).await.unwrap();
++        assert!(matches!(
++            client.next().await,
++            Some(Ok(RelayToClientMsg::Pong { .. }))
++        ));
++
++        tokio::time::timeout_at(deadline + Duration::from_secs(1), async {
++            loop {
++                match client.next().await {
++                    Some(Ok(_)) => continue,
++                    Some(Err(_)) | None => break,
++                }
++            }
++        })
++        .await
++        .expect("relay kept an idle client open past JWT exp plus clock skew");
++
++        server.shutdown().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn sustained_ping_traffic_stops_at_jwt_expiry() {
++        const POST_DEADLINE_PING: [u8; 8] = [u8::MAX; 8];
++
++        let (server, client, deadline) = connect_expiring_client(0).await;
++        let (mut incoming, mut outgoing) = client.split();
++        let traffic = tokio::spawn(async move {
++            let mut sequence = 0u64;
++            loop {
++                let after_deadline = Instant::now() >= deadline;
++                sequence = sequence.wrapping_add(1);
++                let data = if after_deadline {
++                    POST_DEADLINE_PING
++                } else {
++                    sequence.to_be_bytes()
++                };
++                let failed = outgoing.send(ClientToRelayMsg::Ping(data)).await.is_err();
++                if failed && after_deadline {
++                    break (sequence, Instant::now());
++                }
++                if failed {
++                    tokio::time::sleep_until(deadline).await;
++                } else {
++                    tokio::task::yield_now().await;
++                }
++            }
++        });
++
++        let pong_count = tokio::time::timeout_at(deadline + Duration::from_secs(1), async {
++            let mut pong_count = 0usize;
++            loop {
++                match incoming.next().await {
++                    Some(Ok(RelayToClientMsg::Pong(data))) => {
++                        assert_ne!(
++                            data, POST_DEADLINE_PING,
++                            "relay emitted a pong for a post-deadline ping"
++                        );
++                        pong_count += 1;
++                    }
++                    Some(Ok(_)) => continue,
++                    Some(Err(_)) | None => break,
++                }
++            }
++            pong_count
++        })
++        .await
++        .expect("sustained traffic kept the client open past the bounded expiry window");
++        let (sent_count, traffic_stopped_at) =
++            tokio::time::timeout(Duration::from_secs(1), traffic)
++                .await
++                .expect("traffic sender did not stop after relay closure")
++                .expect("traffic sender task failed");
++
++        assert!(pong_count > 1, "test did not sustain ping traffic");
++        assert!(sent_count > pong_count as u64);
++        assert!(
++            traffic_stopped_at >= deadline,
++            "test traffic stopped before the authorization deadline"
++        );
++        server.shutdown().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn rejects_wrong_subject_expiry_and_excess_lifetime() {
++        let endpoint_id = endpoint_key().public();
++        let access = JwtAccess::new(config()).unwrap();
++        let other_id = SecretKey::from_bytes(&[11; 32]).public();
++        let wrong_subject = request(endpoint_id, &token(other_id, json!({})));
++        assert_eq!(
++            access.on_connect(&wrong_subject).await,
++            Access::Deny { reason: None }
++        );
++
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++        let expired = request(
++            endpoint_id,
++            &token(endpoint_id, json!({"iat": now - 120, "exp": now - 60})),
++        );
++        assert_eq!(
++            access.on_connect(&expired).await,
++            Access::Deny { reason: None }
++        );
++        let excessive = request(
++            endpoint_id,
++            &token(endpoint_id, json!({"iat": now, "exp": now + 3601})),
++        );
++        assert_eq!(
++            access.on_connect(&excessive).await,
++            Access::Deny { reason: None }
++        );
++    }
++
++    #[tokio::test]
++    async fn rejects_duplicate_headers_and_query_tokens() {
++        let endpoint_id = endpoint_key().public();
++        let access = JwtAccess::new(config()).unwrap();
++        let jwt = token(endpoint_id, json!({}));
++
++        let mut duplicate_request = Request::builder()
++            .uri("/relay")
++            .header(AUTHORIZATION, format!("Bearer {jwt}"))
++            .body(())
++            .unwrap();
++        duplicate_request
++            .headers_mut()
++            .append(AUTHORIZATION, HeaderValue::from_static("Bearer duplicate"));
++        let (parts, _) = duplicate_request.into_parts();
++        let duplicate = ClientRequest::new(endpoint_id, ProtocolVersion::default(), parts);
++        assert_eq!(
++            access.on_connect(&duplicate).await,
++            Access::Deny { reason: None }
++        );
++
++        let query_request = Request::builder()
++            .uri(format!("/relay?token={jwt}"))
++            .header(AUTHORIZATION, format!("Bearer {jwt}"))
++            .body(())
++            .unwrap();
++        let (parts, _) = query_request.into_parts();
++        let query_request = ClientRequest::new(endpoint_id, ProtocolVersion::default(), parts);
++        assert_eq!(
++            access.on_connect(&query_request).await,
++            Access::Deny { reason: None }
++        );
++    }
++
++    #[test]
++    fn accepts_active_and_retiring_keys_during_rotation() {
++        let endpoint_id = endpoint_key().public();
++        let mut rotation_config = config();
++        rotation_config
++            .keys
++            .push(verification_key(&retiring_signing_key()));
++        let access = JwtAccess::new(rotation_config).unwrap();
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_secs() as i64;
++
++        let active = request(endpoint_id, &token(endpoint_id, json!({})));
++        access.verifier.verify_at(&active, now).unwrap();
++        let retiring_token = token_with_key(endpoint_id, json!({}), &retiring_signing_key());
++        let retiring = request(endpoint_id, &retiring_token);
++        access.verifier.verify_at(&retiring, now).unwrap();
++    }
++
++    #[test]
++    fn accepts_go_issuer_interop_vector() {
++        const NODE_ID: &str = "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618";
++        const TOKEN: &str = "eyJhbGciOiJFZERTQSIsImtpZCI6Il9vRXNFdk9yVE9hc1hiYWEiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2NyZWRlbnRpYWxzLnZvbHQudGVzdCIsImF1ZCI6InZvbHQtaXJvaC1yZWxheS1jYW5hcnkiLCJzdWIiOiJmZDE3MjQzODVhYTBjNzViNjRmYjc4Y2Q2MDJmYTFkOTkxZmRlYmY3NmIxM2M1OGVkNzAyZWFjODM1ZTlmNjE4IiwiZXhwIjoxNzg3MzE0NTAwLCJpYXQiOjE3ODczMTM2MDAsImp0aSI6Imp3dF9pZGVudGlmaWVyX29uZSIsInNjb3BlIjoicmVsYXk6Y29ubmVjdCIsImVuZHBvaW50X2tpbmQiOiJob3N0IiwiZ3JhbnRfaWQiOiJncmFudF9pZGVudGlmaWVyX29uZSJ9.S0Eq4fPo1jq1ZUvASpZiE_6Grdx2Mb_iCkbtMLXxQktkJKSvriAc1CCISYwzd6ynPJKbNdcmnokG71jWpGvwCA";
++        let endpoint_id: EndpointId = NODE_ID.parse().unwrap();
++        let access = JwtAccess::new(JwtAccessConfig {
++            keys: vec![JwtVerificationKey {
++                public_key: "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw".to_string(),
++            }],
++            issuer: ISSUER.to_string(),
++            audience: AUDIENCE.to_string(),
++            max_token_lifetime_seconds: 3600,
++            clock_skew_seconds: 30,
++            max_global_connections: 4,
++            max_node_connections: 1,
++            max_grant_connections: 2,
++            max_concurrent_verifications: 2,
++        })
++        .unwrap();
++        let request = request(endpoint_id, TOKEN);
++        let authority = access.verifier.verify_at(&request, 1_787_313_600).unwrap();
++        assert_eq!(authority.grant_id, "grant_identifier_one");
++    }
++
++    #[test]
++    fn rejects_unsafe_configuration() {
++        let mut unsafe_config = config();
++        unsafe_config.max_token_lifetime_seconds = 3601;
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.max_node_connections = 0;
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.keys[0].public_key = "not-base64url".to_string();
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.keys.clear();
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.keys.push(verification_key(&signing_key()));
++        assert!(JwtAccess::new(unsafe_config).is_err());
++
++        let mut unsafe_config = config();
++        unsafe_config.max_concurrent_verifications = 0;
++        assert!(JwtAccess::new(unsafe_config).is_err());
++    }
++}
+diff --git a/iroh-relay/src/main.rs b/iroh-relay/src/main.rs
+index 2ca043df0229521f2232e24c299986b2ba20464b..7b798c6ba84e265643e05affab92082dddba8499 100644
+--- a/iroh-relay/src/main.rs
++++ b/iroh-relay/src/main.rs
+@@ -3,6 +3,8 @@
+ //! This handles only the CLI and config file loading, the server implementation lives in
+ //! [`iroh::relay::server`].
+ 
++mod jwt_access;
++
+ use std::{
+     net::{Ipv6Addr, SocketAddr},
+     num::NonZeroU32,
+@@ -30,6 +32,8 @@ use tracing_subscriber::{EnvFilter, prelude::*};
+ use url::Url;
+ use webpki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+ 
++use crate::jwt_access::{JwtAccess, JwtAccessConfig};
++
+ /// The default `http_bind_port` when using `--dev`.
+ const DEV_MODE_HTTP_PORT: u16 = 3340;
+ /// The header name for setting the endpoint id in HTTP auth requests.
+@@ -89,6 +93,7 @@ fn load_secret_key(
+ ///
+ /// This is (de)serialised to/from a TOML config file.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
+ struct Config {
+     /// Whether to enable the Relay server.
+     ///
+@@ -151,7 +156,6 @@ struct Config {
+     /// Access control for relaying connections.
+     ///
+     /// This controls which endpoints are allowed to relay connections, other endpoints are not controlled by this.
+-    #[serde(default)]
+     access: AccessConfig,
+ }
+ 
+@@ -173,6 +177,8 @@ enum AccessConfig {
+     /// To grant access, the HTTP endpoint must return a `200` response with `true` as the response text.
+     /// In all other cases, the endpoint will be denied access.
+     Http(HttpAccessConfig),
++    /// Validates short-lived Ed25519 JWTs bound to the proven Iroh endpoint ID.
++    Jwt(JwtAccessConfig),
+     #[serde(rename = "shared_token")]
+     /// Allows only clients that present one of the configured bearer tokens.
+     ///
+@@ -228,6 +234,10 @@ impl TryFrom<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
+                 }
+                 Ok(Arc::new(HttpAccess { client, config }))
+             }
++            AccessConfig::Jwt(config) => match JwtAccess::new(config) {
++                Ok(access) => Ok(Arc::new(access)),
++                Err(message) => bail_any!("{message}"),
++            },
+             AccessConfig::SharedToken(mut tokens) => {
+                 // A single env var token replaces the entire list. A comma-separated list
+                 // is intentionally not supported to avoid restricting the token character set.
+@@ -537,15 +547,16 @@ impl Config {
+     async fn load(opts: &Cli) -> Result<Self> {
+         let config_path = if let Some(config_path) = &opts.config_path {
+             config_path
+-        } else {
++        } else if opts.dev {
+             return Ok(Config::default());
++        } else {
++            bail_any!("--config-path is required outside --dev mode");
+         };
+ 
+-        if config_path.exists() {
+-            Self::read_from_file(&config_path).await
+-        } else {
+-            Ok(Config::default())
++        if !config_path.exists() {
++            bail_any!("config-path does not exist: {}", config_path.display());
+         }
++        Self::read_from_file(config_path).await
+     }
+ 
+     fn from_str(config: &str) -> Result<Self> {
+@@ -582,6 +593,7 @@ async fn main() -> Result<()> {
+ 
+     let cli = Cli::parse();
+     let mut cfg = Config::load(&cli).await?;
++    validate_access_mode(&cli, &cfg)?;
+     if cfg.enable_quic_addr_discovery && cfg.tls.is_none() {
+         bail_any!("TLS must be configured in order to spawn a QUIC endpoint");
+     }
+@@ -612,6 +624,13 @@ async fn main() -> Result<()> {
+     Ok(())
+ }
+ 
++fn validate_access_mode(cli: &Cli, cfg: &Config) -> Result<()> {
++    if !cli.dev && matches!(cfg.access, AccessConfig::Everyone) {
++        bail_any!("access = \"everyone\" is allowed only in --dev mode");
++    }
++    Ok(())
++}
++
+ async fn load_cert_config(tls: &TlsConfig) -> Result<relay::CertConfig> {
+     let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+         rustls::crypto::ring::default_provider(),
+@@ -794,6 +813,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_rate_limit_config() -> Result {
+         let config = "
++            access = \"everyone\"
+             [limits.client.rx]
+             bytes_per_second = 400
+             max_burst_bytes = 800
+@@ -816,7 +836,7 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn test_rate_limit_default() -> Result {
+-        let config = Config::from_str("")?;
++        let config = Config::from_str("access = \"everyone\"")?;
+         let relay_config = build_relay_config(config).await?;
+ 
+         let relay = relay_config.relay.expect("no relay config");
+@@ -898,6 +918,42 @@ mod tests {
+             })
+         );
+ 
++        let config = r#"
++            [access.jwt]
++            issuer = "https://credentials.volt.test"
++            audience = "volt-iroh-relay-canary"
++            max_global_connections = 100
++            max_node_connections = 4
++            max_grant_connections = 8
++
++            [[access.jwt.keys]]
++            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++
++            [[access.jwt.keys]]
++            public_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA"
++        "#
++        .to_string();
++        let config = Config::from_str(dbg!(&config))?;
++        assert!(matches!(config.access, AccessConfig::Jwt(_)));
++
++        let misspelled_jwt_policy = r#"
++            [access.jwt]
++            issuer = "https://credentials.volt.test"
++            audience = "volt-iroh-relay-canary"
++            max_node_connectons = 4
++
++            [[access.jwt.keys]]
++            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++        "#;
++        assert!(
++            Config::from_str(misspelled_jwt_policy).is_err(),
++            "unknown JWT policy fields must fail closed"
++        );
++        assert!(
++            Config::from_str("acces = \"everyone\"").is_err(),
++            "unknown root fields must fail closed"
++        );
++
+         let config = r#"
+             access.shared_token = ["token-a", "token-b"]
+         "#
+@@ -937,6 +993,7 @@ mod tests {
+     async fn test_enable_relay_config() -> Result {
+         let config = "
+             enable_relay = false
++            access = \"everyone\"
+         ";
+         let config = Config::from_str(config)?;
+         let relay_config = build_relay_config(config).await?;
+@@ -944,16 +1001,37 @@ mod tests {
+ 
+         let config = "
+             enable_relay = true
++            access = \"everyone\"
+         ";
+         let config = Config::from_str(config)?;
+         let relay_config = build_relay_config(config).await?;
+         assert!(relay_config.relay.is_some());
+ 
+-        let config = "";
+-        let config = Config::from_str(config)?;
+-        let relay_config = build_relay_config(config).await?;
+-        assert!(relay_config.relay.is_some());
++        assert!(Config::from_str("").is_err(), "access must be explicit");
+ 
+         Ok(())
+     }
++
++    #[tokio::test]
++    async fn test_production_config_fails_closed() {
++        let no_config = Cli {
++            dev: false,
++            config_path: None,
++        };
++        assert!(Config::load(&no_config).await.is_err());
++
++        let missing_config = Cli {
++            dev: false,
++            config_path: Some(std::env::temp_dir().join("missing-iroh-relay-config.toml")),
++        };
++        assert!(Config::load(&missing_config).await.is_err());
++
++        let open_config = Config::from_str("access = \"everyone\"").unwrap();
++        assert!(validate_access_mode(&no_config, &open_config).is_err());
++        let dev = Cli {
++            dev: true,
++            config_path: None,
++        };
++        assert!(validate_access_mode(&dev, &open_config).is_ok());
++    }
+ }
+diff --git a/iroh-relay/src/server.rs b/iroh-relay/src/server.rs
+index 13d947edf1536d162f5cb29b18cbe82c4e62cf93..9bd52296264806ead778c4d9d6665d706b2155fe 100644
+--- a/iroh-relay/src/server.rs
++++ b/iroh-relay/src/server.rs
+@@ -46,6 +46,7 @@ use serde::Serialize;
+ use tokio::{
+     net::TcpListener,
+     task::{JoinError, JoinSet},
++    time::Instant,
+ };
+ use tokio_rustls_acme::{
+     acme::{LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY},
+@@ -292,6 +293,19 @@ pub trait AccessControl: std::fmt::Debug + Send + Sync + 'static {
+     /// Can be implemented as `async fn on_connect(&self, request: &ClientRequest) -> Access`.
+     fn on_connect(&self, request: &ClientRequest) -> impl Future<Output = Access> + Send;
+ 
++    /// Returns the monotonic deadline for an admitted connection, if it has one.
++    ///
++    /// Called immediately after [`Self::on_connect`] returns [`Access::Allow`]. Once the
++    /// deadline is reached, the server closes the connection without waiting for the client.
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant> {
++        let _ = (endpoint_id, connection_id);
++        None
++    }
++
+     /// Notifies that a connection has ended.
+     ///
+     /// Called once for every connection that [`Self::on_connect`] admitted,
+@@ -316,6 +330,13 @@ pub trait DynAccessControl: std::fmt::Debug + Send + Sync + 'static {
+         request: &'a ClientRequest,
+     ) -> Pin<Box<dyn Future<Output = Access> + Send + 'a>>;
+ 
++    /// See [`AccessControl::connection_deadline`].
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant>;
++
+     /// See [`AccessControl::on_disconnect`].
+     fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId);
+ }
+@@ -328,6 +349,14 @@ impl<T: AccessControl> DynAccessControl for T {
+         Box::pin(<Self as AccessControl>::on_connect(self, request))
+     }
+ 
++    fn connection_deadline(
++        &self,
++        endpoint_id: EndpointId,
++        connection_id: ConnectionId,
++    ) -> Option<Instant> {
++        <Self as AccessControl>::connection_deadline(self, endpoint_id, connection_id)
++    }
++
+     fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
+         <Self as AccessControl>::on_disconnect(self, endpoint_id, connection_id)
+     }
+@@ -377,6 +406,7 @@ pub struct OnDisconnectGuard {
+     access: Option<Arc<dyn DynAccessControl>>,
+     endpoint_id: EndpointId,
+     connection_id: ConnectionId,
++    deadline: Option<Instant>,
+ }
+ 
+ impl OnDisconnectGuard {
+@@ -386,10 +416,14 @@ impl OnDisconnectGuard {
+     /// with the request's [`EndpointId`] and [`ConnectionId`]. Create it only
+     /// once [`AccessControl::on_connect`] has admitted the connection.
+     pub fn for_access_control(access: Arc<dyn DynAccessControl>, request: &ClientRequest) -> Self {
++        let endpoint_id = request.endpoint_id();
++        let connection_id = request.connection_id();
++        let deadline = access.connection_deadline(endpoint_id, connection_id);
+         Self {
+             access: Some(access),
+-            endpoint_id: request.endpoint_id(),
+-            connection_id: request.connection_id(),
++            endpoint_id,
++            connection_id,
++            deadline,
+         }
+     }
+ 
+@@ -402,6 +436,7 @@ impl OnDisconnectGuard {
+             access: None,
+             endpoint_id,
+             connection_id: ConnectionId::next(),
++            deadline: None,
+         }
+     }
+ 
+@@ -414,6 +449,11 @@ impl OnDisconnectGuard {
+     pub fn connection_id(&self) -> ConnectionId {
+         self.connection_id
+     }
++
++    /// Returns the monotonic deadline after which this connection must be closed.
++    pub fn deadline(&self) -> Option<Instant> {
++        self.deadline
++    }
+ }
+ 
+ impl Drop for OnDisconnectGuard {
+diff --git a/iroh-relay/src/server/client.rs b/iroh-relay/src/server/client.rs
+index 7d59088516ce98c3da06bc30a451151701fe674c..9170ff77be7671e7ca006cee30bffdfffcc07561 100644
+--- a/iroh-relay/src/server/client.rs
++++ b/iroh-relay/src/server/client.rs
+@@ -333,6 +333,15 @@ where
+     }
+ 
+     async fn run_inner(&mut self, done: CancellationToken) -> Result<(), RunError> {
++        let deadline = self.guard.deadline();
++        let expiry = async move {
++            match deadline {
++                Some(deadline) => tokio::time::sleep_until(deadline).await,
++                None => std::future::pending().await,
++            }
++        };
++        tokio::pin!(expiry);
++
+         // Add some jitter to ping pong interactions, to avoid all pings being sent at the same time
+         let next_interval = || {
+             let random_secs = rand::rng().random_range(1..=5);
+@@ -344,57 +353,107 @@ where
+         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+         ping_interval.tick().await;
+ 
+-        loop {
+-            tokio::select! {
+-                biased;
++        let authorization_expired =
++            || deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+ 
+-                _ = done.cancelled() => {
+-                    trace!("actor loop cancelled, exiting");
+-                    // final flush
+-                    self.stream.flush().await.map_err(|_| e!(RunError::Flush))?;
+-                    break;
+-                }
+-                maybe_frame = self.stream.next() => {
+-                    self
+-                        .handle_frame(maybe_frame)
+-                        .await?;
+-                    // reset the ping interval, we just received a message
+-                    ping_interval.reset();
+-                }
+-                // Second priority, sending regular packets
+-                packet = self.packet_send_queue.recv() => {
+-                    let packet = packet.ok_or_else(|| e!(RunError::HandleDropped))?;
+-                    self.send_packet(packet)
+-                        .await
+-                        .map_err(|err| e!(RunError::PacketSend, err))?;
+-                }
+-                // Last priority, sending other message
+-                message = self.message_send_queue.recv() => {
+-                    let message = message.ok_or_else(|| e!(RunError::HandleDropped))?;
+-                    trace!("send {message:?}");
+-                    self.write_frame(message)
++        loop {
++            let traffic_operation = async {
++                let should_exit = tokio::select! {
++                    biased;
++
++                    _ = done.cancelled() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without flushing");
++                            return Ok(true);
++                        }
++                        trace!("actor loop cancelled, exiting");
++                        // final flush
++                        self.stream.flush().await.map_err(|_| e!(RunError::Flush))?;
++                        true
++                    }
++                    maybe_frame = self.stream.next() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without handling frame");
++                            return Ok(true);
++                        }
++                        self
++                            .handle_frame(maybe_frame)
++                            .await?;
++                        // reset the ping interval, we just received a message
++                        ping_interval.reset();
++                        false
++                    }
++                    // Second priority, sending regular packets
++                    packet = self.packet_send_queue.recv() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without sending packet");
++                            return Ok(true);
++                        }
++                        let packet = packet.ok_or_else(|| e!(RunError::HandleDropped))?;
++                        self.send_packet(packet)
++                            .await
++                            .map_err(|err| e!(RunError::PacketSend, err))?;
++                        false
++                    }
++                    // Last priority, sending other message
++                    message = self.message_send_queue.recv() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without sending message");
++                            return Ok(true);
++                        }
++                        let message = message.ok_or_else(|| e!(RunError::HandleDropped))?;
++                        trace!("send {message:?}");
++                        self.write_frame(message)
++                            .await
++                            .map_err(|err| e!(RunError::WriteFrame, err))?;
++                        false
++                    }
++                    _ = self.ping_tracker.timeout() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection");
++                        } else {
++                            trace!("pong timed out");
++                        }
++                        true
++                    }
++                    _ = ping_interval.tick() => {
++                        if authorization_expired() {
++                            debug!("connection authorization expired, dropping connection without keepalive");
++                            return Ok(true);
++                        }
++                        trace!("keep alive ping");
++                        // new interval
++                        ping_interval.reset_after(next_interval());
++                        let data = self.ping_tracker.new_ping();
++                        self.write_frame(RelayToClientMsg::Ping(data))
++                            .await
++                            .map_err(|err| e!(RunError::WriteFrame, err))?;
++                        false
++                    }
++                };
++
++                if !should_exit {
++                    self.stream
++                        .flush()
+                         .await
+-                        .map_err(|err| e!(RunError::WriteFrame, err))?;
++                        .map_err(|_| e!(RunError::TickFlush))?;
+                 }
+-                _ = self.ping_tracker.timeout() => {
+-                    trace!("pong timed out");
+-                    break;
+-                }
+-                _ = ping_interval.tick() => {
+-                    trace!("keep alive ping");
+-                    // new interval
+-                    ping_interval.reset_after(next_interval());
+-                    let data = self.ping_tracker.new_ping();
+-                    self.write_frame(RelayToClientMsg::Ping(data))
+-                        .await
+-                        .map_err(|err| e!(RunError::WriteFrame, err))?;
++                Ok::<_, RunError>(should_exit)
++            };
++            tokio::pin!(traffic_operation);
++
++            let should_exit = tokio::select! {
++                biased;
++
++                _ = &mut expiry => {
++                    debug!("connection authorization expired, dropping connection without flushing");
++                    return Ok(());
+                 }
++                result = &mut traffic_operation => result?,
++            };
++            if should_exit {
++                break;
+             }
+-
+-            self.stream
+-                .flush()
+-                .await
+-                .map_err(|_| e!(RunError::TickFlush))?;
+         }
+         Ok(())
+     }
+diff --git a/iroh-relay/src/server/http_server.rs b/iroh-relay/src/server/http_server.rs
+index 22384ebfb085f06b40c67c93596863ffa9b11589..374a3115aaad7d183fb046be030989699c22309e 100644
+--- a/iroh-relay/src/server/http_server.rs
++++ b/iroh-relay/src/server/http_server.rs
+@@ -25,7 +25,7 @@ use n0_error::{e, ensure, stack_error};
+ use n0_future::MaybeFuture;
+ use tokio::{
+     net::{TcpListener, TcpStream},
+-    sync::{Notify, watch},
++    sync::{Notify, Semaphore, watch},
+ };
+ use tokio_rustls_acme::AcmeAcceptor;
+ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+@@ -73,7 +73,14 @@ const SEC_WEBSOCKET_ACCEPT_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+ ///
+ /// The connection is aborted if the connection does not complete the TLS handshake
+ /// and establishes relay protocol WebSocket stream within this timeout.
+-const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
++const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
++/// Maximum TCP connections concurrently completing TLS, HTTP upgrade, endpoint authentication,
++/// and access authorization. Established relay clients are governed separately by AccessControl.
++const MAX_PENDING_CONNECTIONS: usize = 64;
++/// Hard cap on HTTP headers accepted before a relay WebSocket upgrade.
++const MAX_HTTP_HEADERS: usize = 32;
++/// Hard cap on Hyper's HTTP/1 read buffer during relay establishment.
++const MAX_HTTP_BUFFER_BYTES: usize = 32 * 1024;
+ 
+ /// Derives the accept key for WebSocket handshake according to RFC 6455.
+ /// Takes the client's Sec-WebSocket-Key value and returns the calculated accept key.
+@@ -468,6 +475,7 @@ impl ServerBuilder {
+ 
+         let cancel = cancel_token.clone();
+         let loop_service = service.clone();
++        let pending_connections = Arc::new(Semaphore::new(MAX_PENDING_CONNECTIONS));
+         let task = tokio::task::spawn(
+             async move {
+                 let service = loop_service;
+@@ -488,11 +496,17 @@ impl ServerBuilder {
+                         }
+                         res = listener.accept() => match res {
+                             Ok((stream, peer_addr)) => {
++                                let Ok(pending_permit) = pending_connections.clone().try_acquire_owned() else {
++                                    debug!(%peer_addr, "dropping connection because pending establishment capacity is full");
++                                    drop(stream);
++                                    continue;
++                                };
+                                 debug!("connection opened from {peer_addr}");
+                                 let tls_config = tls_config.clone();
+                                 let service = service.clone();
+                                 // spawn a task to handle the connection
+                                 set.spawn(async move {
++                                    let _pending_permit = pending_permit;
+                                     service
+                                         .handle_connection(stream, tls_config, self.establish_timeout)
+                                         .await
+@@ -1117,7 +1131,11 @@ impl RelayServiceWithNotify {
+ 
+     /// Wrapper for the actual http connection (with upgrades)
+     async fn serve_connection(self, io: MaybeTlsStream) -> Result<(), ServeConnectionError> {
+-        hyper::server::conn::http1::Builder::new()
++        let mut builder = hyper::server::conn::http1::Builder::new();
++        builder
++            .max_headers(MAX_HTTP_HEADERS)
++            .max_buf_size(MAX_HTTP_BUFFER_BYTES);
++        builder
+             .serve_connection(hyper_util::rt::TokioIo::new(io), self)
+             .with_upgrades()
+             .await

@@ -1,5 +1,6 @@
 let iroh;
 let irohLoadError;
+let irohPackageVersion;
 let loadAttempted = false;
 
 function loadIroh() {
@@ -7,11 +8,14 @@ function loadIroh() {
 		loadAttempted = true;
 		try {
 			iroh = require("@number0/iroh/index.js");
+			try {
+				irohPackageVersion = require("@number0/iroh/package.json").version;
+			} catch {}
 		} catch (error) {
 			irohLoadError = error;
 		}
 	}
-	return { iroh, irohLoadError };
+	return { iroh, irohLoadError, irohPackageVersion };
 }
 
 module.exports = {

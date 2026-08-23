@@ -18,6 +18,7 @@ Commands:
   access <node-id> set <preset> Update a paired device's tool and RPC access.
   status [--json]               Show daemon status (workspaces, clients, leases).
   clients                       List paired clients.
+  credential revoke             Revoke this daemon's managed relay credential.
   revoke <node-id>              Revoke a paired client and close its connections.
   approve-repair <node-id>      Allow a revoked client node ID to re-pair.
   workspace add [path] [--name <name>]
@@ -323,6 +324,25 @@ async function handleClientsCommand(): Promise<void> {
 			return;
 		}
 		console.log(JSON.stringify(response.clients, null, 2));
+	} finally {
+		await session.close();
+	}
+}
+
+async function handleCredentialCommand(args: string[]): Promise<void> {
+	if (args.length !== 1 || args[0] !== "revoke") {
+		console.error("Error: usage: volt remote credential revoke");
+		process.exitCode = 1;
+		return;
+	}
+	const session = await connectToDaemon({ autoStart: false });
+	if (!session) return;
+	try {
+		const response = await session.client.request({ type: "relay_credential_revoke" });
+		if (reportControlError(response, "relay credential revoke")) {
+			return;
+		}
+		console.error("revoked managed relay credential");
 	} finally {
 		await session.close();
 	}
@@ -802,6 +822,9 @@ export async function handleRemoteControlCommand(
 			return true;
 		case "clients":
 			await handleClientsCommand();
+			return true;
+		case "credential":
+			await handleCredentialCommand(rest);
 			return true;
 		case "access":
 			await handleAccessCommand(rest);

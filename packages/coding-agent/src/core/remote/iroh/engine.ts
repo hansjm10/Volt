@@ -67,6 +67,7 @@ export interface IrohRemoteHostEngineOptions {
 	defaultAllowTools?: string;
 	rpcGrant?: IrohRemoteRpcGrant;
 	auditLogger?: IrohRemoteAuditLogger;
+	authorizeRelayCredentialPairing?: (claimId: string, remoteNodeId: string) => Promise<boolean>;
 	hostNodeId?: string;
 	now?: () => number;
 	pairingExpiresAt?: number;
@@ -89,6 +90,7 @@ export interface IrohRemoteHostPairOptions {
 	relayMode?: IrohRemoteRelayMode;
 	relayUrls?: string[];
 	relayAuthToken?: string;
+	relayCredentialClaim?: IrohRemoteTicketPayload["relayCredentialClaim"];
 	secret?: string;
 	ttlMs?: number;
 	workspace?: string;
@@ -177,6 +179,9 @@ function isEmptyIrohRemoteHostStateForRuntimePairingBootstrap(state: IrohRemoteH
 
 export class IrohRemoteHostEngine {
 	private readonly auditLogger: IrohRemoteAuditLogger;
+	private readonly authorizeRelayCredentialPairing:
+		| ((claimId: string, remoteNodeId: string) => Promise<boolean>)
+		| undefined;
 	private readonly classifyWorkspaceAvailability: IrohRemoteWorkspaceAvailabilityClassifier | undefined;
 	private readonly hostNodeId: string | undefined;
 	private readonly relayMode: IrohRemoteRelayMode | undefined;
@@ -201,6 +206,7 @@ export class IrohRemoteHostEngine {
 		this.allowTools = normalizeIrohRemoteAllowTools(options.allowTools, this.defaultAllowTools);
 		this.rpcGrant = cloneIrohRemoteRpcGrant(options.rpcGrant ?? defaultAccess.rpcGrant);
 		this.auditLogger = options.auditLogger ?? new IrohRemoteAuditLogger();
+		this.authorizeRelayCredentialPairing = options.authorizeRelayCredentialPairing;
 		this.classifyWorkspaceAvailability = options.classifyWorkspaceAvailability;
 		this.hostNodeId = options.hostNodeId;
 		this.relayMode = options.relayMode;
@@ -246,6 +252,9 @@ export class IrohRemoteHostEngine {
 				expiresAt,
 				createdAt,
 				...(options.labelHint === undefined ? {} : { labelHint: options.labelHint }),
+				...(options.relayCredentialClaim?.claimId === undefined
+					? {}
+					: { relayCredentialClaimId: options.relayCredentialClaim.claimId }),
 			});
 
 			const payload: IrohRemoteTicketPayload = {
@@ -256,6 +265,9 @@ export class IrohRemoteHostEngine {
 				relayMode: options.relayMode,
 				...(options.relayUrls === undefined ? {} : { relayUrls: options.relayUrls }),
 				...(options.relayAuthToken === undefined ? {} : { relayAuthToken: options.relayAuthToken }),
+				...(options.relayCredentialClaim === undefined
+					? {}
+					: { relayCredentialClaim: options.relayCredentialClaim }),
 				secret,
 				workspace: workspace.name,
 			};
@@ -424,6 +436,29 @@ export class IrohRemoteHostEngine {
 		remoteNodeId: string,
 	): Promise<IrohRemoteClientAuthorizationResult> {
 		await this.ensureRuntimePairingWorkspaceRegistered();
+		const secretHash = hello.secret === undefined ? undefined : hashIrohRemotePairingSecret(hello.secret);
+		const pendingPairingTicket =
+			secretHash === undefined
+				? undefined
+				: (await this.stateManager.getState()).pendingPairingTickets?.find(
+						(ticket) => ticket.secretHash === secretHash,
+					);
+		if (pendingPairingTicket?.relayCredentialClaimId !== undefined && pendingPairingTicket.expiresAt >= this.now()) {
+			const approved =
+				this.authorizeRelayCredentialPairing !== undefined &&
+				(await this.authorizeRelayCredentialPairing(pendingPairingTicket.relayCredentialClaimId, remoteNodeId));
+			if (!approved) {
+				const result: IrohRemoteClientAuthorizationResult = {
+					ok: false,
+					error: "managed relay pairing is not approved for this client",
+					outcome: "client_unknown",
+					pairingSecretExpired: false,
+				};
+				await this.logPairingTicketLifecycle(result, remoteNodeId);
+				await this.logAuthorization(hello, remoteNodeId, result);
+				return result;
+			}
+		}
 		const allowTools = normalizeIrohRemoteAllowTools(
 			this.pairingSecret !== undefined && hello.secret === this.pairingSecret
 				? (this.pairingAllowTools ?? this.allowTools)

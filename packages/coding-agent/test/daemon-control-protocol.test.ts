@@ -69,6 +69,7 @@ describe("control protocol framing", () => {
 			},
 			{ type: "pair_cancel", id: "6b", requestId: "pair-1" },
 			{ type: "clients_list", id: "7" },
+			{ type: "relay_credential_revoke", id: "7b" },
 			{ type: "client_revoke", id: "8", clientNodeId: "n-1" },
 			{ type: "client_approve_repair", id: "8b", clientNodeId: "n-1" },
 			{ type: "workspace_register", id: "9", name: "volt", path: "/tmp/volt" },
