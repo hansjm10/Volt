@@ -624,6 +624,8 @@ export class AgentSession {
 	private readonly _admittedAncillaryWork = new Set<Promise<unknown>>();
 	/** Prompt/preflight work is detached during replacement to avoid ctx.newSession self-joins. */
 	private readonly _admittedPromptWork = new Set<Promise<unknown>>();
+	/** Queue admissions submitted before a remote stop must settle before it aborts their generation. */
+	private readonly _queuedPromptAdmissionWork = new Set<Promise<void>>();
 
 	// Compaction state
 	private _activeCompaction: ActiveCompaction | undefined = undefined;
@@ -3719,6 +3721,22 @@ export class AgentSession {
 		}
 	}
 
+	private async _drainQueuedMessagesAfterRemoteAbort(): Promise<void> {
+		if (this._disposed || !this._harness.hasQueuedMessages()) return;
+		const abortGeneration = this._abortGeneration;
+		const conversationGenerationRevision = this._conversationGenerationRevision;
+		this._beginAgentSettlement();
+		try {
+			let result = await this._continueAgent();
+			while (await this._handlePostAgentRun(result, abortGeneration, conversationGenerationRevision)) {
+				result = await this._continueAgent();
+			}
+		} finally {
+			this._flushPendingBashMessages();
+			this._emitAgentSettledIfIdle();
+		}
+	}
+
 	private _emitAgentSettledIfIdle(): void {
 		if (this._harness.getPhase() === "idle") {
 			this._agentSettlementRevision += 1;
@@ -3856,7 +3874,20 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	prompt(text: string, options?: PromptOptions): Promise<void> {
-		return this._trackAdmittedPromptWork(this._promptAdmitted(text, options));
+		const isQueuedAdmission =
+			options?.streamingBehavior !== undefined && (this.isStreaming || this._harness.isReservedOrRunning());
+		const operation = this._promptAdmitted(text, options);
+		if (isQueuedAdmission) {
+			const admission = operation.then(
+				() => undefined,
+				() => undefined,
+			);
+			this._queuedPromptAdmissionWork.add(admission);
+			void admission.finally(() => {
+				this._queuedPromptAdmissionWork.delete(admission);
+			});
+		}
+		return this._trackAdmittedPromptWork(operation);
 	}
 
 	private async _promptAdmitted(text: string, options?: PromptOptions): Promise<void> {
@@ -4788,9 +4819,14 @@ export class AgentSession {
 	}
 
 	/**
-	 * Abort current operation and wait for agent to become idle.
+	 * Abort the current operation. A remote stop starts any retained queued
+	 * messages as a new run once the interrupted run reaches idle.
 	 */
 	abort(source?: AgentAbortSource): Promise<void> {
+		if (source === "remote_request" && this._queuedPromptAdmissionWork.size > 0) {
+			const admittedBeforeAbort = [...this._queuedPromptAdmissionWork];
+			return Promise.all(admittedBeforeAbort).then(() => this.abort(source));
+		}
 		this._harness.abort(source);
 		if (this._abortPromise) {
 			return this._abortPromise;
@@ -4799,11 +4835,21 @@ export class AgentSession {
 		this.abortRetry();
 		this.abortCompaction();
 		const idlePromise = this.waitForIdle();
-		const abortPromise = idlePromise.finally(() => {
-			if (this._abortPromise === abortPromise) {
-				this._abortPromise = undefined;
-			}
-		});
+		const abortPromise = idlePromise
+			.then(() => {
+				if (source !== "remote_request" || this._disposed || !this._harness.hasQueuedMessages()) return;
+				const drain = this._trackAdmittedPromptWork(this._drainQueuedMessagesAfterRemoteAbort());
+				void drain.catch((error: unknown) => {
+					if (!this._disposed && this._isConversationAuthorityAvailable()) {
+						this._runtimeErrorMessage = error instanceof Error ? error.message : String(error);
+					}
+				});
+			})
+			.finally(() => {
+				if (this._abortPromise === abortPromise) {
+					this._abortPromise = undefined;
+				}
+			});
 		this._abortPromise = abortPromise;
 		return abortPromise;
 	}
