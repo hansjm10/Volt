@@ -437,8 +437,8 @@ function assertExternalImports(metafile) {
 		for (const externalImport of output.imports ?? []) {
 			if (!externalImport.external || isBuiltin(externalImport.path)) continue;
 			if (
-				externalImport.path === "@number0/iroh" ||
-				externalImport.path.startsWith("@number0/iroh/") ||
+				externalImport.path === "@hansjm10/volt-iroh" ||
+				externalImport.path.startsWith("@hansjm10/volt-iroh/") ||
 				ALLOWED_EXTERNAL_PACKAGES.has(externalImport.path)
 			) {
 				continue;
@@ -450,10 +450,10 @@ function assertExternalImports(metafile) {
 		throw new Error(`Unexpected external imports in standalone bundle:\n${[...unexpected].sort().join("\n")}`);
 	}
 	const bundledIroh = Object.keys(metafile.inputs ?? {}).filter((path) =>
-		path.replaceAll("\\", "/").includes("node_modules/@number0/iroh/"),
+		path.replaceAll("\\", "/").includes("node_modules/@hansjm10/volt-iroh/"),
 	);
 	if (bundledIroh.length > 0) {
-		throw new Error(`The standalone bundle embedded @number0/iroh:\n${bundledIroh.join("\n")}`);
+		throw new Error(`The standalone bundle embedded @hansjm10/volt-iroh:\n${bundledIroh.join("\n")}`);
 	}
 }
 
@@ -559,7 +559,7 @@ async function bundleStandalone(scratchDirectory, stageDirectory) {
 			"import.meta.resolve": "undefined",
 			"import.meta.url": "undefined",
 		},
-		external: ["@number0/iroh", "@number0/iroh/*", ...ALLOWED_EXTERNAL_PACKAGES],
+		external: ["@hansjm10/volt-iroh", "@hansjm10/volt-iroh/*", ...ALLOWED_EXTERNAL_PACKAGES],
 	});
 	assertExternalImports(result.metafile);
 

@@ -2,6 +2,6 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-improvement(subagents): Warn each long-running subagent at 80 turns and require its final report after 120 turns.
+improvement(subagents): Long-running subagents now receive a wrap-up warning at 80 turns and a tool-free final-report prompt at 120 turns.
 
 Host `turnLimits` overrides stay consistent: an unset warning threshold clamps to `min(80, maxTurns)`, an explicit `warnAtTurns` above a finite `maxTurns` is rejected, and an infinite `maxTurns` without an explicit warning disables both stages.

@@ -1147,6 +1147,53 @@ Response:
 
 `contextUsage` is omitted when no model or context window is available. `contextUsage.tokens` and `contextUsage.percent` are `null` immediately after compaction until a fresh post-compaction assistant response provides valid usage data.
 
+#### get_subscription_usage
+
+Get normalized subscription quota windows for stored OAuth logins. API keys are not queried. Results use the same brief host-side cache as `/usage`; each configured provider succeeds or fails independently.
+
+```json
+{"type": "get_subscription_usage"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "get_subscription_usage",
+  "success": true,
+  "data": {
+    "status": "providers",
+    "providers": [
+      {
+        "providerId": "openai-codex",
+        "result": {
+          "status": "success",
+          "snapshot": {
+            "providerId": "openai-codex",
+            "fetchedAt": 1800000000000,
+            "plan": "plus",
+            "limits": [
+              {
+                "id": "weekly",
+                "label": "Weekly",
+                "usedPercent": 25,
+                "resetsAt": 1800086400000,
+                "windowDurationMs": 604800000,
+                "limitReached": false
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+`data.status` is `providers`, `no_subscription`, or `unsupported`. Provider results are either a normalized snapshot or an error with code `unauthorized`, `rate_limited`, `timeout`, `unavailable`, or `malformed_response`. The response excludes credentials, account identity, and raw provider payloads. Typed clients can call `getSubscriptionUsage()`.
+
+Iroh conversation streams also allow this command for paired clients with `host.manage.v1`; the standard `coding`, `review`, and `chat` grants include that capability.
+
 #### list_sessions
 
 List sessions for the current workspace. The response omits host file paths so remote clients can present workspace-scoped session choices safely.

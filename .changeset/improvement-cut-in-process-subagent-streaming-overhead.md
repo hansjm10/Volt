@@ -2,4 +2,6 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-improvement(subagents): Cut in-process subagent streaming overhead about 4-7x: parent-child RPC frames now pass as structured objects instead of being JSON-serialized and re-parsed inside the same process, removing the quadratic cost on long streaming outputs.
+improvement(subagents): Reduced in-process subagent streaming overhead by roughly 4–7× for long outputs.
+
+Parent-child RPC frames now pass as structured objects in-process, avoiding repeated serialization and quadratic work.

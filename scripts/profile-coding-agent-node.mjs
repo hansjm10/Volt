@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const packageDir = join(repoRoot, "packages", "coding-agent");
-const distCliPath = join(packageDir, "dist", "cli.js");
+const npmCliPath = join(packageDir, "dist", "core", "npm", "cli.js");
 const srcCliPath = join(packageDir, "src", "cli.ts");
 const defaultNodeProfileDir = join(repoRoot, "profiles-node");
 const defaultBunProfileDir = join(repoRoot, "profiles-bun");
@@ -36,7 +36,7 @@ Options:
   --agent-dir <dir>      Use a specific VOLT_CODING_AGENT_DIR for the benchmark run
   --isolated-agent-dir   Use a fresh temporary agent dir instead of the normal one
   --no-offline           Do not force VOLT_OFFLINE=1 / VOLT_SKIP_VERSION_CHECK=1
-  --skip-build           Reuse the current dist/cli.js without rebuilding first (Node only)
+  --skip-build           Reuse the current bundled npm CLI without rebuilding first (Node only)
   --cpu-profile          Write CPU profiles for benchmark runs
   --help                 Show this help
 
@@ -350,7 +350,7 @@ function getRuntimeCommand(runtime, mode, profileDir, profileName, cpuProfile) {
 	if (cpuProfile) {
 		args.push("--cpu-prof", `--cpu-prof-dir=${profileDir}`, `--cpu-prof-name=${profileName}`);
 	}
-	args.push(distCliPath, ...benchmarkArgs);
+	args.push(npmCliPath, ...benchmarkArgs);
 	return {
 		executable: process.execPath,
 		args,
@@ -557,7 +557,7 @@ async function main() {
 		);
 	}
 
-	const entryPath = runtime === "bun" ? srcCliPath : distCliPath;
+	const entryPath = runtime === "bun" ? srcCliPath : npmCliPath;
 	if (!existsSync(entryPath)) {
 		throw new Error(`CLI entrypoint not found: ${entryPath}`);
 	}

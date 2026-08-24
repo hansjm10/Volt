@@ -69,6 +69,7 @@ describe("control protocol framing", () => {
 			},
 			{ type: "pair_cancel", id: "6b", requestId: "pair-1" },
 			{ type: "clients_list", id: "7" },
+			{ type: "relay_credential_revoke", id: "7b" },
 			{ type: "client_revoke", id: "8", clientNodeId: "n-1" },
 			{ type: "client_approve_repair", id: "8b", clientNodeId: "n-1" },
 			{ type: "workspace_register", id: "9", name: "volt", path: "/tmp/volt" },
@@ -96,6 +97,7 @@ describe("control protocol framing", () => {
 				sessionId: "s-1",
 				notification: {
 					eventId: "plan:s-1:run-1:ready",
+					hostNodeId: "a".repeat(64),
 					kind: "plan_ready",
 					title: "Your plan is ready",
 					body: "Open Volt to review and approve it.",
@@ -224,6 +226,7 @@ describe("control protocol framing", () => {
 			sessionId: "s-1",
 			notification: {
 				eventId: "review:one:completed",
+				hostNodeId: "a".repeat(64),
 				kind: "review_completed",
 				title: "Your review is ready",
 				body: "PR #151 completed with 4 findings.",
@@ -244,6 +247,7 @@ describe("control protocol framing", () => {
 			{ ...reviewNotificationRequest.notification, body: "Open /Users/private/review.diff" },
 			{ ...reviewNotificationRequest.notification, workspaceName: "private/path" },
 			{ ...reviewNotificationRequest.notification, workflowId: "w".repeat(129) },
+			{ ...reviewNotificationRequest.notification, hostNodeId: "A".repeat(64) },
 		]) {
 			expect(isControlRequest({ ...reviewNotificationRequest, notification })).toBe(false);
 		}

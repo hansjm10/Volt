@@ -104,6 +104,7 @@ describe("Iroh remote RPC grants", () => {
 		expect(getIrohRemoteRpcCommandCapabilities({ type: "get_transcript_entry_text" })).toEqual([
 			"conversation.observe.v1",
 		]);
+		expect(getIrohRemoteRpcCommandCapabilities({ type: "get_subscription_usage" })).toEqual(["host.manage.v1"]);
 		expect(getIrohRemoteRpcCommandCapabilities({ type: "set_model", persistDefault: false })).toEqual([
 			"model.select.v1",
 		]);
@@ -242,6 +243,28 @@ describe("Iroh remote RPC grants", () => {
 				createIrohRemotePresetAccess("coding").rpcGrant,
 			),
 		).toMatchObject({ allowed: true });
+		expect(
+			getIrohRemoteRpcFilterResult(
+				JSON.stringify({ id: "usage-allowed", type: "get_subscription_usage" }),
+				createIrohRemotePresetAccess("coding").rpcGrant,
+			),
+		).toEqual({
+			allowed: true,
+			command: { id: "usage-allowed", type: "get_subscription_usage" },
+		});
+		expect(
+			getIrohRemoteRpcFilterResult(
+				JSON.stringify({ id: "usage-denied", type: "get_subscription_usage" }),
+				observeOnly,
+			),
+		).toMatchObject({
+			allowed: false,
+			response: {
+				id: "usage-denied",
+				command: "get_subscription_usage",
+				error: { code: "rpc_capability_denied", requiredCapability: "host.manage.v1" },
+			},
+		});
 
 		const unsupported = getIrohRemoteRpcFilterResult(
 			JSON.stringify({ id: "2", type: "local_only_command" }),

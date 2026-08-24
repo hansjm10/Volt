@@ -16,6 +16,7 @@ import {
 	modelsAreEqual,
 	type OAuthProviderId,
 	type OAuthSelectPrompt,
+	type SubscriptionUsageError,
 } from "@hansjm10/volt-ai";
 import type {
 	AutocompleteItem,
@@ -144,6 +145,7 @@ import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../cor
 import { getDefaultSessionDir, type SessionContext, SessionManager } from "../../core/session-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
+import { SubscriptionUsageService } from "../../core/subscription-usage.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
@@ -670,6 +672,7 @@ export class InteractiveMode {
 		void this.handleRightClickPaste();
 	};
 	private autoTrustOnReloadCwd: string | undefined;
+	private readonly subscriptionUsageService = new SubscriptionUsageService();
 
 	// Convenience accessors
 	private get session(): AgentSession {
@@ -2169,9 +2172,13 @@ export class InteractiveMode {
 		} satisfies IrohRemoteClientAuthorizationSuccess;
 
 		// The daemon's identity from the preamble: the phone verifies the saved
-		// host node id in the handshake response we write over the relay.
+		// host node id in the handshake response and every notification destination.
+		const hostNodeId = preamble.hostNodeId;
+		if (hostNodeId === undefined) {
+			throw new Error("Relay preamble omitted the daemon host node ID");
+		}
 		const responseContext = {
-			hostNodeId: preamble.hostNodeId,
+			hostNodeId,
 			relayMode: preamble.relayMode,
 			relayUrls: preamble.relayUrls,
 		};
@@ -2212,6 +2219,7 @@ export class InteractiveMode {
 				);
 				await runIrohRemoteRpcMode(this.runtimeHost, {
 					rpcGrant,
+					hostNodeId,
 					isRpcIngressOpen: workspaceUnregisterRetirement.isIngressOpen,
 					clientNodeId: authorizationSubset.clientNodeId,
 					stream: relayedStream,
@@ -3719,6 +3727,11 @@ export class InteractiveMode {
 			if (text === "/session") {
 				this.handleSessionCommand();
 				this.editor.setText("");
+				return;
+			}
+			if (text === "/usage") {
+				this.editor.setText("");
+				await this.handleUsageCommand();
 				return;
 			}
 			if (text === "/lsp" || text.startsWith("/lsp ")) {
@@ -8093,6 +8106,80 @@ export class InteractiveMode {
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private formatSubscriptionUsageError(error: SubscriptionUsageError): string {
+		switch (error.code) {
+			case "unauthorized":
+				return "Authentication failed. Run /login to reconnect this subscription.";
+			case "rate_limited":
+				return "Usage status is rate limited. Try again later.";
+			case "timeout":
+				return "Usage status request timed out.";
+			case "malformed_response":
+				return "Usage status returned an unsupported response.";
+			case "unavailable":
+				return "Usage status is temporarily unavailable.";
+		}
+	}
+
+	private formatSubscriptionPlan(plan: string): string {
+		return plan
+			.split(/[_-]+/)
+			.filter(Boolean)
+			.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+			.join(" ");
+	}
+
+	private formatRemainingPercent(usedPercent: number): string {
+		const remaining = Math.max(0, 100 - usedPercent);
+		return Number.isInteger(remaining) ? remaining.toFixed(0) : remaining.toFixed(1);
+	}
+
+	private async handleUsageCommand(): Promise<void> {
+		const report = await this.subscriptionUsageService.fetch(
+			this.session.modelRegistry.authStorage,
+			this.session.model?.provider,
+		);
+		if (report.status === "no_subscription") {
+			this.showStatus("No subscription login is configured. Use /login to connect a supported provider.");
+			return;
+		}
+		if (report.status === "unsupported") {
+			this.showStatus("Stored subscription credentials do not expose quota usage in Volt.");
+			return;
+		}
+
+		const sections: string[] = [];
+		for (const provider of report.providers) {
+			const providerName = this.session.modelRegistry.getProviderDisplayName(provider.providerId);
+			if (provider.result.status === "error") {
+				sections.push(
+					`${theme.bold(providerName)}\n  ${theme.fg("warning", this.formatSubscriptionUsageError(provider.result.error))}`,
+				);
+				continue;
+			}
+
+			const snapshot = provider.result.snapshot;
+			const heading = snapshot.plan
+				? `${providerName} · ${this.formatSubscriptionPlan(snapshot.plan)}`
+				: providerName;
+			const lines = snapshot.limits.map((limit) => {
+				let line = `${theme.fg("dim", `${limit.label}:`)} ${this.formatRemainingPercent(limit.usedPercent)}% remaining`;
+				if (limit.resetsAt !== undefined) {
+					line += ` · resets ${new Date(limit.resetsAt).toLocaleString()}`;
+				}
+				if (limit.limitReached) {
+					line += ` · ${theme.fg("warning", "limit reached")}`;
+				}
+				return `  ${line}`;
+			});
+			sections.push(`${theme.bold(heading)}\n${lines.join("\n")}`);
+		}
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(`${theme.bold("Subscription Usage")}\n\n${sections.join("\n\n")}`, 1, 0));
 		this.ui.requestRender();
 	}
 

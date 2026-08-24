@@ -12,6 +12,8 @@ import {
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	type OAuthProviderId,
+	type SubscriptionUsageFetchOptions,
+	type SubscriptionUsageResult,
 } from "@hansjm10/volt-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@hansjm10/volt-ai/oauth";
 import { existsSync, lstatSync, readFileSync } from "fs";
@@ -493,9 +495,7 @@ export class AuthStorage {
 	 * Refresh OAuth token with backend locking to prevent race conditions.
 	 * Multiple volt instances may try to refresh simultaneously when tokens expire.
 	 */
-	private async refreshOAuthTokenWithLock(
-		providerId: OAuthProviderId,
-	): Promise<{ apiKey: string; newCredentials: OAuthCredentials } | null> {
+	private async refreshOAuthTokenWithLock(providerId: OAuthProviderId): Promise<OAuthCredentials | null> {
 		const provider = getOAuthProvider(providerId);
 		if (!provider) {
 			return null;
@@ -512,7 +512,7 @@ export class AuthStorage {
 			}
 
 			if (Date.now() < cred.expires) {
-				return { result: { apiKey: provider.getApiKey(cred), newCredentials: cred } };
+				return { result: cred };
 			}
 
 			const oauthCreds: Record<string, OAuthCredentials> = {};
@@ -533,10 +533,32 @@ export class AuthStorage {
 			};
 			this.data = merged;
 			this.loadError = null;
-			return { result: refreshed, next: JSON.stringify(merged, null, 2) };
+			return { result: refreshed.newCredentials, next: JSON.stringify(merged, null, 2) };
 		});
 
 		return result;
+	}
+
+	private async resolveUsableOAuthCredentials(providerId: OAuthProviderId): Promise<OAuthCredentials | undefined> {
+		const credential = this.data[providerId];
+		if (credential?.type !== "oauth" || !getOAuthProvider(providerId)) {
+			return undefined;
+		}
+
+		if (Date.now() < credential.expires) {
+			return credential;
+		}
+
+		try {
+			return (await this.refreshOAuthTokenWithLock(providerId)) ?? undefined;
+		} catch (error) {
+			this.recordError(error);
+			this.reload();
+			const updatedCredential = this.data[providerId];
+			return updatedCredential?.type === "oauth" && Date.now() < updatedCredential.expires
+				? updatedCredential
+				: undefined;
+		}
 	}
 
 	/**
@@ -563,40 +585,8 @@ export class AuthStorage {
 
 		if (cred?.type === "oauth") {
 			const provider = getOAuthProvider(providerId);
-			if (!provider) {
-				// Unknown OAuth provider, can't get API key
-				return undefined;
-			}
-
-			// Check if token needs refresh
-			const needsRefresh = Date.now() >= cred.expires;
-
-			if (needsRefresh) {
-				// Use locked refresh to prevent race conditions
-				try {
-					const result = await this.refreshOAuthTokenWithLock(providerId);
-					if (result) {
-						return result.apiKey;
-					}
-				} catch (error) {
-					this.recordError(error);
-					// Refresh failed - re-read file to check if another instance succeeded
-					this.reload();
-					const updatedCred = this.data[providerId];
-
-					if (updatedCred?.type === "oauth" && Date.now() < updatedCred.expires) {
-						// Another instance refreshed successfully, use those credentials
-						return provider.getApiKey(updatedCred);
-					}
-
-					// Refresh truly failed - return undefined so model discovery skips this provider
-					// User can /login to re-authenticate (credentials preserved for retry)
-					return undefined;
-				}
-			} else {
-				// Token not expired, use current access token
-				return provider.getApiKey(cred);
-			}
+			const credentials = await this.resolveUsableOAuthCredentials(providerId);
+			return provider && credentials ? provider.getApiKey(credentials) : undefined;
 		}
 
 		// Fall back to environment variable
@@ -609,6 +599,31 @@ export class AuthStorage {
 		}
 
 		return undefined;
+	}
+
+	/**
+	 * Fetch normalized subscription usage using stored OAuth credentials only.
+	 * Returns undefined when no stored OAuth credential or provider capability exists.
+	 */
+	async fetchSubscriptionUsage(
+		providerId: OAuthProviderId,
+		options: SubscriptionUsageFetchOptions = {},
+	): Promise<SubscriptionUsageResult | undefined> {
+		const credential = this.data[providerId];
+		const provider = getOAuthProvider(providerId);
+		if (credential?.type !== "oauth" || !provider?.fetchSubscriptionUsage) {
+			return undefined;
+		}
+
+		const credentials = await this.resolveUsableOAuthCredentials(providerId);
+		if (!credentials) {
+			return {
+				status: "error",
+				error: { code: "unauthorized", message: "Subscription credentials could not be refreshed." },
+			};
+		}
+
+		return provider.fetchSubscriptionUsage(credentials, options);
 	}
 
 	/**

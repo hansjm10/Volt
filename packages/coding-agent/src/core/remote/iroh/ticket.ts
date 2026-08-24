@@ -10,11 +10,18 @@ import {
 	isIrohRemoteRelayUrls,
 } from "./protocol.ts";
 
+export interface IrohRemoteRelayCredentialClaim {
+	claimId: string;
+	serviceUrl: string;
+}
+
 export interface IrohRemoteTicketPayload {
 	alpn: typeof IROH_REMOTE_ALPN;
 	expiresAt?: number;
 	irohTicket: string;
 	nodeId?: string;
+	/** One-time broker claim. Sanitized reconnect tickets always remove it. */
+	relayCredentialClaim?: IrohRemoteRelayCredentialClaim;
 	relayMode?: IrohRemoteRelayMode;
 	/** Relay server URLs the client should use; required when relayMode is "production". */
 	relayUrls?: string[];
@@ -236,6 +243,13 @@ export function parseIrohRemoteTicketPayload(value: unknown): IrohRemoteTicketPa
 		throw new Error("ticket relayMode production requires relayUrls");
 	}
 	const relayAuthToken = expectOptionalString(payload.relayAuthToken, "ticket relayAuthToken");
+	const relayCredentialClaim = parseOptionalRelayCredentialClaim(payload.relayCredentialClaim);
+	if (relayCredentialClaim !== undefined && relayModeValue !== "production") {
+		throw new Error("ticket relay credential claim requires production relay mode");
+	}
+	if (relayCredentialClaim !== undefined && relayAuthToken !== undefined) {
+		throw new Error("ticket relay credential claim cannot include a host relay token");
+	}
 	const secret = expectOptionalString(payload.secret, "ticket secret");
 	const workspace = expectString(payload.workspace, "ticket workspace");
 
@@ -244,6 +258,7 @@ export function parseIrohRemoteTicketPayload(value: unknown): IrohRemoteTicketPa
 		expiresAt,
 		irohTicket,
 		nodeId,
+		...(relayCredentialClaim === undefined ? {} : { relayCredentialClaim }),
 		relayMode: relayModeValue,
 		relayUrls: relayUrlsValue,
 		relayAuthToken,
@@ -302,6 +317,23 @@ export function assertIrohRemoteTicketPayloadHostIdentity(
 			`expected ${expectedHostNodeId}, got ${payload.nodeId}`,
 		);
 	}
+}
+
+function parseOptionalRelayCredentialClaim(value: unknown): IrohRemoteRelayCredentialClaim | undefined {
+	if (value === undefined) return undefined;
+	const record = expectRecord(value, "ticket relayCredentialClaim");
+	const keys = Object.keys(record).sort();
+	if (keys.length !== 2 || keys[0] !== "claimId" || keys[1] !== "serviceUrl") {
+		throw new Error("ticket relayCredentialClaim has unexpected fields");
+	}
+	const claimId = expectString(record.claimId, "ticket relayCredentialClaim claimId");
+	if (!/^[A-Za-z0-9_-]{24}$/.test(claimId)) {
+		throw new Error("ticket relayCredentialClaim claimId is invalid");
+	}
+	return {
+		claimId,
+		serviceUrl: expectString(record.serviceUrl, "ticket relayCredentialClaim serviceUrl"),
+	};
 }
 
 function expectRecord(value: unknown, label: string): Record<string, unknown> {

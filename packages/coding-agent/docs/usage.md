@@ -45,6 +45,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session file, ID, messages, tokens, and cost |
+| `/usage` | Show remaining subscription quota and local reset times |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
@@ -58,6 +59,8 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/remote` | Manage daemon status, pairing, devices, workspaces, leases, and headless policy |
 | `/changelog` | Display version history |
 | `/quit` | Quit volt |
+
+`/usage` fetches quota status on demand for stored Anthropic Claude and OpenAI ChatGPT/Codex subscription logins. API keys are not queried. The active eligible provider is shown first, provider failures are reported independently, and results are cached briefly without background polling. Headless and paired Iroh clients can request the same normalized data with `get_subscription_usage`; remote access requires `host.manage.v1` and excludes credentials, account identity, and raw provider payloads.
 
 Fast mode requests premium low-latency inference capacity on supported OpenAI and OpenAI Codex models. Enabling it may cost more. It is session-scoped and independent of the thinking level; the footer shows `fast` while it is active. Review workflows inherit the current Fast setting for review inference and carry it into the fresh findings session.
 
@@ -364,7 +367,7 @@ Security and support boundary:
 - Remote push notifications use the managed Volt push relay by default. The mobile app registers its FCM token with the relay and sends the host target-scoped relay credentials over Iroh; the host does not store raw FCM tokens. Use `VOLT_PUSH_RELAY_URL` only for a custom relay, and `VOLT_PUSH_RELAY_AUTH_TOKEN` only when that custom relay requires shared bearer auth.
 - The daemon defaults to Iroh relay mode `production`, using the Volt-operated relay fleet so saved-host reconnects survive restarts and network changes. Set `VOLT_IROH_RELAY_MODE` to `disabled` for LAN-only connections, `development` for the public n0 development relays, or `production`; set `VOLT_IROH_RELAY_URLS` to use custom production relay origins.
 - `volt remote pair` creates pairing tickets with the daemon's live relay mode; it cannot change a running daemon's relay mode.
-- The daemon requires a Node.js npm install or source checkout with optional `@number0/iroh` available for the platform. The pinned adapter supports macOS arm64, Linux x64/arm64 (glibc and musl), and Windows x64/arm64; it does not ship a Darwin x64 binding, so Intel macOS npm installs are local CLI/TUI only. Standalone Node SEA builds reject `volt daemon` because the native Iroh adapter is intentionally not bundled.
+- The daemon requires a Node.js npm install or source checkout with optional `@hansjm10/volt-iroh` available for the platform. The pinned adapter supports macOS arm64, Linux x64/arm64 (glibc and musl), and Windows x64/arm64; it does not ship a Darwin x64 binding, so Intel macOS npm installs are local CLI/TUI only. Standalone Node SEA builds reject `volt daemon` because the native Iroh adapter is intentionally not bundled.
 - Known preview limitations: daemon exit is not durable active-work recovery, idle detached runtime retention is time-limited, very large hidden-agent sets may need future host/app resource controls, per-workspace client grants are deferred, remote workspace creation/rename/path browsing stays local to the desktop host, and production relay/discovery should be validated in the target cross-network environment.
 
 See [Iroh remote protocol v1](iroh-remote-protocol.md), [Iroh remote access design](https://github.com/volt-hq/Volt/blob/main/packages/coding-agent/docs/iroh-remote-access-design.md), and [Security](security.md#remote-access-over-iroh-preview).

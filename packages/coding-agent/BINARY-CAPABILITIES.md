@@ -4,7 +4,7 @@ The prebuilt executable is a local Volt CLI/TUI distribution built as a
 Node.js 22.23.1 Single Executable Application. It supports local interactive
 and print-mode agent sessions.
 
-It does **not** include the optional native `@number0/iroh` adapter and cannot
+It does **not** include the optional native `@hansjm10/volt-iroh` adapter and cannot
 run `volt daemon` or provide remote/iOS access. Install
 `@hansjm10/volt-coding-agent` through npm for daemon and remote support.
 

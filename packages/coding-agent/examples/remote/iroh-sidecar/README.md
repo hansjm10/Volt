@@ -18,7 +18,7 @@ For direct demo-client commands from this directory after the repository root or
 npm install --ignore-scripts
 ```
 
-`@number0/iroh` is an optional dependency of `@hansjm10/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos. Standalone Node SEA builds reject `volt remote host` because the optional native Iroh adapter is intentionally not bundled; use a Node.js npm install or source checkout.
+`@hansjm10/volt-iroh` is an optional dependency of `@hansjm10/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos. Standalone Node SEA builds reject `volt remote host` because the optional native Iroh adapter is intentionally not bundled; use a Node.js npm install or source checkout.
 
 ## Root scripts
 

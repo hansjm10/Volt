@@ -17,6 +17,7 @@ const MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES = 512;
 const MAX_NOTIFICATION_KIND_UTF8_BYTES = 64;
 const NOTIFICATION_UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 const NOTIFICATION_PATH_SEPARATOR = /[/\\]/u;
+const NOTIFICATION_HOST_NODE_ID = /^[0-9a-f]{64}$/u;
 const NOTIFICATION_KINDS = new Set([
 	"conversation_completed",
 	"plan_ready",
@@ -164,6 +165,7 @@ function parseNotification(body) {
 			"pushTargetId",
 			"pushTargetAuthToken",
 			"eventId",
+			"hostNodeId",
 			"kind",
 			"title",
 			"body",
@@ -175,6 +177,7 @@ function parseNotification(body) {
 		"notification",
 	);
 	const eventId = expectNotificationMetadata(body.eventId, "eventId", MAX_NOTIFICATION_EVENT_ID_UTF8_BYTES);
+	const hostNodeId = expectNotificationHostNodeId(body.hostNodeId, "hostNodeId");
 	const kind = expectNotificationMetadata(body.kind, "kind", MAX_NOTIFICATION_KIND_UTF8_BYTES);
 	if (!NOTIFICATION_KINDS.has(kind)) {
 		throw new RequestError(400, "kind_is_unsupported");
@@ -197,8 +200,13 @@ function parseNotification(body) {
 	) {
 		throw new RequestError(400, "notification_navigation_metadata_mismatch");
 	}
-	const data = expectStringRecord(body.data, "data", { maxEntries: 8, maxKeyLength: 64, maxValueLength: 512 });
-	expectAllowedKeys(data, ["eventId", "kind", "sessionId", "workspaceName", "planId", "workflowId"], "data");
+	const data = expectStringRecord(body.data, "data", { maxEntries: 9, maxKeyLength: 64, maxValueLength: 512 });
+	expectAllowedKeys(
+		data,
+		["eventId", "hostNodeId", "kind", "sessionId", "workspaceName", "planId", "workflowId"],
+		"data",
+	);
+	const dataHostNodeId = expectNotificationHostNodeId(data.hostNodeId, "data_hostNodeId");
 	const sessionId = expectOptionalNotificationMetadata(
 		data.sessionId,
 		"sessionId",
@@ -221,6 +229,7 @@ function parseNotification(body) {
 	);
 	if (
 		data.eventId !== eventId ||
+		dataHostNodeId !== hostNodeId ||
 		data.kind !== kind ||
 		dataWorkspaceName !== workspaceName ||
 		dataPlanId !== planId ||
@@ -232,6 +241,7 @@ function parseNotification(body) {
 		body: expectNotificationText(body.body, "body", MAX_NOTIFICATION_BODY_UTF8_BYTES),
 		data: {
 			eventId,
+			hostNodeId,
 			kind,
 			...(sessionId === undefined ? {} : { sessionId }),
 			...(workspaceName === undefined ? {} : { workspaceName }),
@@ -239,6 +249,7 @@ function parseNotification(body) {
 			...(workflowId === undefined ? {} : { workflowId }),
 		},
 		eventId,
+		hostNodeId,
 		kind,
 		pushTargetAuthToken: expectString(body.pushTargetAuthToken, "pushTargetAuthToken", 32, 128),
 		pushTargetId: expectString(body.pushTargetId, "pushTargetId", 16, 96),
@@ -433,6 +444,14 @@ function expectNotificationMetadata(value, label, maximumByteLength) {
 function expectOptionalNotificationMetadata(value, label, maximumByteLength) {
 	if (value === undefined) return undefined;
 	return expectNotificationMetadata(value, label, maximumByteLength);
+}
+
+function expectNotificationHostNodeId(value, label) {
+	const hostNodeId = expectNotificationMetadata(value, label, MAX_NOTIFICATION_METADATA_UTF8_BYTES);
+	if (!NOTIFICATION_HOST_NODE_ID.test(hostNodeId)) {
+		throw new RequestError(400, `${label}_has_invalid_notification_host_identity`);
+	}
+	return hostNodeId;
 }
 
 function expectBoolean(value, label) {

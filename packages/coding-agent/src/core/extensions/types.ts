@@ -29,6 +29,8 @@ import type {
 	OAuthLoginCallbacks,
 	PromptCacheMetadata,
 	SimpleStreamOptions,
+	SubscriptionUsageFetchOptions,
+	SubscriptionUsageResult,
 	TextContent,
 	ToolResultMessage,
 } from "@hansjm10/volt-ai";
@@ -1449,6 +1451,11 @@ export interface ProviderConfig {
 		refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
 		/** Convert credentials to API key string for the provider. */
 		getApiKey(credentials: OAuthCredentials): string;
+		/** Fetch provider-neutral subscription quota usage for `/usage`. */
+		fetchSubscriptionUsage?(
+			credentials: OAuthCredentials,
+			options?: SubscriptionUsageFetchOptions,
+		): Promise<SubscriptionUsageResult>;
 		/** Optional: modify models for this provider (e.g., update baseUrl based on credentials). */
 		modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
 	};

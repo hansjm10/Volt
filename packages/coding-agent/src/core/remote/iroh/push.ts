@@ -25,6 +25,7 @@ export const MAX_IROH_REMOTE_NOTIFICATION_KIND_UTF8_BYTES = 64;
 const NOTIFICATION_UNSAFE_CHARACTERS = /[\p{Cc}\p{Cf}\p{Cs}]/gu;
 const NOTIFICATION_UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 const NOTIFICATION_PATH_SEPARATOR = /[/\\]/u;
+const IROH_REMOTE_NOTIFICATION_HOST_NODE_ID = /^[0-9a-f]{64}$/u;
 const IROH_REMOTE_NOTIFICATION_KINDS = new Set([
 	"conversation_completed",
 	"plan_ready",
@@ -38,6 +39,7 @@ export type IrohRemotePushTargetRegistrationResult = RpcRegisterPushTargetRespon
 
 export interface IrohRemotePushNotificationIntent {
 	eventId: string;
+	hostNodeId: string;
 	kind: string;
 	title: string;
 	body: string;
@@ -111,6 +113,11 @@ export function sanitizeIrohRemoteNotificationMetadata(
 	return value;
 }
 
+export function sanitizeIrohRemoteNotificationHostNodeId(value: string | undefined): string | undefined {
+	const hostNodeId = sanitizeIrohRemoteNotificationMetadata(value);
+	return hostNodeId && IROH_REMOTE_NOTIFICATION_HOST_NODE_ID.test(hostNodeId) ? hostNodeId : undefined;
+}
+
 /** Normalize a trusted notification intent before either push or JSONL delivery. */
 export function sanitizeIrohRemotePushNotificationIntent(
 	value: IrohRemotePushNotificationIntent,
@@ -119,6 +126,7 @@ export function sanitizeIrohRemotePushNotificationIntent(
 		value.eventId,
 		MAX_IROH_REMOTE_NOTIFICATION_EVENT_ID_UTF8_BYTES,
 	);
+	const hostNodeId = sanitizeIrohRemoteNotificationHostNodeId(value.hostNodeId);
 	const kind = sanitizeIrohRemoteNotificationMetadata(value.kind, MAX_IROH_REMOTE_NOTIFICATION_KIND_UTF8_BYTES);
 	const title = sanitizeIrohRemoteNotificationText(value.title, MAX_IROH_REMOTE_NOTIFICATION_TITLE_UTF8_BYTES);
 	const body = sanitizeIrohRemoteNotificationText(value.body, MAX_IROH_REMOTE_NOTIFICATION_BODY_UTF8_BYTES);
@@ -128,6 +136,7 @@ export function sanitizeIrohRemotePushNotificationIntent(
 	const workflowId = sanitizeIrohRemoteNotificationMetadata(value.workflowId);
 	if (
 		!eventId ||
+		!hostNodeId ||
 		!kind ||
 		!IROH_REMOTE_NOTIFICATION_KINDS.has(kind) ||
 		!title ||
@@ -144,6 +153,7 @@ export function sanitizeIrohRemotePushNotificationIntent(
 	}
 	return {
 		eventId,
+		hostNodeId,
 		kind,
 		title,
 		body,
@@ -163,9 +173,20 @@ export function parseIrohRemotePushNotificationIntent(value: unknown): IrohRemot
 	if (
 		!isRecord(value) ||
 		!Object.keys(value).every((key) =>
-			["eventId", "kind", "title", "body", "sessionId", "workspaceName", "planId", "workflowId"].includes(key),
+			[
+				"eventId",
+				"hostNodeId",
+				"kind",
+				"title",
+				"body",
+				"sessionId",
+				"workspaceName",
+				"planId",
+				"workflowId",
+			].includes(key),
 		) ||
 		typeof value.eventId !== "string" ||
+		typeof value.hostNodeId !== "string" ||
 		typeof value.kind !== "string" ||
 		typeof value.title !== "string" ||
 		typeof value.body !== "string" ||
@@ -192,6 +213,7 @@ export interface IrohRemotePushRelayNotificationRequest {
 	pushTargetId: string;
 	pushTargetAuthToken: string;
 	eventId: string;
+	hostNodeId: string;
 	kind: string;
 	title: string;
 	body: string;
@@ -200,6 +222,7 @@ export interface IrohRemotePushRelayNotificationRequest {
 	workflowId?: string;
 	data: {
 		eventId: string;
+		hostNodeId: string;
 		kind: string;
 		sessionId?: string;
 		workspaceName?: string;
@@ -421,6 +444,7 @@ function createRelayNotificationBody(
 		pushTargetId: request.pushTargetId,
 		pushTargetAuthToken: request.pushTargetAuthToken,
 		eventId: request.eventId,
+		hostNodeId: request.hostNodeId,
 		kind: request.kind,
 		title: request.title,
 		body: request.body,
@@ -765,6 +789,7 @@ function createRelayNotificationRequest(
 		pushTargetId: pushTarget.id,
 		pushTargetAuthToken: pushTarget.pushTargetAuthToken,
 		eventId: notification.eventId,
+		hostNodeId: notification.hostNodeId,
 		kind: notification.kind,
 		title: notification.title,
 		body: notification.body,
@@ -773,6 +798,7 @@ function createRelayNotificationRequest(
 		...(notification.workflowId === undefined ? {} : { workflowId: notification.workflowId }),
 		data: {
 			eventId: notification.eventId,
+			hostNodeId: notification.hostNodeId,
 			kind: notification.kind,
 			...(notification.sessionId === undefined ? {} : { sessionId: notification.sessionId }),
 			...(notification.workspaceName === undefined ? {} : { workspaceName: notification.workspaceName }),

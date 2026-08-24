@@ -920,6 +920,7 @@ export {
 	type RpcSubagentEvent,
 	type RpcSubagentSourceInfo,
 	type RpcSubagentStartResponse,
+	type RpcSubscriptionUsageReport,
 	type RpcTranscriptItem,
 	type RpcTranscriptResponse,
 	type RpcTranscriptToolStatus,

@@ -2,8 +2,8 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-feature(web-fetch): Agents can now use `web_fetch` to retrieve approved public URLs as bounded readable text after `web_search` or a user-provided link.
+feature(web-fetch): Agents can now use [`web_fetch`](https://volt-cli.dev/docs/usage/#tool-options) to retrieve approved public URLs as bounded readable text after `web_search` or a user-provided link.
 
-Only URLs already present in the conversation as user input or trusted tool output are eligible; model-constructed and delegated-task URLs are refused. Requests to non-public addresses are rejected before and after every redirect, response buffering and extracted metadata are bounded, and cancellation remains effective during hostname resolution.
+Only links supplied by the user or returned by approved tools are eligible. Non-public destinations are rejected before and after redirects, and response size, parsing work, metadata, and DNS cancellation remain bounded.
 
-HTML extraction preserves code formatting while removing navigation and footer chrome. Parsing and truncation stay within fixed resource limits, including for boundary-heavy pages and alternate IPv6 address spellings.
+Readable HTML extraction removes navigation and footer chrome while preserving code formatting.

@@ -51,6 +51,7 @@ under the MIT License.
   - [Programmatic OAuth](#programmatic-oauth)
   - [Login Flow Example](#login-flow-example)
   - [Using OAuth Tokens](#using-oauth-tokens)
+  - [Subscription Usage](#subscription-usage)
   - [Provider Notes](#provider-notes)
 - [License](#license)
 
@@ -1351,6 +1352,34 @@ const response = await complete(model, {
   messages: [{ role: 'user', content: 'Hello!' }]
 }, { apiKey: result.apiKey });
 ```
+
+### Subscription Usage
+
+OAuth providers can optionally expose normalized subscription quota usage through `fetchSubscriptionUsage`. Anthropic Claude and OpenAI ChatGPT/Codex implement this capability; GitHub Copilot does not currently expose it.
+
+```typescript
+import { getOAuthProvider } from '@hansjm10/volt-ai/oauth';
+
+const provider = getOAuthProvider('anthropic');
+if (!provider?.fetchSubscriptionUsage) {
+  throw new Error('Subscription usage is not supported');
+}
+
+const result = await provider.fetchSubscriptionUsage(credentials, {
+  signal: AbortSignal.timeout(10_000),
+});
+
+if (result.status === 'success') {
+  for (const limit of result.snapshot.limits) {
+    const remainingPercent = Math.max(0, 100 - limit.usedPercent);
+    console.log(limit.label, remainingPercent, limit.resetsAt);
+  }
+} else {
+  console.error(result.error.code, result.error.message);
+}
+```
+
+The result contains only provider-neutral quota fields. `fetchedAt` and `resetsAt` are epoch milliseconds, and `usedPercent` is clamped to 0–100. Provider payloads, account identity, credits, and provider-specific spend controls are not returned. This method does not store or refresh credentials; callers must use current OAuth credentials and persist refreshed credentials separately.
 
 ### Provider Notes
 

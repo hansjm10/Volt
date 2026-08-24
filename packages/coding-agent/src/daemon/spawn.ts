@@ -105,7 +105,11 @@ export function resolveDaemonCliInvocation(): { nodeArgs: string[]; entry: strin
 	if (existsSync(sourceEntry)) {
 		return { nodeArgs: [...DAEMON_NODE_ARGS, "--conditions", "volt-source"], entry: sourceEntry };
 	}
-	return { nodeArgs: [...DAEMON_NODE_ARGS], entry: join(packageDir, "dist", "cli.js") };
+	const bundledEntry = join(packageDir, "dist", "core", "npm", "cli.js");
+	return {
+		nodeArgs: [...DAEMON_NODE_ARGS],
+		entry: existsSync(bundledEntry) ? bundledEntry : join(packageDir, "dist", "cli.js"),
+	};
 }
 
 export interface SpawnDaemonResult {

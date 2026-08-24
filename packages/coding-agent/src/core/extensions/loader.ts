@@ -20,7 +20,7 @@ import { createJiti } from "jiti/static";
 import * as _bundledTypebox from "typebox";
 import * as _bundledTypeboxCompile from "typebox/compile";
 import * as _bundledTypeboxValue from "typebox/value";
-import { CONFIG_DIR_NAME, getAgentDir, isStandaloneBinary } from "../../config.ts";
+import { CONFIG_DIR_NAME, getAgentDir, isBundledCli, isStandaloneBinary } from "../../config.ts";
 // NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
 // avoiding a circular dependency. Extensions can import from @hansjm10/volt-coding-agent.
 import * as _bundledVoltCodingAgent from "../../index.ts";
@@ -392,7 +392,9 @@ async function loadExtensionModule(extensionPath: string) {
 		// In a standalone binary: use virtualModules for bundled packages (no filesystem resolution)
 		// Also disable tryNative so jiti handles ALL imports (not just the entry point)
 		// In Node.js/dev: use aliases to resolve to node_modules paths
-		...(isStandaloneBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
+		...(isStandaloneBinary || isBundledCli
+			? { virtualModules: VIRTUAL_MODULES, tryNative: false }
+			: { alias: getAliases() }),
 	});
 
 	const module = await jiti.import(extensionPath, { default: true });

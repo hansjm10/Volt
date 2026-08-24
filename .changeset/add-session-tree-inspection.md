@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-feature(remote): Added bounded session-tree inspection for branch-aware clients. ([#240](https://github.com/volt-hq/Volt/issues/240))
+improvement(remote): Remote clients can now inspect session branches without loading the full conversation tree. ([#240](https://github.com/volt-hq/Volt/issues/240))

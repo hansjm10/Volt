@@ -69,7 +69,7 @@ completed.
   [AGENTS.md](AGENTS.md#releasing). Then use an isolated
   `VOLT_CODING_AGENT_DIR` to start `volt daemon`, verify `volt daemon status
   --json`, register a disposable workspace, and stop that isolated daemon.
-  Confirm the optional native `@number0/iroh` adapter loads on macOS arm64,
+  Confirm the optional native `@hansjm10/volt-iroh` adapter loads on macOS arm64,
   Linux x64/arm64 (glibc and musl), and Windows x64/arm64. The pinned adapter
   has no Darwin x64 binding, so Intel macOS npm installs remain explicitly
   local CLI/TUI only. Standalone Node SEA binaries intentionally exclude Iroh

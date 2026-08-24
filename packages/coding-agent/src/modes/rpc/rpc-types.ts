@@ -68,6 +68,7 @@ export type {
 	RpcSubagentDefinitionSource,
 	RpcSubagentSourceInfo,
 	RpcSubagentStartResponse,
+	RpcSubscriptionUsageReport,
 	RpcTranscriptItem,
 	RpcTranscriptResponse,
 	RpcTranscriptToolStatus,

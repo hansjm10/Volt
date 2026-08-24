@@ -98,6 +98,7 @@ export const RPC_COMMAND_SCHEMAS = {
 	abort: commandSchema("abort", {}),
 	new_session: commandSchema("new_session", {
 		parentSession: Type.Optional(Type.String()),
+		preserveReviewRunId: Type.Optional(RpcConversationIdentifierSchema),
 	}),
 	set_agent_mode: commandSchema("set_agent_mode", {
 		mode: RpcAgentModeSchema,
@@ -339,6 +340,7 @@ export const RPC_COMMAND_SCHEMAS = {
 
 	// Session
 	get_session_stats: commandSchema("get_session_stats", {}),
+	get_subscription_usage: commandSchema("get_subscription_usage", {}),
 	list_sessions: commandSchema("list_sessions", {
 		limit: Type.Optional(Type.Integer({ minimum: 1, "x-volt-expected": "be a positive integer" })),
 		cursor: Type.Optional(Type.String({ minLength: 1, "x-volt-expected": "be a non-empty string" })),

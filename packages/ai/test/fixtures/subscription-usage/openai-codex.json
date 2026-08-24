@@ -1,0 +1,55 @@
+{
+  "plan_type": "plus",
+  "rate_limit": {
+    "allowed": false,
+    "limit_reached": true,
+    "primary_window": {
+      "used_percent": 125,
+      "limit_window_seconds": 18000,
+      "reset_after_seconds": 600,
+      "reset_at": 1787335200
+    },
+    "secondary_window": null
+  },
+  "additional_rate_limits": [
+    {
+      "limit_name": "codex_spark",
+      "metered_feature": "codex_spark",
+      "rate_limit": {
+        "allowed": true,
+        "limit_reached": false,
+        "primary_window": {
+          "used_percent": -2,
+          "limit_window_seconds": 3600,
+          "reset_after_seconds": 120
+        },
+        "secondary_window": {
+          "used_percent": 50.5,
+          "limit_window_seconds": 604800,
+          "reset_at": 1787936400
+        }
+      }
+    },
+    {
+      "limit_name": "ignored",
+      "rate_limit": {
+        "primary_window": null,
+        "secondary_window": {
+          "reset_at": 1787936400
+        }
+      }
+    }
+  ],
+  "email": "person@example.com",
+  "account_id": "account-secret",
+  "credits": {
+    "balance": "12.34"
+  },
+  "spend_control": {
+    "reached": false,
+    "individual_limit": {
+      "limit": "100",
+      "used": "20"
+    }
+  }
+}

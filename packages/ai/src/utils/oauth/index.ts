@@ -7,8 +7,9 @@
  * - GitHub Copilot
  */
 
-// Anthropic
 export { anthropicOAuthProvider, loginAnthropic, refreshAnthropicToken } from "./anthropic.ts";
+// Anthropic
+export { fetchAnthropicSubscriptionUsage } from "./anthropic-usage.ts";
 export * from "./device-code.ts";
 // GitHub Copilot
 export {
@@ -18,7 +19,6 @@ export {
 	normalizeDomain,
 	refreshGitHubCopilotToken,
 } from "./github-copilot.ts";
-// OpenAI Codex (ChatGPT OAuth)
 export {
 	loginOpenAICodex,
 	loginOpenAICodexDeviceCode,
@@ -27,6 +27,8 @@ export {
 	openaiCodexOAuthProvider,
 	refreshOpenAICodexToken,
 } from "./openai-codex.ts";
+// OpenAI Codex (ChatGPT OAuth)
+export { fetchOpenAICodexSubscriptionUsage } from "./openai-codex-usage.ts";
 
 export * from "./types.ts";
 

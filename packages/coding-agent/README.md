@@ -156,6 +156,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session info (file, ID, messages, tokens, cost) |
+| `/usage` | Show remaining subscription quota and local reset times |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/subagents` | Inspect active or completed subagent conversations and tool flow |
 | `/trust` | Save project trust decision for future sessions (restart required) |
@@ -170,6 +171,8 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/remote` | Manage daemon status, phone pairing, devices, workspaces, leases, and policy |
 | `/changelog` | Display version history |
 | `/quit` | Quit volt |
+
+`/usage` fetches quota status on demand for stored Anthropic Claude and OpenAI ChatGPT/Codex subscription logins. It ignores API keys, shows the active subscription provider first, and keeps successful provider results visible if another provider is unavailable. Results are cached briefly; Volt does not poll in the background.
 
 Fast mode requests premium low-latency inference capacity on supported OpenAI and OpenAI Codex models. Enabling it may cost more. It is session-scoped and independent of the thinking level; the footer shows `fast` while it is active. Review workflows inherit the current Fast setting for review inference and carry it into the fresh findings session.
 
@@ -591,7 +594,7 @@ Security defaults and limitations:
 - Remote workspaces are selected by saved name, not arbitrary client-provided paths.
 - Remote sessions do not bypass project trust. Saved workspace trust is honored; otherwise project resources run untrusted.
 - Daemon files live under `~/.volt/agent/daemon/` (`state.json`, `audit.jsonl`, `voltd.log`); legacy `remote/iroh-host.json` state migrates automatically with pairings intact.
-- The daemon requires a Node.js npm package install or source checkout with optional `@number0/iroh` available for the platform. Standalone Node SEA builds reject `volt daemon` because the native Iroh adapter is intentionally not bundled.
+- The daemon requires a Node.js npm package install or source checkout with optional `@hansjm10/volt-iroh` available for the platform. Standalone Node SEA builds reject `volt daemon` because the native Iroh adapter is intentionally not bundled.
 
 See [Background daemon](docs/daemon.md), [Iroh remote protocol v1](docs/iroh-remote-protocol.md), and [Security](docs/security.md#remote-access-over-iroh-preview).
 

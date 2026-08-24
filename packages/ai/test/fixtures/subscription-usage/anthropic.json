@@ -1,0 +1,66 @@
+{
+  "five_hour": {
+    "utilization": 42.5,
+    "resets_at": "2026-08-21T18:00:00Z"
+  },
+  "seven_day": {
+    "utilization": 110,
+    "resets_at": "2026-08-25T12:30:00Z"
+  },
+  "seven_day_opus": null,
+  "seven_day_sonnet": {
+    "utilization": 12,
+    "resets_at": "2026-08-26T10:00:00Z"
+  },
+  "seven_day_oauth_apps": {
+    "utilization": 17,
+    "resets_at": null
+  },
+  "limits": [
+    {
+      "kind": "weekly_scoped",
+      "group": "weekly",
+      "percent": 68.25,
+      "resets_at": "2026-08-27T09:15:00Z",
+      "scope": {
+        "model": {
+          "id": null,
+          "display_name": "Claude Sonnet 4.6"
+        }
+      },
+      "is_active": false
+    },
+    {
+      "kind": "weekly_scoped",
+      "percent": -5,
+      "resets_at": "not-a-timestamp",
+      "scope": {
+        "model": {
+          "display_name": "Fable"
+        }
+      }
+    },
+    {
+      "kind": "weekly_scoped",
+      "scope": {
+        "model": {
+          "display_name": "Ignored"
+        }
+      }
+    }
+  ],
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 100,
+    "used_credits": 22
+  },
+  "spend": {
+    "enabled": true,
+    "used": {
+      "amount_minor": 2200,
+      "currency": "USD"
+    }
+  },
+  "user_id": "user-secret",
+  "organization_id": "org-secret"
+}

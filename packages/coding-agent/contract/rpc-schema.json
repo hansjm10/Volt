@@ -822,6 +822,9 @@
 					"$ref": "#/$defs/RpcCommand.get_session_stats"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.get_subscription_usage"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.list_sessions"
 				},
 				{
@@ -1099,6 +1102,9 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.get_session_stats"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_subscription_usage"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.list_sessions"
@@ -1928,6 +1934,25 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcCommand.get_subscription_usage": {
+			"type": "object",
+			"required": [
+				"type"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_subscription_usage"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcCommand.get_transcript": {
 			"type": "object",
 			"required": [
@@ -2343,6 +2368,9 @@
 				},
 				"parentSession": {
 					"type": "string"
+				},
+				"preserveReviewRunId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
 				}
 			},
 			"additionalProperties": false
@@ -6551,6 +6579,9 @@
 					"$ref": "#/$defs/RpcResponse.get_session_stats"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.get_subscription_usage"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.list_sessions"
 				},
 				{
@@ -7795,6 +7826,36 @@
 				},
 				"data": {
 					"$ref": "#/$defs/RpcSessionState"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.get_subscription_usage": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_subscription_usage"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcSubscriptionUsageReport"
 				}
 			},
 			"additionalProperties": false
@@ -11228,6 +11289,190 @@
 				},
 				"sessionId": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcSubscriptionUsageErrorCode": {
+			"type": "string",
+			"enum": [
+				"unauthorized",
+				"rate_limited",
+				"timeout",
+				"unavailable",
+				"malformed_response"
+			]
+		},
+		"RpcSubscriptionUsageLimit": {
+			"type": "object",
+			"required": [
+				"id",
+				"label",
+				"usedPercent"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"label": {
+					"type": "string"
+				},
+				"usedPercent": {
+					"type": "number",
+					"minimum": 0,
+					"maximum": 100
+				},
+				"resetsAt": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"windowDurationMs": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"limitReached": {
+					"type": "boolean"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcSubscriptionUsageProviderReport": {
+			"type": "object",
+			"required": [
+				"providerId",
+				"result"
+			],
+			"properties": {
+				"providerId": {
+					"type": "string"
+				},
+				"result": {
+					"$ref": "#/$defs/RpcSubscriptionUsageResult"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcSubscriptionUsageReport": {
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"status",
+						"providers"
+					],
+					"properties": {
+						"status": {
+							"type": "string",
+							"const": "providers"
+						},
+						"providers": {
+							"type": "array",
+							"items": {
+								"$ref": "#/$defs/RpcSubscriptionUsageProviderReport"
+							}
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"status"
+					],
+					"properties": {
+						"status": {
+							"type": "string",
+							"const": "no_subscription"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"status"
+					],
+					"properties": {
+						"status": {
+							"type": "string",
+							"const": "unsupported"
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcSubscriptionUsageResult": {
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"status",
+						"snapshot"
+					],
+					"properties": {
+						"status": {
+							"type": "string",
+							"const": "success"
+						},
+						"snapshot": {
+							"$ref": "#/$defs/RpcSubscriptionUsageSnapshot"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"status",
+						"error"
+					],
+					"properties": {
+						"status": {
+							"type": "string",
+							"const": "error"
+						},
+						"error": {
+							"type": "object",
+							"required": [
+								"code",
+								"message"
+							],
+							"properties": {
+								"code": {
+									"$ref": "#/$defs/RpcSubscriptionUsageErrorCode"
+								},
+								"message": {
+									"type": "string"
+								}
+							},
+							"additionalProperties": false
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcSubscriptionUsageSnapshot": {
+			"type": "object",
+			"required": [
+				"providerId",
+				"fetchedAt",
+				"limits"
+			],
+			"properties": {
+				"providerId": {
+					"type": "string"
+				},
+				"fetchedAt": {
+					"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+				},
+				"plan": {
+					"type": "string"
+				},
+				"limits": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcSubscriptionUsageLimit"
+					}
 				}
 			},
 			"additionalProperties": false

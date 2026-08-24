@@ -204,7 +204,12 @@ const MCP_COMMANDS = new Set([
 	"set_web_search_key",
 	"get_web_search_status",
 ]);
-const HOST_COMMANDS = new Set(["get_pending_host_actions", "host_action_response", "set_keep_awake"]);
+const HOST_COMMANDS = new Set([
+	"get_pending_host_actions",
+	"get_subscription_usage",
+	"host_action_response",
+	"set_keep_awake",
+]);
 
 export function getIrohRemoteRpcCommandCapabilities(
 	command: Record<string, unknown> & { type: string },
