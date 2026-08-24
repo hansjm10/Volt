@@ -8884,6 +8884,9 @@ export class InteractiveMode {
 			onPrepared: (resolution, model) => {
 				baseMessage = `Reviewing ${resolution.description} with ${model.id}…`;
 				loader.setMessage(baseMessage);
+				this.editorContainer.clear();
+				this.editorContainer.addChild(loader);
+				this.ui.setFocus(loader);
 				// Render the isolated review session live in the transcript so it reads like
 				// a normal conversation. This remains transient and is removed on handoff.
 				reviewRenderer = this.createInlineSessionRenderer({

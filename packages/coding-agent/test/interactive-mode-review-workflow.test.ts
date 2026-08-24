@@ -1,4 +1,4 @@
-import { Container, setKeybindings, Text, type TUI } from "@hansjm10/volt-tui";
+import { type Component, Container, setKeybindings, Text, type TUI } from "@hansjm10/volt-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { ReviewWorkflowHooks, ReviewWorkflowOptions, ReviewWorkflowResult } from "../src/core/review.ts";
@@ -31,6 +31,9 @@ interface ReviewContext {
 	showWarning: ReturnType<typeof vi.fn>;
 	showStatus: ReturnType<typeof vi.fn>;
 	showError: ReturnType<typeof vi.fn>;
+	activeView: { regularComponents: Component[]; fullscreenRoot: Component };
+	conversationView: { regularComponents: Component[]; fullscreenRoot: Component };
+	extensionSelector?: { handleInput(data: string): void };
 }
 
 function createContext(): ReviewContext {
@@ -39,9 +42,16 @@ function createContext(): ReviewContext {
 	const editor = new Text("editor");
 	const editorContainer = new Container();
 	editorContainer.addChild(editor);
+	let focusedComponent: Component | null = editor;
 	const ui = {
+		terminal: { rows: 24 },
 		requestRender: vi.fn(),
-		setFocus: vi.fn(),
+		setFocus: vi.fn((component: Component | null) => {
+			focusedComponent = component;
+		}),
+		getFocusedComponent: vi.fn(() => focusedComponent),
+		clear: vi.fn(),
+		addChild: vi.fn(),
 	} as unknown as TUI;
 	const sessionManager = { getCwd: () => "/workspace" };
 	const session = {
@@ -52,6 +62,7 @@ function createContext(): ReviewContext {
 		sessionManager,
 		resourceLoader: {},
 	};
+	const view = { regularComponents: [editorContainer], fullscreenRoot: editorContainer };
 	return Object.assign(Object.create(InteractiveMode.prototype), {
 		runtimeHost: {
 			session,
@@ -63,6 +74,8 @@ function createContext(): ReviewContext {
 		editor,
 		footer: { setTransientUsage: vi.fn() },
 		activeInteractiveReview: false,
+		activeView: view,
+		conversationView: view,
 		createInlineSessionRenderer: vi.fn(() => ({ onSessionEvent: vi.fn(), dispose: vi.fn() })),
 		showWarning: vi.fn(),
 		showStatus: vi.fn(),
@@ -93,13 +106,13 @@ const resolution = {
 	dispose: vi.fn(async () => {}),
 };
 
-function run(context: ReviewContext): Promise<ReviewWorkflowResult> {
+function run(context: ReviewContext, requireConfirmation = false): Promise<ReviewWorkflowResult> {
 	return runInteractiveReviewWorkflow.call(
 		context,
 		{ kind: "uncommitted" },
 		{
 			tools: [],
-			requireConfirmation: false,
+			requireConfirmation,
 			requireProjectTrust: false,
 		},
 	);
@@ -139,6 +152,48 @@ describe("InteractiveMode review workflow", () => {
 		releasePreparation();
 		await pending;
 		expect(context.createInlineSessionRenderer).toHaveBeenCalledOnce();
+		expect(context.editorContainer.children).toEqual([context.editor]);
+	});
+
+	it("reattaches and focuses the loader after accepting review confirmation", async () => {
+		const context = createContext();
+		let loader!: BorderedLoader;
+		let releasePrepared!: () => void;
+		const preparedGate = new Promise<void>((resolve) => {
+			releasePrepared = resolve;
+		});
+		let prepared!: () => void;
+		const preparedReady = new Promise<void>((resolve) => {
+			prepared = resolve;
+		});
+		reviewMocks.runReviewWorkflow.mockImplementationOnce(async (options) => {
+			expect(options.requireConfirmation).toBe(true);
+			const hooks = await options.createHooks?.();
+			loader = context.editorContainer.children[0] as BorderedLoader;
+			const confirmed = await options.confirm?.({
+				title: "Review changes",
+				message: "Confirm rerun",
+				resolution,
+			});
+			expect(confirmed).toBe(true);
+			await hooks?.onPrepared?.(resolution, { id: "review-model" } as never);
+			prepared();
+			await preparedGate;
+			hooks?.cleanup?.();
+			return { status: "cancelled", resolution };
+		});
+
+		const pending = run(context, true);
+		await vi.waitFor(() => expect(context.extensionSelector).toBeDefined());
+		context.extensionSelector?.handleInput("\n");
+		await preparedReady;
+
+		expect(context.editorContainer.children).toEqual([loader]);
+		expect(context.ui.setFocus).toHaveBeenLastCalledWith(loader);
+		expect(context.createInlineSessionRenderer).toHaveBeenCalledOnce();
+
+		releasePrepared();
+		await pending;
 		expect(context.editorContainer.children).toEqual([context.editor]);
 	});
 
