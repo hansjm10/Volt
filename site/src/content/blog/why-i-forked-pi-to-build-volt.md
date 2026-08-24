@@ -4,6 +4,7 @@ description: "How experimenting with coding-agent harnesses led me from Pi exten
 publishedAt: 2026-08-24
 author: Jordan Hans
 image: /blog/why-i-forked-pi-to-build-volt-og.png
+imageAlt: "The purple Volt logo above a terminal prompt connected over a network to a phone beside the title Why I Forked Pi to Build Volt."
 tags:
   - product
   - engineering

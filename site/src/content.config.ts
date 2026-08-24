@@ -13,6 +13,7 @@ const blog = defineCollection({
     updatedAt: z.coerce.date().optional(),
     author: z.string().default("Jordan Hans"),
     image: z.string().optional(),
+    imageAlt: z.string().optional(),
     tags: z.array(z.string()).default([]),
     draft: z.boolean().default(false),
   }),
