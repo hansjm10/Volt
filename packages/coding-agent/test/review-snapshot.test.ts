@@ -525,6 +525,72 @@ describe("review snapshots", () => {
 		).toContain("+feature");
 	});
 
+	it("fetches PR snapshots without borrowing from shallow repositories", async () => {
+		const seed = createRepository();
+		const omittedParentOid = git(seed, "rev-parse", "HEAD");
+		writeFileSync(join(seed, "tracked.txt"), "base\n");
+		git(seed, "commit", "-am", "base");
+		const baseOid = git(seed, "rev-parse", "HEAD");
+		const remote = join(tmpdir(), `volt-review-snapshot-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(seed, "remote", "add", "origin", remote);
+		git(seed, "push", "origin", "main");
+		git(seed, "checkout", "-b", "feature");
+		writeFileSync(join(seed, "tracked.txt"), "pull request\n");
+		git(seed, "commit", "-am", "pull request");
+		const headOid = git(seed, "rev-parse", "HEAD");
+		git(seed, "push", "origin", "HEAD:refs/pull/8/head");
+
+		const repository = join(
+			tmpdir(),
+			`volt-review-snapshot-shallow-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(repository, { recursive: true });
+		tempDirectories.push(repository);
+		git(repository, "init", "--initial-branch=main");
+		git(repository, "remote", "add", "origin", remote);
+		git(repository, "fetch", "--depth=1", "origin", "main");
+		git(repository, "checkout", "-B", "main", "FETCH_HEAD");
+		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
+		expect(spawnSync("git", ["cat-file", "-e", `${omittedParentOid}^{commit}`], { cwd: repository }).status).not.toBe(
+			0,
+		);
+
+		installGitHubShim(repository, {
+			view: {
+				id: "PR_node_8",
+				number: 8,
+				title: "Shallow snapshot",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/8",
+				baseRefOid: baseOid,
+				headRefOid: headOid,
+			},
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const snapshot = await resolve({ kind: "pr", number: "8" }, repository);
+		expect(snapshot.identity.pullRequest).toMatchObject({ number: 8, baseRefOid: baseOid, headRefOid: headOid });
+		expect((await readAvailableFile(snapshot, "base", "tracked.txt")).content.toString()).toBe("base\n");
+		expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("pull request\n");
+
+		const localObjects = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects");
+		const unavailableLocalObjects = `${localObjects}-unavailable`;
+		renameSync(localObjects, unavailableLocalObjects);
+		try {
+			expect((await readAvailableFile(snapshot, "base", "tracked.txt")).content.toString()).toBe("base\n");
+			expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("pull request\n");
+			const checkout = await snapshot.materializeHead();
+			expect(readFileSync(join(checkout, "tracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("pull request\n");
+		} finally {
+			renameSync(unavailableLocalObjects, localObjects);
+		}
+	});
+
 	it("detaches fetched PR snapshots from borrowed local objects and rejects moved metadata", async () => {
 		const repository = createRepository();
 		const remote = join(tmpdir(), `volt-review-snapshot-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);

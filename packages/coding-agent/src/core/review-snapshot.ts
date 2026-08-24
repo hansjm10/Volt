@@ -469,6 +469,24 @@ async function repositoryObjectFormat(
 	return result.ok && (format === "sha1" || format === "sha256") ? format : undefined;
 }
 
+async function repositoryIsShallow(
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<boolean | undefined> {
+	throwIfResolutionCancelled(signal);
+	const result = await runCommand(
+		"git",
+		["rev-parse", "--is-shallow-repository"],
+		cwd,
+		commandOptions(limits, signal),
+	);
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git rev-parse failed", result);
+	const shallow = text(result).trim();
+	return result.ok && (shallow === "true" || shallow === "false") ? shallow === "true" : undefined;
+}
+
 async function repositoryIndexFile(
 	cwd: string,
 	limits: ReviewSnapshotLimits,
@@ -697,9 +715,10 @@ async function createPullRequestSource(
 	signal?: AbortSignal,
 ): Promise<{ source?: GitSource; temporaryDirectory?: string; error?: ReviewSnapshotResolutionError }> {
 	throwIfResolutionCancelled(signal);
-	const [localObjects, objectFormat, originResult] = await Promise.all([
+	const [localObjects, objectFormat, sourceIsShallow, originResult] = await Promise.all([
 		repositoryObjectDirectory(root, limits, signal),
 		repositoryObjectFormat(root, limits, signal),
+		repositoryIsShallow(root, limits, signal),
 		runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits, signal)),
 	]);
 	throwIfResolutionCancelled(signal);
@@ -721,16 +740,19 @@ async function createPullRequestSource(
 		if (!init.ok) return { error: commandFailure("git init failed", init) };
 		const objects = join(temporaryDirectory, "objects");
 		const alternatesPath = join(objects, "info", "alternates");
-		await mkdir(join(objects, "info"), { recursive: true });
-		await writeFile(alternatesPath, `${resolve(localObjects)}\n`, "utf8");
+		const borrowLocalObjects = sourceIsShallow === false;
+		if (borrowLocalObjects) {
+			await mkdir(join(objects, "info"), { recursive: true });
+			await writeFile(alternatesPath, `${resolve(localObjects)}\n`, "utf8");
+		}
 		throwIfResolutionCancelled(signal);
-		const borrowedSource: GitSource = {
+		const fetchSource: GitSource = {
 			cwd: temporaryDirectory,
-			objectDirectories: [objects, localObjects],
+			objectDirectories: borrowLocalObjects ? [objects, localObjects] : [objects],
 			limits,
 			signal,
 		};
-		const fetch = await git(borrowedSource, [
+		const fetch = await git(fetchSource, [
 			"fetch",
 			"--no-tags",
 			"--force",
@@ -746,8 +768,8 @@ async function createPullRequestSource(
 				},
 			};
 		}
-		const fetchedBase = await requireCanonicalCommit(borrowedSource, "refs/review/base");
-		const fetchedHead = await requireCanonicalCommit(borrowedSource, "refs/review/head");
+		const fetchedBase = await requireCanonicalCommit(fetchSource, "refs/review/base");
+		const fetchedHead = await requireCanonicalCommit(fetchSource, "refs/review/head");
 		if (fetchedBase !== pullRequest.baseRefOid || fetchedHead !== pullRequest.headRefOid) {
 			return {
 				error: {
@@ -756,7 +778,7 @@ async function createPullRequestSource(
 				},
 			};
 		}
-		const repack = await git(borrowedSource, ["repack", "-a", "-d"]);
+		const repack = await git(fetchSource, ["repack", "-a", "-d"]);
 		if (!repack.ok) {
 			return {
 				error: {
