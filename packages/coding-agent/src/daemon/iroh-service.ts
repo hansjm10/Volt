@@ -1473,10 +1473,11 @@ class IrohDaemonService {
 			// The durable credential becomes authoritative before the live actor
 			// reconnects. A crash at any later point restarts with this token rather
 			// than reviving the connection whose strict expiry triggered recovery.
+			// Keep an exchanged claim durable until reconnect is confirmed so this
+			// same operation remains retryable after a post-commit transport failure.
 			this.services.state.updateSettings({
 				relayAuthToken: undefined,
 				relayCredential: credential,
-				...(exchangedClaim === undefined ? {} : { relayCredentialClaim: undefined }),
 				...(approvedAppEndpoint === undefined ? {} : { relayCredentialAppEndpoints: nextAppEndpoints }),
 				relayCredentialRevocation: undefined,
 			});
@@ -1490,7 +1491,6 @@ class IrohDaemonService {
 			this.managedRelayCredential = credential;
 			this.managedRelayAppEndpoints = nextAppEndpoints;
 			this.relayAuthToken = credential.accessToken;
-			if (exchangedClaim !== undefined) this.managedRelayCredentialClaim = undefined;
 			this.scheduleManagedRelayCredentialExpiryFence();
 			if (endpoint !== undefined) {
 				const monitor = this.ensureRelayRecoveryMonitor();
@@ -1508,6 +1508,27 @@ class IrohDaemonService {
 					}
 					await monitor.confirmReconnect(() => reconnectRelay({ url, authToken: credential.accessToken }));
 				}
+			}
+			if (exchangedClaim !== undefined) {
+				if (
+					!this.admission.isOpen ||
+					this.relayCredentialIsRevoking ||
+					expectedEpoch !== this.relayCredentialEpoch ||
+					this.managedRelayCredentialClaim !== exchangedClaim
+				) {
+					return;
+				}
+				this.services.state.updateSettings({ relayCredentialClaim: undefined });
+				await this.services.state.flush();
+				if (
+					!this.admission.isOpen ||
+					this.relayCredentialIsRevoking ||
+					expectedEpoch !== this.relayCredentialEpoch ||
+					this.managedRelayCredentialClaim !== exchangedClaim
+				) {
+					return;
+				}
+				this.managedRelayCredentialClaim = undefined;
 			}
 			installed = true;
 		});

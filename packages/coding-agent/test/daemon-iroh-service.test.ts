@@ -2020,6 +2020,133 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 		}
 	}, 30_000);
 
+	it("keeps an exchanged claim retryable until live relay reconnect is confirmed", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-exchange-reconnect-retry-"));
+		const originalCredential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		const claimId = "claimabcdefghijklmnopqrs";
+		const exchangedAccessToken = "exchanged.payload.signature";
+		const relayReconnects: IrohRelayConfigLike[] = [];
+		let exchangeRequests = 0;
+		let reconnectAttempts = 0;
+		let credentialWasDurableBeforeReconnect = false;
+		let claimWasDurableBeforeReconnect = false;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims`) {
+				return new Response(
+					JSON.stringify({ claimId, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() }),
+					{ status: 201, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims/${claimId}/exchange`) {
+				exchangeRequests++;
+				return new Response(
+					JSON.stringify({
+						grantId: originalCredential.grantId,
+						endpointId: originalCredential.endpointId,
+						hostNodeId: originalCredential.endpointNodeId,
+						appEndpointId: "appendpointabcdefghijklm",
+						appNodeId: "b".repeat(64),
+						credential: {
+							accessToken: exchangedAccessToken,
+							accessTokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+							tokenType: "Bearer",
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`unexpected managed relay credential request: ${url}`);
+		});
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		let pairingRequestId: string | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{},
+				{
+					decorateEndpoint: (endpoint) =>
+						withRecordedRelayCredentialInstall(
+							endpoint,
+							relayReconnects,
+							() => {},
+							undefined,
+							undefined,
+							() => {
+								reconnectAttempts++;
+								if (reconnectAttempts !== 1) return;
+								const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+									settings: {
+										relayCredential?: IrohManagedRelayCredential;
+										relayCredentialClaim?: { claimId: string };
+									};
+								};
+								credentialWasDurableBeforeReconnect =
+									state.settings.relayCredential?.accessToken === exchangedAccessToken;
+								claimWasDurableBeforeReconnect = state.settings.relayCredentialClaim?.claimId === claimId;
+								throw new Error("injected first relay reconnect failure");
+							},
+						),
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expectIrohEndpointReady(control);
+			const pairing = await control.request({ type: "pair_request" });
+			expect(pairing).toMatchObject({ type: "pair_started" });
+			if (pairing.type !== "pair_started") throw new Error("managed relay pairing did not start");
+			pairingRequestId = pairing.requestId;
+
+			await expect.poll(() => reconnectAttempts, { timeout: 5_000 }).toBe(2);
+			expect(exchangeRequests).toBe(2);
+			expect(credentialWasDurableBeforeReconnect).toBe(true);
+			expect(claimWasDurableBeforeReconnect).toBe(true);
+			expect(relayReconnects).toEqual([{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: exchangedAccessToken }]);
+			await expect
+				.poll(() => {
+					const state = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+						settings: {
+							relayCredential?: IrohManagedRelayCredential;
+							relayCredentialClaim?: unknown;
+						};
+					};
+					return {
+						accessToken: state.settings.relayCredential?.accessToken,
+						claim: state.settings.relayCredentialClaim,
+					};
+				})
+				.toEqual({ accessToken: exchangedAccessToken, claim: undefined });
+
+			expect(await control.request({ type: "pair_cancel", requestId: pairing.requestId })).toMatchObject({
+				type: "ok",
+			});
+			pairingRequestId = undefined;
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await daemon;
+			daemonStopped = true;
+		} finally {
+			if (!daemonStopped) {
+				if (pairingRequestId !== undefined) {
+					await control?.request({ type: "pair_cancel", requestId: pairingRequestId }).catch(() => {});
+				}
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await control?.close();
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	it("durably installs and confirms a live relay reconnect when refreshing a valid JWT", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-refresh-reconnect-"));
 		const originalCredential = await provisionManagedRelayCredentialState(agentDir, 31_000);
