@@ -3,6 +3,6 @@
 "@hansjm10/volt-ai": minor
 ---
 
-breaking(agent): Added delivery-aware next-action dispatch and explicit event-stream failure propagation.
+breaking(agent): Changed low-level agent dispatch to use delivery-aware next actions and explicit event-stream failure propagation.
 
 Exhaustive `AgentEvent` consumers must handle `delivery_start`. Low-level loops now always use delivery-aware dispatch: migrate `prepareNextTurn` to `prepareRequest`, and replace `shouldStopAfterTurn`, `getSteeringMessages`, and `getFollowUpMessages` with `nextAction` plus explicit deliveries. Migrate queued-message hooks to an `AgentDeliveryOwner` installed before admission.
