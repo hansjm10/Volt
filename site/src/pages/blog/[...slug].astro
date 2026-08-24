@@ -18,7 +18,9 @@ interface Props {
 const { post } = Astro.props;
 const { Content } = await render(post);
 const canonicalPath = `/blog/${post.id}/`;
-const canonicalUrl = new URL(canonicalPath, Astro.site ?? "https://volt-cli.dev").href;
+const siteUrl = Astro.site ?? new URL("https://volt-cli.dev");
+const canonicalUrl = new URL(canonicalPath, siteUrl).href;
+const imageUrl = post.data.image ? new URL(post.data.image, siteUrl).href : undefined;
 const dateFormatter = new Intl.DateTimeFormat("en", {
   dateStyle: "long",
   timeZone: "UTC",
@@ -40,6 +42,8 @@ const structuredData = JSON.stringify({
     url: "https://volt-cli.dev",
   },
   mainEntityOfPage: canonicalUrl,
+  keywords: post.data.tags,
+  ...(imageUrl ? { image: imageUrl } : {}),
 }).replaceAll("<", "\\u003c");
 ---
 
@@ -47,6 +51,7 @@ const structuredData = JSON.stringify({
   title={`${post.data.title} — Volt Blog`}
   description={post.data.description}
   canonicalPath={canonicalPath}
+  image={post.data.image}
   type="article"
   publishedAt={post.data.publishedAt}
   updatedAt={post.data.updatedAt}
