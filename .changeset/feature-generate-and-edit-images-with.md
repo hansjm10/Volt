@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-feature(tools): Generate and edit local, attached, and conversation images with GPT Image 2 when using an OpenAI Codex model.
+feature(tools): Added [GPT Image 2 generation and editing](https://volt-cli.dev/docs/usage/#tool-options) for local, attached, and conversation images when using an OpenAI Codex model.

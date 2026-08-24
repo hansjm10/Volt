@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(review): Displayed the active review context and cumulative review cost in the footer.
+improvement(review): The footer now displays the active review context and cumulative review cost.
