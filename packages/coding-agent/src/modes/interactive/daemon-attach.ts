@@ -463,7 +463,9 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 	const handleRelayOffer = (offer: DaemonRelayOffer) => {
 		const handler = relayOfferHandler;
 		const activeClient = client;
-		if (!handler || !activeClient) {
+		// A warm rekey can publish its target lease before AgentSessionRuntime
+		// applies that target. Keep every relay on the stable installed session.
+		if (!handler || !activeClient || pendingRekeyTransactionId || offer.sessionId !== currentSessionId) {
 			return;
 		}
 		handler(offer, async () => {
