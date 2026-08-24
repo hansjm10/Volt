@@ -1,0 +1,74 @@
+---
+import "../styles/blog.css";
+
+interface Props {
+  title: string;
+  description: string;
+  canonicalPath: string;
+  type?: "article" | "website";
+  publishedAt?: Date;
+  updatedAt?: Date;
+}
+
+const {
+  title,
+  description,
+  canonicalPath,
+  type = "website",
+  publishedAt,
+  updatedAt,
+} = Astro.props;
+const canonicalUrl = new URL(canonicalPath, Astro.site ?? "https://volt-cli.dev").href;
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalUrl} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta property="og:site_name" content="Volt" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content={type} />
+    <meta property="og:url" content={canonicalUrl} />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    {publishedAt && <meta property="article:published_time" content={publishedAt.toISOString()} />}
+    {updatedAt && <meta property="article:modified_time" content={updatedAt.toISOString()} />}
+    <slot name="head" />
+  </head>
+  <body>
+    <header class="site-nav">
+      <a class="brand" href="/" aria-label="Volt home">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M13 2 4.5 13.5H11L9.5 22 19 9.5h-6.5L13 2z"></path></svg>
+        volt
+      </a>
+      <nav aria-label="Main navigation">
+        <a href="/blog/" aria-current={Astro.url.pathname.startsWith("/blog/") ? "page" : undefined}>Blog</a>
+        <a href="/docs/">Docs</a>
+        <a href="/docs/quickstart/">Quickstart</a>
+        <a href="https://github.com/volt-hq/Volt">GitHub</a>
+      </nav>
+    </header>
+
+    <main class="site-main">
+      <slot />
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Maintained by <a href="https://github.com/hansjm10">Jordan Hans</a>. Built in the open at
+        <a href="https://github.com/volt-hq/Volt">volt-hq/Volt</a>.
+      </p>
+      <nav aria-label="Footer navigation">
+        <a href="/blog/">Blog</a>
+        <a href="/docs/">Docs</a>
+        <a href="/docs/security/">Security</a>
+      </nav>
+    </footer>
+  </body>
+</html>
