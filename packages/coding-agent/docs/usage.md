@@ -524,8 +524,12 @@ volt --exclude-tools ask_question
 
 ## Design Principles
 
-Volt keeps the core small and pushes workflow-specific behavior into extensions, skills, prompt templates, and packages.
+Volt includes common coding-agent primitives in core while pushing project-specific behavior into extensions, skills, prompt templates, and packages.
 
-Native MCP support is intentionally explicit: configured servers are exposed through a single `mcp` gateway tool and project MCP config follows project trust. HTTP/SSE MCP servers that require OAuth can be authenticated with `volt mcp auth <server>` or `volt mcp auth-device <server>`; tokens stay on the host. Volt still avoids permission popups, plan mode, built-in to-dos, background bash, or advanced subagent orchestration. The core subagent MVP is limited to built-in/discovered named agents, the single/parallel/chain `subagent` spawning tool, and child registry list/follow access; richer workflows can be built as extensions or external tools.
+Plan mode provides restricted research, explicit approval, and tracked execution steps. Native subagents provide isolated contexts through built-in or discovered agents, single/parallel/chain spawning, and shared registry access. Extensions and the SDK remain available for specialized planning, delegation, task management, and approval workflows.
+
+Native MCP support is intentionally explicit: configured servers are exposed through a single `mcp` gateway tool and project MCP config follows project trust. HTTP/SSE MCP servers that require OAuth can be authenticated with `volt mcp auth <server>` or `volt mcp auth-device <server>`; tokens stay on the host.
+
+Volt does not put a permission popup in front of every tool call. Control capabilities with tool allowlists and exclusions, project trust, Plan mode's restricted research profile, and remote tool grants; use a container or extension when a workflow requires additional isolation or confirmation. Volt also leaves standalone task management and background shell execution outside core: use a TODO file or extension for task tracking and tmux for observable background commands.
 
 For the full rationale, see the project documentation and extension examples.
