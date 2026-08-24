@@ -125,7 +125,6 @@ import {
 	probeCurrentBranchPullRequest,
 	REMOTE_REVIEW_TOOL_NAMES,
 	REVIEW_USAGE,
-	type ResolvedReview,
 	type ReviewRunControls,
 	type ReviewTarget,
 	type ReviewWorkflowHooks,
@@ -559,6 +558,7 @@ export class InteractiveMode {
 	private changelogMarkdown: string | undefined = undefined;
 	private startupNoticesShown = false;
 	private anthropicSubscriptionWarningShown = false;
+	private activeInteractiveReview = false;
 
 	// Status line tracking (for mutating immediately-sequential status updates)
 	private lastStatusSpacer: Spacer | undefined = undefined;
@@ -8865,57 +8865,54 @@ export class InteractiveMode {
 		});
 	}
 
-	private createReviewWorkflowHooks(resolution: ResolvedReview, model: Model<any>): ReviewWorkflowHooks {
-		const baseMessage = `Reviewing ${resolution.description} with ${model.id}...`;
-		const loader = new BorderedLoader(this.ui, theme, baseMessage);
+	private createReviewWorkflowHooks(): ReviewWorkflowHooks {
+		const loader = new BorderedLoader(this.ui, theme, "Preparing review…");
 		this.editorContainer.clear();
 		this.editorContainer.addChild(loader);
 		this.ui.setFocus(loader);
-
-		// Render the isolated review session live in the transcript so it reads like
-		// a normal conversation. This is display-only and transient: the review runs
-		// in its own session, and the handoff (or the next full re-render) rebuilds
-		// the transcript, at which point this group is gone. The machine `<response>`
-		// envelope is stripped from displayed text; the formatted findings are
-		// surfaced later via the handoff.
-		const reviewRenderer = this.createInlineSessionRenderer({
-			headerText: theme.fg("accent", `Reviewing ${resolution.description} with ${model.id}`),
-			transformAssistantMessage: (message) => ({
-				...message,
-				content: message.content.map((part) =>
-					part.type === "text" ? { ...part, text: stripReviewEnvelopeForDisplay(part.text) } : part,
-				),
-			}),
-		});
 		this.ui.requestRender();
 
-		const abortController = new AbortController();
-		loader.onAbort = () => {
-			abortController.abort();
-		};
-
-		const cleanup = () => {
-			this.footer.setTransientUsage(undefined);
-			reviewRenderer.dispose();
-			loader.dispose();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
-		};
-
+		let baseMessage = "Preparing review…";
+		let reviewRenderer: InlineSessionRenderer | undefined;
+		let cleanedUp = false;
 		return {
-			signal: abortController.signal,
+			signal: loader.signal,
 			onProgress: (message) => {
-				loader.setMessage(`${baseMessage} ${message}`);
+				loader.setMessage(reviewRenderer ? `${baseMessage} ${message}` : message);
 				this.ui.requestRender();
 			},
-			onSessionEvent: reviewRenderer.onSessionEvent,
+			onPrepared: (resolution, model) => {
+				baseMessage = `Reviewing ${resolution.description} with ${model.id}…`;
+				loader.setMessage(baseMessage);
+				// Render the isolated review session live in the transcript so it reads like
+				// a normal conversation. This remains transient and is removed on handoff.
+				reviewRenderer = this.createInlineSessionRenderer({
+					headerText: theme.fg("accent", `Reviewing ${resolution.description} with ${model.id}`),
+					transformAssistantMessage: (message) => ({
+						...message,
+						content: message.content.map((part) =>
+							part.type === "text" ? { ...part, text: stripReviewEnvelopeForDisplay(part.text) } : part,
+						),
+					}),
+				});
+				this.ui.requestRender();
+			},
+			onSessionEvent: (event) => reviewRenderer?.onSessionEvent(event),
 			onUsage: (usage) => {
 				this.footer.setTransientUsage(usage);
 				this.ui.requestRender();
 			},
-			cleanup,
+			cleanup: () => {
+				if (cleanedUp) return;
+				cleanedUp = true;
+				this.footer.setTransientUsage(undefined);
+				reviewRenderer?.dispose();
+				loader.dispose();
+				this.editorContainer.clear();
+				this.editorContainer.addChild(this.editor);
+				this.ui.setFocus(this.editor);
+				this.ui.requestRender();
+			},
 		};
 	}
 
@@ -9241,6 +9238,11 @@ export class InteractiveMode {
 			parentRunId?: string;
 		},
 	): Promise<Awaited<ReturnType<NonNullable<HostActionInvocationContext["runReviewAction"]>>>> {
+		if (this.activeInteractiveReview) {
+			this.showWarning("A review is already running. Cancel it before starting another.");
+			return { status: "cancelled" };
+		}
+		this.activeInteractiveReview = true;
 		try {
 			const result = await runReviewWorkflow({
 				target,
@@ -9257,7 +9259,7 @@ export class InteractiveMode {
 				requireProjectTrust: options.requireProjectTrust,
 				confirm: ({ title, message }) => this.showExtensionConfirm(title, message),
 				onReviewModelWarning: (message) => this.showWarning(message),
-				onBeforeReview: (resolution, model) => this.createReviewWorkflowHooks(resolution, model),
+				createHooks: () => this.createReviewWorkflowHooks(),
 			});
 
 			if (result.status !== "completed") {
@@ -9280,6 +9282,8 @@ export class InteractiveMode {
 				message.includes("git") || message.includes("repository") ? `${message} ${REVIEW_USAGE}` : message,
 			);
 			return { status: "cancelled" };
+		} finally {
+			this.activeInteractiveReview = false;
 		}
 	}
 

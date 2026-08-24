@@ -278,12 +278,14 @@ const ISSUE_COMMENTS_QUERY = `query VoltReviewIssueComments($id: ID!, $cursor: S
   }
 }`;
 
-function runGh(args: string[], cwd: string, input?: string): Promise<CommandResult> {
-	return new Promise((resolveResult) => {
+async function runGh(args: string[], cwd: string, input?: string, signal?: AbortSignal): Promise<CommandResult> {
+	if (signal?.aborted) throw new Error("GitHub context capture was cancelled.");
+	const result = await new Promise<CommandResult>((resolveResult) => {
 		const child = spawnProcess("gh", args, {
 			cwd,
 			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: process.env,
+			signal,
 		});
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
@@ -329,6 +331,8 @@ function runGh(args: string[], cwd: string, input?: string): Promise<CommandResu
 		child.stdin?.on("error", () => {});
 		if (input !== undefined) child.stdin?.end(input);
 	});
+	if (signal?.aborted) throw new Error("GitHub context capture was cancelled.");
+	return result;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -436,8 +440,13 @@ function parsePullRequestView(
 	};
 }
 
-async function graphql(cwd: string, query: string, variables: Record<string, unknown>): Promise<CommandResult> {
-	return runGh(["api", "graphql", "--input", "-"], cwd, JSON.stringify({ query, variables }));
+async function graphql(
+	cwd: string,
+	query: string,
+	variables: Record<string, unknown>,
+	signal?: AbortSignal,
+): Promise<CommandResult> {
+	return runGh(["api", "graphql", "--input", "-"], cwd, JSON.stringify({ query, variables }), signal);
 }
 
 function connectionAt(value: unknown, path: string[]): GraphqlConnection | undefined {
@@ -461,8 +470,9 @@ async function loadConnection(options: {
 	path: string[];
 	source: string;
 	limitations: ReviewGitHubContextLimitation[];
+	signal?: AbortSignal;
 }): Promise<GraphqlConnection | undefined> {
-	const result = await graphql(options.cwd, options.query, options.variables);
+	const result = await graphql(options.cwd, options.query, options.variables, options.signal);
 	if (!result.ok) {
 		addLimitation(options.limitations, "api-error", options.source);
 		return undefined;
@@ -527,19 +537,13 @@ async function captureLinkedIssueSet(
 	pullRequestId: string,
 	manualOnly: boolean,
 	limitations: ReviewGitHubContextLimitation[],
+	initialConnection: GraphqlConnection | undefined,
+	signal?: AbortSignal,
 ): Promise<{ issues: Array<Omit<ReviewGitHubLinkedIssue, "relationship">>; complete: boolean }> {
 	const issues: Array<Omit<ReviewGitHubLinkedIssue, "relationship">> = [];
 	const seenCursors = new Set<string>();
-	let cursor: string | undefined;
+	let connection = initialConnection;
 	while (issues.length < REVIEW_GITHUB_LINKED_ISSUE_LIMIT) {
-		const connection = await loadConnection({
-			cwd,
-			query: LINKED_ISSUES_QUERY,
-			variables: { id: pullRequestId, cursor: cursor ?? null, manualOnly },
-			path: ["data", "node", "closingIssuesReferences"],
-			source: manualOnly ? "manual-linked-issues" : "linked-issues",
-			limitations,
-		});
 		if (!connection) return { issues, complete: false };
 		for (const node of connection.nodes) {
 			const issue = parseLinkedIssue(node, limitations);
@@ -556,9 +560,17 @@ async function captureLinkedIssueSet(
 			return { issues, complete: false };
 		}
 		const source = manualOnly ? "manual-linked-issues" : "linked-issues";
-		const nextCursor = nextPageCursor(connection, seenCursors, limitations, source);
-		if (!nextCursor) return { issues, complete: false };
-		cursor = nextCursor;
+		const cursor = nextPageCursor(connection, seenCursors, limitations, source);
+		if (!cursor) return { issues, complete: false };
+		connection = await loadConnection({
+			cwd,
+			query: LINKED_ISSUES_QUERY,
+			variables: { id: pullRequestId, cursor, manualOnly },
+			path: ["data", "node", "closingIssuesReferences"],
+			source,
+			limitations,
+			signal,
+		});
 	}
 	return { issues, complete: true };
 }
@@ -688,30 +700,32 @@ async function captureSimpleDiscussionConnection(options: {
 	path: string[];
 	source: string;
 	state: CaptureState;
+	initialConnection: GraphqlConnection | undefined;
+	signal?: AbortSignal;
 	parse: (value: unknown, limitations: ReviewGitHubContextLimitation[]) => ReviewGitHubDiscussionEntry | undefined;
 }): Promise<boolean> {
 	const seenCursors = new Set<string>();
-	let cursor: string | undefined;
-	while (true) {
-		const connection = await loadConnection({
-			cwd: options.cwd,
-			query: options.query,
-			variables: { id: options.pullRequestId, cursor: cursor ?? null },
-			path: options.path,
-			source: options.source,
-			limitations: options.state.limitations,
-		});
-		if (!connection) return true;
+	let connection = options.initialConnection;
+	while (connection) {
 		for (const node of connection.nodes) {
 			const entry = options.parse(node, options.state.limitations);
 			if (!entry && options.source === "pr-reviews" && isObject(node) && node.state === "PENDING") continue;
 			if (!appendDiscussion(options.state, entry, options.source)) return false;
 		}
 		if (!connection.hasNextPage) return true;
-		const nextCursor = nextPageCursor(connection, seenCursors, options.state.limitations, options.source);
-		if (!nextCursor) return true;
-		cursor = nextCursor;
+		const cursor = nextPageCursor(connection, seenCursors, options.state.limitations, options.source);
+		if (!cursor) return true;
+		connection = await loadConnection({
+			cwd: options.cwd,
+			query: options.query,
+			variables: { id: options.pullRequestId, cursor },
+			path: options.path,
+			source: options.source,
+			limitations: options.state.limitations,
+			signal: options.signal,
+		});
 	}
+	return true;
 }
 
 function parseThread(value: unknown): ReviewGitHubDiscussionEntry["thread"] | undefined {
@@ -742,6 +756,7 @@ async function captureThreadCommentPages(
 	thread: NonNullable<ReviewGitHubDiscussionEntry["thread"]>,
 	initialConnection: GraphqlConnection,
 	state: CaptureState,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	const seenCursors = new Set<string>();
 	let connection: GraphqlConnection | undefined = initialConnection;
@@ -761,24 +776,22 @@ async function captureThreadCommentPages(
 			path: ["data", "node", "comments"],
 			source: "review-thread-comments",
 			limitations: state.limitations,
+			signal,
 		});
 	}
 	return true;
 }
 
-async function captureReviewThreads(cwd: string, pullRequestId: string, state: CaptureState): Promise<boolean> {
+async function captureReviewThreads(
+	cwd: string,
+	pullRequestId: string,
+	state: CaptureState,
+	initialConnection: GraphqlConnection | undefined,
+	signal?: AbortSignal,
+): Promise<boolean> {
 	const seenCursors = new Set<string>();
-	let cursor: string | undefined;
-	while (true) {
-		const connection = await loadConnection({
-			cwd,
-			query: REVIEW_THREADS_QUERY,
-			variables: { id: pullRequestId, cursor: cursor ?? null },
-			path: ["data", "node", "reviewThreads"],
-			source: "review-threads",
-			limitations: state.limitations,
-		});
-		if (!connection) return true;
+	let connection = initialConnection;
+	while (connection) {
 		for (const node of connection.nodes) {
 			const thread = parseThread(node);
 			const comments = isObject(node) ? connectionAt(node, ["comments"]) : undefined;
@@ -786,19 +799,29 @@ async function captureReviewThreads(cwd: string, pullRequestId: string, state: C
 				addLimitation(state.limitations, "invalid-api-response", "review-threads");
 				continue;
 			}
-			if (!(await captureThreadCommentPages(cwd, thread, comments, state))) return false;
+			if (!(await captureThreadCommentPages(cwd, thread, comments, state, signal))) return false;
 		}
 		if (!connection.hasNextPage) return true;
-		const nextCursor = nextPageCursor(connection, seenCursors, state.limitations, "review-threads");
-		if (!nextCursor) return true;
-		cursor = nextCursor;
+		const cursor = nextPageCursor(connection, seenCursors, state.limitations, "review-threads");
+		if (!cursor) return true;
+		connection = await loadConnection({
+			cwd,
+			query: REVIEW_THREADS_QUERY,
+			variables: { id: pullRequestId, cursor },
+			path: ["data", "node", "reviewThreads"],
+			source: "review-threads",
+			limitations: state.limitations,
+			signal,
+		});
 	}
+	return true;
 }
 
 async function captureIssueComments(
 	cwd: string,
 	issues: ReviewGitHubLinkedIssue[],
 	state: CaptureState,
+	signal?: AbortSignal,
 ): Promise<void> {
 	for (const issue of issues) {
 		const seenCursors = new Set<string>();
@@ -811,6 +834,7 @@ async function captureIssueComments(
 				path: ["data", "node", "comments"],
 				source: "linked-issue-comments",
 				limitations: state.limitations,
+				signal,
 			});
 			if (!connection) break;
 			for (const node of connection.nodes) {
@@ -938,8 +962,14 @@ function contextFingerprint(
 async function finalHeadCheck(
 	cwd: string,
 	pullRequest: PullRequestView,
+	signal?: AbortSignal,
 ): Promise<ReviewGitHubContextCaptureResult | undefined> {
-	const result = await runGh(["pr", "view", String(pullRequest.number), "--json", "headRefOid"], cwd);
+	const result = await runGh(
+		["pr", "view", String(pullRequest.number), "--json", "headRefOid"],
+		cwd,
+		undefined,
+		signal,
+	);
 	if (!result.ok) {
 		return {
 			ok: false,
@@ -969,8 +999,11 @@ export async function captureReviewGitHubContext(options: {
 	cwd: string;
 	number?: string;
 	maxPullRequestNumber: number;
+	signal?: AbortSignal;
+	onProgress?: (message: string) => void;
 }): Promise<ReviewGitHubContextCaptureResult> {
 	const initialLimitations: ReviewGitHubContextLimitation[] = [];
+	options.onProgress?.("Loading pull request metadata…");
 	const result = await runGh(
 		[
 			"pr",
@@ -980,6 +1013,8 @@ export async function captureReviewGitHubContext(options: {
 			"id,number,title,body,baseRefName,headRefName,url,baseRefOid,headRefOid",
 		],
 		options.cwd,
+		undefined,
+		options.signal,
 	);
 	if (!result.ok) {
 		const error = commandError(result);
@@ -995,38 +1030,128 @@ export async function captureReviewGitHubContext(options: {
 	const pullRequest = parsePullRequestView(parseJson(result.stdout), options.maxPullRequestNumber, initialLimitations);
 	if (!pullRequest) return { ok: false, error: "Could not parse gh pr view output." };
 
-	const closing = await captureLinkedIssueSet(options.cwd, pullRequest.id, false, initialLimitations);
-	const manual = await captureLinkedIssueSet(options.cwd, pullRequest.id, true, initialLimitations);
+	options.onProgress?.("Capturing pull request context…");
+	const closingLimitations: ReviewGitHubContextLimitation[] = [];
+	const manualLimitations: ReviewGitHubContextLimitation[] = [];
+	const commentLimitations: ReviewGitHubContextLimitation[] = [];
+	const reviewLimitations: ReviewGitHubContextLimitation[] = [];
+	const threadLimitations: ReviewGitHubContextLimitation[] = [];
+	const [closingInitial, manualInitial, commentsInitial, reviewsInitial, threadsInitial] = await Promise.all([
+		loadConnection({
+			cwd: options.cwd,
+			query: LINKED_ISSUES_QUERY,
+			variables: { id: pullRequest.id, cursor: null, manualOnly: false },
+			path: ["data", "node", "closingIssuesReferences"],
+			source: "linked-issues",
+			limitations: closingLimitations,
+			signal: options.signal,
+		}),
+		loadConnection({
+			cwd: options.cwd,
+			query: LINKED_ISSUES_QUERY,
+			variables: { id: pullRequest.id, cursor: null, manualOnly: true },
+			path: ["data", "node", "closingIssuesReferences"],
+			source: "manual-linked-issues",
+			limitations: manualLimitations,
+			signal: options.signal,
+		}),
+		loadConnection({
+			cwd: options.cwd,
+			query: PR_COMMENTS_QUERY,
+			variables: { id: pullRequest.id, cursor: null },
+			path: ["data", "node", "comments"],
+			source: "pr-comments",
+			limitations: commentLimitations,
+			signal: options.signal,
+		}),
+		loadConnection({
+			cwd: options.cwd,
+			query: PR_REVIEWS_QUERY,
+			variables: { id: pullRequest.id, cursor: null },
+			path: ["data", "node", "reviews"],
+			source: "pr-reviews",
+			limitations: reviewLimitations,
+			signal: options.signal,
+		}),
+		loadConnection({
+			cwd: options.cwd,
+			query: REVIEW_THREADS_QUERY,
+			variables: { id: pullRequest.id, cursor: null },
+			path: ["data", "node", "reviewThreads"],
+			source: "review-threads",
+			limitations: threadLimitations,
+			signal: options.signal,
+		}),
+	]);
+
+	const closing = await captureLinkedIssueSet(
+		options.cwd,
+		pullRequest.id,
+		false,
+		closingLimitations,
+		closingInitial,
+		options.signal,
+	);
+	initialLimitations.push(...closingLimitations);
+	const manual = await captureLinkedIssueSet(
+		options.cwd,
+		pullRequest.id,
+		true,
+		manualLimitations,
+		manualInitial,
+		options.signal,
+	);
+	initialLimitations.push(...manualLimitations);
 	const manualIds = new Set(manual.issues.map((issue) => issue.id));
 	const linkedIssues: ReviewGitHubLinkedIssue[] = closing.issues.map((issue) => ({
 		...issue,
 		relationship: manualIds.has(issue.id) ? "manual" : manual.complete ? "closing" : "unknown",
 	}));
-	const state: CaptureState = { limitations: initialLimitations, discussionEntries: [] };
+	const discussionEntries: ReviewGitHubDiscussionEntry[] = [];
+	const commentState: CaptureState = { limitations: commentLimitations, discussionEntries };
 	let underDiscussionLimit = await captureSimpleDiscussionConnection({
 		cwd: options.cwd,
 		pullRequestId: pullRequest.id,
 		query: PR_COMMENTS_QUERY,
 		path: ["data", "node", "comments"],
 		source: "pr-comments",
-		state,
+		state: commentState,
+		initialConnection: commentsInitial,
+		signal: options.signal,
 		parse: parsePrComment,
 	});
+	initialLimitations.push(...commentLimitations);
 	if (underDiscussionLimit) {
+		const reviewState: CaptureState = { limitations: reviewLimitations, discussionEntries };
 		underDiscussionLimit = await captureSimpleDiscussionConnection({
 			cwd: options.cwd,
 			pullRequestId: pullRequest.id,
 			query: PR_REVIEWS_QUERY,
 			path: ["data", "node", "reviews"],
 			source: "pr-reviews",
-			state,
+			state: reviewState,
+			initialConnection: reviewsInitial,
+			signal: options.signal,
 			parse: parseReviewSummary,
 		});
+		initialLimitations.push(...reviewLimitations);
 	}
-	if (underDiscussionLimit) underDiscussionLimit = await captureReviewThreads(options.cwd, pullRequest.id, state);
-	if (underDiscussionLimit) await captureIssueComments(options.cwd, linkedIssues, state);
+	if (underDiscussionLimit) {
+		const threadState: CaptureState = { limitations: threadLimitations, discussionEntries };
+		underDiscussionLimit = await captureReviewThreads(
+			options.cwd,
+			pullRequest.id,
+			threadState,
+			threadsInitial,
+			options.signal,
+		);
+		initialLimitations.push(...threadLimitations);
+	}
+	const state: CaptureState = { limitations: initialLimitations, discussionEntries };
+	if (underDiscussionLimit) await captureIssueComments(options.cwd, linkedIssues, state, options.signal);
 
-	const finalError = await finalHeadCheck(options.cwd, pullRequest);
+	options.onProgress?.("Verifying pull request head…");
+	const finalError = await finalHeadCheck(options.cwd, pullRequest, options.signal);
 	if (finalError) return finalError;
 
 	const identity: ReviewPullRequestIdentity = {
