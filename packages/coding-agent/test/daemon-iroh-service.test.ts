@@ -115,7 +115,7 @@ function withRecordedRelayCredentialInstall(
 	onClose: () => void,
 	removals?: string[],
 	mutations?: string[],
-	beforeReconnect?: () => void,
+	beforeReconnect?: () => void | Promise<void>,
 ): IrohEndpointLike {
 	let watcher: IrohHomeRelayWatchCallback | undefined;
 	return {
@@ -124,7 +124,7 @@ function withRecordedRelayCredentialInstall(
 		online: () => Promise.resolve(),
 		insertRelay: (config) => endpoint.insertRelay?.(config) ?? Promise.resolve(),
 		reconnectRelay: async (config) => {
-			beforeReconnect?.();
+			await beforeReconnect?.();
 			mutations?.push(`reconnect:${config.url}`);
 			reconnects.push(config);
 			watcher?.(null, [config.url]);
@@ -2134,6 +2134,147 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 			await daemon;
 			daemonStopped = true;
 		} finally {
+			if (!daemonStopped) {
+				if (pairingRequestId !== undefined) {
+					await control?.request({ type: "pair_cancel", requestId: pairingRequestId }).catch(() => {});
+				}
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await control?.close();
+			fetchSpy.mockRestore();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("refreshes a committed credential when pairing cancellation supersedes its claim during reconnect", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-managed-cancel-during-reconnect-"));
+		const originalCredential = await provisionManagedRelayCredentialState(agentDir, 15 * 60_000);
+		const claimId = "claimabcdefghijklmnopqrs";
+		const exchangedAccessToken = "exchanged.payload.signature";
+		const refreshedAccessToken = "refreshed.payload.signature";
+		const reconnectGate = createDeferred();
+		const relayReconnects: IrohRelayConfigLike[] = [];
+		let reconnectAttempts = 0;
+		let reconnectStarted = false;
+		let exchangeRequests = 0;
+		let refreshRequests = 0;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims`) {
+				return new Response(
+					JSON.stringify({ claimId, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() }),
+					{ status: 201, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/pairing-claims/${claimId}/exchange`) {
+				exchangeRequests++;
+				return new Response(
+					JSON.stringify({
+						grantId: originalCredential.grantId,
+						endpointId: originalCredential.endpointId,
+						hostNodeId: originalCredential.endpointNodeId,
+						appEndpointId: "appendpointabcdefghijklm",
+						appNodeId: "b".repeat(64),
+						credential: {
+							accessToken: exchangedAccessToken,
+							accessTokenExpiresAt: new Date(Date.now() + 31_000).toISOString(),
+							tokenType: "Bearer",
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === `${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL}/v1/tokens/refresh`) {
+				refreshRequests++;
+				return new Response(
+					JSON.stringify({
+						accessToken: refreshedAccessToken,
+						accessTokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+						tokenType: "Bearer",
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`unexpected managed relay credential request: ${url}`);
+		});
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		let pairingRequestId: string | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{},
+				{
+					decorateEndpoint: (endpoint) =>
+						withRecordedRelayCredentialInstall(
+							endpoint,
+							relayReconnects,
+							() => {},
+							undefined,
+							undefined,
+							async () => {
+								reconnectAttempts++;
+								if (reconnectAttempts !== 1) return;
+								reconnectStarted = true;
+								await reconnectGate.promise;
+							},
+						),
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			await expectIrohEndpointReady(control);
+			const pairing = await control.request({ type: "pair_request" });
+			expect(pairing).toMatchObject({ type: "pair_started" });
+			if (pairing.type !== "pair_started") throw new Error("managed relay pairing did not start");
+			pairingRequestId = pairing.requestId;
+			await expect.poll(() => reconnectStarted, { timeout: 5_000 }).toBe(true);
+
+			expect(await control.request({ type: "pair_cancel", requestId: pairing.requestId })).toMatchObject({
+				type: "ok",
+			});
+			pairingRequestId = undefined;
+			const cancelledState = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+				settings: {
+					relayCredential?: IrohManagedRelayCredential;
+					relayCredentialClaim?: unknown;
+				};
+			};
+			expect(cancelledState.settings.relayCredential?.accessToken).toBe(exchangedAccessToken);
+			expect(cancelledState.settings.relayCredentialClaim).toBeUndefined();
+
+			reconnectGate.resolve();
+			await expect.poll(() => refreshRequests, { timeout: 5_000 }).toBe(1);
+			expect(exchangeRequests).toBe(1);
+			await expect
+				.poll(() => relayReconnects, { timeout: 5_000 })
+				.toEqual([
+					{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: exchangedAccessToken },
+					{ url: VOLT_PRODUCTION_RELAY_URLS[0], authToken: refreshedAccessToken },
+				]);
+			const refreshedState = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+				settings: {
+					relayCredential?: IrohManagedRelayCredential;
+					relayCredentialClaim?: unknown;
+				};
+			};
+			expect(refreshedState.settings.relayCredential?.accessToken).toBe(refreshedAccessToken);
+			expect(refreshedState.settings.relayCredentialClaim).toBeUndefined();
+
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await daemon;
+			daemonStopped = true;
+		} finally {
+			reconnectGate.resolve();
 			if (!daemonStopped) {
 				if (pairingRequestId !== undefined) {
 					await control?.request({ type: "pair_cancel", requestId: pairingRequestId }).catch(() => {});

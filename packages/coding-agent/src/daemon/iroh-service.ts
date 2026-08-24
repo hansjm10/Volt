@@ -1513,22 +1513,24 @@ class IrohDaemonService {
 				if (
 					!this.admission.isOpen ||
 					this.relayCredentialIsRevoking ||
-					expectedEpoch !== this.relayCredentialEpoch ||
-					this.managedRelayCredentialClaim !== exchangedClaim
+					expectedEpoch !== this.relayCredentialEpoch
 				) {
 					return;
 				}
-				this.services.state.updateSettings({ relayCredentialClaim: undefined });
-				await this.services.state.flush();
-				if (
-					!this.admission.isOpen ||
-					this.relayCredentialIsRevoking ||
-					expectedEpoch !== this.relayCredentialEpoch ||
-					this.managedRelayCredentialClaim !== exchangedClaim
-				) {
-					return;
+				if (this.managedRelayCredentialClaim === exchangedClaim) {
+					this.services.state.updateSettings({ relayCredentialClaim: undefined });
+					await this.services.state.flush();
+					if (
+						!this.admission.isOpen ||
+						this.relayCredentialIsRevoking ||
+						expectedEpoch !== this.relayCredentialEpoch
+					) {
+						return;
+					}
+					if (this.managedRelayCredentialClaim === exchangedClaim) {
+						this.managedRelayCredentialClaim = undefined;
+					}
 				}
-				this.managedRelayCredentialClaim = undefined;
 			}
 			installed = true;
 		});
