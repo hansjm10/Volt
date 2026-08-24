@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(coding-agent): Kept ready-plan transitions atomic with their canonical feedback delivery.
+fix(plan): Plan mode no longer becomes ready without preserving the feedback that produced the final plan. ([#212](https://github.com/volt-hq/Volt/issues/212))

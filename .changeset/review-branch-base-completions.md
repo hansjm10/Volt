@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-improvement(rpc): The review.branch UI action now advertises a gitBranches completion source on its base argument, so get_ui_action_completions serves workspace branch names to local and remote clients. ([#79](https://github.com/volt-hq/Volt/issues/79))
+improvement(rpc): Local and remote clients can now complete workspace branch names for the `review.branch` action through `get_ui_action_completions`. ([#79](https://github.com/volt-hq/Volt/issues/79))

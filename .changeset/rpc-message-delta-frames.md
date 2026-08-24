@@ -2,7 +2,7 @@
 "@hansjm10/volt-coding-agent": minor
 ---
 
-breaking(rpc): message_update frames are now delta-only: they no longer carry the accumulated partial message or the duplicated assistantMessageEvent.partial. ([#44](https://github.com/volt-hq/Volt/issues/44))
+breaking(rpc): Changed `message_update` frames to carry only deltas instead of accumulated partial messages. ([#44](https://github.com/volt-hq/Volt/issues/44))
 
 Every `message_update` frame previously serialized the full accumulated assistant message twice (as `message` and as `assistantMessageEvent.partial`), making streaming bandwidth quadratic in message length on stdio RPC, Iroh remote, `--mode json`, and daemon viewer feeds. Frames now carry only the streaming delta; `message_start` seeds the accumulator, `message_end` carries the final message, and a client attaching mid-message receives one full `message` snapshot on its first update. Daemon viewer feeds still carry full messages but drop the duplicated partial.
 
