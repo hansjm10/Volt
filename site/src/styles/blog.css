@@ -1,12 +1,14 @@
 :root {
-  --bg: #0c0f0a;
-  --panel: #141810;
-  --border: #2a3222;
-  --text: #e6ebe0;
-  --muted: #9aa78d;
-  --accent: #a3e635;
-  --accent-soft: #1d2a12;
-  --code: #11150e;
+  --bg: #171420;
+  --panel: #1d1a28;
+  --border: #39304f;
+  --text: #d4d4d4;
+  --muted: #808080;
+  --accent: #bf5af2;
+  --accent-bright: #e066ff;
+  --accent-dim: #7d6bfa;
+  --accent-soft: #322c44;
+  --code: #120f1a;
 }
 
 * {
@@ -20,7 +22,7 @@ html {
 body {
   min-height: 100vh;
   margin: 0;
-  background: radial-gradient(ellipse 80% 35% at 50% -10%, #1a2411, transparent), var(--bg);
+  background: radial-gradient(ellipse 80% 35% at 50% -10%, var(--accent-soft), transparent), var(--bg);
   color: var(--text);
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   line-height: 1.7;
@@ -74,8 +76,8 @@ pre {
   text-decoration: none;
 }
 
-.brand svg {
-  color: var(--accent);
+.brand img {
+  border-radius: 6px;
 }
 
 .site-nav nav,
@@ -150,7 +152,7 @@ pre {
 }
 
 .post-card:hover {
-  border-color: #4d7c0f;
+  border-color: var(--accent-dim);
   text-decoration: none;
 }
 
@@ -185,7 +187,7 @@ pre {
 
 .draft-badge {
   padding: 0.1rem 0.45rem;
-  border: 1px solid #4d7c0f;
+  border: 1px solid var(--accent-dim);
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--accent);
