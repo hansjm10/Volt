@@ -1,8 +1,11 @@
 ---
+import { getCollection } from "astro:content";
+
 const install = "curl -fsSL https://volt-cli.dev/install.sh | sh";
 const title = "Volt — a fast, hackable coding agent for your terminal";
 const description =
   "Volt is an open-source coding agent CLI: multi-provider, extensible with skills and packages, and reachable from your phone over end-to-end encrypted remote access.";
+const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft)).length > 0;
 ---
 
 <html lang="en">
@@ -24,6 +27,7 @@ const description =
         volt
       </a>
       <nav>
+        {hasPublishedPosts && <a href="/blog/">Blog</a>}
         <a href="/docs/">Docs</a>
         <a href="/docs/quickstart/">Quickstart</a>
         <a href="https://github.com/hansjm10/Volt">GitHub</a>
@@ -123,6 +127,7 @@ const description =
         <a href="https://github.com/hansjm10/Volt">github.com/hansjm10/Volt</a>.
       </p>
       <nav>
+        {hasPublishedPosts && <a href="/blog/">Blog</a>}
         <a href="/docs/">Docs</a>
         <a href="/docs/security/">Security</a>
         <a href="https://github.com/hansjm10/Volt/blob/main/CONTRIBUTING.md">Contributing</a>
