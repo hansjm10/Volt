@@ -19,6 +19,7 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://volt-cli.dev/" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="alternate" type="application/rss+xml" title="Volt Blog" href="/rss.xml" />
   </head>
   <body>
     <header class="nav">
