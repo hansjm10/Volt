@@ -3,4 +3,4 @@
 "@hansjm10/volt-tui": patch
 ---
 
-fix(tui): Prevented session replacement renders from reading disposed sessions during clear and resume.
+fix(tui): Clearing or resuming a conversation no longer renders from a session that has already been replaced.
