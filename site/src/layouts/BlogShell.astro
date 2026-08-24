@@ -37,7 +37,7 @@ const rssUrl = new URL("/rss.xml", siteUrl).href;
     <meta name="description" content={description} />
     <link rel="canonical" href={canonicalUrl} />
     <link rel="alternate" type="application/rss+xml" title="Volt Blog" href={rssUrl} />
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/volt-icon.png" type="image/png" />
     <meta property="og:site_name" content="Volt" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
@@ -60,7 +60,7 @@ const rssUrl = new URL("/rss.xml", siteUrl).href;
   <body>
     <header class="site-nav">
       <a class="brand" href="/" aria-label="Volt home">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M13 2 4.5 13.5H11L9.5 22 19 9.5h-6.5L13 2z"></path></svg>
+        <img src="/volt-icon.png" width="28" height="28" alt="" />
         volt
       </a>
       <nav aria-label="Main navigation">

@@ -15,7 +15,7 @@
 set -eu
 
 PACKAGE="@hansjm10/volt-coding-agent"
-REPO="hansjm10/Volt"
+REPO="volt-hq/Volt"
 MIN_NODE_MAJOR=22
 MIN_NODE_MINOR=19
 METHOD="${VOLT_INSTALL_METHOD:-npm}"

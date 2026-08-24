@@ -1678,7 +1678,7 @@ test("installers use the published package and verify binary checksums before ex
 	assert.equal(spawnSync(posixShell, ["-n", "site/public/install.sh"]).status, 0);
 });
 
-test("site sources never rewrite documentation to the obsolete npm identity", () => {
+test("site sources preserve the package identity and beta/relay disclosures", () => {
 	for (const file of [
 		"site/src/pages/index.astro",
 		"site/scripts/sync-docs.mjs",
@@ -1689,8 +1689,8 @@ test("site sources never rewrite documentation to the obsolete npm identity", ()
 		assert.doesNotMatch(readFileSync(file, "utf8"), /@hansjm10\/volt-cli/, file);
 	}
 	const landingPage = readFileSync("site/src/pages/index.astro", "utf8");
-	assert.match(landingPage, /public beta gates in progress/i);
-	assert.match(landingPage, /traffic may traverse configured Iroh relays/i);
+	assert.match(landingPage, /public beta/i);
+	assert.match(landingPage, /connects\s+devices directly when possible and falls back to end-to-end encrypted relays/i);
 });
 
 test("published packages and binary build include the repository license and notices", () => {
