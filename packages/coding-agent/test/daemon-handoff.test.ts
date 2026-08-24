@@ -423,6 +423,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 
 		await transaction?.commit();
 		expect(tui.reacquired).toEqual([{ sessionId: "phone-session", outcome: { kind: "granted", handoff: "warm" } }]);
+		await vi.waitFor(() => expect(dispatchedRelaySessions).toEqual(["phone-session"]));
 		expect(
 			daemon.server.sendTo(targetLease.tuiConnectionId, {
 				type: "relay_offer",
@@ -447,7 +448,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 				streamId: "stream-after-target-apply",
 			}),
 		).toBe(true);
-		await vi.waitFor(() => expect(dispatchedRelaySessions).toEqual(["phone-session"]));
+		await vi.waitFor(() => expect(dispatchedRelaySessions).toEqual(["phone-session", "phone-session"]));
 		expect(daemon.broker.lookup("ws", "old")).toBeUndefined();
 		expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("tui-owned");
 	}, 20_000);
