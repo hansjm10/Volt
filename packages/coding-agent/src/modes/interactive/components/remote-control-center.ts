@@ -1,8 +1,13 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import {
 	type Component,
+	concatRenderFrames,
 	createRenderFrame,
+	getCapabilities,
+	getCellDimensions,
 	getKeybindings,
+	Image,
+	prefixRenderFrame,
 	type RenderFrame,
 	truncateToWidth,
 	visibleWidth,
@@ -14,7 +19,7 @@ import {
 	type IrohRemoteAccessPresetName,
 	isIrohRemoteAccessPresetName,
 } from "../../../core/remote/iroh/access-grant.ts";
-import { formatIrohRemoteTicketQrCode } from "../../../core/remote/iroh/qr.ts";
+import { createIrohRemoteTicketQrCodePng, formatIrohRemoteTicketQrCode } from "../../../core/remote/iroh/qr.ts";
 import { getIrohRemotePairingVerificationDetails } from "../../../core/remote/iroh/ticket.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 import { createDaemonClient, type DaemonClient } from "../../../daemon/control-client.ts";
@@ -381,6 +386,11 @@ function policyTools(policy: DaemonRemotePolicyStatus, fallback?: string[]): str
 	return "per-device grant";
 }
 
+function supportsInlinePairingQr(): boolean {
+	const protocol = getCapabilities().images;
+	return protocol === "kitty" || protocol === "sixel";
+}
+
 /** Full-viewport control center for daemon health, phone pairing, and access. */
 export class RemoteControlCenterComponent implements Component {
 	private readonly backend: RemoteControlBackend;
@@ -392,6 +402,8 @@ export class RemoteControlCenterComponent implements Component {
 	private lastRows: DisplayRow[] = [];
 	private lastPageSize = 1;
 	private pairingHandle: RemotePairingHandle | undefined;
+	private pairingQrPng: { ticket: string; png: ReturnType<typeof createIrohRemoteTicketQrCodePng> } | undefined;
+	private pairingQrImage: { key: string; image: Image } | undefined;
 	private pairingAttempt = 0;
 	private generation = 0;
 	private disposed = false;
@@ -416,6 +428,7 @@ export class RemoteControlCenterComponent implements Component {
 		this.pairingAttempt++;
 		this.pairingHandle?.dispose();
 		this.pairingHandle = undefined;
+		this.clearPairingQrImage(true);
 		void this.backend.close();
 	}
 
@@ -429,6 +442,13 @@ export class RemoteControlCenterComponent implements Component {
 		const rows = this.buildRows(width, pageSize);
 		this.lastRows = rows;
 		this.ensureSelection(rows);
+		const pairingQrBody = this.renderPairingQrBody(width, pageSize, rows);
+		if (pairingQrBody) {
+			this.scrollOffset = 0;
+			this.manualScroll = false;
+			return concatRenderFrames([createRenderFrame(header), pairingQrBody, createRenderFrame(footer)]);
+		}
+		this.clearPairingQrImage();
 		const selectedIndex = rows.findIndex((row) => row.key === this.selectedKey);
 		const maxOffset = Math.max(0, rows.length - pageSize);
 		if (!this.manualScroll && selectedIndex >= 0) {
@@ -1207,7 +1227,16 @@ export class RemoteControlCenterComponent implements Component {
 			qrLines !== undefined &&
 			qrLines.length + 4 <= pageSize &&
 			qrLines.every((line) => visibleWidth(line) <= width);
+		const inlineQrFits = this.inlinePairingQrFits(this.view.ticket, width, pageSize);
 		if (this.view.showQr) {
+			if (inlineQrFits) {
+				return [
+					{ text: `PAIR QR · ${this.view.workspaceName}`, tone: "accent" },
+					{ key: "pairing-verification", text: "Show verification details", tone: "text" },
+					{ key: "pairing-copy", text: "Copy pairing ticket", tone: "text" },
+					{ key: "pairing-back", text: "Cancel pairing", tone: "text" },
+				];
+			}
 			if (qrFits && qrLines !== undefined) {
 				return [
 					{ text: `PAIR QR · ${this.view.workspaceName}`, tone: "accent" },
@@ -1249,7 +1278,7 @@ export class RemoteControlCenterComponent implements Component {
 					tone: "error",
 				});
 			}
-			if (qrFits) {
+			if (inlineQrFits || qrFits) {
 				rows.push({ key: "pairing-show-qr", text: "Show pairing QR", tone: "text" });
 			} else if (qrError) {
 				rows.push({ text: `QR unavailable: ${qrError}`, tone: "warning" });
@@ -1277,6 +1306,77 @@ export class RemoteControlCenterComponent implements Component {
 			tone: "text",
 		});
 		return rows;
+	}
+
+	private getPairingQrPng(ticket: string): ReturnType<typeof createIrohRemoteTicketQrCodePng> {
+		if (this.pairingQrPng?.ticket === ticket) return this.pairingQrPng.png;
+		this.clearPairingQrImage(true);
+		const png = createIrohRemoteTicketQrCodePng(ticket);
+		this.pairingQrPng = { ticket, png };
+		return png;
+	}
+
+	private inlinePairingQrFits(ticket: string | undefined, width: number, pageSize: number): boolean {
+		if (!ticket || !supportsInlinePairingQr() || width <= 2 || pageSize <= 4) return false;
+		try {
+			const png = this.getPairingQrPng(ticket);
+			const cells = getCellDimensions();
+			const availableSidePixels = Math.min((width - 2) * cells.widthPx, (pageSize - 4) * cells.heightPx);
+			return availableSidePixels >= png.widthPx / 2;
+		} catch {
+			return false;
+		}
+	}
+
+	private renderPairingQrBody(width: number, pageSize: number, rows: DisplayRow[]): RenderFrame | undefined {
+		if (
+			this.view.kind !== "pairing" ||
+			!this.view.showQr ||
+			!this.inlinePairingQrFits(this.view.ticket, width, pageSize) ||
+			!this.view.ticket
+		) {
+			return undefined;
+		}
+		const imageRows = pageSize - rows.length;
+		if (imageRows < 1) return undefined;
+		const imageKey = `${this.view.ticket}\0${width}\0${imageRows}`;
+		if (this.pairingQrImage?.key !== imageKey) {
+			this.clearPairingQrImage();
+			const png = this.getPairingQrPng(this.view.ticket);
+			this.pairingQrImage = {
+				key: imageKey,
+				image: new Image(
+					png.base64Data,
+					"image/png",
+					{ fallbackColor: (value) => theme.fg("muted", value) },
+					{ maxWidthCells: width, maxHeightCells: imageRows, filename: "pairing-qr.png" },
+					{ widthPx: png.widthPx, heightPx: png.heightPx },
+				),
+			};
+		}
+		const imageFrame = this.pairingQrImage.image.render(width);
+		const placement = imageFrame.images[0];
+		if (!placement || imageFrame.lines.length > imageRows) return undefined;
+		const centeredImage = prefixRenderFrame(
+			imageFrame,
+			" ".repeat(Math.max(0, Math.floor((width - placement.columns) / 2))),
+		);
+		const body = concatRenderFrames([
+			createRenderFrame([this.renderRow(rows[0]!, width)]),
+			centeredImage,
+			createRenderFrame(rows.slice(1).map((row) => this.renderRow(row, width))),
+		]);
+		if (body.lines.length > pageSize) return undefined;
+		return concatRenderFrames([
+			body,
+			createRenderFrame(Array.from({ length: pageSize - body.lines.length }, () => "")),
+		]);
+	}
+
+	private clearPairingQrImage(clearPng = false): void {
+		this.pairingQrImage?.image.dispose();
+		this.pairingQrImage = undefined;
+		if (clearPng) this.pairingQrPng = undefined;
 	}
 
 	private renderRow(row: DisplayRow, width: number): string {

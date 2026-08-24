@@ -1,4 +1,4 @@
-import { visibleWidth } from "@hansjm10/volt-tui";
+import { getCapabilities, setCapabilities, visibleWidth } from "@hansjm10/volt-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { IrohRemoteAccessPresetName } from "../src/core/remote/iroh/access-grant.ts";
 import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS, IROH_REMOTE_ALPN } from "../src/core/remote/iroh/protocol.ts";
@@ -622,6 +622,47 @@ describe("RemoteControlCenterComponent", () => {
 		expect(completed).toContain("Pairing complete");
 		expect(completed).toContain("Paired paired-phone");
 		expect(completed).not.toMatch(/[▀▄█]/);
+	});
+
+	it("renders the pairing QR as an inline image in a standard Windows Terminal viewport", async () => {
+		const previousCapabilities = getCapabilities();
+		setCapabilities({ images: "sixel", trueColor: true, hyperlinks: true });
+		const backend = new FakeBackend({ kind: "online", status: status() });
+		const { component } = createComponent(backend, 24);
+		try {
+			await component.start();
+			component.render(80).lines;
+			component.handleInput("\x1b[B");
+			component.handleInput("\x1b[B");
+			component.handleInput("\n");
+			component.handleInput("\n");
+			await settle();
+			backend.pairingProgress?.({
+				type: "pairing_progress",
+				requestId: "pair-1",
+				phase: "ticket",
+				ticket: verificationTicket(),
+			});
+			backend.pairingProgress?.({ type: "pairing_progress", requestId: "pair-1", phase: "waiting" });
+
+			let frame = component.render(80);
+			expect(frame.lines.some((line) => stripAnsi(line).includes("Show pairing QR"))).toBe(true);
+			component.handleInput("\x1b[A");
+			component.handleInput("\x1b[A");
+			component.handleInput("\n");
+			frame = component.render(80);
+
+			expect(frame.lines).toHaveLength(24);
+			expect(frame.images).toHaveLength(1);
+			expect(frame.images[0]).toMatchObject({ protocol: "sixel", top: 4 });
+			expect(frame.images[0]!.columns).toBeLessThanOrEqual(80);
+			expect(frame.images[0]!.rows).toBeLessThanOrEqual(15);
+			expect(frame.lines.some((line) => stripAnsi(line).includes("Show verification details"))).toBe(true);
+			expect(frame.lines.some((line) => stripAnsi(line).includes("Enlarge the terminal"))).toBe(false);
+		} finally {
+			component.dispose();
+			setCapabilities(previousCapabilities);
+		}
 	});
 
 	it("requires confirmation before revoking a paired device", async () => {
