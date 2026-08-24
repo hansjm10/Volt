@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -516,7 +525,7 @@ describe("review snapshots", () => {
 		).toContain("+feature");
 	});
 
-	it("borrows local objects, fetches a remote-only PR head, and rejects moved metadata", async () => {
+	it("detaches fetched PR snapshots from borrowed local objects and rejects moved metadata", async () => {
 		const repository = createRepository();
 		const remote = join(tmpdir(), `volt-review-snapshot-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(remote, { recursive: true });
@@ -575,6 +584,17 @@ describe("review snapshots", () => {
 				.map((hunk) => hunk.patch)
 				.join("\n"),
 		).toContain("+pull request");
+
+		const unavailableLocalObjects = `${localObjects}-unavailable`;
+		renameSync(localObjects, unavailableLocalObjects);
+		try {
+			expect((await readAvailableFile(snapshot, "base", "tracked.txt")).content.toString()).toBe("before\n");
+			expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("pull request\n");
+			const checkout = await snapshot.materializeHead();
+			expect(readFileSync(join(checkout, "tracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("pull request\n");
+		} finally {
+			renameSync(unavailableLocalObjects, localObjects);
+		}
 
 		config.finalHeadOid = baseOid;
 		writeFileSync(join(repository, "bin", "gh-config.json"), JSON.stringify(config));

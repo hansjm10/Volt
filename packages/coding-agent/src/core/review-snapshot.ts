@@ -720,16 +720,17 @@ async function createPullRequestSource(
 		throwIfResolutionCancelled(signal);
 		if (!init.ok) return { error: commandFailure("git init failed", init) };
 		const objects = join(temporaryDirectory, "objects");
+		const alternatesPath = join(objects, "info", "alternates");
 		await mkdir(join(objects, "info"), { recursive: true });
-		await writeFile(join(objects, "info", "alternates"), `${resolve(localObjects)}\n`, "utf8");
+		await writeFile(alternatesPath, `${resolve(localObjects)}\n`, "utf8");
 		throwIfResolutionCancelled(signal);
-		const source: GitSource = {
+		const borrowedSource: GitSource = {
 			cwd: temporaryDirectory,
 			objectDirectories: [objects, localObjects],
 			limits,
 			signal,
 		};
-		const fetch = await git(source, [
+		const fetch = await git(borrowedSource, [
 			"fetch",
 			"--no-tags",
 			"--force",
@@ -745,13 +746,40 @@ async function createPullRequestSource(
 				},
 			};
 		}
-		const fetchedBase = await requireCanonicalCommit(source, "refs/review/base");
-		const fetchedHead = await requireCanonicalCommit(source, "refs/review/head");
+		const fetchedBase = await requireCanonicalCommit(borrowedSource, "refs/review/base");
+		const fetchedHead = await requireCanonicalCommit(borrowedSource, "refs/review/head");
 		if (fetchedBase !== pullRequest.baseRefOid || fetchedHead !== pullRequest.headRefOid) {
 			return {
 				error: {
 					error: "The pull request moved while Volt captured it. Retry the review.",
 					remoteError: "The pull request changed while Volt captured it. Retry the review.",
+				},
+			};
+		}
+		const repack = await git(borrowedSource, ["repack", "-a", "-d"]);
+		if (!repack.ok) {
+			return {
+				error: {
+					error: `git repack failed: ${commandError(repack)}`,
+					remoteError: "Could not make the pull request snapshot self-contained.",
+				},
+			};
+		}
+		await rm(alternatesPath, { force: true });
+		throwIfResolutionCancelled(signal);
+		const source: GitSource = {
+			cwd: temporaryDirectory,
+			objectDirectories: [objects],
+			limits,
+			signal,
+		};
+		const detachedBase = await requireCanonicalCommit(source, "refs/review/base");
+		const detachedHead = await requireCanonicalCommit(source, "refs/review/head");
+		if (detachedBase !== pullRequest.baseRefOid || detachedHead !== pullRequest.headRefOid) {
+			return {
+				error: {
+					error: "The pull request snapshot remained dependent on local Git objects.",
+					remoteError: "Could not make the pull request snapshot self-contained.",
 				},
 			};
 		}
