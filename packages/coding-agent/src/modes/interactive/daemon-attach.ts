@@ -10,6 +10,7 @@ import {
 	CONTROL_RPC_GRANTS_CAPABILITY,
 	CONTROL_WORKTREES_CAPABILITY,
 	type ControlEvent,
+	type ControlResponse,
 	type ControlWorktreeStatus,
 	type LeaseReleaseReason,
 	type LeaseState,
@@ -391,6 +392,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 	let currentSessionId: string | undefined;
 	let heldSessionId: string | undefined;
 	let pendingRekeyTransactionId: string | undefined;
+	const pendingRekeyRelayOffers = new Map<string, DaemonRelayOffer>();
 	let disposed = false;
 	let resolvingWorkspace: Promise<void> | undefined;
 	const eventHandlers = new Set<(event: ControlEvent) => void>();
@@ -465,6 +467,16 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 		if (!handler || !activeClient) {
 			return;
 		}
+		// A warm rekey can publish its target lease before AgentSessionRuntime
+		// applies that target. Hold every offer behind the rekey barrier, then
+		// replay only the session that remains installed after the transition.
+		if (pendingRekeyTransactionId) {
+			pendingRekeyRelayOffers.set(offer.relayId, offer);
+			return;
+		}
+		if (offer.sessionId !== currentSessionId) {
+			return;
+		}
 		handler(offer, async () => {
 			const opened = await activeClient.openRelay({ relayId: offer.relayId, relayToken: offer.relayToken });
 			const key = relayKey(offer.clientNodeId, offer.sessionId);
@@ -483,6 +495,20 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			opened.stream.once("close", finish);
 			return { preamble: opened.preamble, stream: opened.stream, finished: finish };
 		});
+	};
+
+	const completePendingRekey = (installedSessionId?: string): void => {
+		pendingRekeyTransactionId = undefined;
+		const offers = Array.from(pendingRekeyRelayOffers.values());
+		pendingRekeyRelayOffers.clear();
+		if (installedSessionId === undefined) {
+			return;
+		}
+		for (const offer of offers) {
+			if (offer.sessionId === installedSessionId) {
+				handleRelayOffer(offer);
+			}
+		}
 	};
 
 	const resolveWorkspace = async (): Promise<void> => {
@@ -582,6 +608,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							handleRelayOffer(event);
 						}
 						if (event.type === "relay_closed") {
+							pendingRekeyRelayOffers.delete(event.relayId);
 							// The socket close callback decrements the count; nothing to do
 							// beyond fanning the event out.
 						}
@@ -597,6 +624,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						if (next !== "connected") {
 							connectionGeneration++;
 							heldSessionId = undefined;
+							pendingRekeyRelayOffers.clear();
 						}
 						if (next === "connected") {
 							void ensureLeaseAfterConnected().catch(() => {});
@@ -682,7 +710,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								}
 							: undefined;
 			} catch (error) {
-				pendingRekeyTransactionId = undefined;
+				completePendingRekey(oldSessionId);
 				throw error;
 			}
 			stagedWorktreeContext = undefined;
@@ -700,8 +728,12 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			const contextChanged = workspaceName !== previousWorkspaceName || resolvedWorktreeId !== previousWorktreeId;
 			const sourceLeaseConnectionGeneration = connectionGeneration;
 			let targetLeasePreacquired = false;
+			let targetLeaseHandoff: "cold" | "warm" | "none" = "none";
 			let targetLeaseConnectionGeneration: number | undefined;
-			if (contextChanged && activeClient && workspaceName && state === "connected") {
+			const preacquireTargetLease = async (): Promise<void> => {
+				if (!activeClient || !workspaceName || state !== "connected") {
+					throw new Error("replacement session lease was not acquired");
+				}
 				let targetAcquireStarted = false;
 				try {
 					targetAcquireStarted = true;
@@ -724,7 +756,8 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								: "replacement session lease was not acquired",
 						);
 					}
-					if (targetAcquire.kind === "pending") await targetAcquire.granted;
+					targetLeaseHandoff =
+						targetAcquire.kind === "pending" ? (await targetAcquire.granted).handoff : targetAcquire.handoff;
 					targetLeasePreacquired = true;
 					targetLeaseConnectionGeneration = connectionGeneration;
 				} catch (error) {
@@ -738,15 +771,65 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							})
 							.catch(() => {});
 					}
-					pendingRekeyTransactionId = undefined;
+					throw error;
+				}
+			};
+			if (contextChanged && activeClient && workspaceName && state === "connected") {
+				try {
+					await preacquireTargetLease();
+				} catch (error) {
 					resolvedWorkspaceName = previousWorkspaceName;
 					resolvedContextCwd = previousContextCwd;
 					resolvedWorktreeId = previousWorktreeId;
 					boundWorktreeSessionId = previousBoundWorktreeSessionId;
+					completePendingRekey(oldSessionId);
 					if (state === "connected" && heldSessionId !== oldSessionId) {
 						await ensureLeaseAfterConnected().catch(() => {});
 					}
 					throw error;
+				}
+			}
+			let prepared: ControlResponse | undefined;
+			if (
+				heldSessionId === oldSessionId &&
+				activeClient &&
+				workspaceName &&
+				state === "connected" &&
+				!contextChanged
+			) {
+				prepared = await activeClient.request({
+					type: "lease_rekey_prepare",
+					workspaceName,
+					oldSessionId,
+					newSessionId,
+				});
+				if (prepared.type !== "lease_rekey_prepared") {
+					if (prepared.type === "error" && prepared.code === "target_in_use") {
+						try {
+							// An existing daemon-owned conversation is a warm-switch target,
+							// not a new identity to overwrite. Acquire it through the normal
+							// drain/takeover path while retaining the source for rollback.
+							await preacquireTargetLease();
+						} catch (error) {
+							resolvedWorkspaceName = previousWorkspaceName;
+							resolvedContextCwd = previousContextCwd;
+							resolvedWorktreeId = previousWorktreeId;
+							boundWorktreeSessionId = previousBoundWorktreeSessionId;
+							completePendingRekey(oldSessionId);
+							throw error;
+						}
+					} else {
+						resolvedWorkspaceName = previousWorkspaceName;
+						resolvedContextCwd = previousContextCwd;
+						resolvedWorktreeId = previousWorktreeId;
+						boundWorktreeSessionId = previousBoundWorktreeSessionId;
+						completePendingRekey(oldSessionId);
+						throw new Error(
+							prepared.type === "error"
+								? prepared.message
+								: `unexpected daemon response to conversation lease rekey preflight: ${prepared.type}`,
+						);
+					}
 				}
 			}
 			if (
@@ -754,7 +837,8 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				!activeClient ||
 				!workspaceName ||
 				state !== "connected" ||
-				contextChanged
+				contextChanged ||
+				targetLeasePreacquired
 			) {
 				pendingRekeyTransactionId = "local";
 				const previousHeldSessionId = heldSessionId;
@@ -787,7 +871,10 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							if (outcome.kind === "denied" || outcome.kind === "noop") {
 								throw new Error("replacement session lease could not be reacquired");
 							}
-							if (outcome.kind === "pending") await outcome.granted;
+							const reacquired = outcome.kind === "pending" ? await outcome.granted : outcome;
+							if (targetLeaseHandoff === "none") {
+								targetLeaseHandoff = reacquired.handoff;
+							}
 							targetLeaseConnectionGeneration = connectionGeneration;
 						}
 						const bindClient = client;
@@ -820,7 +907,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								// The old connection may already have released this lease.
 							}
 							if (targetLeasePreacquired) {
-								const outcome: AcquireOutcome = { kind: "granted", handoff: "none" };
+								const outcome: AcquireOutcome = { kind: "granted", handoff: targetLeaseHandoff };
 								trackAcquireOutcome(newSessionId, outcome);
 								reacquiredHandler?.(newSessionId, outcome);
 							} else {
@@ -845,7 +932,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							}
 						}
 						phase = "committed";
-						pendingRekeyTransactionId = undefined;
+						completePendingRekey(newSessionId);
 						if (state === "connected" && heldSessionId !== newSessionId) {
 							await ensureLeaseAfterConnected().catch(() => {});
 						}
@@ -865,7 +952,6 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								.catch(() => {});
 						}
 						phase = "rolled_back";
-						pendingRekeyTransactionId = undefined;
 						resolvedWorkspaceName = previousWorkspaceName;
 						resolvedContextCwd = previousContextCwd;
 						resolvedWorktreeId = previousWorktreeId;
@@ -877,6 +963,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							connectionGeneration === sourceLeaseConnectionGeneration
 								? previousHeldSessionId
 								: undefined;
+						completePendingRekey(oldSessionId);
 						if (state === "connected" && heldSessionId !== oldSessionId) {
 							await ensureLeaseAfterConnected().catch(() => {});
 						}
@@ -917,29 +1004,14 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							boundWorktreeSessionId = previousBoundWorktreeSessionId;
 						}
 						phase = "disposed";
-						pendingRekeyTransactionId = undefined;
 						currentSessionId = undefined;
 						heldSessionId = undefined;
+						completePendingRekey();
 					},
 				};
 			}
-			const prepared = await activeClient.request({
-				type: "lease_rekey_prepare",
-				workspaceName,
-				oldSessionId,
-				newSessionId,
-			});
-			if (prepared.type !== "lease_rekey_prepared") {
-				pendingRekeyTransactionId = undefined;
-				resolvedWorkspaceName = previousWorkspaceName;
-				resolvedContextCwd = previousContextCwd;
-				resolvedWorktreeId = previousWorktreeId;
-				boundWorktreeSessionId = previousBoundWorktreeSessionId;
-				throw new Error(
-					prepared.type === "error"
-						? prepared.message
-						: `unexpected daemon response to conversation lease rekey preflight: ${prepared.type}`,
-				);
+			if (prepared?.type !== "lease_rekey_prepared") {
+				throw new Error("conversation lease rekey preflight did not reserve its target");
 			}
 			const transactionId = prepared.transactionId;
 			pendingRekeyTransactionId = transactionId;
@@ -961,9 +1033,9 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						);
 					}
 					phase = "committed";
-					pendingRekeyTransactionId = undefined;
 					currentSessionId = newSessionId;
 					heldSessionId = newSessionId;
+					completePendingRekey(newSessionId);
 				},
 				async rollback() {
 					if (phase !== "prepared") {
@@ -977,13 +1049,13 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						// Disconnect cleanup rolls the reservation and lease back implicitly.
 					}
 					phase = "rolled_back";
-					pendingRekeyTransactionId = undefined;
 					resolvedWorkspaceName = previousWorkspaceName;
 					resolvedContextCwd = previousContextCwd;
 					resolvedWorktreeId = previousWorktreeId;
 					boundWorktreeSessionId = previousBoundWorktreeSessionId;
 					currentSessionId = oldSessionId;
 					heldSessionId = retained && state === "connected" ? oldSessionId : undefined;
+					completePendingRekey(oldSessionId);
 					if (state === "connected" && heldSessionId !== oldSessionId) {
 						await ensureLeaseAfterConnected().catch(() => {});
 					}
@@ -1013,9 +1085,9 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						boundWorktreeSessionId = previousBoundWorktreeSessionId;
 					}
 					phase = "disposed";
-					pendingRekeyTransactionId = undefined;
 					currentSessionId = undefined;
 					heldSessionId = undefined;
+					completePendingRekey();
 				},
 			};
 		},
@@ -1148,7 +1220,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			disposed = true;
 			currentSessionId = undefined;
 			heldSessionId = undefined;
-			pendingRekeyTransactionId = undefined;
+			completePendingRekey();
 			activeRelayIds.clear();
 			await client?.close();
 			client = undefined;

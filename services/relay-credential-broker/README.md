@@ -32,7 +32,7 @@ Remaining production blockers:
 
 - Canary and production now use separate Cloud Run, Cloud SQL, Secret Manager, KMS, issuer, audience, JWKS, and relay authority. Production uses a Cloud Armor-protected external HTTPS load balancer, private-ingress Cloud Run, regional-HA PostgreSQL with point-in-time recovery, and a successful pre-admission restore drill. Production alert policies, secret-free operator dashboards, and administrative runbooks remain outstanding.
 - Both managed relays now run the published strict-expiry artifact with SHA-256 `e7dff08edd35abc7d66244682d3136e2cb4c3288ac455a2b424435646fe3e1ca`, a 900-second maximum token lifetime, and 30-second clock skew. The pinned relay tests cover idle and sustained established connections plus blocked writes at expiry. Relay rejection metrics and crash, replay, key-rotation, and log-redaction drills remain outstanding.
-- Bounded daemon re-registration after relay restart is implemented behind a native-version safety gate, but remains blocked until `@number0/iroh` publishes the watcher runtime fix merged in [iroh-ffi #281](https://github.com/n0-computer/iroh-ffi/pull/281). Unsafe 1.0.0/1.1.0 watcher APIs are never called.
+- Bounded daemon re-registration after relay restart is implemented behind a native-version safety gate, but remains blocked until `@hansjm10/volt-iroh` publishes the watcher runtime fix merged in [iroh-ffi #281](https://github.com/n0-computer/iroh-ffi/pull/281). Unsafe 1.0.0/1.1.0 watcher APIs are never called.
 
 Do not expose the development App Check mode to the public internet or use its token in an app build.
 

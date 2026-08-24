@@ -46,7 +46,7 @@ export interface IrohRpcTransportOptions {
  *
  * The transport preserves Volt RPC's strict LF-only JSONL framing and uses the
  * Iroh stream's write promises for backpressure. It is intentionally typed
- * structurally so callers can pass @number0/iroh BiStream values without making
+ * structurally so callers can pass @hansjm10/volt-iroh BiStream values without making
  * the core RPC abstraction own endpoint lifecycle.
  */
 export function createIrohRpcTransport(options: IrohRpcTransportOptions): RpcTransport {

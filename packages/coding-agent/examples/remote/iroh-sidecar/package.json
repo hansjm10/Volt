@@ -8,6 +8,6 @@
 		"client": "node source-aware-run.mjs client.mjs"
 	},
   "dependencies": {
-    "@number0/iroh": "1.0.0"
+    "@hansjm10/volt-iroh": "1.1.1-volt.2"
   }
 }

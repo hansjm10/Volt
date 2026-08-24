@@ -13,14 +13,14 @@ const SOURCE_IMPORT_CONDITION_ARGS = ["--conditions", "volt-source"];
 
 async function assertClientNativeDependencyInstalled() {
 	try {
-		requireModule("@number0/iroh/index.js");
+		requireModule("@hansjm10/volt-iroh/index.js");
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
-		console.error("The optional @number0/iroh native adapter is not available.");
+		console.error("The optional @hansjm10/volt-iroh native adapter is not available.");
 		console.error(`Native adapter error: ${detail}`);
 		console.error("Run from the repository root:");
 		console.error("  npm run iroh:poc:install");
-		console.error("Then retry on a platform supported by @number0/iroh.");
+		console.error("Then retry on a platform supported by @hansjm10/volt-iroh.");
 		process.exit(1);
 	}
 }

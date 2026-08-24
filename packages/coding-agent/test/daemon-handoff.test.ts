@@ -353,7 +353,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		expect(await first.attach.acquire("old")).toMatchObject({ kind: "granted" });
 		expect(await second.attach.acquire("occupied")).toMatchObject({ kind: "granted" });
 
-		await expect(first.attach.prepareRekey("old", "occupied")).rejects.toThrow(/target_in_use/);
+		await expect(first.attach.prepareRekey("old", "occupied")).rejects.toThrow(/held_by_tui/);
 		expect(daemon.broker.lookup("ws", "old")?.state).toBe("tui-owned");
 		expect(daemon.broker.lookup("ws", "occupied")?.state).toBe("tui-owned");
 
@@ -364,6 +364,93 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		await transaction?.commit();
 		expect(daemon.broker.lookup("ws", "old")).toBeUndefined();
 		expect(daemon.broker.lookup("ws", "fresh-new")?.state).toBe("tui-owned");
+	}, 20_000);
+
+	it("preserves a drained target's warm handoff when switching to an existing daemon-owned conversation", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-"));
+		const cwd = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-ws-"));
+		cleanups.push(() => {
+			rmSync(agentDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		});
+		const paths = getDaemonPaths(agentDir);
+		ensureDaemonDirs(paths);
+		const daemon = await startDaemonHalf(paths.socketPath, { workspaces: [{ name: "ws", path: cwd }] });
+		cleanups.push(() => daemon.close());
+		daemon.session.isStreaming = true;
+		const runtimeOwner = publishDaemonRuntime(daemon.broker, "ws", "phone-session");
+		daemon.broker.onDaemonRuntimeStreamCountChanged(runtimeOwner, "ws", "phone-session", 0);
+
+		const tui = await startTuiHalf(agentDir, cwd);
+		const dispatchedRelaySessions: string[] = [];
+		tui.attach.onRelayOffer((offer) => dispatchedRelaySessions.push(offer.sessionId));
+		expect(await tui.attach.acquire("old")).toMatchObject({ kind: "granted" });
+
+		const preparing = tui.attach.prepareRekey("old", "phone-session");
+		await vi.waitFor(() => expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("daemon-draining"));
+		daemon.session.endTurn();
+		const transaction = await preparing;
+		expect(transaction).toBeDefined();
+		expect(daemon.disposed).toEqual([{ reason: "lease_transferred_to_tui" }]);
+		expect(daemon.closedStreams).toEqual([{ reason: "lease_transferred" }]);
+		expect(daemon.broker.lookup("ws", "old")?.state).toBe("tui-owned");
+		const targetLease = daemon.broker.lookup("ws", "phone-session");
+		expect(targetLease?.state).toBe("tui-owned");
+		if (!targetLease?.tuiConnectionId) throw new Error("prepared target has no TUI owner");
+		expect(
+			daemon.server.sendTo(targetLease.tuiConnectionId, {
+				type: "relay_offer",
+				relayId: "rl-before-target-apply",
+				relayToken: "token-before-target-apply",
+				workspaceName: "ws",
+				sessionId: "phone-session",
+				clientNodeId: "phone",
+				connectionId: "phone-before-target-apply",
+				streamId: "stream-before-target-apply",
+			}),
+		).toBe(true);
+		expect(
+			daemon.server.sendTo(targetLease.tuiConnectionId, {
+				type: "theme_snapshot",
+				themeName: "relay-offer-barrier",
+				tokens: {},
+			}),
+		).toBe(true);
+		await vi.waitFor(() =>
+			expect(tui.events).toContainEqual({ type: "theme_snapshot", themeName: "relay-offer-barrier", tokens: {} }),
+		);
+		expect(dispatchedRelaySessions).toEqual([]);
+
+		await transaction?.commit();
+		expect(tui.reacquired).toEqual([{ sessionId: "phone-session", outcome: { kind: "granted", handoff: "warm" } }]);
+		await vi.waitFor(() => expect(dispatchedRelaySessions).toEqual(["phone-session"]));
+		expect(
+			daemon.server.sendTo(targetLease.tuiConnectionId, {
+				type: "relay_offer",
+				relayId: "rl-stale-source",
+				relayToken: "token-stale-source",
+				workspaceName: "ws",
+				sessionId: "old",
+				clientNodeId: "phone",
+				connectionId: "phone-stale-source",
+				streamId: "stream-stale-source",
+			}),
+		).toBe(true);
+		expect(
+			daemon.server.sendTo(targetLease.tuiConnectionId, {
+				type: "relay_offer",
+				relayId: "rl-after-target-apply",
+				relayToken: "token-after-target-apply",
+				workspaceName: "ws",
+				sessionId: "phone-session",
+				clientNodeId: "phone",
+				connectionId: "phone-after-target-apply",
+				streamId: "stream-after-target-apply",
+			}),
+		).toBe(true);
+		await vi.waitFor(() => expect(dispatchedRelaySessions).toEqual(["phone-session", "phone-session"]));
+		expect(daemon.broker.lookup("ws", "old")).toBeUndefined();
+		expect(daemon.broker.lookup("ws", "phone-session")?.state).toBe("tui-owned");
 	}, 20_000);
 
 	it("commits local session tracking while disconnected and reacquires only the replacement", async () => {

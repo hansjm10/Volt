@@ -165,12 +165,12 @@ Evidence sources:
   `npm run iroh:poc:client`.
 - Manual relay test with `--relay default` on two networks when relay behavior is
   part of the item.
-- Minimal direct inspection of `@number0/iroh` types/API in `node_modules` when an
+- Minimal direct inspection of `@hansjm10/volt-iroh` types/API in `node_modules` when an
   item depends on native API shape. Do not guess external API behavior.
 
 Rules:
 
-- Do not add `@number0/iroh` imports to TypeScript core modules.
+- Do not add `@hansjm10/volt-iroh` imports to TypeScript core modules.
 - Do not move native loading out of `src/remote/iroh-native-adapter.cjs` and
   `src/remote/iroh-host.mjs` unless the selected item explicitly changes the
   packaging architecture.
@@ -270,7 +270,7 @@ the rollup item is resolved, and the final turn's required verification passed.
 <group n="2" title="First-class pairing workflow">
   <item ref="B.1" status="resolved" prereq="A.1,A.3" type="decision">
     <title>Resolve the Iroh endpoint-ticket model for `volt remote pair`: decide whether pairing can be generated offline, must be mediated by a running host control channel, or should be implemented as a short-lived pair endpoint</title>
-    <acceptance>Decision is recorded with direct evidence from @number0/iroh API behavior or a small native smoke; design doc open decision #1 is updated; chosen approach includes user-visible behavior, failure modes, and security implications; no misleading offline pair command is shipped if the endpoint ticket cannot be valid offline.</acceptance>
+    <acceptance>Decision is recorded with direct evidence from @hansjm10/volt-iroh API behavior or a small native smoke; design doc open decision #1 is updated; chosen approach includes user-visible behavior, failure modes, and security implications; no misleading offline pair command is shipped if the endpoint ticket cannot be valid offline.</acceptance>
     <evidence>Resolved 2026-06-21: decided `volt remote pair` must be mediated by a running host control channel; native smoke showed an ID-only persisted-secret ticket had zero direct addresses/no relay and connect failed with no address lookup, while a bound endpoint ticket had a direct address; design records user behavior, failure modes, and security implications; verification: git diff --check -- .volt/iroh-productization-design.md and pre-commit npm run check; commit 9d3aa735</evidence>
   </item>
 
@@ -297,7 +297,7 @@ the rollup item is resolved, and the final turn's required verification passed.
   <item ref="C.2" status="resolved" prereq="C.1" type="decision">
     <title>Decide active revocation semantics: future-connections-only with explicit docs, or live host coordination that disconnects active revoked clients promptly</title>
     <acceptance>Decision is recorded in both ledgers with rationale; if active disconnect is deferred, docs state revocation affects future connections only; if active disconnect is chosen, implementation plan names the control mechanism and lifecycle guarantees; audit event requirements are updated.</acceptance>
-    <evidence>Resolved 2026-06-21: chose live host coordination for preview active revocation, with persisted-state revocation as fallback; design names the running host control channel, active connection registry, one-second close guarantee, and `active_connection_revoked` audit requirements; direct @number0/iroh API evidence: Connection.close/closed plus stream stop/reset handles in node_modules/@number0/iroh/index.d.ts; verification: git diff --check -- .volt/iroh-productization-design.md and pre-commit npm run check; commit c36d9dd4</evidence>
+    <evidence>Resolved 2026-06-21: chose live host coordination for preview active revocation, with persisted-state revocation as fallback; design names the running host control channel, active connection registry, one-second close guarantee, and `active_connection_revoked` audit requirements; direct @hansjm10/volt-iroh API evidence: Connection.close/closed plus stream stop/reset handles in node_modules/@hansjm10/volt-iroh/index.d.ts; verification: git diff --check -- .volt/iroh-productization-design.md and pre-commit npm run check; commit c36d9dd4</evidence>
   </item>
 
   <item ref="C.3" status="resolved" prereq="C.2">

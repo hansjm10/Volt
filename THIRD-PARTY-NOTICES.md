@@ -35,10 +35,13 @@ license file. The small number of packages whose npm tarballs omit their
 repository-level license use checksum-pinned, version- or commit-specific
 authoritative copies declared in `compliance/npm-license-overrides.json`.
 
-The standalone archive also carries Volt's MIT license and this notice. The
-optional native `@number0/iroh` adapter is intentionally not bundled, so a
-standalone executable cannot host `volt daemon` or provide remote/iOS access.
-Use the npm package or a source checkout for those features.
+The npm CLI optionally installs `@hansjm10/volt-iroh@1.1.1-volt.2`, Volt's
+MIT/Apache-2.0 fork of Iroh FFI 1.1.0; its root and native platform packages
+ship their own license texts and provenance. The standalone archive carries
+Volt's MIT license and this notice but intentionally does not bundle that
+native adapter, so a standalone executable cannot host `volt daemon` or
+provide remote/iOS access. Use the npm package or a source checkout for those
+features.
 
 The source-only `examples/extensions/doom-overlay` demo remains in the
 repository, but is excluded from both the published npm package and standalone

@@ -14,8 +14,8 @@ const cliOutputPath = join(outputDirectory, "cli.js");
 const allowedExternalPackages = [
 	"@hansjm10/volt-tui",
 	"@hansjm10/volt-tui/*",
-	"@number0/iroh",
-	"@number0/iroh/*",
+	"@hansjm10/volt-iroh",
+	"@hansjm10/volt-iroh/*",
 	"bufferutil",
 	"supports-color",
 	"utf-8-validate",
@@ -53,10 +53,10 @@ function assertBundleMetafile(metafile) {
 	}
 
 	const bundledIroh = Object.keys(metafile.inputs ?? {}).filter((path) =>
-		path.replaceAll("\\", "/").includes("node_modules/@number0/iroh/"),
+		path.replaceAll("\\", "/").includes("node_modules/@hansjm10/volt-iroh/"),
 	);
 	if (bundledIroh.length > 0) {
-		throw new Error(`The npm CLI bundle embedded @number0/iroh:\n${bundledIroh.join("\n")}`);
+		throw new Error(`The npm CLI bundle embedded @hansjm10/volt-iroh:\n${bundledIroh.join("\n")}`);
 	}
 }
 
