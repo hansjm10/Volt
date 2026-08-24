@@ -6,6 +6,7 @@ interface Props {
   description: string;
   canonicalPath: string;
   image?: string;
+  imageAlt?: string;
   type?: "article" | "website";
   publishedAt?: Date;
   updatedAt?: Date;
@@ -16,6 +17,7 @@ const {
   description,
   canonicalPath,
   image,
+  imageAlt,
   type = "website",
   publishedAt,
   updatedAt,
@@ -23,6 +25,7 @@ const {
 const siteUrl = Astro.site ?? new URL("https://volt-cli.dev");
 const canonicalUrl = new URL(canonicalPath, siteUrl).href;
 const imageUrl = image ? new URL(image, siteUrl).href : undefined;
+const resolvedImageAlt = imageAlt ?? title;
 const rssUrl = new URL("/rss.xml", siteUrl).href;
 ---
 
@@ -41,7 +44,7 @@ const rssUrl = new URL("/rss.xml", siteUrl).href;
     <meta property="og:type" content={type} />
     <meta property="og:url" content={canonicalUrl} />
     {imageUrl && <meta property="og:image" content={imageUrl} />}
-    {imageUrl && <meta property="og:image:alt" content={title} />}
+    {imageUrl && <meta property="og:image:alt" content={resolvedImageAlt} />}
     {imageUrl && <meta property="og:image:width" content="1200" />}
     {imageUrl && <meta property="og:image:height" content="630" />}
     {imageUrl && <meta property="og:image:type" content="image/png" />}
@@ -49,7 +52,7 @@ const rssUrl = new URL("/rss.xml", siteUrl).href;
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
     {imageUrl && <meta name="twitter:image" content={imageUrl} />}
-    {imageUrl && <meta name="twitter:image:alt" content={title} />}
+    {imageUrl && <meta name="twitter:image:alt" content={resolvedImageAlt} />}
     {publishedAt && <meta property="article:published_time" content={publishedAt.toISOString()} />}
     {updatedAt && <meta property="article:modified_time" content={updatedAt.toISOString()} />}
     <slot name="head" />

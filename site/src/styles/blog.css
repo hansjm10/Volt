@@ -154,6 +154,15 @@ pre {
   text-decoration: none;
 }
 
+.post-card-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-bottom: 1.2rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
 .post-card h2 {
   margin: 0.25rem 0 0.55rem;
   font-size: 1.35rem;
@@ -195,6 +204,15 @@ pre {
 .post-shell {
   max-width: 46rem;
   margin-inline: auto;
+}
+
+.post-hero {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: -1rem 0 2.5rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
 }
 
 .post-header h1 {

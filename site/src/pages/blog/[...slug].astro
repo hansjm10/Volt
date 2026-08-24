@@ -52,6 +52,7 @@ const structuredData = JSON.stringify({
   description={post.data.description}
   canonicalPath={canonicalPath}
   image={post.data.image}
+  imageAlt={post.data.imageAlt}
   type="article"
   publishedAt={post.data.publishedAt}
   updatedAt={post.data.updatedAt}
@@ -72,6 +73,20 @@ const structuredData = JSON.stringify({
       <h1>{post.data.title}</h1>
       <p class="post-description">{post.data.description}</p>
     </header>
+
+    {
+      post.data.image && (
+        <img
+          class="post-hero"
+          src={post.data.image}
+          alt={post.data.imageAlt ?? ""}
+          width="1200"
+          height="630"
+          loading="eager"
+          fetchpriority="high"
+        />
+      )
+    }
 
     <div class="post-content">
       <Content />

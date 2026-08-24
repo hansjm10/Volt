@@ -24,7 +24,7 @@ npm run build      # syncs docs, then builds to dist/
 
 Docs edits go in `packages/coding-agent/docs/`; re-run `npm run sync-docs` (or restart dev) to pick them up. New pages must be added to `docs.json` to appear in the sidebar.
 
-Blog posts go in `src/content/blog/` and require `title`, `description`, and `publishedAt` frontmatter. `author` defaults to Jordan Hans, `tags` defaults to an empty list, and `draft` defaults to `false`. Set optional `image` to a public-root path for a 1200×630 social card; post metadata uses it for Open Graph, Twitter, and structured data. Start posts with `draft: true`, review them through the local or Cloudflare preview, then remove the flag to publish.
+Blog posts go in `src/content/blog/` and require `title`, `description`, and `publishedAt` frontmatter. `author` defaults to Jordan Hans, `tags` defaults to an empty list, and `draft` defaults to `false`. Set optional `image` to a public-root path for a 1200×630 hero/social card and provide `imageAlt`; the post page, blog index, Open Graph, Twitter, and structured data all use it. Start posts with `draft: true`, review them through the local or Cloudflare preview, then remove the flag to publish.
 
 ## Deploying to Cloudflare (Workers Builds)
 
