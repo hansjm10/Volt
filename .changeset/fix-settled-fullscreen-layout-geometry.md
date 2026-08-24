@@ -3,4 +3,4 @@
 "@hansjm10/volt-tui": patch
 ---
 
-fix(tui): Corrected geometry-dependent fullscreen content on initial display and terminal resize.
+fix(tui): Fullscreen content now uses the correct layout on first display and after terminal resizing.

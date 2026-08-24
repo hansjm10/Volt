@@ -9,7 +9,7 @@ Remote conversation clients must upgrade with the daemon because conversation at
 
 Prompt, steer, and follow-up commands now require a stable `clientMessageId`, which the host echoes on the canonical user transcript entry.
 
-The host now durably deduplicates prompt, steer, and follow-up retries by `clientMessageId`, including across daemon restarts.
+The host now durably deduplicates prompt, steer, and follow-up retries by `clientMessageId`, including across daemon restarts. Input acknowledgements and queued delivery remain durable across branch changes, outstanding records are bounded, and audits identify the acting device.
 Private retry receipts never appear as blank conversations in local or remote session history.
 
 Conversation runtime, lease, direct-stream, and relay ownership now remain under one stable coordinator through handoff, rekey, reconnect, and retirement.

@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(review): Preserved review actions when starting a clear review discussion.
+fix(review): Starting a fresh review discussion no longer loses the review record needed for rerun and publish actions.

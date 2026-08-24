@@ -2,4 +2,4 @@
 "@hansjm10/volt-agent-core": patch
 ---
 
-fix(agent): Fixed prompt-preflight cancellation and retained delivery retries preserving their effective context.
+fix(agent): Canceled prompt preflights and retained delivery retries now preserve the context they were admitted with.

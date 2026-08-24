@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(tui): Drained fullscreen transcript and terminal restore output without allowing stalled stdout to block shutdown.
+fix(tui): Fullscreen mode now exits cleanly when transcript or terminal-restore output stalls.
