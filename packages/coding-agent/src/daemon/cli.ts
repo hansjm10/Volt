@@ -3,7 +3,7 @@ import { open } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { getAgentDir, VERSION } from "../config.ts";
 import { createDaemonClient } from "./control-client.ts";
-import type { ControlKeepAwakeStatus, ControlResponse } from "./control-protocol.ts";
+import type { ControlKeepAwakeStatus, ControlResponse, RemoteTransportHealth } from "./control-protocol.ts";
 import { createIrohDaemonService } from "./iroh-service.ts";
 import { type PidfileContents, readPidfile, runVoltDaemon } from "./main.ts";
 import { getDaemonPaths } from "./paths.ts";
@@ -30,7 +30,7 @@ function printDaemonUsage(): void {
 Commands:
   start                 Start the background daemon (no-op if already running).
   stop                  Ask the daemon to shut down gracefully.
-  status [--json]       Show daemon status; exit 0 when running, 1 when not.
+  status [--json]       Show daemon status; exit 0 only when phone transport is ready.
   restart               Stop then start; persistent state survives.
   regenerate-state      Back up invalid state and regenerate it after confirmation.
   keep-awake [on|off]   Prevent the host from sleeping while voltd runs; no arg prints state.
@@ -286,6 +286,13 @@ function formatKeepAwake(keepAwake: ControlKeepAwakeStatus | undefined): string 
 	return keepAwake.state === "active" ? "on (active)" : `on (degraded: ${keepAwake.reason ?? "unknown"})`;
 }
 
+function formatRemoteTransport(health: RemoteTransportHealth | undefined): string {
+	if (!health) return "unavailable (status missing from daemon)";
+	const version = health.wrapperVersion === undefined ? "" : ` · wrapper ${health.wrapperVersion}`;
+	const reason = health.reasonCode === undefined ? "" : ` · ${health.reasonCode}`;
+	return `${health.state}${version}${reason}`;
+}
+
 function formatUptime(startedAtMs: number): string {
 	const totalSeconds = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
 	const hours = Math.floor(totalSeconds / 3600);
@@ -307,12 +314,15 @@ async function daemonStatus(agentDir: string, json: boolean): Promise<void> {
 	}
 	if (json) {
 		console.log(JSON.stringify({ running: true, ...status, id: undefined, type: undefined }));
+		if (status.remoteTransport?.state !== "ready") process.exitCode = 1;
 		return;
 	}
 	console.error(`voltd ${status.version} (protocol ${status.protocolVersion})`);
 	console.error(`pid: ${status.pid}`);
 	console.error(`uptime: ${formatUptime(status.startedAtMs)}`);
 	console.error(`keep awake: ${formatKeepAwake(status.keepAwake)}`);
+	console.error(`remote transport: ${formatRemoteTransport(status.remoteTransport)}`);
+	if (status.remoteTransport?.message) console.error(`  ${status.remoteTransport.message}`);
 	console.error(`phone connections: ${status.phoneConnections}`);
 	console.error(`workspaces: ${status.workspaces.length}`);
 	for (const workspace of status.workspaces) {
@@ -328,6 +338,7 @@ async function daemonStatus(agentDir: string, json: boolean): Promise<void> {
 			`  ${lease.workspaceName}/${lease.sessionId}: ${lease.state} (streams ${lease.streamCount}, relays ${lease.relayCount})`,
 		);
 	}
+	if (status.remoteTransport?.state !== "ready") process.exitCode = 1;
 }
 
 async function daemonKeepAwake(agentDir: string, args: string[]): Promise<void> {
@@ -497,7 +508,9 @@ export async function handleDaemonCommand(args: string[], options: DaemonCommand
 	}
 	if (options.isStandaloneBinary) {
 		console.error("Error: volt daemon is not available from the standalone binary release.");
-		console.error("Use a Node.js npm install or a source checkout with optional @hansjm10/volt-iroh dependencies.");
+		console.error(
+			"Use a Node.js npm install or source checkout with the required Iroh wrapper and optional platform binding.",
+		);
 		process.exitCode = 1;
 		return true;
 	}

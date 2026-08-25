@@ -41,6 +41,7 @@ import {
 import { resolveIrohRemoteWorkspaceProjectTrusted } from "../core/remote/iroh/host-policy.ts";
 import {
 	IROH_REMOTE_ALPN,
+	isIrohRemoteHostStorageFullError,
 	normalizeIrohRemoteAllowTools,
 	resolveIrohRemoteRuntimeToolPolicy,
 } from "../core/remote/iroh/protocol.ts";
@@ -77,7 +78,9 @@ import {
 	type ControlRequest,
 	createControlClientStatus,
 	RELAY_RPC_COMMAND_TYPES,
+	REMOTE_TRANSPORT_REASON_MESSAGES,
 	type RelayCloseReason,
+	type RemoteTransportHealth,
 } from "./control-protocol.ts";
 import type { ControlConnection } from "./control-server.ts";
 import {
@@ -305,6 +308,8 @@ export interface IrohDaemonServiceConfig {
 }
 
 export interface IrohDaemonServiceDependencies {
+	/** Override native module loading for deterministic missing-binding tests. */
+	loadIrohModule?: typeof loadIrohModule;
 	/** Decorate a freshly bound endpoint (used to exercise native lifecycle failures). */
 	decorateEndpoint?(endpoint: IrohEndpointLike): IrohEndpointLike;
 	/** Decorate an accepted raw stream before lifecycle fencing (test-only failure injection). */
@@ -656,9 +661,15 @@ export function createIrohDaemonService(
 ): VoltdServiceExtension {
 	return (services: VoltdRuntimeServices) => {
 		const log = services.logger.child("iroh");
-		const loaded = loadIrohModule();
+		const loaded = (dependencies.loadIrohModule ?? loadIrohModule)();
 		if (!loaded.iroh) {
 			log("warn", formatIrohLoadError(loaded.error));
+			const remoteTransport: RemoteTransportHealth = {
+				state: "unavailable",
+				reasonCode: "native_binding_missing",
+				message: REMOTE_TRANSPORT_REASON_MESSAGES.native_binding_missing,
+				...(loaded.packageVersion === undefined ? {} : { wrapperVersion: loaded.packageVersion }),
+			};
 			return {
 				async handleRequest(connection, request) {
 					if (request.type === "pair_request") {
@@ -666,23 +677,49 @@ export function createIrohDaemonService(
 							type: "error",
 							id: request.id,
 							code: "iroh_unavailable",
-							message: formatIrohLoadError(loaded.error),
+							message: remoteTransport.message!,
 						});
 						return true;
 					}
 					return false;
 				},
+				statusExtras: () => ({ remoteTransport }),
 			};
 		}
 
-		const service = new IrohDaemonService(
-			loaded.iroh,
-			services,
-			config,
-			loaded.capabilities?.connectedHomeRelayWatch === true,
-			loaded.capabilities?.reconnectRelay === true,
-			dependencies,
-		);
+		let service: IrohDaemonService;
+		try {
+			service = new IrohDaemonService(
+				loaded.iroh,
+				services,
+				config,
+				loaded.packageVersion,
+				loaded.capabilities?.connectedHomeRelayWatch === true,
+				loaded.capabilities?.reconnectRelay === true,
+				dependencies,
+			);
+		} catch (error) {
+			log("error", `failed to initialize iroh endpoint: ${error instanceof Error ? error.message : String(error)}`);
+			const remoteTransport: RemoteTransportHealth = {
+				state: "unavailable",
+				reasonCode: "endpoint_start_failed",
+				message: REMOTE_TRANSPORT_REASON_MESSAGES.endpoint_start_failed,
+				...(loaded.packageVersion === undefined ? {} : { wrapperVersion: loaded.packageVersion }),
+			};
+			return {
+				async handleRequest(connection, request) {
+					if (request.type !== "pair_request") return false;
+					connection.send({
+						type: "error",
+						id: request.id,
+						code: "iroh_unavailable",
+						message: remoteTransport.message!,
+					});
+					return true;
+				},
+				statusExtras: () => ({ remoteTransport }),
+			};
+		}
 		service.start();
 		return {
 			handleRequest: (connection, request) => service.handleRequest(connection, request),
@@ -723,6 +760,8 @@ class IrohDaemonService {
 	private relayCredentialIsRevoking = false;
 	private readonly relayConfigWarning: string | undefined;
 	private readonly profile: string | undefined;
+	private readonly wrapperVersion: string | undefined;
+	private remoteTransport: RemoteTransportHealth;
 	private readonly log: ReturnType<VoltdRuntimeServices["logger"]["child"]>;
 	private readonly stateManager: IrohRemoteHostStateManager;
 	private readonly activeStreams = new IrohRemoteActiveStreamRegistry();
@@ -760,6 +799,7 @@ class IrohDaemonService {
 		iroh: IrohModuleLike,
 		services: VoltdRuntimeServices,
 		config: IrohDaemonServiceConfig,
+		wrapperVersion: string | undefined,
 		nativeWatchApiSafe: boolean,
 		nativeReconnectApiSafe: boolean,
 		dependencies: IrohDaemonServiceDependencies,
@@ -767,6 +807,11 @@ class IrohDaemonService {
 		this.iroh = iroh;
 		this.services = services;
 		this.dependencies = dependencies;
+		this.wrapperVersion = wrapperVersion;
+		this.remoteTransport = {
+			state: "starting",
+			...(wrapperVersion === undefined ? {} : { wrapperVersion }),
+		};
 		this.relayWatchApiSafe = dependencies.relayWatchApiSafe ?? nativeWatchApiSafe;
 		this.relayReconnectApiSafe = dependencies.relayReconnectApiSafe ?? nativeReconnectApiSafe;
 		const persistedRevocation = services.state.state.settings.relayCredentialRevocation;
@@ -1032,6 +1077,23 @@ class IrohDaemonService {
 			throw new Error("iroh host engine is not ready");
 		}
 		return this.engine;
+	}
+
+	private markStorageCapacityUnavailable(): void {
+		this.remoteTransport = {
+			state: this.endpoint && this.engine ? "degraded" : "unavailable",
+			reasonCode: "host_storage_full",
+			message: REMOTE_TRANSPORT_REASON_MESSAGES.host_storage_full,
+			...(this.wrapperVersion === undefined ? {} : { wrapperVersion: this.wrapperVersion }),
+		};
+	}
+
+	private clearStorageCapacityDegradation(): void {
+		if (this.remoteTransport.reasonCode !== "host_storage_full" || !this.endpoint || !this.engine) return;
+		this.remoteTransport = {
+			state: "ready",
+			...(this.wrapperVersion === undefined ? {} : { wrapperVersion: this.wrapperVersion }),
+		};
 	}
 
 	private async pruneWorktreesOnStart(signal: AbortSignal): Promise<void> {
@@ -1991,6 +2053,10 @@ class IrohDaemonService {
 					}),
 				);
 			}
+			this.remoteTransport = {
+				state: "ready",
+				...(this.wrapperVersion === undefined ? {} : { wrapperVersion: this.wrapperVersion }),
+			};
 			this.ready.resolve();
 			this.log("info", `iroh endpoint online`, {
 				hostNodeId: this.hostNodeId,
@@ -1998,12 +2064,28 @@ class IrohDaemonService {
 				...(this.relayMode === "production" ? { relayUrls: this.relayUrls } : {}),
 			});
 			this.acceptLoopTask = this.acceptLoop(endpoint).catch((error) => {
+				this.remoteTransport = {
+					state: "unavailable",
+					reasonCode: "endpoint_start_failed",
+					message: REMOTE_TRANSPORT_REASON_MESSAGES.endpoint_start_failed,
+					...(this.wrapperVersion === undefined ? {} : { wrapperVersion: this.wrapperVersion }),
+				};
 				this.log("error", `accept loop failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
 			endpoint = undefined;
 		} catch (error) {
 			if (endpoint) {
 				this.retireEndpoint(endpoint, "iroh endpoint disposal after startup failure failed");
+			}
+			if (isIrohRemoteHostStorageFullError(error)) {
+				this.markStorageCapacityUnavailable();
+			} else {
+				this.remoteTransport = {
+					state: "unavailable",
+					reasonCode: "endpoint_start_failed",
+					message: REMOTE_TRANSPORT_REASON_MESSAGES.endpoint_start_failed,
+					...(this.wrapperVersion === undefined ? {} : { wrapperVersion: this.wrapperVersion }),
+				};
 			}
 			this.ready.reject(error);
 			this.log("error", `failed to start iroh endpoint: ${error instanceof Error ? error.message : String(error)}`);
@@ -2409,6 +2491,9 @@ class IrohDaemonService {
 			return;
 		}
 		if (!handshake.ok) {
+			if (handshake.response.outcome === "host_storage_full") {
+				this.markStorageCapacityUnavailable();
+			}
 			if (
 				handshake.response.outcome === "workspace_authorization_removed" &&
 				typeof handshake.response.workspace === "string"
@@ -2418,6 +2503,7 @@ class IrohDaemonService {
 			await this.writeTerminalHandshakeResponse(stream, handshake.response);
 			return;
 		}
+		this.clearStorageCapacityDegradation();
 		if (!(await markAuthenticated())) {
 			await owner.close("handshake_timeout").catch(() => {});
 			return;
@@ -4397,19 +4483,26 @@ class IrohDaemonService {
 				IROH_ENDPOINT_READY_TIMEOUT_MS,
 				"Iroh endpoint did not become ready within 15s",
 			);
-		} catch (error) {
+		} catch {
 			connection.send({
 				type: "error",
 				id: request.id,
 				code: "iroh_unavailable",
-				message: error instanceof Error ? error.message : String(error),
+				message:
+					this.remoteTransport.message ??
+					"Phone transport is still starting. Run `volt daemon status`, then retry.",
 			});
 			return;
 		}
 		const engine = this.requireEngine();
 		const endpoint = this.endpoint;
-		if (!endpoint || !this.endpointTicket) {
-			connection.send({ type: "error", id: request.id, code: "iroh_unavailable", message: "endpoint not ready" });
+		if (!endpoint || !this.endpointTicket || this.remoteTransport.state !== "ready") {
+			connection.send({
+				type: "error",
+				id: request.id,
+				code: "iroh_unavailable",
+				message: this.remoteTransport.message ?? "Phone transport is not ready. Run `volt daemon status`.",
+			});
 			return;
 		}
 		const workspaceName =
@@ -4497,11 +4590,17 @@ class IrohDaemonService {
 			if (relayCredentialClaim !== undefined && !pairingPublished) {
 				await this.discardManagedRelayCredentialClaim(relayCredentialClaim).catch(() => {});
 			}
+			const storageFull = isIrohRemoteHostStorageFullError(error);
+			if (storageFull) this.markStorageCapacityUnavailable();
 			connection.send({
 				type: "error",
 				id: request.id,
-				code: "pair_failed",
-				message: error instanceof Error ? error.message : String(error),
+				code: storageFull ? "iroh_unavailable" : "pair_failed",
+				message: storageFull
+					? REMOTE_TRANSPORT_REASON_MESSAGES.host_storage_full
+					: error instanceof Error
+						? error.message
+						: String(error),
 			});
 		}
 	}
@@ -5212,7 +5311,12 @@ class IrohDaemonService {
 		return this.relays.admit(relayId, relayToken, socket, bufferedRemainder);
 	}
 
-	statusExtras(): { leases: ControlLeaseStatus[]; phoneConnections: number; relayCount: number } {
+	statusExtras(): {
+		leases: ControlLeaseStatus[];
+		phoneConnections: number;
+		relayCount: number;
+		remoteTransport: RemoteTransportHealth;
+	} {
 		const leases: ControlLeaseStatus[] = this.leaseBroker.list().map((record) => ({
 			workspaceName: record.workspaceName,
 			sessionId: record.sessionId,
@@ -5220,7 +5324,12 @@ class IrohDaemonService {
 			relayCount: record.relayIds.size,
 			streamCount: record.streamCount,
 		}));
-		return { leases, phoneConnections: this.clientConnections.size, relayCount: this.relays.activeCount() };
+		return {
+			leases,
+			phoneConnections: this.clientConnections.size,
+			relayCount: this.relays.activeCount(),
+			remoteTransport: { ...this.remoteTransport },
+		};
 	}
 
 	async quiesce(): Promise<void> {

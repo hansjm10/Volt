@@ -804,6 +804,70 @@ test("release package versions and the product changelog must match the tag", ()
 	assert.throws(() => verifyReleasePackageMetadata("v1.2.3", (path) => files.get(path)), /expected @hansjm10\/volt-ai/);
 });
 
+test("npm policy requires the exact Iroh wrapper while quarantining third-party releases", () => {
+	const rootManifest = JSON.parse(readFileSync("package.json", "utf8"));
+	const codingAgentManifest = JSON.parse(readFileSync("packages/coding-agent/package.json", "utf8"));
+	assert.equal(rootManifest.packageManager, "npm@11.17.0");
+	assert.deepEqual(rootManifest.devEngines?.packageManager, {
+		name: "npm",
+		version: "11.17.0",
+		onFail: "error",
+	});
+	assert.deepEqual(readFileSync(".npmrc", "utf8").trim().split(/\r?\n/), [
+		"save-exact=true",
+		"min-release-age=2",
+		"min-release-age-exclude[]=@hansjm10/volt-iroh*",
+	]);
+	assert.equal(codingAgentManifest.dependencies["@hansjm10/volt-iroh"], "1.1.1-volt.2");
+	assert.equal(codingAgentManifest.optionalDependencies?.["@hansjm10/volt-iroh"], undefined);
+
+	for (const [path, rootPath] of [
+		["package-lock.json", "packages/coding-agent"],
+		["packages/coding-agent/npm-shrinkwrap.json", ""],
+	]) {
+		const lock = JSON.parse(readFileSync(path, "utf8"));
+		const root = lock.packages[rootPath];
+		const wrapper = lock.packages["node_modules/@hansjm10/volt-iroh"];
+		assert.equal(root.dependencies["@hansjm10/volt-iroh"], "1.1.1-volt.2", `${path} requires the wrapper`);
+		assert.equal(root.optionalDependencies?.["@hansjm10/volt-iroh"], undefined, `${path} cannot omit the wrapper`);
+		assert.equal(wrapper.version, "1.1.1-volt.2");
+		assert.equal(wrapper.optional, undefined, `${path} marks the wrapper required`);
+		assert.match(wrapper.integrity, /^sha512-/);
+		assert.equal(
+			lock.packages["node_modules/@hansjm10/volt-iroh-darwin-x64"],
+			undefined,
+			`${path} must not claim unsupported Darwin x64 phone transport`,
+		);
+		const bindings = Object.entries(lock.packages).filter(([entryPath]) =>
+			/^node_modules\/@hansjm10\/volt-iroh-(?!$)/.test(entryPath),
+		);
+		assert.ok(bindings.length > 0, `${path} includes platform bindings`);
+		for (const [entryPath, entry] of bindings) {
+			assert.equal(entry.optional, true, `${path} keeps ${entryPath} optional`);
+			assert.match(entry.integrity, /^sha512-/);
+		}
+	}
+
+	for (const path of [
+		".github/workflows/approve-release.yml",
+		".github/workflows/build-binaries.yml",
+		".github/workflows/build-standalone-candidate.yml",
+		".github/workflows/ci.yml",
+		".github/workflows/npm-audit.yml",
+		".github/workflows/prepare-release.yml",
+	]) {
+		const workflow = readFileSync(path, "utf8");
+		let installSearchFrom = 0;
+		for (const match of workflow.matchAll(/npm ci\b/g)) {
+			const precedingPin = workflow.lastIndexOf("npm install -g npm@11.17.0 --ignore-scripts", match.index);
+			assert.ok(precedingPin >= installSearchFrom, `${path} installs npm 11.17.0 before each dependency resolution`);
+			installSearchFrom = match.index + match[0].length;
+		}
+		assert.doesNotMatch(workflow, /npm install -g npm@(?!11\.17\.0\b)/);
+	}
+	assert.doesNotMatch(readFileSync(".github/workflows/prepare-release.yml", "utf8"), /min_release_age|--min-release-age=0/);
+});
+
 test("shipped packages and standalone archives contain no development workflow tooling", () => {
 	const rootManifest = JSON.parse(readFileSync("package.json", "utf8"));
 	assert.equal(rootManifest.private, true, "the monorepo root must never be publishable");

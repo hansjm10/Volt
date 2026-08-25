@@ -6,7 +6,7 @@ import { formatIrohRemoteTicketQrCode } from "../core/remote/iroh/qr.ts";
 import { getIrohRemotePairingVerificationDetails } from "../core/remote/iroh/ticket.ts";
 import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
 import { createDaemonClient, type DaemonClient } from "./control-client.ts";
-import type { ControlEvent, ControlResponse } from "./control-protocol.ts";
+import type { ControlEvent, ControlResponse, RemoteTransportHealth } from "./control-protocol.ts";
 import { ensureDaemonRunning, probeDaemon } from "./spawn.ts";
 
 function printRemoteUsage(): void {
@@ -105,6 +105,13 @@ async function connectToDaemon(options: { autoStart: boolean }): Promise<RemoteC
 	};
 }
 
+function formatRemoteTransport(health: RemoteTransportHealth | undefined): string {
+	if (!health) return "unavailable (status missing from daemon)";
+	const version = health.wrapperVersion === undefined ? "" : ` · wrapper ${health.wrapperVersion}`;
+	const reason = health.reasonCode === undefined ? "" : ` · ${health.reasonCode}`;
+	return `${health.state}${version}${reason}`;
+}
+
 function reportControlError(response: ControlResponse, context: string): boolean {
 	if (response.type === "error") {
 		const code = response.code === "workspace_has_worktrees" ? ` [${response.code}]` : "";
@@ -183,14 +190,20 @@ async function handlePairCommand(args: string[]): Promise<void> {
 		return;
 	}
 	try {
+		const status = await session.client.request({ type: "status" });
+		if (status.type !== "status_result") {
+			reportControlError(status, "status");
+			return;
+		}
+		if (status.remoteTransport?.state !== "ready") {
+			console.error(`Error: phone transport is ${formatRemoteTransport(status.remoteTransport)}.`);
+			if (status.remoteTransport?.message) console.error(status.remoteTransport.message);
+			process.exitCode = 1;
+			return;
+		}
 		// Default the pairing workspace to the daemon workspace registered for the cwd,
 		// registering the cwd when nothing matches (name = basename).
 		if (workspaceName === undefined) {
-			const status = await session.client.request({ type: "status" });
-			if (status.type !== "status_result") {
-				reportControlError(status, "status");
-				return;
-			}
 			const cwd = await getCanonicalCwd();
 			const match = findWorkspaceForPath(status.workspaces, cwd);
 			if (match) {
@@ -289,9 +302,12 @@ async function handleStatusCommand(args: string[]): Promise<void> {
 		}
 		if (args.includes("--json")) {
 			console.log(JSON.stringify({ ...response, id: undefined, type: undefined }, null, 2));
+			if (response.remoteTransport?.state !== "ready") process.exitCode = 1;
 			return;
 		}
 		console.error(`voltd ${response.version} (pid ${response.pid})`);
+		console.error(`remote transport: ${formatRemoteTransport(response.remoteTransport)}`);
+		if (response.remoteTransport?.message) console.error(`  ${response.remoteTransport.message}`);
 		console.error(`workspaces: ${response.workspaces.length}`);
 		for (const workspace of response.workspaces) {
 			console.error(`  ${workspace.name} -> ${workspace.path}`);
@@ -307,6 +323,7 @@ async function handleStatusCommand(args: string[]): Promise<void> {
 				`  ${lease.workspaceName}/${lease.sessionId}: ${lease.state} (streams ${lease.streamCount}, relays ${lease.relayCount})`,
 			);
 		}
+		if (response.remoteTransport?.state !== "ready") process.exitCode = 1;
 	} finally {
 		await session.close();
 	}
@@ -808,7 +825,9 @@ export async function handleRemoteControlCommand(
 	}
 	if (options.isStandaloneBinary) {
 		console.error("Error: volt remote is not available from the standalone binary release.");
-		console.error("Use a Node.js npm install or a source checkout with optional @hansjm10/volt-iroh dependencies.");
+		console.error(
+			"Use a Node.js npm install or source checkout with the required Iroh wrapper and optional platform binding.",
+		);
 		process.exitCode = 1;
 		return true;
 	}

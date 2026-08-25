@@ -7,10 +7,10 @@ function loadIroh() {
 	if (!loadAttempted) {
 		loadAttempted = true;
 		try {
+			irohPackageVersion = require("@hansjm10/volt-iroh/package.json").version;
+		} catch {}
+		try {
 			iroh = require("@hansjm10/volt-iroh/index.js");
-			try {
-				irohPackageVersion = require("@hansjm10/volt-iroh/package.json").version;
-			} catch {}
 		} catch (error) {
 			irohLoadError = error;
 		}
