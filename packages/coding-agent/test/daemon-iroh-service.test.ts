@@ -143,6 +143,87 @@ describe("native Iroh test prerequisite", () => {
 		20_000,
 	);
 
+	it.runIf(nativeAvailable).each([
+		{
+			outcome: "rejection",
+			terminalAccept: () => Promise.reject(new Error("injected acceptNext rejection")),
+		},
+		{ outcome: "null", terminalAccept: () => Promise.resolve(null) },
+		{ outcome: "undefined", terminalAccept: () => Promise.resolve(undefined) },
+	] satisfies Array<{
+		outcome: string;
+		terminalAccept: () => Promise<IrohIncomingLike | null | undefined>;
+	}>)(
+		"marks a ready phone transport unavailable after acceptNext returns $outcome",
+		async ({ terminalAccept }) => {
+			const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-accept-terminal-"));
+			const acceptTerminalGate = createDeferred();
+			let acceptStarted = false;
+			let daemonStopped = false;
+			let control: DaemonClient | undefined;
+			const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+				createIrohDaemonService(
+					{ relayMode: "disabled" },
+					{
+						decorateEndpoint: (endpoint) => ({
+							id: () => endpoint.id(),
+							addr: () => endpoint.addr(),
+							online: () => endpoint.online(),
+							async acceptNext() {
+								acceptStarted = true;
+								await acceptTerminalGate.promise;
+								return terminalAccept();
+							},
+							secretKey: () => endpoint.secretKey(),
+							close: () => endpoint.close(),
+						}),
+					},
+				),
+			]);
+			try {
+				const healthy = await waitForHealthyDaemon(agentDir);
+				control = createDaemonClient({
+					socketPath: healthy.socketPath,
+					client: "cli",
+					version: "test",
+					authToken: healthy.authToken,
+					reconnect: false,
+				});
+				await expect
+					.poll(async () => {
+						const status = await control?.request({ type: "status" });
+						return status?.type === "status_result" ? status.remoteTransport : undefined;
+					})
+					.toMatchObject({ state: "ready" });
+				await expect.poll(() => acceptStarted).toBe(true);
+
+				acceptTerminalGate.resolve();
+				await expect
+					.poll(async () => {
+						const status = await control?.request({ type: "status" });
+						return status?.type === "status_result" ? status.remoteTransport : undefined;
+					})
+					.toMatchObject({ state: "unavailable", reasonCode: "endpoint_start_failed" });
+				expect(await control.request({ type: "pair_request", access: "coding" })).toMatchObject({
+					type: "error",
+					code: "iroh_unavailable",
+				});
+				expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+				await expect(daemon).resolves.toBe(0);
+				daemonStopped = true;
+			} finally {
+				acceptTerminalGate.resolve();
+				if (!daemonStopped) {
+					await control?.request({ type: "shutdown" }).catch(() => {});
+					await daemon;
+				}
+				await control?.close();
+				rmSync(agentDir, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
 	it("loads the native adapter when required", () => {
 		if (nativeRequired && !native.iroh) {
 			throw new Error(formatIrohLoadError(native.error));

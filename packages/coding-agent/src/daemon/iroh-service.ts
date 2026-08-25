@@ -2103,11 +2103,13 @@ class IrohDaemonService {
 				if (!this.admission.isOpen) {
 					break;
 				}
-				this.log("error", `accept failed: ${error instanceof Error ? error.message : String(error)}`);
-				continue;
+				throw error;
 			}
 			if (!incoming) {
-				break;
+				if (!this.admission.isOpen) {
+					break;
+				}
+				throw new Error("Iroh endpoint accept loop terminated unexpectedly");
 			}
 			// Acquire once for the accepted incoming before branching. This is the
 			// exact publication fence for both rejection work and handleConnection;
