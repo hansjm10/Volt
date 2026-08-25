@@ -173,6 +173,33 @@ describe("daemon startup lock", () => {
 		}
 	});
 
+	it.each(["ENOSPC", "EDQUOT"] as const)(
+		"defers %s retirement during release and stale takeover without throwing",
+		async (code) => {
+			const retirementError = Object.assign(new Error(`${code} injected`), { code });
+			const retireGeneration = () => {
+				throw retirementError;
+			};
+			const owned = createLockPath();
+			const acquired = await acquireDaemonLock(owned.lockDirPath, { retireGeneration });
+			expect(acquired.ok).toBe(true);
+			if (acquired.ok) {
+				expect(() => acquired.lock.release()).not.toThrow();
+				expect(readDaemonLockOwner(owned.lockDirPath)).toEqual(acquired.lock.owner);
+			}
+
+			const stale = createLockPath();
+			const staleOwner: DaemonLockOwner = { pid: 4242, startedAtMs: 1, token: `stale-${code}` };
+			seedLock(stale.lockDirPath, staleOwner);
+			const takeover = await acquireDaemonLock(stale.lockDirPath, {
+				retireGeneration,
+				verifyOwner: async () => "gone",
+			});
+			expect(takeover).toEqual({ ok: false, reason: "contended" });
+			expect(readDaemonLockOwner(stale.lockDirPath)).toEqual(staleOwner);
+		},
+	);
+
 	it("an old release cannot remove a replacement lock after stale takeover", async () => {
 		const { lockDirPath } = createLockPath();
 		const first = await acquireDaemonLock(lockDirPath);

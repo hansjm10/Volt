@@ -4,9 +4,11 @@ The prebuilt executable is a local Volt CLI/TUI distribution built as a
 Node.js 22.23.1 Single Executable Application. It supports local interactive
 and print-mode agent sessions.
 
-It does **not** include the optional native `@hansjm10/volt-iroh` adapter and cannot
-run `volt daemon` or provide remote/iOS access. Install
-`@hansjm10/volt-coding-agent` through npm for daemon and remote support.
+It does **not** include the required `@hansjm10/volt-iroh` wrapper or any native
+Iroh binding and cannot run `volt daemon` or provide remote/iOS access. Install
+`@hansjm10/volt-coding-agent` through npm for daemon and remote support. The npm
+package requires the exact wrapper while npm selects an optional platform
+binding; `--omit=optional` disables phone transport, and Darwin x64 is unsupported.
 
 Release binaries are built natively for macOS arm64/x64, Linux arm64/x64, and
 Windows arm64/x64. Each archive includes its matching capability-rooted

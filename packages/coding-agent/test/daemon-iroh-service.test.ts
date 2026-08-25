@@ -16,7 +16,11 @@ import { decodeIrohRemoteTicketPayload } from "../src/core/remote/iroh/ticket.ts
 import type { IrohBiStreamLike } from "../src/core/rpc/iroh-transport.ts";
 import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
 import { createDaemonClient, type DaemonClient } from "../src/daemon/control-client.ts";
-import { CONTROL_RPC_GRANTS_CAPABILITY, type ControlEvent } from "../src/daemon/control-protocol.ts";
+import {
+	CONTROL_RPC_GRANTS_CAPABILITY,
+	type ControlEvent,
+	type RemoteTransportHealth,
+} from "../src/daemon/control-protocol.ts";
 import { createIntegratedConversationHandshakeResponse } from "../src/daemon/handshake-responses.ts";
 import {
 	formatIrohLoadError,
@@ -54,6 +58,172 @@ const nativeAvailable = native.iroh !== undefined;
 const nativeRequired = process.env.VOLT_TEST_REQUIRE_NATIVE_IROH === "1";
 
 describe("native Iroh test prerequisite", () => {
+	it("reports an injected missing native binding without taking down local daemon control", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-missing-iroh-"));
+		let control: DaemonClient | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			createIrohDaemonService(
+				{ relayMode: "disabled" },
+				{
+					loadIrohModule: () => ({
+						packageVersion: "1.1.1-volt.2",
+						error: Object.assign(new Error("binding omitted"), { code: "MODULE_NOT_FOUND" }),
+					}),
+				},
+			),
+		]);
+		try {
+			const healthy = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: healthy.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: healthy.authToken,
+				reconnect: false,
+			});
+			const status = await control.request({ type: "status" });
+			expect(status).toMatchObject({
+				type: "status_result",
+				remoteTransport: {
+					state: "unavailable",
+					reasonCode: "native_binding_missing",
+					wrapperVersion: "1.1.1-volt.2",
+				},
+			});
+			expect(await control.request({ type: "clients_list" })).toMatchObject({ type: "clients_result" });
+			expect(await control.request({ type: "pair_request", access: "coding" })).toMatchObject({
+				type: "error",
+				code: "iroh_unavailable",
+			});
+			await control.request({ type: "shutdown" });
+			await expect(daemon).resolves.toBe(0);
+		} finally {
+			await control?.close();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 20_000);
+
+	it.runIf(nativeAvailable)(
+		"reports injected endpoint startup failure through remote health",
+		async () => {
+			const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-start-failure-"));
+			let control: DaemonClient | undefined;
+			const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+				createIrohDaemonService(
+					{ relayMode: "disabled" },
+					{
+						decorateEndpoint: () => {
+							throw new Error("injected endpoint startup failure");
+						},
+					},
+				),
+			]);
+			try {
+				const healthy = await waitForHealthyDaemon(agentDir);
+				control = createDaemonClient({
+					socketPath: healthy.socketPath,
+					client: "cli",
+					version: "test",
+					authToken: healthy.authToken,
+					reconnect: false,
+				});
+				await expect
+					.poll(async () => {
+						const status = await control?.request({ type: "status" });
+						return status?.type === "status_result" ? status.remoteTransport : undefined;
+					})
+					.toMatchObject({ state: "unavailable", reasonCode: "endpoint_start_failed" });
+				await control.request({ type: "shutdown" });
+				await expect(daemon).resolves.toBe(0);
+			} finally {
+				await control?.close();
+				rmSync(agentDir, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
+	it.runIf(nativeAvailable).each([
+		{
+			outcome: "rejection",
+			terminalAccept: () => Promise.reject(new Error("injected acceptNext rejection")),
+		},
+		{ outcome: "null", terminalAccept: () => Promise.resolve(null) },
+		{ outcome: "undefined", terminalAccept: () => Promise.resolve(undefined) },
+	] satisfies Array<{
+		outcome: string;
+		terminalAccept: () => Promise<IrohIncomingLike | null | undefined>;
+	}>)(
+		"marks a ready phone transport unavailable after acceptNext returns $outcome",
+		async ({ terminalAccept }) => {
+			const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-accept-terminal-"));
+			const acceptTerminalGate = createDeferred();
+			let acceptStarted = false;
+			let daemonStopped = false;
+			let control: DaemonClient | undefined;
+			const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+				createIrohDaemonService(
+					{ relayMode: "disabled" },
+					{
+						decorateEndpoint: (endpoint) => ({
+							id: () => endpoint.id(),
+							addr: () => endpoint.addr(),
+							online: () => endpoint.online(),
+							async acceptNext() {
+								acceptStarted = true;
+								await acceptTerminalGate.promise;
+								return terminalAccept();
+							},
+							secretKey: () => endpoint.secretKey(),
+							close: () => endpoint.close(),
+						}),
+					},
+				),
+			]);
+			try {
+				const healthy = await waitForHealthyDaemon(agentDir);
+				control = createDaemonClient({
+					socketPath: healthy.socketPath,
+					client: "cli",
+					version: "test",
+					authToken: healthy.authToken,
+					reconnect: false,
+				});
+				await expect
+					.poll(async () => {
+						const status = await control?.request({ type: "status" });
+						return status?.type === "status_result" ? status.remoteTransport : undefined;
+					})
+					.toMatchObject({ state: "ready" });
+				await expect.poll(() => acceptStarted).toBe(true);
+
+				acceptTerminalGate.resolve();
+				await expect
+					.poll(async () => {
+						const status = await control?.request({ type: "status" });
+						return status?.type === "status_result" ? status.remoteTransport : undefined;
+					})
+					.toMatchObject({ state: "unavailable", reasonCode: "endpoint_start_failed" });
+				expect(await control.request({ type: "pair_request", access: "coding" })).toMatchObject({
+					type: "error",
+					code: "iroh_unavailable",
+				});
+				expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+				await expect(daemon).resolves.toBe(0);
+				daemonStopped = true;
+			} finally {
+				acceptTerminalGate.resolve();
+				if (!daemonStopped) {
+					await control?.request({ type: "shutdown" }).catch(() => {});
+					await daemon;
+				}
+				await control?.close();
+				rmSync(agentDir, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+
 	it("loads the native adapter when required", () => {
 		if (nativeRequired && !native.iroh) {
 			throw new Error(formatIrohLoadError(native.error));
@@ -249,7 +419,12 @@ function persistCanaryManagedRelayAuthority(
 async function captureIrohStartupError(
 	agentDir: string,
 	config: Parameters<typeof createIrohDaemonService>[0] = {},
-): Promise<{ error: string | undefined; endpointDecorations: number }> {
+): Promise<{
+	error: string | undefined;
+	endpointDecorations: number;
+	remoteTransport: RemoteTransportHealth;
+	startupLog: string;
+}> {
 	let startupError: string | undefined;
 	let endpointDecorations = 0;
 	let daemonStopped = false;
@@ -279,10 +454,17 @@ async function captureIrohStartupError(
 			authToken: status.authToken,
 			reconnect: false,
 		});
+		const statusResponse = await control.request({ type: "status" });
+		if (statusResponse.type !== "status_result") throw new Error("daemon status missing");
 		await control.request({ type: "shutdown" });
 		await daemon;
 		daemonStopped = true;
-		return { error: startupError, endpointDecorations };
+		return {
+			error: startupError,
+			endpointDecorations,
+			remoteTransport: statusResponse.remoteTransport,
+			startupLog: readFileSync(getDaemonPaths(agentDir).logPath, "utf8"),
+		};
 	} finally {
 		if (!daemonStopped) {
 			await control?.request({ type: "shutdown" }).catch(() => {});
@@ -1695,7 +1877,12 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
 		try {
 			const result = await captureIrohStartupError(agentDir);
-			expect(result.error).toBe(
+			expect(result.error).toBeUndefined();
+			expect(result.remoteTransport).toMatchObject({
+				state: "unavailable",
+				reasonCode: "endpoint_start_failed",
+			});
+			expect(result.startupLog).toContain(
 				`managed relay credential authority service URL ${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL} conflicts with the built-in relay deployment broker ${VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL}`,
 			);
 			expect(result.endpointDecorations).toBe(0);
@@ -1713,7 +1900,12 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network must not be used"));
 		try {
 			const result = await captureIrohStartupError(agentDir);
-			expect(result.error).toBe(
+			expect(result.error).toBeUndefined();
+			expect(result.remoteTransport).toMatchObject({
+				state: "unavailable",
+				reasonCode: "endpoint_start_failed",
+			});
+			expect(result.startupLog).toContain(
 				`managed relay claim authority service URL ${VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL} conflicts with the built-in relay deployment broker ${VOLT_CANARY_RELAY_CREDENTIAL_SERVICE_URL}`,
 			);
 			expect(result.endpointDecorations).toBe(0);
@@ -1740,7 +1932,14 @@ describe.skipIf(!nativeAvailable)("voltd managed relay credential startup", () =
 				relayUrls: [...VOLT_PRODUCTION_RELAY_URLS],
 				relayCredentialServiceUrl: VOLT_PRODUCTION_RELAY_CREDENTIAL_SERVICE_URL,
 			});
-			expect(result.error).toBe("managed relay credential revocation is scoped to a different relay origin set");
+			expect(result.error).toBeUndefined();
+			expect(result.remoteTransport).toMatchObject({
+				state: "unavailable",
+				reasonCode: "endpoint_start_failed",
+			});
+			expect(result.startupLog).toContain(
+				"managed relay credential revocation is scoped to a different relay origin set",
+			);
 			expect(result.endpointDecorations).toBe(0);
 			expect(fetchSpy).not.toHaveBeenCalled();
 		} finally {
@@ -2782,6 +2981,94 @@ describe.skipIf(!nativeAvailable)("voltd iroh startup ownership", () => {
 			rmSync(agentDir, { recursive: true, force: true });
 		}
 	}, 30_000);
+});
+
+describe.skipIf(!nativeAvailable)("voltd iroh pairing storage recovery", () => {
+	it.each(["ENOSPC", "EDQUOT"] as const)(
+		"retries pairing persistence after %s capacity is restored",
+		async (code) => {
+			const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-pairing-storage-recovery-"));
+			const workspaceDir = join(agentDir, "ws");
+			mkdirSync(workspaceDir, { recursive: true });
+			let failNextHostStateWrite = false;
+			let injectedFailureCount = 0;
+			let daemonStopped = false;
+			let control: DaemonClient | undefined;
+			const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+				(services) => {
+					const persistHostState = services.state.persistHostState.bind(services.state);
+					services.state.persistHostState = async (hostState) => {
+						if (failNextHostStateWrite) {
+							failNextHostStateWrite = false;
+							injectedFailureCount++;
+							throw Object.assign(new Error(`${code}: injected pairing persistence failure`), { code });
+						}
+						await persistHostState(hostState);
+					};
+					return {};
+				},
+				createIrohDaemonService({ relayMode: "disabled" }),
+			]);
+
+			try {
+				const status = await waitForHealthyDaemon(agentDir);
+				control = createDaemonClient({
+					socketPath: status.socketPath,
+					client: "cli",
+					version: "test",
+					authToken: status.authToken,
+					reconnect: false,
+				});
+				await expect
+					.poll(async () => {
+						const current = await control?.request({ type: "status" });
+						return current?.type === "status_result" ? current.remoteTransport : undefined;
+					})
+					.toMatchObject({ state: "ready" });
+				expect(await control.request({ type: "workspace_register", name: "ws", path: workspaceDir })).toMatchObject(
+					{ type: "ok" },
+				);
+
+				failNextHostStateWrite = true;
+				expect(await control.request({ type: "pair_request", workspaceName: "ws" })).toMatchObject({
+					type: "error",
+					code: "iroh_unavailable",
+				});
+				expect(injectedFailureCount).toBe(1);
+				expect(await control.request({ type: "status" })).toMatchObject({
+					type: "status_result",
+					remoteTransport: { state: "degraded", reasonCode: "host_storage_full" },
+				});
+
+				const retry = await control.request({ type: "pair_request", workspaceName: "ws" });
+				expect(retry).toMatchObject({ type: "pair_started" });
+				if (retry.type !== "pair_started") throw new Error("pairing persistence retry did not start");
+				expect(await control.request({ type: "status" })).toMatchObject({
+					type: "status_result",
+					remoteTransport: { state: "ready" },
+				});
+				const persistedState = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+					pendingPairingTickets: unknown[];
+				};
+				expect(persistedState.pendingPairingTickets).toHaveLength(1);
+				expect(await control.request({ type: "pair_cancel", requestId: retry.requestId })).toMatchObject({
+					type: "ok",
+				});
+				expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+				await daemon;
+				daemonStopped = true;
+			} finally {
+				failNextHostStateWrite = false;
+				if (!daemonStopped) {
+					await control?.request({ type: "shutdown" }).catch(() => {});
+					await daemon;
+				}
+				await control?.close();
+				rmSync(agentDir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
 });
 
 describe.skipIf(!nativeAvailable)("voltd iroh control pairing ownership", () => {

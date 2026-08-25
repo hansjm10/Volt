@@ -244,6 +244,7 @@ async function startOwnedRelayDaemonHarness(): Promise<OwnedRelayDaemonHarness> 
 						streamCount: record.streamCount,
 					})),
 					phoneConnections: registry.activeCount(),
+					remoteTransport: { state: "ready" },
 					workspaces: workspaceRegistered ? [{ name: WORKSPACE.name, path: workspaceDir }] : [],
 					clients: [],
 					keepAwake: { enabled: false, state: "disabled" },

@@ -561,6 +561,19 @@ export class VoltdStateStore {
 		this.scheduleFlush();
 	}
 
+	/** Persist one authority snapshot and restore the previous in-memory authority on failure. */
+	async persistHostState(hostState: IrohRemoteHostState): Promise<void> {
+		const previousHostState = this.getHostState();
+		this.setHostState(hostState);
+		try {
+			await this.flush();
+		} catch (error) {
+			this.current = hostStateToVoltdState(previousHostState, this.state.settings);
+			this.markStateChanged();
+			throw error;
+		}
+	}
+
 	getHostState(): IrohRemoteHostState {
 		return this.current ? voltdStateToHostState(this.current) : createEmptyIrohRemoteHostState();
 	}

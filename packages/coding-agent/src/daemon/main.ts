@@ -35,12 +35,14 @@ import type {
 	ControlRequest,
 	ControlRevokedClientStatus,
 	ControlWorkspaceStatus,
+	RemoteTransportHealth,
 } from "./control-protocol.ts";
 import {
 	CONTROL_PAIR_CANCEL_CAPABILITY,
 	CONTROL_RPC_GRANTS_CAPABILITY,
 	createControlClientStatus,
 	PROTOCOL_VERSION,
+	REMOTE_TRANSPORT_REASON_MESSAGES,
 } from "./control-protocol.ts";
 import {
 	type ControlConnection,
@@ -178,7 +180,12 @@ export interface VoltdServiceExtensionInstance {
 	onThemeChanged?(): void;
 	/** Keep-awake status changed (control toggle, phone RPC toggle, or degradation). */
 	onKeepAwakeChanged?(): void;
-	statusExtras?(): { leases?: ControlLeaseStatus[]; phoneConnections?: number; relayCount?: number };
+	statusExtras?(): {
+		leases?: ControlLeaseStatus[];
+		phoneConnections?: number;
+		relayCount?: number;
+		remoteTransport?: RemoteTransportHealth;
+	};
 	/** Redeem a relay hello token; true when the socket was taken over. */
 	admitRelay?(relayId: string, relayToken: string, socket: Socket, bufferedRemainder: Buffer): boolean;
 	/** Stop admitting work, settle durable ownership, and flush extension state. */
@@ -333,10 +340,9 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 		store: {
 			read: () => state.getHostState(),
 			write: async (hostState) => {
-				state.setHostState(hostState);
 				// State-manager mutations are security-sensitive: callers must not
 				// expose tickets or acknowledge pairing/revocation before durability.
-				await state.flush();
+				await state.persistHostState(hostState);
 			},
 		},
 	});
@@ -542,12 +548,20 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 				}));
 				let leases: ControlLeaseStatus[] = [];
 				let phoneConnections = 0;
+				let remoteTransport: RemoteTransportHealth = {
+					state: "unavailable",
+					reasonCode: "extension_missing",
+					message: REMOTE_TRANSPORT_REASON_MESSAGES.extension_missing,
+				};
 				for (const extension of extensionInstances) {
 					const extras = extension.statusExtras?.();
 					if (extras?.leases) {
 						leases = leases.concat(extras.leases);
 					}
 					phoneConnections += extras?.phoneConnections ?? 0;
+					if (extras?.remoteTransport) {
+						remoteTransport = extras.remoteTransport;
+					}
 				}
 				connection.send({
 					type: "status_result",
@@ -559,6 +573,7 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 					capabilities: [CONTROL_PAIR_CANCEL_CAPABILITY, CONTROL_RPC_GRANTS_CAPABILITY],
 					leases,
 					phoneConnections,
+					remoteTransport,
 					workspaces,
 					clients: toClientStatuses(),
 					revokedClients: toRevokedClientStatuses(),

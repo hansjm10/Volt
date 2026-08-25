@@ -17,11 +17,13 @@ and remains available under the MIT License.
 
 ## Remote Access Preview
 
-`volt remote host` can expose a local Volt runtime to a paired phone over Iroh
+`volt daemon start` exposes local Volt runtimes to a paired phone over Iroh
 without moving provider credentials or repository files off the host. Pairing is
 workstation-scoped: register local workspaces by name, pair the phone once with
 `volt remote pair`, then the phone can open known workspace names without another
-QR scan.
+QR scan. `volt daemon status` and `volt remote status` exit successfully only when
+`remoteTransport.state` is `ready`; local-only daemon functions remain available
+when phone transport is degraded or unavailable.
 
 Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`.
 Mobile streams bind during the Iroh handshake to one workspace/session
@@ -65,6 +67,7 @@ If you need stronger boundaries, containerize or sandbox Volt. See [packages/cod
 ## Development
 
 ```bash
+npm install -g npm@11.17.0 --ignore-scripts
 npm install --ignore-scripts  # Install all dependencies without running lifecycle scripts
 npm run check                 # Lint, format, and type check
 ./test.sh                     # Run tests without e2e provider tests
@@ -80,10 +83,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.m
 We treat npm dependency changes as reviewed code changes.
 
 - Direct external dependencies are pinned to exact versions. Internal workspace packages remain version-ranged.
-- `.npmrc` sets `save-exact=true` and `min-release-age=2` to avoid same-day dependency releases during npm resolution.
+- Development, CI, and release dependency resolution use exact npm 11.17.0 (`packageManager` plus erroring `devEngines`).
+- `.npmrc` sets `save-exact=true` and `min-release-age=2`. Only Volt's self-packaged `@hansjm10/volt-iroh*` family bypasses that age quarantine; third-party releases do not.
 - `package-lock.json` is the dependency ground truth. Pre-commit blocks accidental lockfile commits unless `VOLT_ALLOW_LOCKFILE_CHANGE=1` is set.
 - `npm run check` verifies pinned direct deps, native TypeScript import compatibility, and the generated coding-agent shrinkwrap.
-- The published CLI package includes `packages/coding-agent/npm-shrinkwrap.json`, generated from the root lockfile, to pin transitive deps for npm users.
+- The published CLI package includes `packages/coding-agent/npm-shrinkwrap.json`, generated from the root lockfile, to pin transitive deps for npm users. The exact `@hansjm10/volt-iroh` wrapper is required; its selected native platform binding remains optional. Installing with `--omit=optional` leaves phone transport unavailable.
 - Local release installs, documented npm installs, and `volt update --self` use `--ignore-scripts` where supported.
 
 ## License

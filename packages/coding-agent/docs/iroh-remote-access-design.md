@@ -4,11 +4,11 @@
 
 ## Status
 
-The Iroh remote host is a supported preview for Node.js npm installs and source checkouts with optional `@hansjm10/volt-iroh` available for the platform. RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers cover tickets, handshakes, host identity verification, host state, authorization, workspace selection, audit logging, redaction, reconnect/session selection, revocation, active stream registration, push notification routing, and host/client engine orchestration. `volt remote host` launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`. Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`, bind mobile streams during handshake to one workspace/session conversation, allow multiple sessions in the same workspace, treat stream close as client detach, keep active work running on the host, and reserve explicit cancellation for the selected stream's `abort` RPC command. The iOS app uses saved-host and workspace metadata to render pinned agent tabs across verified workspaces, opens New Agent and Resume Agent by targeted conversation stream, uses short-lived workspace discovery and management streams, and recovers selected conversations without another QR scan. The preview wire contract is documented in [Iroh Remote Protocol v1](iroh-remote-protocol.md). Unsupported areas remain explicit: standalone Node SEA builds reject remote host startup because Iroh is not bundled, host process exit is not durable recovery, `volt remote status` is persisted-state-only, hidden-agent resource controls are conservative, and cross-network relay should be validated in `production` relay mode in the target environment.
+The Iroh remote host is a supported preview for Node.js npm installs and source checkouts with the exact required `@hansjm10/volt-iroh` wrapper and an optional selected native binding available for the platform. RPC mode has a transport abstraction, Iroh streams have a structurally typed RPC adapter, remote command filtering is available, and the Iroh remote helpers cover tickets, handshakes, host identity verification, host state, authorization, workspace selection, audit logging, redaction, reconnect/session selection, revocation, active stream registration, push notification routing, and host/client engine orchestration. `volt remote host` launches a product host entrypoint in the coding-agent package and runs Volt's runtime in-process over `runIrohRemoteRpcMode()`. Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`, bind mobile streams during handshake to one workspace/session conversation, allow multiple sessions in the same workspace, treat stream close as client detach, keep active work running on the host, and reserve explicit cancellation for the selected stream's `abort` RPC command. The iOS app uses saved-host and workspace metadata to render pinned agent tabs across verified workspaces, opens New Agent and Resume Agent by targeted conversation stream, uses short-lived workspace discovery and management streams, and recovers selected conversations without another QR scan. The preview wire contract is documented in [Iroh Remote Protocol v1](iroh-remote-protocol.md). Unsupported areas remain explicit: standalone Node SEA builds reject remote host startup because Iroh is not bundled, host process exit is not durable recovery, Darwin x64 and `--omit=optional` installs cannot provide phone transport, hidden-agent resource controls are conservative, and cross-network relay should be validated in `production` relay mode in the target environment. Current daemon status reports live structured transport health.
 
 ## Summary
 
-Add optional remote access that exposes Volt's existing RPC protocol over [Iroh](https://www.iroh.computer/blog/v1). The native `@hansjm10/volt-iroh` dependency is optional in the coding-agent package, while Volt core provides the typed transport, handshake, state, authorization, audit, redaction, reconnect, revocation, and engine helpers needed for the integrated remote mode.
+Add remote access that exposes Volt's existing RPC protocol over [Iroh](https://www.iroh.computer/blog/v1). The exact `@hansjm10/volt-iroh` JavaScript wrapper is required in the coding-agent package; only its platform bindings remain optional, while Volt core provides the typed transport, handshake, state, authorization, audit, redaction, reconnect, revocation, and engine helpers needed for the integrated remote mode.
 
 This turns Volt into a remotely reachable local coding agent without requiring users to open ports, configure reverse proxies, or move provider credentials to a mobile client. The iOS app uses Iroh Swift support to connect to the user's host machine and render a native UI from RPC events.
 
@@ -27,7 +27,7 @@ Iroh v1 provides key-based dialing, encrypted QUIC connections, NAT traversal, l
 - Enable remote access to a local Volt session from another device without port forwarding.
 - Keep model credentials, repository files, and tool execution on the host machine.
 - Reuse Volt RPC as the application protocol instead of inventing a new agent protocol.
-- Keep the native Iroh dependency optional while sharing remote protocol logic through core helpers.
+- Require the reviewed Iroh wrapper while keeping platform-native bindings optional and sharing remote protocol logic through core helpers.
 - Define a security model before exposing shell/file tools remotely.
 
 ## Non-goals
@@ -35,7 +35,7 @@ Iroh v1 provides key-based dialing, encrypted QUIC connections, NAT traversal, l
 - No TUI tunneling.
 - No mobile app implementation in the host preview.
 - No built-in sandbox. Remote Volt has the same local-agent risks described in [Security](security.md).
-- No mandatory native dependency; `@hansjm10/volt-iroh` remains optional and remote host startup reports missing or unsupported native installs explicitly.
+- No mandatory platform binding on unsupported installs; the wrapper remains required, and structured daemon health reports missing/unsupported bindings explicitly. `--omit=optional` cannot provide phone transport, and Darwin x64 remains local CLI/TUI only.
 - No multi-user collaboration semantics in the host preview.
 
 ## Current State
@@ -246,7 +246,7 @@ npm run iroh:poc:client -- "<ticket>" --get-state
 ### Phase 1: Monorepo experiment
 
 - Add an example under `packages/coding-agent/examples/remote/iroh-sidecar/` if the external exploration is successful.
-- Keep native dependencies isolated until the optional dependency strategy is proven.
+- Keep native loading isolated while requiring the wrapper and selecting platform bindings through optional dependencies.
 - Document setup, pairing, and security warnings.
 
 ### Phase 2: RPC transport and remote core extraction
@@ -307,7 +307,7 @@ Automated tests for a monorepo version:
 | Risk | Mitigation |
 | --- | --- |
 | Remote access exposes local shell and filesystem | Opt-in host command, unsafe-tool confirmation, workspace allowlist, client revocation, clear warnings |
-| Native dependency increases install complexity | Keep `@hansjm10/volt-iroh` optional, keep native loading isolated from the main CLI, document native install troubleshooting, and reject standalone Node SEA remote host startup with actionable npm/source guidance |
+| Native dependency increases install complexity | Require the exact reviewed `@hansjm10/volt-iroh` wrapper, keep only platform bindings optional, keep native loading isolated from the main CLI, report structured transport health, document `--omit=optional`/Darwin x64 limitations, and reject standalone Node SEA remote host startup with actionable npm/source guidance |
 | Mobile networks disconnect often | Integrated hosts treat stream close as detach, retain active host work, allow same-client/workspace reconnect, and recover persisted output through `get_transcript` |
 | RPC responses expose host paths | Remote-safe outbound filtering normalizes workspace paths and only uses dedicated redaction for host-only session, export, and bash-output paths |
 | Relay fallback may add latency or cost | Prefer direct connections, expose connection diagnostics, allow custom relay config later |

@@ -11,6 +11,7 @@
 			"dependencies": {
 				"@hansjm10/volt-agent-core": "^0.1.0",
 				"@hansjm10/volt-ai": "^0.1.0",
+				"@hansjm10/volt-iroh": "1.1.1-volt.2",
 				"@hansjm10/volt-tui": "^0.1.0",
 				"@jimp/core": "1.6.1",
 				"@jimp/js-bmp": "1.6.1",
@@ -36,9 +37,6 @@
 				"typebox": "1.1.38",
 				"undici": "8.5.0",
 				"yaml": "2.9.0"
-			},
-			"optionalDependencies": {
-				"@hansjm10/volt-iroh": "1.1.1-volt.2"
 			},
 			"bin": {
 				"volt": "dist/core/npm/cli.js"
@@ -573,8 +571,7 @@
 			},
 			"engines": {
 				"node": ">= 20.3.0"
-			},
-			"optional": true
+			}
 		},
 		"node_modules/@hansjm10/volt-iroh-android-arm-eabi": {
 			"version": "1.1.1-volt.2",
