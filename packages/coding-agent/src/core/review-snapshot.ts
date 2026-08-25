@@ -5,6 +5,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnProcess } from "../utils/child-process.ts";
+import { terminateProcessTree } from "../utils/shell.ts";
 import {
 	captureReviewGitHubContext,
 	type ReviewGitHubContext,
@@ -145,12 +146,15 @@ export interface ReviewSnapshot {
 export interface ReviewSnapshotResolutionError {
 	error: string;
 	remoteError?: string;
+	cancelled?: true;
 }
 
 export interface ResolveReviewSnapshotOptions {
 	maxCommitRefBytes: number;
 	maxPullRequestNumber: number;
 	limits?: Partial<ReviewSnapshotLimits>;
+	signal?: AbortSignal;
+	onProgress?: (message: string) => void;
 }
 
 interface ReviewSnapshotLimits {
@@ -180,6 +184,7 @@ interface GitSource {
 	env?: Record<string, string>;
 	objectDirectories: string[];
 	limits: ReviewSnapshotLimits;
+	signal?: AbortSignal;
 }
 
 interface SnapshotInit {
@@ -281,7 +286,6 @@ function runCommand(
 			cwd,
 			stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: options.env ? { ...process.env, ...options.env } : process.env,
-			signal: options.signal,
 		});
 		let stdout: Buffer[] = [];
 		let stdoutBytes = 0;
@@ -290,9 +294,15 @@ function runCommand(
 		let failure: CommandOutputLimitFailure | undefined;
 		let processError: string | undefined;
 		let settled = false;
+		const onAbort = (): void => {
+			proc.stdin?.destroy();
+			if (proc.pid) void terminateProcessTree(proc.pid);
+			else proc.kill();
+		};
 		const finish = (result: CommandResult): void => {
 			if (settled) return;
 			settled = true;
+			options.signal?.removeEventListener("abort", onAbort);
 			resolveResult(result);
 		};
 		const exceed = (stream: CommandOutputLimitFailure["stream"], limit: number): void => {
@@ -335,22 +345,28 @@ function runCommand(
 			});
 		});
 		proc.stdin?.on("error", () => {});
-		if (options.input !== undefined) proc.stdin?.end(options.input);
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted) onAbort();
+		else if (options.input !== undefined) proc.stdin?.end(options.input);
 	});
 }
 
-function git(
-	source: Pick<GitSource, "cwd" | "env" | "limits">,
+async function git(
+	source: Pick<GitSource, "cwd" | "env" | "limits" | "signal">,
 	args: string[],
 	input?: Buffer | string,
 	maxStdoutBytes = source.limits.maxMetadataBytes,
 ): Promise<CommandResult> {
-	return runCommand("git", args, source.cwd, {
+	throwIfResolutionCancelled(source.signal);
+	const result = await runCommand("git", args, source.cwd, {
 		env: source.env,
 		input,
+		signal: source.signal,
 		maxStdoutBytes,
 		maxStderrBytes: source.limits.maxStderrBytes,
 	});
+	throwIfResolutionCancelled(source.signal);
+	return result;
 }
 
 function text(result: CommandResult): string {
@@ -401,45 +417,114 @@ async function createEmptyTree(source: Pick<GitSource, "cwd" | "env" | "limits">
 	return oid;
 }
 
-function commandOptions(limits: ReviewSnapshotLimits): { maxStdoutBytes: number; maxStderrBytes: number } {
-	return { maxStdoutBytes: limits.maxMetadataBytes, maxStderrBytes: limits.maxStderrBytes };
+class ReviewSnapshotResolutionCancelledError extends Error {
+	constructor() {
+		super("Review snapshot resolution was cancelled.");
+		this.name = "ReviewSnapshotResolutionCancelledError";
+	}
 }
 
-async function repositoryRoot(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
-	const result = await runCommand("git", ["rev-parse", "--show-toplevel"], cwd, commandOptions(limits));
+function throwIfResolutionCancelled(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new ReviewSnapshotResolutionCancelledError();
+}
+
+function commandOptions(
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): { signal?: AbortSignal; maxStdoutBytes: number; maxStderrBytes: number } {
+	return { signal, maxStdoutBytes: limits.maxMetadataBytes, maxStderrBytes: limits.maxStderrBytes };
+}
+
+async function repositoryRoot(
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	throwIfResolutionCancelled(signal);
+	const result = await runCommand("git", ["rev-parse", "--show-toplevel"], cwd, commandOptions(limits, signal));
+	throwIfResolutionCancelled(signal);
 	throwIfOutputLimited("git rev-parse failed", result);
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
-async function repositoryObjectDirectory(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+async function repositoryObjectDirectory(
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	throwIfResolutionCancelled(signal);
 	const result = await runCommand(
 		"git",
 		["rev-parse", "--path-format=absolute", "--git-path", "objects"],
 		cwd,
-		commandOptions(limits),
+		commandOptions(limits, signal),
 	);
+	throwIfResolutionCancelled(signal);
 	throwIfOutputLimited("git rev-parse failed", result);
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
-async function repositoryIndexFile(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+async function repositoryObjectFormat(
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<"sha1" | "sha256" | undefined> {
+	throwIfResolutionCancelled(signal);
+	const result = await runCommand("git", ["rev-parse", "--show-object-format"], cwd, commandOptions(limits, signal));
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git rev-parse failed", result);
+	const format = text(result).trim();
+	return result.ok && (format === "sha1" || format === "sha256") ? format : undefined;
+}
+
+async function repositoryIsShallow(
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<boolean | undefined> {
+	throwIfResolutionCancelled(signal);
+	const result = await runCommand(
+		"git",
+		["rev-parse", "--is-shallow-repository"],
+		cwd,
+		commandOptions(limits, signal),
+	);
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git rev-parse failed", result);
+	const shallow = text(result).trim();
+	return result.ok && (shallow === "true" || shallow === "false") ? shallow === "true" : undefined;
+}
+
+async function repositoryIndexFile(
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	throwIfResolutionCancelled(signal);
 	const result = await runCommand(
 		"git",
 		["rev-parse", "--path-format=absolute", "--git-path", "index"],
 		cwd,
-		commandOptions(limits),
+		commandOptions(limits, signal),
 	);
+	throwIfResolutionCancelled(signal);
 	throwIfOutputLimited("git rev-parse failed", result);
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
-async function detectBaseBranch(cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
+async function detectBaseBranch(
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	throwIfResolutionCancelled(signal);
 	const originHead = await runCommand(
 		"git",
 		["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
 		cwd,
-		commandOptions(limits),
+		commandOptions(limits, signal),
 	);
+	throwIfResolutionCancelled(signal);
 	throwIfOutputLimited("git symbolic-ref failed", originHead);
 	if (originHead.ok) {
 		const ref = text(originHead).trim();
@@ -450,16 +535,29 @@ async function detectBaseBranch(cwd: string, limits: ReviewSnapshotLimits): Prom
 			"git",
 			["rev-parse", "--verify", "--quiet", candidate],
 			cwd,
-			commandOptions(limits),
+			commandOptions(limits, signal),
 		);
+		throwIfResolutionCancelled(signal);
 		throwIfOutputLimited("git rev-parse failed", exists);
 		if (exists.ok) return candidate;
 	}
 	return undefined;
 }
 
-async function resolveBaseRef(base: string, cwd: string, limits: ReviewSnapshotLimits): Promise<string | undefined> {
-	const direct = await runCommand("git", ["rev-parse", "--verify", "--quiet", base], cwd, commandOptions(limits));
+async function resolveBaseRef(
+	base: string,
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	throwIfResolutionCancelled(signal);
+	const direct = await runCommand(
+		"git",
+		["rev-parse", "--verify", "--quiet", base],
+		cwd,
+		commandOptions(limits, signal),
+	);
+	throwIfResolutionCancelled(signal);
 	throwIfOutputLimited("git rev-parse failed", direct);
 	if (direct.ok) return base;
 	if (!base.startsWith("origin/")) {
@@ -468,8 +566,9 @@ async function resolveBaseRef(base: string, cwd: string, limits: ReviewSnapshotL
 			"git",
 			["rev-parse", "--verify", "--quiet", remote],
 			cwd,
-			commandOptions(limits),
+			commandOptions(limits, signal),
 		);
+		throwIfResolutionCancelled(signal);
 		throwIfOutputLimited("git rev-parse failed", remoteExists);
 		if (remoteExists.ok) return remote;
 	}
@@ -484,20 +583,22 @@ function normalizePullRequestNumber(value: string | undefined, maximum: number):
 	return Number.isSafeInteger(numeric) && numeric <= maximum ? number : undefined;
 }
 
-async function createLocalSource(root: string, limits: ReviewSnapshotLimits): Promise<GitSource> {
-	const objects = await repositoryObjectDirectory(root, limits);
+async function createLocalSource(root: string, limits: ReviewSnapshotLimits, signal?: AbortSignal): Promise<GitSource> {
+	const objects = await repositoryObjectDirectory(root, limits, signal);
 	if (!objects) throw new Error("Could not resolve the Git object directory.");
-	return { cwd: root, objectDirectories: [objects], limits };
+	return { cwd: root, objectDirectories: [objects], limits, signal };
 }
 
 async function createUncommittedSource(
 	root: string,
 	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
 ): Promise<{ source: GitSource; temporaryDirectory: string; originalIndex: string }> {
-	const originalObjects = await repositoryObjectDirectory(root, limits);
+	const originalObjects = await repositoryObjectDirectory(root, limits, signal);
 	if (!originalObjects) throw new Error("Could not resolve the Git object directory.");
-	const originalIndex = await repositoryIndexFile(root, limits);
+	const originalIndex = await repositoryIndexFile(root, limits, signal);
 	if (!originalIndex) throw new Error("Could not resolve the Git index file.");
+	throwIfResolutionCancelled(signal);
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-snapshot-"));
 	const objects = join(temporaryDirectory, "objects");
 	await mkdir(objects, { recursive: true });
@@ -510,6 +611,7 @@ async function createUncommittedSource(
 		},
 		objectDirectories: [objects, originalObjects],
 		limits,
+		signal,
 	};
 	return { source, temporaryDirectory, originalIndex };
 }
@@ -618,51 +720,104 @@ async function createPullRequestSource(
 	root: string,
 	pullRequest: ReviewPullRequestIdentity,
 	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
 ): Promise<{ source?: GitSource; temporaryDirectory?: string; error?: ReviewSnapshotResolutionError }> {
-	const originResult = await runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits));
+	throwIfResolutionCancelled(signal);
+	const [localObjects, objectFormat, sourceIsShallow, originResult] = await Promise.all([
+		repositoryObjectDirectory(root, limits, signal),
+		repositoryObjectFormat(root, limits, signal),
+		repositoryIsShallow(root, limits, signal),
+		runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits, signal)),
+	]);
+	throwIfResolutionCancelled(signal);
+	if (!localObjects) return { error: { error: "Could not resolve the Git object directory." } };
+	if (!objectFormat) return { error: { error: "Could not resolve the Git object format." } };
 	if (!originResult.ok || !text(originResult).trim()) {
 		return { error: { error: "Could not resolve the origin remote for the pull request snapshot." } };
 	}
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-pr-"));
-	const init = await runCommand("git", ["init", "--bare"], temporaryDirectory, commandOptions(limits));
-	if (!init.ok) {
-		await rm(temporaryDirectory, { recursive: true, force: true });
-		return { error: commandFailure("git init failed", init) };
-	}
-	const source: GitSource = {
-		cwd: temporaryDirectory,
-		objectDirectories: [join(temporaryDirectory, "objects")],
-		limits,
-	};
-	const fetch = await git(source, [
-		"fetch",
-		"--no-tags",
-		"--force",
-		text(originResult).trim(),
-		`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
-		`+refs/pull/${pullRequest.number}/head:refs/review/head`,
-	]);
-	if (!fetch.ok) {
-		await rm(temporaryDirectory, { recursive: true, force: true });
-		return {
-			error: {
-				error: `git fetch failed: ${commandError(fetch)}`,
-				remoteError: "Could not fetch the exact pull request snapshot.",
-			},
+	let retainTemporaryDirectory = false;
+	try {
+		const init = await runCommand(
+			"git",
+			["init", "--bare", `--object-format=${objectFormat}`],
+			temporaryDirectory,
+			commandOptions(limits, signal),
+		);
+		throwIfResolutionCancelled(signal);
+		if (!init.ok) return { error: commandFailure("git init failed", init) };
+		const objects = join(temporaryDirectory, "objects");
+		const alternatesPath = join(objects, "info", "alternates");
+		const borrowLocalObjects = sourceIsShallow === false;
+		if (borrowLocalObjects) {
+			await mkdir(join(objects, "info"), { recursive: true });
+			await writeFile(alternatesPath, `${resolve(localObjects)}\n`, "utf8");
+		}
+		throwIfResolutionCancelled(signal);
+		const fetchSource: GitSource = {
+			cwd: temporaryDirectory,
+			objectDirectories: borrowLocalObjects ? [objects, localObjects] : [objects],
+			limits,
+			signal,
 		};
-	}
-	const fetchedBase = await requireCanonicalCommit(source, "refs/review/base");
-	const fetchedHead = await requireCanonicalCommit(source, "refs/review/head");
-	if (fetchedBase !== pullRequest.baseRefOid || fetchedHead !== pullRequest.headRefOid) {
-		await rm(temporaryDirectory, { recursive: true, force: true });
-		return {
-			error: {
-				error: "The pull request moved while Volt captured it. Retry the review.",
-				remoteError: "The pull request changed while Volt captured it. Retry the review.",
-			},
+		const fetch = await git(fetchSource, [
+			"fetch",
+			"--no-tags",
+			"--force",
+			text(originResult).trim(),
+			`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
+			`+refs/pull/${pullRequest.number}/head:refs/review/head`,
+		]);
+		if (!fetch.ok) {
+			return {
+				error: {
+					error: `git fetch failed: ${commandError(fetch)}`,
+					remoteError: "Could not fetch the exact pull request snapshot.",
+				},
+			};
+		}
+		const fetchedBase = await requireCanonicalCommit(fetchSource, "refs/review/base");
+		const fetchedHead = await requireCanonicalCommit(fetchSource, "refs/review/head");
+		if (fetchedBase !== pullRequest.baseRefOid || fetchedHead !== pullRequest.headRefOid) {
+			return {
+				error: {
+					error: "The pull request moved while Volt captured it. Retry the review.",
+					remoteError: "The pull request changed while Volt captured it. Retry the review.",
+				},
+			};
+		}
+		const repack = await git(fetchSource, ["repack", "-a", "-d"]);
+		if (!repack.ok) {
+			return {
+				error: {
+					error: `git repack failed: ${commandError(repack)}`,
+					remoteError: "Could not make the pull request snapshot self-contained.",
+				},
+			};
+		}
+		await rm(alternatesPath, { force: true });
+		throwIfResolutionCancelled(signal);
+		const source: GitSource = {
+			cwd: temporaryDirectory,
+			objectDirectories: [objects],
+			limits,
+			signal,
 		};
+		const detachedBase = await requireCanonicalCommit(source, "refs/review/base");
+		const detachedHead = await requireCanonicalCommit(source, "refs/review/head");
+		if (detachedBase !== pullRequest.baseRefOid || detachedHead !== pullRequest.headRefOid) {
+			return {
+				error: {
+					error: "The pull request snapshot remained dependent on local Git objects.",
+					remoteError: "Could not make the pull request snapshot self-contained.",
+				},
+			};
+		}
+		retainTemporaryDirectory = true;
+		return { source, temporaryDirectory };
+	} finally {
+		if (!retainTemporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
 	}
-	return { source, temporaryDirectory };
 }
 
 function statusFromGit(value: string): ReviewChangedFileStatus {
@@ -2042,7 +2197,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.assertActive();
 		const directory = await mkdtemp(join(tmpdir(), "volt-review-checkout-"));
 		this.materializedDirectories.push(directory);
-		const init = await runCommand("git", ["init"], directory, commandOptions(this.limits));
+		const init = await runCommand("git", ["init"], directory, commandOptions(this.limits, this.source.signal));
 		if (!init.ok) throw new Error(`Could not initialize review checkout: ${commandError(init)}`);
 		const alternatesPath = join(directory, ".git", "objects", "info", "alternates");
 		await mkdir(join(directory, ".git", "objects", "info"), { recursive: true });
@@ -2056,7 +2211,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 			["commit-tree", this.identity.headTree, "-m", "Volt review snapshot"],
 			directory,
 			{
-				...commandOptions(this.limits),
+				...commandOptions(this.limits, this.source.signal),
 				env: {
 					GIT_AUTHOR_NAME: "Volt Review",
 					GIT_AUTHOR_EMAIL: "review@localhost",
@@ -2069,7 +2224,12 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		if (!commit.ok || !CANONICAL_GIT_OBJECT_ID_PATTERN.test(commitOid)) {
 			throw new Error(`Could not create review checkout commit: ${commandError(commit)}`);
 		}
-		const reset = await runCommand("git", ["reset", "--hard", commitOid], directory, commandOptions(this.limits));
+		const reset = await runCommand(
+			"git",
+			["reset", "--hard", commitOid],
+			directory,
+			commandOptions(this.limits, this.source.signal),
+		);
 		if (!reset.ok) throw new Error(`Could not materialize review checkout: ${commandError(reset)}`);
 		return directory;
 	}
@@ -2141,13 +2301,22 @@ export async function resolveReviewSnapshot(
 	options: ResolveReviewSnapshotOptions,
 ): Promise<ReviewSnapshot | ReviewSnapshotResolutionError> {
 	let init: SnapshotInit | undefined;
+	const pendingTemporaryDirectories = new Set<string>();
 	try {
+		throwIfResolutionCancelled(options.signal);
 		const limits = normalizeSnapshotLimits(options.limits);
-		const root = await repositoryRoot(cwd, limits);
+		options.onProgress?.("Resolving repository…");
+		const root = await repositoryRoot(cwd, limits, options.signal);
 		if (!root) return { error: "Not inside a git repository." };
 		switch (target.kind) {
 			case "uncommitted": {
-				const { source, temporaryDirectory, originalIndex } = await createUncommittedSource(root, limits);
+				options.onProgress?.("Capturing uncommitted changes…");
+				const { source, temporaryDirectory, originalIndex } = await createUncommittedSource(
+					root,
+					limits,
+					options.signal,
+				);
+				pendingTemporaryDirectories.add(temporaryDirectory);
 				const headCommit = await requireCanonicalCommit(source, "HEAD");
 				const baseTree = headCommit
 					? await requireCanonicalTree(source, headCommit)
@@ -2185,11 +2354,12 @@ export async function resolveReviewSnapshot(
 				break;
 			}
 			case "branch": {
-				const requestedBase = target.base ?? (await detectBaseBranch(root, limits));
+				options.onProgress?.("Resolving branch history…");
+				const requestedBase = target.base ?? (await detectBaseBranch(root, limits, options.signal));
 				if (!requestedBase) return { error: "Could not detect a base branch. Use /review branch <base>." };
-				const baseRef = await resolveBaseRef(requestedBase, root, limits);
+				const baseRef = await resolveBaseRef(requestedBase, root, limits, options.signal);
 				if (!baseRef) return { error: `Base branch "${requestedBase}" not found.` };
-				const source = await createLocalSource(root, limits);
+				const source = await createLocalSource(root, limits, options.signal);
 				const baseCommit = await requireCanonicalCommit(source, baseRef);
 				const headCommit = await requireCanonicalCommit(source, "HEAD");
 				if (!baseCommit || !headCommit) return { error: "Could not resolve the branch endpoints." };
@@ -2219,12 +2389,13 @@ export async function resolveReviewSnapshot(
 				break;
 			}
 			case "commit": {
+				options.onProgress?.("Resolving commit…");
 				const ref = target.sha?.trim();
 				if (!ref) return { error: "Missing commit ref." };
 				if (Buffer.byteLength(ref, "utf8") > options.maxCommitRefBytes) {
 					return { error: `Commit ref exceeds ${options.maxCommitRefBytes} UTF-8 bytes.` };
 				}
-				const source = await createLocalSource(root, limits);
+				const source = await createLocalSource(root, limits, options.signal);
 				const headCommit = await requireCanonicalCommit(source, ref);
 				if (!headCommit) return { error: "Commit ref was not found or does not resolve to a commit." };
 				const headTree = await requireCanonicalTree(source, headCommit);
@@ -2265,12 +2436,16 @@ export async function resolveReviewSnapshot(
 					cwd: root,
 					...(normalized ? { number: normalized } : {}),
 					maxPullRequestNumber: options.maxPullRequestNumber,
+					signal: options.signal,
+					onProgress: options.onProgress,
 				});
 				if (!captured.ok) return captured;
 				const { pullRequest } = captured;
-				const fetched = await createPullRequestSource(root, pullRequest, limits);
+				options.onProgress?.("Fetching pull request history…");
+				const fetched = await createPullRequestSource(root, pullRequest, limits, options.signal);
 				if (!fetched.source || !fetched.temporaryDirectory)
 					return fetched.error ?? { error: "Could not fetch pull request snapshot." };
+				pendingTemporaryDirectories.add(fetched.temporaryDirectory);
 				const source = fetched.source;
 				const mergeBaseResult = await git(source, ["merge-base", pullRequest.baseRefOid, pullRequest.headRefOid]);
 				const mergeBaseCommit = text(mergeBaseResult).trim();
@@ -2314,11 +2489,19 @@ export async function resolveReviewSnapshot(
 			}
 		}
 		if (!init) return { error: "Could not initialize the review snapshot." };
-		return await GitReviewSnapshot.create(init);
+		options.onProgress?.("Building review snapshot…");
+		const snapshot = await GitReviewSnapshot.create(init);
+		if (options.signal?.aborted) {
+			await snapshot.dispose();
+			throw new ReviewSnapshotResolutionCancelledError();
+		}
+		return snapshot;
 	} catch (error) {
-		if (init) {
-			for (const directory of init.temporaryDirectories)
-				await rm(directory, { recursive: true, force: true }).catch(() => {});
+		for (const directory of pendingTemporaryDirectories) {
+			await rm(directory, { recursive: true, force: true }).catch(() => {});
+		}
+		if (error instanceof ReviewSnapshotResolutionCancelledError || options.signal?.aborted) {
+			return { error: "Review cancelled.", cancelled: true };
 		}
 		return { error: error instanceof Error ? error.message : String(error) };
 	}

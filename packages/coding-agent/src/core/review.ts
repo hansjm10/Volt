@@ -273,10 +273,13 @@ export function normalizeReviewPullRequestNumber(value: string | undefined): { n
 export async function resolveReviewTarget(
 	target: ReviewTarget,
 	cwd: string,
+	options: { signal?: AbortSignal; onProgress?: (message: string) => void } = {},
 ): Promise<ResolvedReview | ReviewSnapshotResolutionError> {
 	return resolveReviewSnapshot(target, cwd, {
 		maxCommitRefBytes: MAX_REVIEW_COMMIT_REF_BYTES,
 		maxPullRequestNumber: MAX_GITHUB_PR_NUMBER,
+		signal: options.signal,
+		onProgress: options.onProgress,
 	});
 }
 
@@ -849,6 +852,7 @@ export type ReviewWorkflowToolEvent =
 export interface ReviewWorkflowHooks {
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
+	onPrepared?: (resolution: ResolvedReview, model: Model<Api>) => Promise<void> | void;
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 	onSessionEvent?: (event: AgentSessionEvent) => void;
 	onUsage?: (usage: ReviewUsageSnapshot) => void;
@@ -869,10 +873,7 @@ export interface ReviewWorkflowOptions {
 	requireProjectTrust?: boolean;
 	requireConfirmation?: boolean;
 	confirm?: (request: { title: string; message: string; resolution: ResolvedReview }) => Promise<boolean>;
-	onBeforeReview?: (
-		resolution: ResolvedReview,
-		model: Model<Api>,
-	) => Promise<ReviewWorkflowHooks> | ReviewWorkflowHooks;
+	createHooks?: () => Promise<ReviewWorkflowHooks> | ReviewWorkflowHooks;
 	onReviewModelWarning?: (message: string) => void;
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 }
@@ -899,6 +900,8 @@ export interface PrepareReviewWorkflowOptions {
 	sessionManager?: SessionManager;
 	requireProjectTrust?: boolean;
 	sanitizeRemoteErrors?: boolean;
+	signal?: AbortSignal;
+	onProgress?: (message: string) => void;
 }
 
 export interface PreparedReviewWorkflow {
@@ -1020,45 +1023,65 @@ function createReviewWorkflowId(): string {
 	return `review:${randomUUID()}`;
 }
 
+class ReviewPreparationCancelledError extends Error {
+	constructor() {
+		super("Review preparation was cancelled.");
+		this.name = "ReviewPreparationCancelledError";
+	}
+}
+
+function throwIfReviewPreparationCancelled(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new ReviewPreparationCancelledError();
+}
+
 export async function prepareReviewWorkflow(options: PrepareReviewWorkflowOptions): Promise<PreparedReviewWorkflow> {
+	throwIfReviewPreparationCancelled(options.signal);
 	if (options.requireProjectTrust && !options.settingsManager.isProjectTrusted()) {
 		throw new Error("Project trust is required before running a remote review.");
 	}
 	const controls = controlsWithDefaults(options.controls);
 	assertReviewControlsPersistLosslessly(controls);
-	const resolution = await resolveReviewTarget(options.target, options.cwd);
-	if ("error" in resolution)
+	const resolution = await resolveReviewTarget(options.target, options.cwd, {
+		signal: options.signal,
+		onProgress: options.onProgress,
+	});
+	if ("error" in resolution) {
+		if (resolution.cancelled || options.signal?.aborted) throw new ReviewPreparationCancelledError();
 		throw new Error(
 			options.sanitizeRemoteErrors && resolution.remoteError ? resolution.remoteError : resolution.error,
 		);
-	const reviewModel = resolveReviewModel(options);
-	if (!reviewModel.model) {
-		await resolution.dispose();
-		throw new Error("No model available for review. Use /model to select one.");
 	}
-	const verifier = resolveVerifierModel({
-		settingsManager: options.settingsManager,
-		modelRegistry: options.modelRegistry,
-		discoveryModel: reviewModel.model,
-	});
-	return {
-		workflowId: createReviewWorkflowId(),
-		action: reviewActionIdForTarget(options.target),
-		target: options.target,
-		controls,
-		resolution,
-		model: reviewModel.model,
-		verifierModel: verifier.model,
-		startedAt: Date.now(),
-		incrementalPlan: planIncrementalReview(
-			options.sessionManager,
-			resolution,
+	try {
+		throwIfReviewPreparationCancelled(options.signal);
+		const reviewModel = resolveReviewModel(options);
+		if (!reviewModel.model) throw new Error("No model available for review. Use /model to select one.");
+		const verifier = resolveVerifierModel({
+			settingsManager: options.settingsManager,
+			modelRegistry: options.modelRegistry,
+			discoveryModel: reviewModel.model,
+		});
+		return {
+			workflowId: createReviewWorkflowId(),
+			action: reviewActionIdForTarget(options.target),
+			target: options.target,
 			controls,
-			options.parentRunId ? { parentRunId: options.parentRunId } : {},
-		),
-		...(reviewModel.warning ? { modelWarning: reviewModel.warning } : {}),
-		...(verifier.warning ? { verifierModelWarning: verifier.warning } : {}),
-	};
+			resolution,
+			model: reviewModel.model,
+			verifierModel: verifier.model,
+			startedAt: Date.now(),
+			incrementalPlan: planIncrementalReview(
+				options.sessionManager,
+				resolution,
+				controls,
+				options.parentRunId ? { parentRunId: options.parentRunId } : {},
+			),
+			...(reviewModel.warning ? { modelWarning: reviewModel.warning } : {}),
+			...(verifier.warning ? { verifierModelWarning: verifier.warning } : {}),
+		};
+	} catch (error) {
+		await resolution.dispose();
+		throw error;
+	}
 }
 
 function summarizeToolArgs(args: unknown): string | undefined {
@@ -1633,77 +1656,93 @@ export function createReviewSeedMessage(
 
 export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise<ReviewWorkflowResult> {
 	assertReviewCanStart(options.session);
-	const prepared = await prepareReviewWorkflow({
-		target: options.target,
-		controls: options.controls,
-		...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
-		cwd: options.cwd,
-		settingsManager: options.settingsManager,
-		modelRegistry: options.session.modelRegistry,
-		currentModel: options.session.model,
-		sessionManager: options.session.sessionManager,
-		requireProjectTrust: options.requireProjectTrust,
-	});
-	const { resolution, model, workflowId, action } = prepared;
-	if (options.requireConfirmation) {
-		const confirmed = await options.confirm?.({
-			title: "Review changes",
-			message: createReviewConfirmationMessage(resolution),
-			resolution,
-		});
-		if (!confirmed) {
+	let hooks: ReviewWorkflowHooks | undefined;
+	let prepared: PreparedReviewWorkflow | undefined;
+	try {
+		hooks = await options.createHooks?.();
+		if (hooks?.signal?.aborted) return { status: "cancelled" };
+		try {
+			prepared = await prepareReviewWorkflow({
+				target: options.target,
+				controls: options.controls,
+				...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
+				cwd: options.cwd,
+				settingsManager: options.settingsManager,
+				modelRegistry: options.session.modelRegistry,
+				currentModel: options.session.model,
+				sessionManager: options.session.sessionManager,
+				requireProjectTrust: options.requireProjectTrust,
+				signal: hooks?.signal,
+				onProgress: hooks?.onProgress,
+			});
+		} catch (error) {
+			if (error instanceof ReviewPreparationCancelledError || hooks?.signal?.aborted) {
+				return { status: "cancelled" };
+			}
+			throw error;
+		}
+
+		const { resolution, workflowId, action, startedAt, controls, incrementalPlan } = prepared;
+		const persistPreparedCancellation = async (): Promise<ReviewWorkflowResult> => {
 			const record = createReviewRunRecord({
-				workflowId: prepared.workflowId,
-				workflowAction: prepared.action,
+				workflowId,
+				workflowAction: action,
+				startedAt,
+				snapshot: resolution,
+				controls,
+				status: "cancelled",
+				incrementalPlan,
+			});
+			if (options.session.sessionManager) await appendReviewRunDurably(options.session.sessionManager, record);
+			return { status: "cancelled", resolution };
+		};
+
+		if (hooks?.signal?.aborted) return await persistPreparedCancellation();
+		if (options.requireConfirmation) {
+			const confirmed = await options.confirm?.({
+				title: "Review changes",
+				message: createReviewConfirmationMessage(resolution),
+				resolution,
+			});
+			if (!confirmed) return await persistPreparedCancellation();
+		}
+		if (prepared.modelWarning) options.onReviewModelWarning?.(prepared.modelWarning);
+		if (prepared.verifierModelWarning) options.onReviewModelWarning?.(prepared.verifierModelWarning);
+		try {
+			assertReviewCanStart(options.session);
+			await hooks?.onPrepared?.(resolution, prepared.model);
+			if (hooks?.signal?.aborted) return await persistPreparedCancellation();
+		} catch (error) {
+			if (hooks?.signal?.aborted) return await persistPreparedCancellation();
+			const record = createReviewRunRecord({
+				workflowId,
+				workflowAction: action,
 				startedAt: prepared.startedAt,
 				snapshot: resolution,
 				controls: prepared.controls,
-				status: "cancelled",
+				status: "failed",
+				errorMessage: resolution.githubContext
+					? REMOTE_REVIEW_FAILURE_MESSAGE
+					: error instanceof Error
+						? error.message
+						: String(error),
 				incrementalPlan: prepared.incrementalPlan,
 			});
 			if (options.session.sessionManager) await appendReviewRunDurably(options.session.sessionManager, record);
-			await resolution.dispose();
-			return { status: "cancelled", resolution };
+			throw error;
 		}
-	}
-	if (prepared.modelWarning) options.onReviewModelWarning?.(prepared.modelWarning);
-	if (prepared.verifierModelWarning) options.onReviewModelWarning?.(prepared.verifierModelWarning);
-	let hooks: ReviewWorkflowHooks | undefined;
-	try {
-		assertReviewCanStart(options.session);
-		hooks = await options.onBeforeReview?.(resolution, model);
-	} catch (error) {
-		const record = createReviewRunRecord({
-			workflowId: prepared.workflowId,
-			workflowAction: prepared.action,
-			startedAt: prepared.startedAt,
-			snapshot: resolution,
-			controls: prepared.controls,
-			status: "failed",
-			errorMessage: resolution.githubContext
-				? REMOTE_REVIEW_FAILURE_MESSAGE
-				: error instanceof Error
-					? error.message
-					: String(error),
-			incrementalPlan: prepared.incrementalPlan,
-		});
-		if (options.session.sessionManager) await appendReviewRunDurably(options.session.sessionManager, record);
-		await resolution.dispose();
-		throw error;
-	}
-	const emit = (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent): void => {
-		options.onEvent?.(event);
-		hooks?.onEvent?.(event);
-	};
-	let terminalEmitted = false;
-	const terminal = (event: Extract<ReviewWorkflowEvent, { type: "workflow_end" }>): void => {
-		terminalEmitted = true;
-		emit(event);
-	};
-	try {
-		let result: ExecuteReviewWorkflowResult;
+
+		const emit = (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent): void => {
+			options.onEvent?.(event);
+			hooks?.onEvent?.(event);
+		};
+		let terminalEmitted = false;
+		const terminal = (event: Extract<ReviewWorkflowEvent, { type: "workflow_end" }>): void => {
+			terminalEmitted = true;
+			emit(event);
+		};
 		try {
-			result = await executeReviewWorkflow({
+			const result = await executeReviewWorkflow({
 				prepared,
 				cwd: options.cwd,
 				agentDir: options.agentDir,
@@ -1721,80 +1760,84 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 				onUsage: hooks?.onUsage,
 				onEvent: emit,
 			});
-		} finally {
+			if (result.status === "cancelled") {
+				terminal({
+					type: "workflow_end",
+					workflowId,
+					kind: "review",
+					action,
+					title: "Review",
+					message: "Review cancelled.",
+					status: "cancelled",
+				});
+				return { status: "cancelled", resolution };
+			}
+			if (result.status === "failed") {
+				terminal({
+					type: "workflow_end",
+					workflowId,
+					kind: "review",
+					action,
+					title: "Review",
+					message: `Review failed: ${result.errorMessage}`,
+					status: "failed",
+				});
+				throw new Error(`Review failed: ${result.errorMessage}`);
+			}
+			const runRecord = result.record;
+			if (!runRecord) throw new Error("Review completed without a durable run record.");
+			const reviewMessage = createReviewSeedMessage(resolution, result);
+			const fastModeEnabled = options.session.fastModeEnabled === true;
+			const newSessionResult = await options.newSession({
+				setup: async (sessionManager) => {
+					if (fastModeEnabled) sessionManager.appendFastModeChange(true);
+					appendReviewRun(sessionManager, runRecord);
+				},
+				withSession: async (context: ReplacedSessionContext) => {
+					await context.sendMessage(reviewMessage);
+				},
+			});
+			if (newSessionResult.cancelled) await options.session.sendCustomMessage(reviewMessage);
+			else if (!newSessionResult.seeded)
+				throw new Error("Review completed, but seeding verified findings was skipped in the replacement session.");
+			const completed = {
+				status: "completed" as const,
+				resolution,
+				findingsCount: result.findingsCount,
+				completionStatus: result.completionStatus,
+				sessionSwitchCancelled: newSessionResult.cancelled,
+			};
+			terminal({
+				type: "workflow_end",
+				workflowId,
+				kind: "review",
+				action,
+				title: "Review",
+				message: newSessionResult.cancelled
+					? `${formatReviewWorkflowSummary(completed)} Findings were added to the current session.`
+					: `${formatReviewWorkflowSummary(completed)} Opening review session.`,
+				status: "completed",
+			});
+			return completed;
+		} catch (error) {
+			if (!terminalEmitted)
+				terminal({
+					type: "workflow_end",
+					workflowId,
+					kind: "review",
+					action,
+					title: "Review",
+					message: "Review failed.",
+					status: "failed",
+				});
+			throw error;
+		}
+	} finally {
+		try {
 			hooks?.cleanup?.();
+		} finally {
+			await prepared?.resolution.dispose();
 		}
-		if (result.status === "cancelled") {
-			terminal({
-				type: "workflow_end",
-				workflowId,
-				kind: "review",
-				action,
-				title: "Review",
-				message: "Review cancelled.",
-				status: "cancelled",
-			});
-			return { status: "cancelled", resolution };
-		}
-		if (result.status === "failed") {
-			terminal({
-				type: "workflow_end",
-				workflowId,
-				kind: "review",
-				action,
-				title: "Review",
-				message: `Review failed: ${result.errorMessage}`,
-				status: "failed",
-			});
-			throw new Error(`Review failed: ${result.errorMessage}`);
-		}
-		const runRecord = result.record;
-		if (!runRecord) throw new Error("Review completed without a durable run record.");
-		const reviewMessage = createReviewSeedMessage(resolution, result);
-		const fastModeEnabled = options.session.fastModeEnabled === true;
-		const newSessionResult = await options.newSession({
-			setup: async (sessionManager) => {
-				if (fastModeEnabled) sessionManager.appendFastModeChange(true);
-				appendReviewRun(sessionManager, runRecord);
-			},
-			withSession: async (context: ReplacedSessionContext) => {
-				await context.sendMessage(reviewMessage);
-			},
-		});
-		if (newSessionResult.cancelled) await options.session.sendCustomMessage(reviewMessage);
-		else if (!newSessionResult.seeded)
-			throw new Error("Review completed, but seeding verified findings was skipped in the replacement session.");
-		const completed = {
-			status: "completed" as const,
-			resolution,
-			findingsCount: result.findingsCount,
-			completionStatus: result.completionStatus,
-			sessionSwitchCancelled: newSessionResult.cancelled,
-		};
-		terminal({
-			type: "workflow_end",
-			workflowId,
-			kind: "review",
-			action,
-			title: "Review",
-			message: newSessionResult.cancelled
-				? `${formatReviewWorkflowSummary(completed)} Findings were added to the current session.`
-				: `${formatReviewWorkflowSummary(completed)} Opening review session.`,
-			status: "completed",
-		});
-		return completed;
-	} catch (error) {
-		if (!terminalEmitted)
-			terminal({
-				type: "workflow_end",
-				workflowId,
-				kind: "review",
-				action,
-				title: "Review",
-				message: "Review failed.",
-				status: "failed",
-			});
-		throw error;
 	}
 }
 
