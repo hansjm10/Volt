@@ -279,6 +279,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			prepared: {
 				workflowId: record.runId,
 				action: record.workflowAction,
+				startedAt: record.startedAt,
 				resolution: {
 					description: record.target.description,
 					diffCommand: record.target.diffCommand,

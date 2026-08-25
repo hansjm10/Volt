@@ -238,6 +238,7 @@ function startTestReview(
 		prepared: {
 			workflowId,
 			action: "review.uncommitted",
+			startedAt: 1_782_470_400_000,
 			resolution: {
 				description: "private review target",
 				workflowDescription: targetDescription,
