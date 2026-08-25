@@ -42,7 +42,7 @@ Volt runs in four modes: interactive, print or JSON, RPC for process integration
 npm install -g --ignore-scripts @hansjm10/volt-coding-agent@beta
 ```
 
-`--ignore-scripts` disables dependency lifecycle scripts during install. Volt does not require install scripts for normal npm installs.
+`--ignore-scripts` disables dependency lifecycle scripts during install. Volt does not require install scripts for normal npm installs. Phone transport requires the exact bundled `@hansjm10/volt-iroh` wrapper plus npm's optional native binding for the current platform; do not install with `--omit=optional`. Darwin x64 has no binding and remains local CLI/TUI only.
 
 Authenticate with an API key:
 
@@ -574,8 +574,8 @@ Set `remote.background: true` in settings and interactive Volt manages the daemo
 Use `/remote` for interactive management, including registering Volt's current directory, QR pairing, confirmed device revocation, and explicit approval before a revoked identity can re-pair. Equivalent shell commands are:
 
 ```bash
-volt daemon status                        # daemon health, workspaces, clients, leases
-volt remote status                        # same status view
+volt daemon status                        # exits 0 only when phone transport is ready
+volt remote status                        # same readiness contract                        # same status view
 volt remote clients                       # paired client JSON
 volt remote revoke <node-id>              # revoke one client and close its connections
 volt remote workspace add . --name volt
@@ -590,7 +590,7 @@ Security defaults and limitations:
 - Remote workspaces are selected by saved name, not arbitrary client-provided paths.
 - Remote sessions do not bypass project trust. Saved workspace trust is honored; otherwise project resources run untrusted.
 - Daemon files live under `~/.volt/agent/daemon/` (`state.json`, `audit.jsonl`, `voltd.log`); legacy `remote/iroh-host.json` state migrates automatically with pairings intact.
-- The daemon requires a Node.js npm package install or source checkout with optional `@hansjm10/volt-iroh` available for the platform. Standalone Node SEA builds reject `volt daemon` because the native Iroh adapter is intentionally not bundled.
+- The daemon requires a Node.js npm package install or source checkout with the exact required `@hansjm10/volt-iroh` wrapper and its optional selected platform binding. `--omit=optional` installs cannot provide phone transport; Darwin x64 has no binding. `volt daemon status --json` reports `remoteTransport` (`starting`, `ready`, `degraded`, or `unavailable`) and exits nonzero unless ready. Standalone Node SEA builds reject `volt daemon` because Iroh is intentionally not bundled.
 
 See [Background daemon](docs/daemon.md), [Iroh remote protocol v1](docs/iroh-remote-protocol.md), and [Security](docs/security.md#remote-access-over-iroh-preview).
 

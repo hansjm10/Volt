@@ -7,7 +7,7 @@ import {
 	parseIrohRemoteRpcCapabilities,
 	parseIrohRemoteRpcGrant,
 } from "../core/remote/iroh/access-grant.ts";
-import { parseIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
+import { IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE, parseIrohRemoteAllowTools } from "../core/remote/iroh/protocol.ts";
 import {
 	type IrohRemotePushNotificationDeliveryStatus,
 	type IrohRemotePushNotificationIntent,
@@ -291,6 +291,32 @@ export interface DaemonRemotePolicyStatus {
 	detachedRuntimeTtlMs: number;
 }
 
+export type RemoteTransportState = "starting" | "ready" | "degraded" | "unavailable";
+
+export const REMOTE_TRANSPORT_REASON_MESSAGES = {
+	extension_missing: "Phone transport is not enabled in this daemon.",
+	native_binding_missing:
+		"Phone transport is unavailable on this platform. Reinstall Volt without `--omit=optional` on a supported platform.",
+	endpoint_start_failed: "Phone transport failed to start. Check `volt daemon logs`.",
+	host_storage_full: IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE,
+} as const;
+
+export type RemoteTransportReasonCode = keyof typeof REMOTE_TRANSPORT_REASON_MESSAGES;
+
+export interface RemoteTransportHealth {
+	state: RemoteTransportState;
+	/** Exact @hansjm10/volt-iroh wrapper version, when its manifest is readable. */
+	wrapperVersion?: string;
+	/** Stable machine-readable reason; present whenever state is degraded or unavailable. */
+	reasonCode?: RemoteTransportReasonCode;
+	/** Safe operator-facing guidance corresponding to reasonCode. */
+	message?: string;
+}
+
+export function isRemoteTransportPairingAvailable(health: RemoteTransportHealth | undefined): boolean {
+	return health?.state === "ready" || (health?.state === "degraded" && health.reasonCode === "host_storage_full");
+}
+
 export type ControlResponse =
 	| { type: "ok"; id: string }
 	| { type: "error"; id: string; code: string; message: string }
@@ -315,6 +341,8 @@ export type ControlResponse =
 			clients: ControlClientStatus[];
 			/** Revoked identities retained for explicit repair approval; absent on older running daemons. */
 			revokedClients?: ControlRevokedClientStatus[];
+			/** Required phone-transport readiness; local daemon functions remain available when not ready. */
+			remoteTransport: RemoteTransportHealth;
 			/** Added to protocol v1 after launch; absent on older running daemons. */
 			remotePolicy?: DaemonRemotePolicyStatus;
 			keepAwake: ControlKeepAwakeStatus;
@@ -575,6 +603,27 @@ function isLeaseReleaseReason(value: unknown): value is LeaseReleaseReason {
 	);
 }
 
+function isRemoteTransportHealth(value: unknown): value is RemoteTransportHealth {
+	if (!isRecord(value)) return false;
+	if (
+		value.state !== "starting" &&
+		value.state !== "ready" &&
+		value.state !== "degraded" &&
+		value.state !== "unavailable"
+	) {
+		return false;
+	}
+	if (value.wrapperVersion !== undefined && typeof value.wrapperVersion !== "string") return false;
+	if (
+		value.reasonCode !== undefined &&
+		(typeof value.reasonCode !== "string" || !(value.reasonCode in REMOTE_TRANSPORT_REASON_MESSAGES))
+	) {
+		return false;
+	}
+	if (value.message !== undefined && typeof value.message !== "string") return false;
+	return true;
+}
+
 function isPushDeliveryStatus(value: unknown): value is IrohRemotePushNotificationDeliveryStatus {
 	return (
 		value === "sent" ||
@@ -764,13 +813,14 @@ export function isControlResponse(value: unknown): value is ControlResponse {
 		case "lease_granted":
 		case "lease_pending":
 		case "lease_denied":
-		case "status_result":
 		case "clients_result":
 		case "client_access_updated":
 		case "pair_started":
 			return true;
 		case "lease_rekey_prepared":
 			return typeof value.transactionId === "string";
+		case "status_result":
+			return isRemoteTransportHealth(value.remoteTransport);
 		case "worktree_result":
 			return isRecord(value.worktree);
 		case "worktrees_result":

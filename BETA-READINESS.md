@@ -67,13 +67,18 @@ completed.
 - [x] **Prove the npm daemon distribution.** From an unpublished package
   installed outside the repository, run the full Node smoke test in
   [AGENTS.md](AGENTS.md#releasing). Then use an isolated
-  `VOLT_CODING_AGENT_DIR` to start `volt daemon`, verify `volt daemon status
-  --json`, register a disposable workspace, and stop that isolated daemon.
-  Confirm the optional native `@hansjm10/volt-iroh` adapter loads on macOS arm64,
-  Linux x64/arm64 (glibc and musl), and Windows x64/arm64. The pinned adapter
-  has no Darwin x64 binding, so Intel macOS npm installs remain explicitly
-  local CLI/TUI only. Standalone Node SEA binaries intentionally exclude Iroh
-  on every platform and must reject daemon/remote commands; see
+  `VOLT_CODING_AGENT_DIR` to start a relay-disabled `volt daemon`, poll `volt
+  daemon status --json` until `remoteTransport.state` is `ready`, register a
+  disposable workspace, and always stop that isolated daemon. Confirm the
+  required exact `@hansjm10/volt-iroh` wrapper and its optional selected native
+  binding load on macOS arm64, Linux x64/arm64 (glibc and musl), and Windows
+  x64/arm64. Installs use npm 11.17.0; the two-day release-age quarantine keeps
+  applying to third-party packages and exempts only Volt's self-packaged
+  `@hansjm10/volt-iroh*` family. `--omit=optional` keeps the wrapper but cannot
+  provide phone transport. The pinned adapter has no Darwin x64 binding, so
+  Intel macOS npm installs remain explicitly local CLI/TUI only. Standalone Node
+  SEA binaries intentionally exclude Iroh on every platform and must reject
+  daemon/remote commands; see
   [Binary Capabilities](packages/coding-agent/BINARY-CAPABILITIES.md).
 
   The release owner confirmed this gate complete on 2026-07-12 after extensive

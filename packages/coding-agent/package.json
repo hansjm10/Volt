@@ -68,6 +68,7 @@
 	"dependencies": {
 		"@hansjm10/volt-agent-core": "^0.1.0",
 		"@hansjm10/volt-ai": "^0.1.0",
+		"@hansjm10/volt-iroh": "1.1.1-volt.2",
 		"@hansjm10/volt-tui": "^0.1.0",
 		"@jimp/core": "1.6.1",
 		"@jimp/js-bmp": "1.6.1",
@@ -99,9 +100,6 @@
 		"gaxios": {
 			"rimraf": "6.1.2"
 		}
-	},
-	"optionalDependencies": {
-		"@hansjm10/volt-iroh": "1.1.1-volt.2"
 	},
 	"devDependencies": {
 		"@types/cross-spawn": "6.0.6",

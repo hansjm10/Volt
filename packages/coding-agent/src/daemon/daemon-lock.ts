@@ -28,6 +28,8 @@ export type AcquireDaemonLockResult =
 export interface AcquireDaemonLockOptions {
 	/** Injectable for deterministic contention and process-identity tests. */
 	verifyOwner?(owner: DaemonLockOwner): Promise<ProcessCreationVerification>;
+	/** Injectable retirement rename for deterministic filesystem-capacity tests. */
+	retireGeneration?(lockDirPath: string, retiredPath: string): void;
 }
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
@@ -134,10 +136,14 @@ function retiredLockPath(lockDirPath: string, identity: string): string {
  * wins, delayed operations for that generation cannot rename a replacement
  * over the retained non-empty directory on POSIX or Windows.
  */
-function retireLockGeneration(lockDirPath: string, identity: string): "retired" | "retry" | "contended" {
+function retireLockGeneration(
+	lockDirPath: string,
+	identity: string,
+	retireGeneration: (lockDirPath: string, retiredPath: string) => void = renameSync,
+): "retired" | "retry" | "contended" {
 	const retiredPath = retiredLockPath(lockDirPath, identity);
 	try {
-		renameSync(lockDirPath, retiredPath);
+		retireGeneration(lockDirPath, retiredPath);
 		return "retired";
 	} catch (error) {
 		if (!isErrnoException(error)) {
@@ -145,6 +151,12 @@ function retireLockGeneration(lockDirPath: string, identity: string): "retired" 
 		}
 		if (error.code === "ENOENT") {
 			return "retry";
+		}
+		if (error.code === "ENOSPC" || error.code === "EDQUOT") {
+			// Leave the current generation in place. Shutdown must not crash when
+			// the filesystem cannot allocate retirement metadata, and a later start
+			// can safely retry stale retirement after capacity is restored.
+			return "contended";
 		}
 		if (existsSync(retiredPath)) {
 			return "contended";
@@ -188,7 +200,11 @@ function tryPublishCandidate(candidatePath: string, lockDirPath: string): boolea
 	}
 }
 
-function createDaemonLock(lockDirPath: string, owner: DaemonLockOwner): DaemonLock {
+function createDaemonLock(
+	lockDirPath: string,
+	owner: DaemonLockOwner,
+	retireGeneration?: AcquireDaemonLockOptions["retireGeneration"],
+): DaemonLock {
 	let released = false;
 	return {
 		owner,
@@ -197,7 +213,7 @@ function createDaemonLock(lockDirPath: string, owner: DaemonLockOwner): DaemonLo
 				return;
 			}
 			released = true;
-			retireLockGeneration(lockDirPath, ownerIdentity(owner));
+			retireLockGeneration(lockDirPath, ownerIdentity(owner), retireGeneration);
 		},
 	};
 }
@@ -222,7 +238,7 @@ export async function acquireDaemonLock(
 		for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt++) {
 			if (tryPublishCandidate(candidatePath, lockDirPath)) {
 				published = true;
-				return { ok: true, lock: createDaemonLock(lockDirPath, owner) };
+				return { ok: true, lock: createDaemonLock(lockDirPath, owner, options.retireGeneration) };
 			}
 
 			const existingOwner = readDaemonLockOwner(lockDirPath);
@@ -236,7 +252,7 @@ export async function acquireDaemonLock(
 				if (verification === "match" || verification === "unknown") {
 					return { ok: false, owner: existingOwner, reason: "held" };
 				}
-				const result = retireLockGeneration(lockDirPath, ownerIdentity(existingOwner));
+				const result = retireLockGeneration(lockDirPath, ownerIdentity(existingOwner), options.retireGeneration);
 				if (result === "contended") {
 					return { ok: false, reason: "contended" };
 				}
@@ -248,7 +264,7 @@ export async function acquireDaemonLock(
 			}
 			const malformedIdentity = getMalformedLockIdentity(lockDirPath);
 			if (malformedIdentity) {
-				const result = retireLockGeneration(lockDirPath, malformedIdentity);
+				const result = retireLockGeneration(lockDirPath, malformedIdentity, options.retireGeneration);
 				if (result === "contended") {
 					return { ok: false, reason: "contended" };
 				}
@@ -261,7 +277,7 @@ export async function acquireDaemonLock(
 			if (readDaemonLockOwner(lockDirPath)) {
 				continue;
 			}
-			const result = retireLockGeneration(lockDirPath, emptyIdentity);
+			const result = retireLockGeneration(lockDirPath, emptyIdentity, options.retireGeneration);
 			if (result === "contended") {
 				return { ok: false, reason: "contended" };
 			}

@@ -32,7 +32,9 @@ import {
 	canonicalizePersistedIrohRemoteAllowTools,
 	IROH_REMOTE_ALPN,
 	IROH_REMOTE_HOST_FEATURES,
+	IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE,
 	type IrohRemoteRelayMode,
+	isIrohRemoteHostStorageFullError,
 	normalizeIrohRemoteAllowTools,
 } from "./protocol.ts";
 import {
@@ -542,10 +544,13 @@ export class IrohRemoteHostEngine {
 			if (options.isCancelled?.()) {
 				throw error;
 			}
+			const failure = isIrohRemoteHostStorageFullError(error)
+				? new IrohRemoteHandshakeError("host_storage_full", IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE)
+				: error;
 			return await this.createHandshakeFailure(
-				error instanceof Error ? error.message : String(error),
+				failure instanceof Error ? failure.message : String(failure),
 				initialInput,
-				error,
+				failure,
 			);
 		}
 	}
