@@ -2902,6 +2902,94 @@ describe.skipIf(!nativeAvailable)("voltd iroh startup ownership", () => {
 	}, 30_000);
 });
 
+describe.skipIf(!nativeAvailable)("voltd iroh pairing storage recovery", () => {
+	it.each(["ENOSPC", "EDQUOT"] as const)(
+		"retries pairing persistence after %s capacity is restored",
+		async (code) => {
+			const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-pairing-storage-recovery-"));
+			const workspaceDir = join(agentDir, "ws");
+			mkdirSync(workspaceDir, { recursive: true });
+			let failNextHostStateWrite = false;
+			let injectedFailureCount = 0;
+			let daemonStopped = false;
+			let control: DaemonClient | undefined;
+			const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+				(services) => {
+					const persistHostState = services.state.persistHostState.bind(services.state);
+					services.state.persistHostState = async (hostState) => {
+						if (failNextHostStateWrite) {
+							failNextHostStateWrite = false;
+							injectedFailureCount++;
+							throw Object.assign(new Error(`${code}: injected pairing persistence failure`), { code });
+						}
+						await persistHostState(hostState);
+					};
+					return {};
+				},
+				createIrohDaemonService({ relayMode: "disabled" }),
+			]);
+
+			try {
+				const status = await waitForHealthyDaemon(agentDir);
+				control = createDaemonClient({
+					socketPath: status.socketPath,
+					client: "cli",
+					version: "test",
+					authToken: status.authToken,
+					reconnect: false,
+				});
+				await expect
+					.poll(async () => {
+						const current = await control?.request({ type: "status" });
+						return current?.type === "status_result" ? current.remoteTransport : undefined;
+					})
+					.toMatchObject({ state: "ready" });
+				expect(await control.request({ type: "workspace_register", name: "ws", path: workspaceDir })).toMatchObject(
+					{ type: "ok" },
+				);
+
+				failNextHostStateWrite = true;
+				expect(await control.request({ type: "pair_request", workspaceName: "ws" })).toMatchObject({
+					type: "error",
+					code: "iroh_unavailable",
+				});
+				expect(injectedFailureCount).toBe(1);
+				expect(await control.request({ type: "status" })).toMatchObject({
+					type: "status_result",
+					remoteTransport: { state: "degraded", reasonCode: "host_storage_full" },
+				});
+
+				const retry = await control.request({ type: "pair_request", workspaceName: "ws" });
+				expect(retry).toMatchObject({ type: "pair_started" });
+				if (retry.type !== "pair_started") throw new Error("pairing persistence retry did not start");
+				expect(await control.request({ type: "status" })).toMatchObject({
+					type: "status_result",
+					remoteTransport: { state: "ready" },
+				});
+				const persistedState = JSON.parse(readFileSync(getDaemonPaths(agentDir).statePath, "utf8")) as {
+					pendingPairingTickets: unknown[];
+				};
+				expect(persistedState.pendingPairingTickets).toHaveLength(1);
+				expect(await control.request({ type: "pair_cancel", requestId: retry.requestId })).toMatchObject({
+					type: "ok",
+				});
+				expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+				await daemon;
+				daemonStopped = true;
+			} finally {
+				failNextHostStateWrite = false;
+				if (!daemonStopped) {
+					await control?.request({ type: "shutdown" }).catch(() => {});
+					await daemon;
+				}
+				await control?.close();
+				rmSync(agentDir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
+});
+
 describe.skipIf(!nativeAvailable)("voltd iroh control pairing ownership", () => {
 	it("cancels pending pairing state before the final control connection closes", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-pairing-quiesce-"));

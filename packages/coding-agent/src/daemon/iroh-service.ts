@@ -4496,7 +4496,10 @@ class IrohDaemonService {
 		}
 		const engine = this.requireEngine();
 		const endpoint = this.endpoint;
-		if (!endpoint || !this.endpointTicket || this.remoteTransport.state !== "ready") {
+		const canPair =
+			this.remoteTransport.state === "ready" ||
+			(this.remoteTransport.state === "degraded" && this.remoteTransport.reasonCode === "host_storage_full");
+		if (!endpoint || !this.endpointTicket || !canPair) {
 			connection.send({
 				type: "error",
 				id: request.id,
@@ -4553,6 +4556,7 @@ class IrohDaemonService {
 					: {}),
 				...(workspaceName === undefined ? {} : { workspace: workspaceName }),
 			});
+			this.clearStorageCapacityDegradation();
 			connection.send({ type: "pair_started", id: request.id, requestId });
 			connection.send({
 				type: "pairing_progress",
