@@ -1,0 +1,103 @@
+---
+import type { GetStaticPaths } from "astro";
+import { getCollection, render, type CollectionEntry } from "astro:content";
+import BlogShell from "../../layouts/BlogShell.astro";
+
+export const getStaticPaths = (async () => {
+  const posts = await getCollection("blog", ({ data }) => !data.draft || import.meta.env.DEV);
+  return posts.map((post) => ({
+    params: { slug: post.id },
+    props: { post },
+  }));
+}) satisfies GetStaticPaths;
+
+interface Props {
+  post: CollectionEntry<"blog">;
+}
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+const canonicalPath = `/blog/${post.id}/`;
+const siteUrl = Astro.site ?? new URL("https://volt-cli.dev");
+const canonicalUrl = new URL(canonicalPath, siteUrl).href;
+const imageUrl = post.data.image ? new URL(post.data.image, siteUrl).href : undefined;
+const dateFormatter = new Intl.DateTimeFormat("en", {
+  dateStyle: "long",
+  timeZone: "UTC",
+});
+const structuredData = JSON.stringify({
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  headline: post.data.title,
+  description: post.data.description,
+  datePublished: post.data.publishedAt.toISOString(),
+  dateModified: (post.data.updatedAt ?? post.data.publishedAt).toISOString(),
+  author: {
+    "@type": "Person",
+    name: post.data.author,
+  },
+  publisher: {
+    "@type": "Organization",
+    name: "Volt",
+    url: "https://volt-cli.dev",
+  },
+  mainEntityOfPage: canonicalUrl,
+  keywords: post.data.tags,
+  ...(imageUrl ? { image: imageUrl } : {}),
+}).replaceAll("<", "\\u003c");
+---
+
+<BlogShell
+  title={`${post.data.title} — Volt Blog`}
+  description={post.data.description}
+  canonicalPath={canonicalPath}
+  image={post.data.image}
+  imageAlt={post.data.imageAlt}
+  type="article"
+  publishedAt={post.data.publishedAt}
+  updatedAt={post.data.updatedAt}
+>
+  <script slot="head" type="application/ld+json" set:html={structuredData} is:inline></script>
+
+  <article class="post-shell">
+    <header class="post-header">
+      <a class="post-back" href="/blog/">← Volt Blog</a>
+      <div class="post-meta">
+        <time datetime={post.data.publishedAt.toISOString()}>
+          {dateFormatter.format(post.data.publishedAt)}
+        </time>
+        <span aria-hidden="true">·</span>
+        <span>{post.data.author}</span>
+        {post.data.draft && <span class="draft-badge">Draft</span>}
+      </div>
+      <h1>{post.data.title}</h1>
+      <p class="post-description">{post.data.description}</p>
+    </header>
+
+    {
+      post.data.image && (
+        <img
+          class="post-hero"
+          src={post.data.image}
+          alt={post.data.imageAlt ?? ""}
+          width="1200"
+          height="630"
+          loading="eager"
+          fetchpriority="high"
+        />
+      )
+    }
+
+    <div class="post-content">
+      <Content />
+    </div>
+
+    {
+      post.data.tags.length > 0 && (
+        <footer class="post-tags" aria-label="Tags">
+          {post.data.tags.map((tag) => <span>{tag}</span>)}
+        </footer>
+      )
+    }
+  </article>
+</BlogShell>

@@ -13,7 +13,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $package = "@hansjm10/volt-coding-agent"
-$repo = "hansjm10/Volt"
+$repo = "volt-hq/Volt"
 $method = if ([string]::IsNullOrWhiteSpace($env:VOLT_INSTALL_METHOD)) { "npm" } else { $env:VOLT_INSTALL_METHOD }
 $version = if ([string]::IsNullOrWhiteSpace($env:VOLT_VERSION)) { "latest" } else { $env:VOLT_VERSION }
 

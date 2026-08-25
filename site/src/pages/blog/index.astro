@@ -1,0 +1,59 @@
+---
+import { getCollection } from "astro:content";
+import BlogShell from "../../layouts/BlogShell.astro";
+
+const posts = (await getCollection("blog", ({ data }) => !data.draft || import.meta.env.DEV)).sort(
+  (left, right) => right.data.publishedAt.valueOf() - left.data.publishedAt.valueOf(),
+);
+const dateFormatter = new Intl.DateTimeFormat("en", {
+  dateStyle: "long",
+  timeZone: "UTC",
+});
+---
+
+<BlogShell
+  title="Volt Blog"
+  description="Engineering notes about Volt, coding agents, local-first infrastructure, and remote sessions over Iroh."
+  canonicalPath="/blog/"
+>
+  <header class="blog-header">
+    <p class="eyebrow">Volt Blog</p>
+    <h1>Building Volt in the open.</h1>
+    <p>Engineering notes about coding agents, local-first infrastructure, and remote sessions over Iroh.</p>
+  </header>
+
+  {
+    posts.length > 0 ? (
+      <ol class="post-list">
+        {posts.map((post) => (
+          <li>
+            <a class="post-card" href={`/blog/${post.id}/`}>
+              {post.data.image && (
+                <img
+                  class="post-card-image"
+                  src={post.data.image}
+                  alt={post.data.imageAlt ?? ""}
+                  width="1200"
+                  height="630"
+                  loading="lazy"
+                />
+              )}
+              <div class="post-meta">
+                <time datetime={post.data.publishedAt.toISOString()}>
+                  {dateFormatter.format(post.data.publishedAt)}
+                </time>
+                <span aria-hidden="true">·</span>
+                <span>{post.data.author}</span>
+                {post.data.draft && <span class="draft-badge">Draft</span>}
+              </div>
+              <h2>{post.data.title}</h2>
+              <p>{post.data.description}</p>
+            </a>
+          </li>
+        ))}
+      </ol>
+    ) : (
+      <p class="empty-state">The first Volt engineering post is in progress.</p>
+    )
+  }
+</BlogShell>

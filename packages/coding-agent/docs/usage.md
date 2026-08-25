@@ -102,7 +102,7 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 ## Code Review
 
-`/review` captures the selected change as an exact Git snapshot, then runs candidate discovery and independent verification in separate isolated contexts. Host-owned paged tools read only that snapshot. For PR runs with newly accepted findings, a third context-blind pass uses the verifier model to render code-derived finding prose from host-validated anchors; it receives immutable repository tools but no GitHub context or private discovery/verifier prose. Zero-new-finding and prior-only incremental runs skip that pass. Optional auxiliary tools selected with `/review tools` run in a disposable checkout for analysis only; mutable workspace `read`/`grep`/`find`/`ls`/edit tools are never used by a review. When `/review` opens the local target selector, Volt also makes a short best-effort GitHub lookup and puts `Current PR #N — title` first when the current branch has one unambiguous pull request; lookup failures silently leave the normal selector unchanged. Explicit review targets and RPC actions never perform or inherit this selector lookup.
+`/review` immediately shows preparation progress while it captures the selected change as an exact Git snapshot, then runs candidate discovery and independent verification in separate isolated contexts. Press Escape to cancel snapshot and GitHub context capture as well as review inference. Host-owned paged tools read only that snapshot. For PR runs with newly accepted findings, a third context-blind pass uses the verifier model to render code-derived finding prose from host-validated anchors; it receives immutable repository tools but no GitHub context or private discovery/verifier prose. Zero-new-finding and prior-only incremental runs skip that pass. Optional auxiliary tools selected with `/review tools` run in a disposable checkout for analysis only; mutable workspace `read`/`grep`/`find`/`ls`/edit tools are never used by a review. When `/review` opens the local target selector, Volt also makes a short best-effort GitHub lookup and puts `Current PR #N — title` first when the current branch has one unambiguous pull request; lookup failures silently leave the normal selector unchanged. Explicit review targets and RPC actions never perform or inherit this selector lookup.
 
 ```
 /review                                      # open a target selector
@@ -524,8 +524,12 @@ volt --exclude-tools ask_question
 
 ## Design Principles
 
-Volt keeps the core small and pushes workflow-specific behavior into extensions, skills, prompt templates, and packages.
+Volt includes common coding-agent primitives in core while pushing project-specific behavior into extensions, skills, prompt templates, and packages.
 
-Native MCP support is intentionally explicit: configured servers are exposed through a single `mcp` gateway tool and project MCP config follows project trust. HTTP/SSE MCP servers that require OAuth can be authenticated with `volt mcp auth <server>` or `volt mcp auth-device <server>`; tokens stay on the host. Volt still avoids permission popups, plan mode, built-in to-dos, background bash, or advanced subagent orchestration. The core subagent MVP is limited to built-in/discovered named agents, the single/parallel/chain `subagent` spawning tool, and child registry list/follow access; richer workflows can be built as extensions or external tools.
+Plan mode provides restricted research, explicit approval, and tracked execution steps. Native subagents provide isolated contexts through built-in or discovered agents, single/parallel/chain spawning, and shared registry access. Extensions and the SDK remain available for specialized planning, delegation, task management, and approval workflows.
+
+Native MCP support is intentionally explicit: configured servers are exposed through a single `mcp` gateway tool and project MCP config follows project trust. HTTP/SSE MCP servers that require OAuth can be authenticated with `volt mcp auth <server>` or `volt mcp auth-device <server>`; tokens stay on the host.
+
+Volt does not put a permission popup in front of every tool call. Control capabilities with tool allowlists and exclusions, project trust, Plan mode's restricted research profile, and remote tool grants; use a container or extension when a workflow requires additional isolation or confirmation. Volt also leaves standalone task management and background shell execution outside core: use a TODO file or extension for task tracking and tmux for observable background commands.
 
 For the full rationale, see the project documentation and extension examples.

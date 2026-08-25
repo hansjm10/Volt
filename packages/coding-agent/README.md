@@ -502,21 +502,17 @@ See [docs/rpc.md](docs/rpc.md) for the protocol.
 
 ## Philosophy
 
-Volt is aggressively extensible so it doesn't have to dictate your workflow. Features that other tools bake in can be built with [extensions](#extensions), [skills](#skills), or installed from third-party [volt packages](#volt-packages). This keeps the core minimal while letting you shape volt to fit how you work.
+Volt includes common coding-agent primitives in core while keeping project-specific workflows customizable. Use [extensions](#extensions), [skills](#skills), [prompt templates](#prompt-templates), and [volt packages](#volt-packages) to shape volt without forking it.
+
+**Planning and delegation are first-class.** [Plan mode](#plan-mode) provides a restricted research and approval workflow, while [native subagents](docs/usage.md#subagents-mvp) provide isolated contexts for bounded delegation. Custom agents and extensions remain available for specialized orchestration.
 
 **MCP stays explicit.** Native MCP support is available through `.mcp.json` or `.volt/mcp.json` and a single gateway tool; project MCP configs follow project trust and MCP server outputs are treated as untrusted data.
 
-**No sub-agents.** There's many ways to do this. Spawn volt instances via tmux, or build your own with [extensions](#extensions), or install a package that does it your way.
+**Safety is host-controlled.** Volt does not put a permission popup in front of every tool call. Control capabilities with tool allowlists and exclusions, project trust, Plan mode's restricted research profile, and remote tool grants. Use a container or an extension when a workflow requires additional isolation or confirmation.
 
-**No permission popups.** Run in a container, or build your own confirmation flow with [extensions](#extensions) inline with your environment and security requirements.
+**Task tracking stays lightweight.** Plan mode tracks approved implementation steps. For standalone task management, use a TODO file or an extension.
 
-**No plan mode.** Write plans to files, or build it with [extensions](#extensions), or install a package.
-
-**No built-in to-dos.** They confuse models. Use a TODO.md file, or build your own with [extensions](#extensions).
-
-**No background bash.** Use tmux. Full observability, direct interaction.
-
-The project keeps the core small and relies on extensions for workflow-specific behavior.
+**Shell work stays observable.** Volt does not provide background bash execution; use tmux for direct visibility and control.
 
 ---
 

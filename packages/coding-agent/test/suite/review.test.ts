@@ -18,6 +18,7 @@ import {
 	type ReviewUsageSnapshot,
 	resolveReviewModel,
 	runReview,
+	runReviewWorkflow,
 } from "../../src/core/review.ts";
 import type {
 	ReviewCandidateReport,
@@ -26,7 +27,7 @@ import type {
 	ReviewVerificationReport,
 } from "../../src/core/review-report.ts";
 import { type ReviewSnapshot, resolveReviewSnapshot } from "../../src/core/review-snapshot.ts";
-import { getReviewRun } from "../../src/core/review-state.ts";
+import { getReviewRun, listReviewRuns } from "../../src/core/review-state.ts";
 import { ReviewWorkflowManager } from "../../src/core/review-workflows.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -198,6 +199,46 @@ describe("review command controls", () => {
 			await expect(prepareReviewWorkflow({ ...options, controls: { scope: ["x".repeat(501)] } })).rejects.toThrow(
 				/at most 500 UTF-8 bytes/,
 			);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("cancels preparation without inference or a durable failed outcome", async () => {
+		const harness = await createHarness();
+		git(harness.tempDir, "init", "--initial-branch=main");
+		git(harness.tempDir, "config", "user.email", "review@example.com");
+		git(harness.tempDir, "config", "user.name", "Review Test");
+		writeFileSync(join(harness.tempDir, "file.txt"), "before\n");
+		git(harness.tempDir, "add", "file.txt");
+		git(harness.tempDir, "commit", "-m", "initial");
+		writeFileSync(join(harness.tempDir, "file.txt"), "after\n");
+		const controller = new AbortController();
+		const cleanup = vi.fn();
+		const onPrepared = vi.fn();
+		try {
+			const result = await runReviewWorkflow({
+				target: { kind: "uncommitted" },
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				session: harness.session,
+				newSession: vi.fn(),
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				createHooks: () => ({
+					signal: controller.signal,
+					onProgress: (message) => {
+						if (message === "Capturing uncommitted changes…") controller.abort();
+					},
+					onPrepared,
+					cleanup,
+				}),
+			});
+			expect(result).toEqual({ status: "cancelled" });
+			expect(onPrepared).not.toHaveBeenCalled();
+			expect(cleanup).toHaveBeenCalledOnce();
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(listReviewRuns(harness.session.sessionManager!).runs).toEqual([]);
 		} finally {
 			harness.cleanup();
 		}

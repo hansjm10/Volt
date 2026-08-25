@@ -8,8 +8,10 @@ distributed by Jordan Hans and derived from Mario Zechner's Pi project under
 the MIT License.
 
 - `src/pages/index.astro` — marketing landing page.
+- `src/content/blog/` — Markdown or MDX blog posts published under `/blog/`. Posts with `draft: true` are visible during local development but excluded from production builds; the landing-page Blog link appears after the first post is published. Published posts are also listed in `/rss.xml`.
 - `packages/coding-agent/docs/` — the documentation source of truth. `scripts/sync-docs.mjs` copies it into the Starlight content collection at build time, deriving the sidebar and redirects from `docs.json`. Do not edit `src/content/docs/docs/` or `src/generated/`; both are generated and gitignored.
 - The sync step preserves the canonical package identities used by the source documentation, including `@hansjm10/volt-coding-agent`.
+- `public/volt-icon.png` — site copy of the companion app icon, used by the landing page, blog, docs, and favicon. Keep it synchronized with `volt-app/Volt/Assets.xcassets/AppIcon.appiconset/AppIcon.png`.
 - `public/install.sh`, `public/install.ps1` — served at `https://volt-cli.dev/install.sh` and `/install.ps1`. The shell installer defaults to `npm install -g --ignore-scripts`; `VOLT_INSTALL_METHOD=binary` fetches a standalone binary from GitHub Releases instead (binary builds do not support `volt daemon`).
 - `public/_headers`, `public/_redirects` — Cloudflare Pages config (`/install` → `/install.sh`, `/github` → repo).
 
@@ -22,6 +24,8 @@ npm run build      # syncs docs, then builds to dist/
 ```
 
 Docs edits go in `packages/coding-agent/docs/`; re-run `npm run sync-docs` (or restart dev) to pick them up. New pages must be added to `docs.json` to appear in the sidebar.
+
+Blog posts go in `src/content/blog/` and require `title`, `description`, and `publishedAt` frontmatter. `author` defaults to Jordan Hans, `tags` defaults to an empty list, and `draft` defaults to `false`. Set optional `image` to a public-root path for a 1200×630 hero/social card and provide `imageAlt`; the post page, blog index, Open Graph, Twitter, and structured data all use it. Start posts with `draft: true`, review them through the local or Cloudflare preview, then remove the flag to publish.
 
 ## Deploying to Cloudflare (Workers Builds)
 
