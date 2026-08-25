@@ -315,12 +315,12 @@ describe("local RPC subagent lifecycle commands", () => {
 			expect(manager.startByName).toHaveBeenCalledWith("scout", { allowedTools: ["read"] });
 			expect(child.prompt).toHaveBeenCalledWith("inspect auth");
 
-			child.emit({ type: "agent_start" });
+			child.emit({ type: "agent_start", startedAt: 1_782_470_400_000 });
 			await vi.waitFor(() =>
 				expect(rpc.writes).toContainEqual({
 					type: "subagent_event",
 					subagentId: "sa_child",
-					event: { type: "agent_start" },
+					event: { type: "agent_start", startedAt: 1_782_470_400_000 },
 				}),
 			);
 

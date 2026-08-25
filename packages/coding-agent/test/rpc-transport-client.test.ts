@@ -1448,6 +1448,25 @@ describe("createInProcessRpcClient", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	test("exposes active agent-run timing metadata in state", async () => {
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = createRuntimeHost(dispose, async () => {}, {
+			activeAgentRun: { startedAt: 1_782_470_400_000 },
+			isStreaming: true,
+		});
+		const client = await createInProcessRpcClient(runtimeHost);
+
+		try {
+			await expect(client.getState()).resolves.toMatchObject({
+				isStreaming: true,
+				activeAgentRun: { startedAt: 1_782_470_400_000 },
+			});
+		} finally {
+			await client.stop();
+		}
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
 	test("exposes active compaction metadata in state", async () => {
 		const dispose = vi.fn(async () => {});
 		const runtimeHost = createRuntimeHost(dispose, async () => {}, {
@@ -2353,6 +2372,7 @@ function createRuntimeHost(
 	resources: {
 		abort?: () => Promise<void>;
 		agentDir?: string;
+		activeAgentRun?: { startedAt: number };
 		activeCompaction?: { reason: "manual" | "threshold" | "overflow"; startedAt: number };
 		compact?: (customInstructions?: string) => Promise<ReturnType<typeof createCompactionResult>>;
 		commands?: ResolvedCommand[];
@@ -2431,6 +2451,9 @@ function createRuntimeHost(
 			}),
 			activeToolExecutions: new Map(),
 			subscribeRuntimeEvents: vi.fn(() => () => {}),
+			get activeAgentRun() {
+				return resources.activeAgentRun;
+			},
 			get activeCompaction() {
 				return resources.activeCompaction;
 			},

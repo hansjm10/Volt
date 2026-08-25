@@ -40,6 +40,14 @@ export const RpcActiveToolExecutionSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+export const RpcActiveAgentRunSchema = Type.Object(
+	{
+		/** Unix epoch milliseconds when the current agent run started. */
+		startedAt: Type.Number(),
+	},
+	{ additionalProperties: false },
+);
+
 export const RpcActiveCompactionSchema = Type.Object(
 	{
 		reason: stringEnum(["manual", "threshold", "overflow"]),
@@ -118,6 +126,7 @@ export const RpcSessionStateSchema = Type.Object(
 		steeringQueue: readonlyArrayOf(RpcQueuedMessageSchema),
 		followUpQueue: readonlyArrayOf(RpcQueuedMessageSchema),
 		activeTools: Type.Optional(Type.Array(RpcActiveToolExecutionSchema)),
+		activeAgentRun: Type.Optional(RpcActiveAgentRunSchema),
 		activeCompaction: Type.Optional(RpcActiveCompactionSchema),
 		activeRetry: Type.Optional(RpcActiveRetrySchema),
 		projection: Type.Optional(RpcSessionStateProjectionSchema),

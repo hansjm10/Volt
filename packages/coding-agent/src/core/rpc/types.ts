@@ -33,6 +33,7 @@ import type {
 	RpcTranscriptEntryEventSchema,
 } from "./schema/conversation.ts";
 import type {
+	RpcAgentStartEventSchema,
 	RpcExtensionErrorEventSchema,
 	RpcExtensionUIRequestSchema,
 	RpcExtensionUIResponseSchema,
@@ -108,6 +109,7 @@ import type {
 	RpcTranscriptEntryTextResponseSchema,
 } from "./schema/responses.ts";
 import type {
+	RpcActiveAgentRunSchema,
 	RpcActiveCompactionSchema,
 	RpcActiveRetrySchema,
 	RpcActiveToolExecutionSchema,
@@ -314,6 +316,7 @@ export type RpcSubscriptionUsageReport = Static<typeof RpcSubscriptionUsageRepor
 /** Path-free host-observed metadata for one active session worktree. */
 export type RpcGitContext = Static<typeof RpcGitContextSchema>;
 export type RpcActiveToolExecution = Static<typeof RpcActiveToolExecutionSchema>;
+export type RpcActiveAgentRun = Static<typeof RpcActiveAgentRunSchema>;
 export type RpcActiveCompaction = Static<typeof RpcActiveCompactionSchema>;
 export type RpcActiveRetry = Static<typeof RpcActiveRetrySchema>;
 /** One authoritative queued user message exposed to remote clients. */
@@ -408,6 +411,8 @@ export type RpcResponse =
 // Host→client events and client→host control messages
 // ============================================================================
 
+/** Agent provider run started with a host-authoritative presentation timestamp. */
+export type RpcAgentStartEvent = Static<typeof RpcAgentStartEventSchema>;
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest = Static<typeof RpcExtensionUIRequestSchema>;
 /** Response to an extension UI request */

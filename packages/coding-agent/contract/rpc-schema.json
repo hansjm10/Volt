@@ -91,6 +91,18 @@
 		]
 	},
 	"$defs": {
+		"RpcActiveAgentRun": {
+			"type": "object",
+			"required": [
+				"startedAt"
+			],
+			"properties": {
+				"startedAt": {
+					"type": "number"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcActiveCompaction": {
 			"type": "object",
 			"required": [
@@ -249,6 +261,26 @@
 				"modelId": {
 					"type": "string",
 					"minLength": 1
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcAgentStartEvent": {
+			"type": "object",
+			"required": [
+				"type",
+				"startedAt"
+			],
+			"properties": {
+				"type": {
+					"type": "string",
+					"const": "agent_start"
+				},
+				"startedAt": {
+					"type": "number"
+				},
+				"delivery": {
+					"$ref": "#/$defs/RpcConversationDeliveryPosition"
 				}
 			},
 			"additionalProperties": false
@@ -10407,6 +10439,9 @@
 		"RpcServerEvent": {
 			"anyOf": [
 				{
+					"$ref": "#/$defs/RpcAgentStartEvent"
+				},
+				{
 					"$ref": "#/$defs/RpcConversationBootstrapEvent"
 				},
 				{
@@ -10602,6 +10637,9 @@
 					"items": {
 						"$ref": "#/$defs/RpcActiveToolExecution"
 					}
+				},
+				"activeAgentRun": {
+					"$ref": "#/$defs/RpcActiveAgentRun"
 				},
 				"activeCompaction": {
 					"$ref": "#/$defs/RpcActiveCompaction"

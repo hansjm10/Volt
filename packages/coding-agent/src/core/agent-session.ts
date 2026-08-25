@@ -226,6 +226,11 @@ export interface ParsedSkillBlock {
 
 export type CompactionReason = "manual" | "threshold" | "overflow";
 
+export interface ActiveAgentRun {
+	/** Unix epoch milliseconds when the current agent run started. */
+	startedAt: number;
+}
+
 export interface ActiveCompaction {
 	reason: CompactionReason;
 	startedAt: number;
@@ -268,7 +273,12 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
-	| Exclude<AgentEvent, { type: "agent_end" }>
+	| Exclude<AgentEvent, { type: "agent_start" | "agent_end" }>
+	| {
+			type: "agent_start";
+			/** Host-authoritative Unix epoch milliseconds for elapsed-time presentation. */
+			startedAt: number;
+	  }
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
@@ -625,7 +635,8 @@ export class AgentSession {
 	/** Prompt/preflight work is detached during replacement to avoid ctx.newSession self-joins. */
 	private readonly _admittedPromptWork = new Set<Promise<unknown>>();
 
-	// Compaction state
+	// Agent-run and compaction state
+	private _activeAgentRun: ActiveAgentRun | undefined = undefined;
 	private _activeCompaction: ActiveCompaction | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	/**
@@ -1573,6 +1584,9 @@ export class AgentSession {
 			// transcript commit, so do not expose it through message lifecycle events.
 			return event.type === "message_end" ? event.message : undefined;
 		}
+		if (event.type === "agent_start") {
+			this._activeAgentRun = { startedAt: Date.now() };
+		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user" && event.deliveryId === undefined) {
@@ -1718,12 +1732,20 @@ export class AgentSession {
 			this._pendingToolExecutions.clear();
 		}
 
-		// Notify all listeners
-		this._emit(
-			handledEvent.type === "agent_end"
-				? { ...handledEvent, willRetry: this._willRetryAfterAgentEnd(handledEvent) }
-				: handledEvent,
-		);
+		// Notify all listeners. Agent runs carry the host timestamp captured at
+		// their lifecycle boundary so remote clients never infer elapsed time from
+		// delayed delivery.
+		if (handledEvent.type === "agent_start") {
+			this._emit({
+				type: "agent_start",
+				startedAt: this._activeAgentRun!.startedAt,
+			});
+		} else if (handledEvent.type === "agent_end") {
+			this._emit({ ...handledEvent, willRetry: this._willRetryAfterAgentEnd(handledEvent) });
+			this._activeAgentRun = undefined;
+		} else {
+			this._emit(handledEvent);
+		}
 		if (handledEvent.type === "delivery_start") {
 			const userMessage = handledEvent.messages.find((message) => message.role === "user");
 			if (userMessage) {
@@ -3144,6 +3166,11 @@ export class AgentSession {
 		});
 	}
 
+	/** Active agent-run timing metadata, if a provider run is currently executing. */
+	get activeAgentRun(): ActiveAgentRun | undefined {
+		return this._activeAgentRun ? { ...this._activeAgentRun } : undefined;
+	}
+
 	/** Whether compaction or branch summarization is currently running */
 	get isCompacting(): boolean {
 		return this._activeCompaction !== undefined;
@@ -3673,6 +3700,7 @@ export class AgentSession {
 				}
 			} finally {
 				this._agentConversationMutationInFlight = false;
+				this._activeAgentRun = undefined;
 				this._flushPendingBashMessages();
 			}
 		} finally {
@@ -3716,6 +3744,7 @@ export class AgentSession {
 			);
 		} finally {
 			this._agentConversationMutationInFlight = false;
+			this._activeAgentRun = undefined;
 		}
 	}
 
