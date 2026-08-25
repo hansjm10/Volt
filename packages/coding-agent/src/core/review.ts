@@ -809,6 +809,7 @@ export type ReviewWorkflowEvent =
 			title: string;
 			message: string;
 			status: "running";
+			startedAt: number;
 	  }
 	| {
 			type: "workflow_update";
@@ -818,6 +819,7 @@ export type ReviewWorkflowEvent =
 			title: string;
 			message: string;
 			status: "running" | "finalizing";
+			startedAt: number;
 	  }
 	| {
 			type: "workflow_end";
@@ -827,6 +829,8 @@ export type ReviewWorkflowEvent =
 			title: string;
 			message: string;
 			status: "completed" | "cancelled" | "failed";
+			startedAt: number;
+			endedAt: number;
 	  };
 
 export type ReviewWorkflowToolEvent =
@@ -1552,6 +1556,7 @@ export async function executeReviewWorkflow(
 		title: "Review",
 		message: `Reviewing ${prepared.resolution.workflowDescription ?? prepared.resolution.description}.`,
 		status: "running",
+		startedAt: prepared.startedAt,
 	});
 	const result = await runReview({
 		cwd: options.cwd,
@@ -1615,6 +1620,7 @@ export async function executeReviewWorkflow(
 		title: "Review",
 		message: "Finalizing verified findings.",
 		status: "finalizing",
+		startedAt: prepared.startedAt,
 	});
 	const record = createReviewRunRecord({
 		workflowId: prepared.workflowId,
@@ -1769,6 +1775,8 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 					title: "Review",
 					message: "Review cancelled.",
 					status: "cancelled",
+					startedAt: prepared.startedAt,
+					endedAt: result.record?.endedAt ?? Date.now(),
 				});
 				return { status: "cancelled", resolution };
 			}
@@ -1781,6 +1789,8 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 					title: "Review",
 					message: `Review failed: ${result.errorMessage}`,
 					status: "failed",
+					startedAt: prepared.startedAt,
+					endedAt: result.record?.endedAt ?? Date.now(),
 				});
 				throw new Error(`Review failed: ${result.errorMessage}`);
 			}
@@ -1817,6 +1827,8 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 					? `${formatReviewWorkflowSummary(completed)} Findings were added to the current session.`
 					: `${formatReviewWorkflowSummary(completed)} Opening review session.`,
 				status: "completed",
+				startedAt: prepared.startedAt,
+				endedAt: runRecord.endedAt,
 			});
 			return completed;
 		} catch (error) {
@@ -1829,6 +1841,8 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 					title: "Review",
 					message: "Review failed.",
 					status: "failed",
+					startedAt: prepared.startedAt,
+					endedAt: Date.now(),
 				});
 			throw error;
 		}

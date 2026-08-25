@@ -253,6 +253,7 @@ function startTestReview(
 				title: "Review",
 				message: "Reviewing uncommitted changes.",
 				status: "running",
+				startedAt: 1_782_470_400_000,
 			});
 			return result;
 		},

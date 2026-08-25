@@ -12077,6 +12077,12 @@
 				"status": {
 					"$ref": "#/$defs/RpcWorkflowStatus"
 				},
+				"startedAt": {
+					"type": "number"
+				},
+				"endedAt": {
+					"type": "number"
+				},
 				"projection": {
 					"$ref": "#/$defs/RpcProjectionTruncation"
 				}

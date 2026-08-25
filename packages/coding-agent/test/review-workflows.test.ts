@@ -108,6 +108,7 @@ describe("ReviewWorkflowManager", () => {
 					title: "Review",
 					message: "Reviewing.",
 					status: "running",
+					startedAt: 1_782_470_400_000,
 				});
 				return completed();
 			},

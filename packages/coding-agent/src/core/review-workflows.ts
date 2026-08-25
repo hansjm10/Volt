@@ -333,6 +333,8 @@ export class ReviewWorkflowManager {
 			title: "Review",
 			message,
 			status: result.status,
+			startedAt: descriptor.startedAt,
+			endedAt: descriptor.endedAt,
 		});
 		entry.settle();
 	}
