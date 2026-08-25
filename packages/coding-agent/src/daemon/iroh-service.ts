@@ -77,6 +77,7 @@ import {
 	type ControlLeaseStatus,
 	type ControlRequest,
 	createControlClientStatus,
+	isRemoteTransportPairingAvailable,
 	RELAY_RPC_COMMAND_TYPES,
 	REMOTE_TRANSPORT_REASON_MESSAGES,
 	type RelayCloseReason,
@@ -4498,10 +4499,7 @@ class IrohDaemonService {
 		}
 		const engine = this.requireEngine();
 		const endpoint = this.endpoint;
-		const canPair =
-			this.remoteTransport.state === "ready" ||
-			(this.remoteTransport.state === "degraded" && this.remoteTransport.reasonCode === "host_storage_full");
-		if (!endpoint || !this.endpointTicket || !canPair) {
+		if (!endpoint || !this.endpointTicket || !isRemoteTransportPairingAvailable(this.remoteTransport)) {
 			connection.send({
 				type: "error",
 				id: request.id,

@@ -24,6 +24,7 @@ import {
 	type ControlEvent,
 	type ControlResponse,
 	type DaemonRemotePolicyStatus,
+	isRemoteTransportPairingAvailable,
 } from "../../../daemon/control-protocol.ts";
 import { type DaemonProbeState, ensureDaemonRunning, probeDaemon, waitForDaemonExit } from "../../../daemon/spawn.ts";
 import {
@@ -339,7 +340,7 @@ function abbreviatedId(value: string, width = 12): string {
 
 function supportsSafePairing(status: RemoteStatus): boolean {
 	return (
-		status.remoteTransport?.state === "ready" &&
+		isRemoteTransportPairingAvailable(status.remoteTransport) &&
 		status.capabilities?.includes(CONTROL_PAIR_CANCEL_CAPABILITY) === true &&
 		status.capabilities.includes(CONTROL_RPC_GRANTS_CAPABILITY)
 	);
@@ -1095,7 +1096,7 @@ export class RemoteControlCenterComponent implements Component {
 			{ text: "ACTIONS", tone: "accent" },
 			{ key: "refresh", text: "Refresh status", tone: "text" },
 			{ key: "register-current", text: "Register current directory", tone: "text" },
-			...(status.remoteTransport?.state !== "ready"
+			...(!isRemoteTransportPairingAvailable(status.remoteTransport)
 				? [{ text: "Pairing is disabled until phone transport is ready.", tone: "warning" as const }]
 				: status.workspaces.length === 0
 					? [{ text: "Pairing needs a registered workspace.", tone: "warning" as const }]

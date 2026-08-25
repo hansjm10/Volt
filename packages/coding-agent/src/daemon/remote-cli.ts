@@ -6,7 +6,12 @@ import { formatIrohRemoteTicketQrCode } from "../core/remote/iroh/qr.ts";
 import { getIrohRemotePairingVerificationDetails } from "../core/remote/iroh/ticket.ts";
 import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
 import { createDaemonClient, type DaemonClient } from "./control-client.ts";
-import type { ControlEvent, ControlResponse, RemoteTransportHealth } from "./control-protocol.ts";
+import {
+	type ControlEvent,
+	type ControlResponse,
+	isRemoteTransportPairingAvailable,
+	type RemoteTransportHealth,
+} from "./control-protocol.ts";
 import { ensureDaemonRunning, probeDaemon } from "./spawn.ts";
 
 function printRemoteUsage(): void {
@@ -195,7 +200,7 @@ async function handlePairCommand(args: string[]): Promise<void> {
 			reportControlError(status, "status");
 			return;
 		}
-		if (status.remoteTransport?.state !== "ready") {
+		if (!isRemoteTransportPairingAvailable(status.remoteTransport)) {
 			console.error(`Error: phone transport is ${formatRemoteTransport(status.remoteTransport)}.`);
 			if (status.remoteTransport?.message) console.error(status.remoteTransport.message);
 			process.exitCode = 1;

@@ -313,6 +313,10 @@ export interface RemoteTransportHealth {
 	message?: string;
 }
 
+export function isRemoteTransportPairingAvailable(health: RemoteTransportHealth | undefined): boolean {
+	return health?.state === "ready" || (health?.state === "degraded" && health.reasonCode === "host_storage_full");
+}
+
 export type ControlResponse =
 	| { type: "ok"; id: string }
 	| { type: "error"; id: string; code: string; message: string }

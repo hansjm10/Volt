@@ -259,7 +259,7 @@ describe("RemoteControlCenterComponent", () => {
 		expect(text).toContain("/tmp/volt");
 	});
 
-	it("shows degraded phone transport and removes the pairing action", async () => {
+	it("allows pairing retries while storage-full degradation is recoverable", async () => {
 		const backend = new FakeBackend({
 			kind: "online",
 			status: status({
@@ -273,10 +273,40 @@ describe("RemoteControlCenterComponent", () => {
 		});
 		const { component } = createComponent(backend, 45);
 		await component.start();
-		const text = component.render(120).lines.map(stripAnsi).join("\n");
+		let text = component.render(120).lines.map(stripAnsi).join("\n");
 
 		expect(text).toContain("Phone transport: degraded · wrapper 1.1.1-volt.2 · host_storage_full");
 		expect(text).toContain("Computer storage is full");
+		expect(text).toContain("Pair a phone");
+		expect(text).not.toContain("Pairing is disabled until phone transport is ready");
+
+		component.handleInput("\x1b[B");
+		component.handleInput("\x1b[B");
+		component.handleInput("\n");
+		component.handleInput("\n");
+		await settle();
+
+		expect(backend.pairWorkspace).toBe("volt");
+		expect(backend.pairAccess).toBe("coding");
+		text = component.render(120).lines.map(stripAnsi).join("\n");
+		expect(text).toContain("PAIR PHONE · volt · Coding");
+	});
+
+	it("blocks pairing when storage-full degradation is unavailable", async () => {
+		const backend = new FakeBackend({
+			kind: "online",
+			status: status({
+				remoteTransport: {
+					state: "unavailable",
+					reasonCode: "host_storage_full",
+					message: "Computer storage is full. Free space on the computer, then retry.",
+				},
+			}),
+		});
+		const { component } = createComponent(backend, 45);
+		await component.start();
+		const text = component.render(120).lines.map(stripAnsi).join("\n");
+
 		expect(text).toContain("Pairing is disabled until phone transport is ready");
 		expect(text).not.toContain("Pair a phone");
 	});
