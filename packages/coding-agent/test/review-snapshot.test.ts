@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve as resolvePath } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { captureReviewGitHubContext } from "../src/core/github-pr-context.ts";
 import { normalizeReviewPath, type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
@@ -26,6 +26,17 @@ function run(cwd: string, command: string, ...args: string[]): string {
 
 function git(cwd: string, ...args: string[]): string {
 	return run(cwd, "git", ...args);
+}
+
+function processIsAlive(pidPath: string): boolean {
+	const pid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+	if (!Number.isInteger(pid) || pid < 1) throw new Error(`Invalid process ID in ${pidPath}`);
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function installNodeCommandShim(directory: string, command: string, source: string): void {
@@ -641,7 +652,7 @@ describe("review snapshots", () => {
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
 		const snapshot = await resolve({ kind: "pr", number: "7" }, repository);
-		expect(readFileSync(alternatesLog, "utf8").trim()).toBe(localObjects);
+		expect(readFileSync(alternatesLog, "utf8").trim()).toBe(resolvePath(localObjects));
 		expect(snapshot.identity.pullRequest).toMatchObject({ number: 7, baseRefOid: baseOid, headRefOid: headOid });
 		expect(snapshot.githubContext?.manifest).toMatchObject({ status: "complete", fingerprint: expect.any(String) });
 		expect(
@@ -1286,12 +1297,11 @@ describe("review snapshots", () => {
 		if (!realGit) throw new Error("Unable to locate git executable");
 		const bin = join(repository, "delayed-git-bin");
 		const startedPath = join(repository, "delayed-git-started");
-		const killedPath = join(repository, "delayed-git-killed");
 		mkdirSync(bin);
 		installNodeCommandShim(
 			bin,
 			"git",
-			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "rev-parse" && args[1] === "--show-toplevel") {\n  writeFileSync(${JSON.stringify(startedPath)}, "started\\n");\n  process.on("SIGTERM", () => { writeFileSync(${JSON.stringify(killedPath)}, "killed\\n"); process.exit(143); });\n  setInterval(() => {}, 1_000);\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "rev-parse" && args[1] === "--show-toplevel") {\n  writeFileSync(${JSON.stringify(startedPath)}, String(process.pid));\n  setInterval(() => {}, 1_000);\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
 		);
 		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 		const controller = new AbortController();
@@ -1303,7 +1313,7 @@ describe("review snapshots", () => {
 			await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true));
 			controller.abort();
 			await expect(resolution).resolves.toEqual({ error: "Review cancelled.", cancelled: true });
-			await vi.waitFor(() => expect(existsSync(killedPath)).toBe(true));
+			await vi.waitFor(() => expect(processIsAlive(startedPath)).toBe(false));
 		} finally {
 			controller.abort();
 		}
@@ -1313,12 +1323,11 @@ describe("review snapshots", () => {
 		const repository = createRepository();
 		const bin = join(repository, "delayed-gh-bin");
 		const startedPath = join(repository, "delayed-gh-started");
-		const killedPath = join(repository, "delayed-gh-killed");
 		mkdirSync(bin);
 		installNodeCommandShim(
 			bin,
 			"gh",
-			`import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(startedPath)}, "started\\n");\nprocess.on("SIGTERM", () => { writeFileSync(${JSON.stringify(killedPath)}, "killed\\n"); process.exit(143); });\nsetInterval(() => {}, 1_000);\n`,
+			`import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(startedPath)}, String(process.pid));\nsetInterval(() => {}, 1_000);\n`,
 		);
 		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 		const controller = new AbortController();
@@ -1330,7 +1339,7 @@ describe("review snapshots", () => {
 			await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true));
 			controller.abort();
 			await expect(resolution).resolves.toEqual({ error: "Review cancelled.", cancelled: true });
-			await vi.waitFor(() => expect(existsSync(killedPath)).toBe(true));
+			await vi.waitFor(() => expect(processIsAlive(startedPath)).toBe(false));
 		} finally {
 			controller.abort();
 		}

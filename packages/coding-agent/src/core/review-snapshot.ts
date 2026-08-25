@@ -5,6 +5,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnProcess } from "../utils/child-process.ts";
+import { terminateProcessTree } from "../utils/shell.ts";
 import {
 	captureReviewGitHubContext,
 	type ReviewGitHubContext,
@@ -285,7 +286,6 @@ function runCommand(
 			cwd,
 			stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: options.env ? { ...process.env, ...options.env } : process.env,
-			signal: options.signal,
 		});
 		let stdout: Buffer[] = [];
 		let stdoutBytes = 0;
@@ -294,9 +294,15 @@ function runCommand(
 		let failure: CommandOutputLimitFailure | undefined;
 		let processError: string | undefined;
 		let settled = false;
+		const onAbort = (): void => {
+			proc.stdin?.destroy();
+			if (proc.pid) void terminateProcessTree(proc.pid);
+			else proc.kill();
+		};
 		const finish = (result: CommandResult): void => {
 			if (settled) return;
 			settled = true;
+			options.signal?.removeEventListener("abort", onAbort);
 			resolveResult(result);
 		};
 		const exceed = (stream: CommandOutputLimitFailure["stream"], limit: number): void => {
@@ -339,7 +345,9 @@ function runCommand(
 			});
 		});
 		proc.stdin?.on("error", () => {});
-		if (options.input !== undefined) proc.stdin?.end(options.input);
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted) onAbort();
+		else if (options.input !== undefined) proc.stdin?.end(options.input);
 	});
 }
 

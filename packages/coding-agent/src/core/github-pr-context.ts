@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { spawnProcess } from "../utils/child-process.ts";
+import { terminateProcessTree } from "../utils/shell.ts";
 
 export const REVIEW_GITHUB_TEXT_MAX_BYTES = 32 * 1024;
 export const REVIEW_GITHUB_LINKED_ISSUE_LIMIT = 20;
@@ -285,7 +286,6 @@ async function runGh(args: string[], cwd: string, input?: string, signal?: Abort
 			cwd,
 			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: process.env,
-			signal,
 		});
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
@@ -293,9 +293,15 @@ async function runGh(args: string[], cwd: string, input?: string, signal?: Abort
 		let stderrBytes = 0;
 		let outputLimited = false;
 		let settled = false;
+		const onAbort = (): void => {
+			child.stdin?.destroy();
+			if (child.pid) void terminateProcessTree(child.pid);
+			else child.kill();
+		};
 		const finish = (result: CommandResult): void => {
 			if (settled) return;
 			settled = true;
+			signal?.removeEventListener("abort", onAbort);
 			resolveResult(result);
 		};
 		const limitOutput = (): void => {
@@ -329,7 +335,9 @@ async function runGh(args: string[], cwd: string, input?: string, signal?: Abort
 			});
 		});
 		child.stdin?.on("error", () => {});
-		if (input !== undefined) child.stdin?.end(input);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
+		else if (input !== undefined) child.stdin?.end(input);
 	});
 	if (signal?.aborted) throw new Error("GitHub context capture was cancelled.");
 	return result;
