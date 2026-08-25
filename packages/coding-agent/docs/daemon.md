@@ -31,7 +31,7 @@ when another process starts it.
 ```
 volt daemon start                 Start the background daemon.
 volt daemon stop                  Graceful shutdown (state flushed, phones notified).
-volt daemon status [--json]       Status; exit 0 when running, 1 when not.
+volt daemon status [--json]       Status; exit 0 only when phone transport is ready.
 volt daemon restart               Stop then start; persistent state survives.
 volt daemon logs [-f] [-n N]      Tail the daemon log.
 volt daemon install-service       Register a login service (launchd/systemd).
@@ -55,8 +55,10 @@ volt remote worktree diff <id> [--workspace <name>]
 
 `volt remote host` is gone; running it prints a pointer to `volt daemon
 start`. The daemon requires a Node.js npm install or source checkout with the
-optional `@hansjm10/volt-iroh` native adapter. Standalone Node SEA builds do not
-bundle that adapter and cannot host the daemon.
+exact required `@hansjm10/volt-iroh` wrapper and its optional selected native
+binding. Installs made with `--omit=optional` cannot provide phone transport,
+and Darwin x64 has no binding. Standalone Node SEA builds do not bundle Iroh and
+cannot host the daemon.
 
 `volt daemon install-service` writes a launchd LaunchAgent (macOS) or a
 systemd user unit (Linux) that starts the daemon at login. The service does
@@ -201,7 +203,19 @@ supported.
 
 ## Troubleshooting
 
-- `volt daemon status` exits 1 → the daemon is not running; `volt daemon
+- `volt daemon status --json` reports `remoteTransport.state` as `starting`,
+  `ready`, `degraded`, or `unavailable`, plus a safe reason code/message and the
+  wrapper version when discoverable. Both daemon and remote status exit nonzero
+  unless phone transport is `ready`; local daemon workspace/client maintenance
+  remains available while it is not ready.
+- `native_binding_missing` → reinstall without `--omit=optional` on a supported
+  platform. Darwin x64 is intentionally local CLI/TUI only.
+- `endpoint_start_failed` → inspect `volt daemon logs`, fix the reported host
+  issue, then restart the daemon.
+- `host_storage_full` → free computer disk/quota capacity, then retry. Rejected
+  handshakes do not create an in-memory authorization, and the phone keeps its
+  saved pairing, selected agent, and transcript.
+- `volt daemon status` reports that the daemon is not running → run `volt daemon
   start` and check `volt daemon logs`.
 - Stale socket after a crash: `volt daemon start` probes the socket, unlinks
   it when dead, and rebinds.

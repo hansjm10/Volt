@@ -84,6 +84,7 @@ import {
 	writeIrohRemoteHello,
 	writeIrohRemoteHostState,
 } from "../src/core/remote/iroh/index.ts";
+import { IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE } from "../src/core/remote/iroh/protocol.ts";
 import type {
 	IrohBytes,
 	IrohRecvStreamLike,
@@ -889,6 +890,7 @@ describe("Iroh remote core helpers", () => {
 	test("pins protocol v1 remote command and redaction compatibility vectors", () => {
 		expect(Array.from(IROH_REMOTE_OUTCOMES)).toEqual([
 			"host_unreachable",
+			"host_storage_full",
 			"invalid_workspace",
 			"invalid_conversation_target",
 			"conversation_streams_unsupported",
@@ -908,6 +910,7 @@ describe("Iroh remote core helpers", () => {
 			"saved_host_invalid",
 		]);
 		expect(Array.from(IROH_REMOTE_HOST_HANDSHAKE_FAILURE_OUTCOMES)).toEqual([
+			"host_storage_full",
 			"invalid_workspace",
 			"invalid_conversation_target",
 			"conversation_streams_unsupported",
@@ -3309,6 +3312,67 @@ describe("Iroh remote core helpers", () => {
 		expect(handshake.response.success).toBe(true);
 		expect(await hostEngine.listClients()).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
 	});
+
+	test.each(["ENOSPC", "EDQUOT"] as const)(
+		"host engine rejects %s authorization without ghost authority even when audit also fails",
+		async (code) => {
+			const initialState = {
+				...createEmptyIrohRemoteHostState(),
+				workspaces: [{ name: "volt", path: "/workspace" }],
+			};
+			const attemptedSnapshots: IrohRemoteHostState[] = [];
+			const capacityError = Object.assign(new Error(`${code} injected`), { code });
+			const nestedError = new Error("daemon state envelope write failed", {
+				cause: new AggregateError([new Error("atomic write failed", { cause: capacityError })]),
+			});
+			const stateManager = new IrohRemoteHostStateManager({
+				store: {
+					read: () => initialState,
+					write: (state) => {
+						attemptedSnapshots.push(state);
+						throw nestedError;
+					},
+				},
+			});
+			const hostEngine = new IrohRemoteHostEngine({
+				auditLogger: new IrohRemoteAuditLogger({ sink: new FailingAuditSink() }),
+				hostNodeId: "host-node",
+				now: () => 100,
+				pairingExpiresAt: 1_000,
+				pairingSecret: "secret",
+				stateManager,
+				workspace: { name: "volt", path: "/workspace" },
+			});
+			const recv = new ManualIrohRecvStream();
+			recv.push(
+				Buffer.from(
+					`${JSON.stringify({
+						type: "volt_iroh_hello",
+						protocol: IROH_REMOTE_ALPN,
+						workspace: "volt",
+						secret: "secret",
+						conversation: { target: "last" },
+					})}\n`,
+				),
+			);
+
+			const handshake = await hostEngine.readHandshake(recv, "client-node");
+
+			expect(handshake).toMatchObject({
+				ok: false,
+				error: IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE,
+				response: {
+					success: false,
+					outcome: "host_storage_full",
+					error: IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE,
+				},
+			});
+			expect(attemptedSnapshots).toHaveLength(2);
+			expect(attemptedSnapshots[0]?.clients).toEqual([expect.objectContaining({ nodeId: "client-node" })]);
+			expect(attemptedSnapshots[1]?.clients).toEqual([]);
+			expect((await stateManager.getState()).clients).toEqual([]);
+		},
+	);
 
 	test("host engine returns authorized handshakes without writing transport responses", async () => {
 		const stateManager = new IrohRemoteHostStateManager({ initialState: createEmptyIrohRemoteHostState() });

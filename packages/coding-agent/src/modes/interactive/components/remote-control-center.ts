@@ -24,6 +24,7 @@ import {
 	type ControlEvent,
 	type ControlResponse,
 	type DaemonRemotePolicyStatus,
+	isRemoteTransportPairingAvailable,
 } from "../../../daemon/control-protocol.ts";
 import { type DaemonProbeState, ensureDaemonRunning, probeDaemon, waitForDaemonExit } from "../../../daemon/spawn.ts";
 import {
@@ -339,6 +340,7 @@ function abbreviatedId(value: string, width = 12): string {
 
 function supportsSafePairing(status: RemoteStatus): boolean {
 	return (
+		isRemoteTransportPairingAvailable(status.remoteTransport) &&
 		status.capabilities?.includes(CONTROL_PAIR_CANCEL_CAPABILITY) === true &&
 		status.capabilities.includes(CONTROL_RPC_GRANTS_CAPABILITY)
 	);
@@ -938,9 +940,10 @@ export class RemoteControlCenterComponent implements Component {
 		if (this.view.kind === "offline") state = this.view.snapshot.state;
 		else if (this.view.kind === "confirm-regenerate" || this.view.kind === "confirm-recover") state = "confirmation";
 		else if ("status" in this.view)
-			state = `online · ${this.view.status.phoneConnections} phone${this.view.status.phoneConnections === 1 ? "" : "s"}`;
+			state = `${this.view.status.remoteTransport?.state ?? "unavailable"} · ${this.view.status.phoneConnections} phone${this.view.status.phoneConnections === 1 ? "" : "s"}`;
 		const title = theme.bold(theme.fg("accent", "Remote Access"));
-		const right = theme.fg(this.view.kind === "offline" ? "warning" : "muted", state);
+		const remoteUnavailable = "status" in this.view && this.view.status.remoteTransport?.state !== "ready";
+		const right = theme.fg(this.view.kind === "offline" || remoteUnavailable ? "warning" : "muted", state);
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(title) - visibleWidth(right) - 2));
 		return [new DynamicBorder().render(width).lines[0]!, truncateToWidth(` ${title}${gap}${right} `, width, ""), ""];
 	}
@@ -1074,6 +1077,13 @@ export class RemoteControlCenterComponent implements Component {
 				tone: "text",
 			},
 			{
+				text: `Phone transport: ${status.remoteTransport?.state ?? "unavailable"}${status.remoteTransport?.wrapperVersion ? ` · wrapper ${status.remoteTransport.wrapperVersion}` : ""}${status.remoteTransport?.reasonCode ? ` · ${status.remoteTransport.reasonCode}` : ""}`,
+				tone: status.remoteTransport?.state === "ready" ? "success" : "warning",
+			},
+			...(status.remoteTransport?.message
+				? [{ text: status.remoteTransport.message, tone: "warning" as const }]
+				: []),
+			{
 				text: `${status.phoneConnections} attached phone${status.phoneConnections === 1 ? "" : "s"} · ${status.clients.length} paired device${status.clients.length === 1 ? "" : "s"}${status.revokedClients === undefined ? "" : ` · ${status.revokedClients.length} revoked`}`,
 				tone: status.phoneConnections > 0 ? "success" : "muted",
 			},
@@ -1086,11 +1096,13 @@ export class RemoteControlCenterComponent implements Component {
 			{ text: "ACTIONS", tone: "accent" },
 			{ key: "refresh", text: "Refresh status", tone: "text" },
 			{ key: "register-current", text: "Register current directory", tone: "text" },
-			...(status.workspaces.length === 0
-				? [{ text: "Pairing needs a registered workspace.", tone: "warning" as const }]
-				: supportsSafePairing(status)
-					? [{ key: "pair", text: "Pair a phone", tone: "text" as const }]
-					: [{ text: "Restart voltd to pair with explicit access grants.", tone: "warning" as const }]),
+			...(!isRemoteTransportPairingAvailable(status.remoteTransport)
+				? [{ text: "Pairing is disabled until phone transport is ready.", tone: "warning" as const }]
+				: status.workspaces.length === 0
+					? [{ text: "Pairing needs a registered workspace.", tone: "warning" as const }]
+					: supportsSafePairing(status)
+						? [{ key: "pair", text: "Pair a phone", tone: "text" as const }]
+						: [{ text: "Restart voltd to pair with explicit access grants.", tone: "warning" as const }]),
 			{ text: "HEADLESS POLICY", tone: "accent" },
 			...(status.remotePolicy
 				? [

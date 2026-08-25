@@ -68,6 +68,7 @@ function run(command, args, options = {}) {
 	const result = spawnSync(command, args, {
 		cwd: options.cwd,
 		encoding: "utf8",
+		env: options.env === undefined ? process.env : { ...process.env, ...options.env },
 		shell: process.platform === "win32",
 		stdio: options.capture ? ["inherit", "pipe", "inherit"] : "inherit",
 	});
@@ -157,6 +158,76 @@ function createVoltShim(installDirectory) {
 	symlinkSync(join("node_modules", ".bin", "volt"), join(installDirectory, "volt"));
 }
 
+function sleepSync(milliseconds) {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function smokePackedDaemon(installDirectory, outputDirectory, repoRoot) {
+	if (process.platform === "darwin" && process.arch === "x64") {
+		console.log("Skipping packed daemon smoke: @hansjm10/volt-iroh does not publish a Darwin x64 binding.");
+		return;
+	}
+	const voltCommand = join(installDirectory, process.platform === "win32" ? "volt.cmd" : "volt");
+	const agentDir = join(outputDirectory, ".daemon-smoke-agent");
+	const env = {
+		VOLT_CODING_AGENT_DIR: agentDir,
+		VOLT_IROH_RELAY_MODE: "disabled",
+	};
+	let failure;
+	let startAttempted = false;
+	try {
+		run("node", [join(repoRoot, "scripts/check-iroh-native-load.mjs"), "--from", installDirectory], {
+			cwd: outputDirectory,
+		});
+		startAttempted = true;
+		run(voltCommand, ["daemon", "start"], { cwd: outputDirectory, env });
+		const deadline = Date.now() + 30_000;
+		let lastHealth;
+		let ready = false;
+		while (Date.now() < deadline) {
+			const statusResult = spawnSync(voltCommand, ["daemon", "status", "--json"], {
+				cwd: outputDirectory,
+				encoding: "utf8",
+				env: { ...process.env, ...env },
+				shell: process.platform === "win32",
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			try {
+				const status = JSON.parse(statusResult.stdout ?? "");
+				lastHealth = status.remoteTransport;
+				if (status.running === true && status.remoteTransport?.state === "ready") {
+					console.log(
+						`Packed daemon phone transport ready (wrapper ${status.remoteTransport.wrapperVersion ?? "unknown"}).`,
+					);
+					ready = true;
+					break;
+				}
+			} catch {}
+			sleepSync(200);
+		}
+		if (!ready) {
+			throw new Error(`Packed daemon phone transport did not become ready: ${JSON.stringify(lastHealth)}`);
+		}
+	} catch (error) {
+		failure = error;
+	} finally {
+		if (startAttempted) {
+			const stopResult = spawnSync(voltCommand, ["daemon", "stop"], {
+				cwd: outputDirectory,
+				encoding: "utf8",
+				env: { ...process.env, ...env },
+				shell: process.platform === "win32",
+				stdio: "inherit",
+			});
+			if (stopResult.status !== 0 && failure === undefined) {
+				failure = new Error("Packed daemon smoke could not stop the isolated daemon");
+			}
+		}
+		rmSync(agentDir, { force: true, recursive: true });
+	}
+	if (failure !== undefined) throw failure;
+}
+
 function packPackage(pkg, tarballDirectory) {
 	const packageJson = readPackageJson(pkg.directory);
 	if (packageJson.name !== pkg.name) {
@@ -213,6 +284,7 @@ if (!options.skipInstall) {
 
 	run("npm", ["install", "--omit=dev", "--ignore-scripts"], { cwd: nodeInstallDirectory });
 	createVoltShim(nodeInstallDirectory);
+	smokePackedDaemon(nodeInstallDirectory, outDir, repoRoot);
 
 }
 

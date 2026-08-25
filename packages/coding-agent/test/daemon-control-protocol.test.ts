@@ -132,6 +132,7 @@ describe("control protocol framing", () => {
 				capabilities: ["pair_cancel"],
 				leases: [{ workspaceName: "volt", sessionId: "s-1", state: "tui-owned", relayCount: 1, streamCount: 0 }],
 				phoneConnections: 1,
+				remoteTransport: { state: "ready", wrapperVersion: "1.1.1-volt.2" },
 				workspaces: [{ name: "volt", path: "/tmp/volt", allowedTools: ["read", "bash"] }],
 				clients: [
 					{
@@ -186,6 +187,27 @@ describe("control protocol framing", () => {
 			expect(decoded).toEqual(response);
 			expect(isControlResponse(decoded), `response ${response.type}`).toBe(true);
 		}
+	});
+
+	it("requires structured remote transport health on status responses", () => {
+		const base = { type: "status_result", id: "status" };
+		expect(isControlResponse(base)).toBe(false);
+		expect(isControlResponse({ ...base, remoteTransport: { state: "ready" } })).toBe(true);
+		expect(
+			isControlResponse({
+				...base,
+				remoteTransport: {
+					state: "unavailable",
+					reasonCode: "native_binding_missing",
+					message: "Phone transport is unavailable on this platform.",
+					wrapperVersion: "1.1.1-volt.2",
+				},
+			}),
+		).toBe(true);
+		expect(isControlResponse({ ...base, remoteTransport: { state: "healthy" } })).toBe(false);
+		expect(isControlResponse({ ...base, remoteTransport: { state: "unavailable", reasonCode: "secret" } })).toBe(
+			false,
+		);
 	});
 
 	it("rejects a prepared-rekey response without its transaction id", () => {

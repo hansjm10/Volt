@@ -1,6 +1,8 @@
 import { Buffer } from "node:buffer";
 
 export const IROH_REMOTE_ALPN = "volt-rpc/0";
+export const IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE =
+	"Computer storage is full. Free space on the computer, then retry.";
 export const IROH_REMOTE_TICKET_PREFIX = "volt+iroh://v1/";
 export const IROH_REMOTE_HELLO_TYPE = "volt_iroh_hello";
 export const IROH_REMOTE_HANDSHAKE_TYPE = "volt_iroh_handshake";
@@ -68,6 +70,7 @@ export const IROH_REMOTE_UNSAFE_TOOL_NAMES = [
 ] as const;
 export const IROH_REMOTE_OUTCOMES = [
 	"host_unreachable",
+	"host_storage_full",
 	"invalid_workspace",
 	"invalid_conversation_target",
 	"conversation_streams_unsupported",
@@ -87,6 +90,7 @@ export const IROH_REMOTE_OUTCOMES = [
 	"saved_host_invalid",
 ] as const;
 export const IROH_REMOTE_HOST_HANDSHAKE_FAILURE_OUTCOMES = [
+	"host_storage_full",
 	"invalid_workspace",
 	"invalid_conversation_target",
 	"conversation_streams_unsupported",
@@ -139,6 +143,24 @@ export class IrohRemoteOutcomeError extends Error {
 		this.name = "IrohRemoteOutcomeError";
 		this.outcome = outcome;
 	}
+}
+
+/** Recognize disk/quota exhaustion through Error.cause and AggregateError chains. */
+export function isIrohRemoteHostStorageFullError(error: unknown): boolean {
+	const pending: unknown[] = [error];
+	const seen = new Set<unknown>();
+	while (pending.length > 0) {
+		const current = pending.pop();
+		if ((typeof current !== "object" && typeof current !== "function") || current === null || seen.has(current)) {
+			continue;
+		}
+		seen.add(current);
+		const record = current as Record<string, unknown>;
+		if (record.code === "ENOSPC" || record.code === "EDQUOT") return true;
+		if (record.cause !== undefined) pending.push(record.cause);
+		if (Array.isArray(record.errors)) pending.push(...record.errors);
+	}
+	return false;
 }
 
 export function normalizeIrohRemoteAllowTools(

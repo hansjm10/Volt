@@ -97,7 +97,7 @@ describe("remote CLI (daemon control client)", () => {
 		expect(process.exitCode).toBe(1);
 	});
 
-	it("prints daemon status including workspaces", async () => {
+	it("prints daemon status and exits nonzero when phone transport is unavailable", async () => {
 		await main(["remote", "workspace", "add", workspaceDir, "--name", "status-ws"]);
 		logSpy.mockClear();
 		await main(["remote", "status", "--json"]);
@@ -106,12 +106,33 @@ describe("remote CLI (daemon control client)", () => {
 			clients: unknown[];
 			leases: unknown[];
 			remotePolicy: { allowTools: string[] | null; detachedRuntimeTtlMs: number };
+			remoteTransport: { state: string; reasonCode?: string };
 		};
 		expect(status.workspaces.some((workspace) => workspace.name === "status-ws")).toBe(true);
 		expect(Array.isArray(status.clients)).toBe(true);
 		expect(Array.isArray(status.leases)).toBe(true);
 		expect(status.remotePolicy).toEqual({ allowTools: null, detachedRuntimeTtlMs: 30 * 60 * 1000 });
+		expect(status.remoteTransport).toMatchObject({ state: "unavailable", reasonCode: "extension_missing" });
+		expect(process.exitCode).toBe(1);
+
+		process.exitCode = undefined;
+		logSpy.mockClear();
+		await main(["daemon", "status", "--json"]);
+		const daemonStatus = JSON.parse(loggedLines(logSpy)) as {
+			remoteTransport: { state: string; reasonCode?: string };
+		};
+		expect(daemonStatus.remoteTransport).toMatchObject({ state: "unavailable", reasonCode: "extension_missing" });
+		expect(process.exitCode).toBe(1);
+
+		process.exitCode = undefined;
 		await main(["remote", "workspace", "remove", "status-ws"]);
+	});
+
+	it("blocks pairing before workspace mutation when phone transport is unavailable", async () => {
+		await main(["remote", "pair", "--workspace", "missing"]);
+		expect(process.exitCode).toBe(1);
+		expect(loggedLines(errorSpy)).toContain("phone transport is unavailable");
+		expect(loggedLines(errorSpy)).toContain("Phone transport is not enabled in this daemon");
 	});
 
 	it("lists paired clients as JSON", async () => {

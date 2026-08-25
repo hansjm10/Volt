@@ -24,6 +24,31 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 }
 
 describe("VoltdStateStore flush serialization", () => {
+	test("restores the previous in-memory host snapshot when durable persistence fails", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "voltd-state-rollback-"));
+		temporaryDirectories.push(directory);
+		const statePath = join(directory, "state.json");
+		await writeFile(statePath, `${JSON.stringify(createEmptyVoltdState())}\n`);
+		const storageError = Object.assign(new Error("quota exhausted"), { code: "EDQUOT" });
+		const store = new VoltdStateStore({
+			agentDir: directory,
+			statePath,
+			debounceMs: 60_000,
+			writeStateFile: async () => {
+				throw storageError;
+			},
+		});
+		await store.load();
+		const previous = store.getHostState();
+		const candidate = {
+			...previous,
+			workspaces: [{ name: "ghost", path: "/tmp/ghost" }],
+		};
+
+		await expect(store.persistHostState(candidate)).rejects.toBe(storageError);
+		expect(store.getHostState()).toEqual(previous);
+	});
+
 	test("a delayed older writer cannot rename after and overwrite newer security state", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "voltd-state-flush-race-"));
 		temporaryDirectories.push(directory);

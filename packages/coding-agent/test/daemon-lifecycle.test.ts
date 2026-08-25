@@ -286,6 +286,13 @@ describe("voltd lifecycle", () => {
 			client.request({ type: "viewer_subscribe", viewerFeedId: "vf-nope" }),
 		]);
 		expect(statusResponse.type).toBe("status_result");
+		if (statusResponse.type === "status_result") {
+			expect(statusResponse.remoteTransport).toEqual({
+				state: "unavailable",
+				reasonCode: "extension_missing",
+				message: "Phone transport is not enabled in this daemon.",
+			});
+		}
 		expect(clientsResponse.type).toBe("clients_result");
 		expect(unsupported.type).toBe("error");
 		await client.request({ type: "shutdown" });

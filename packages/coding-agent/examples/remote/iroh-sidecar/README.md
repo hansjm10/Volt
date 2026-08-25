@@ -18,7 +18,7 @@ For direct demo-client commands from this directory after the repository root or
 npm install --ignore-scripts
 ```
 
-`@hansjm10/volt-iroh` is an optional dependency of `@hansjm10/volt-coding-agent`. Host commands use the product package install, so run root install before `volt remote host` or `npm run iroh:poc:host`. If `volt remote host` reports that the optional native adapter is unavailable, reinstall with optional dependencies enabled for the current platform. The example package can still install the dependency locally for direct client demos. Standalone Node SEA builds reject `volt remote host` because the optional native Iroh adapter is intentionally not bundled; use a Node.js npm install or source checkout.
+`@hansjm10/volt-iroh` is an exact required dependency of `@hansjm10/volt-coding-agent`; its selected native platform package remains optional. Host commands use the product package install, so run the root install with npm 11.17.0 before `volt daemon start` or the source demo. Do not use `--omit=optional`: status will report `native_binding_missing`. Darwin x64 has no binding and remains local CLI/TUI only. The example package can install the wrapper locally for direct client demos. Standalone Node SEA builds intentionally omit Iroh and reject daemon/remote commands; use a supported Node.js npm install or source checkout.
 
 ## Root scripts
 
@@ -31,7 +31,7 @@ npm run iroh:poc:client -- "<ticket>"    # one-shot client
 npm run iroh:poc:client -- "<ticket>" --interactive  # persistent prompt loop
 npm run iroh:poc:clients                # list paired clients through the example wrapper
 volt remote clients                     # list paired clients through the product CLI
-volt remote status                      # inspect persisted host state
+volt remote status                      # exits 0 only when phone transport is ready
 npm run iroh:poc:revoke -- <node-id>    # revoke a paired client through the wrapper
 volt remote revoke <node-id>            # revoke a paired client through the product CLI
 ```
@@ -118,7 +118,7 @@ volt remote status
 volt remote status
 ```
 
-`volt remote status` prints persisted state only and includes that warning in its output; it does not print pairing secrets or secret hashes.
+`volt remote status` reports live daemon and structured phone-transport health without printing pairing secrets or secret hashes. It exits nonzero unless `remoteTransport.state` is `ready`.
 
 Revoke a client:
 

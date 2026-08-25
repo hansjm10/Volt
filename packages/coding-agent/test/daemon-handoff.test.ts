@@ -148,6 +148,7 @@ async function startDaemonHalf(
 						streamCount: record.streamCount,
 					})),
 					phoneConnections: 0,
+					remoteTransport: { state: "ready" },
 					workspaces,
 					clients: [],
 					keepAwake: { enabled: false, state: "disabled" },
