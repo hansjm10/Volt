@@ -67,6 +67,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install npm 11.17.0
+        working-directory: ${{ runner.temp }}
         run: npm install -g npm@11.17.0 --ignore-scripts
 
       - name: Verify tag, source commit, and versions
@@ -416,6 +417,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install npm 11.17.0
+        working-directory: ${{ runner.temp }}
         run: npm install -g npm@11.17.0 --ignore-scripts
 
       - name: Verify tag, source commit, and versions
@@ -447,6 +449,7 @@ jobs:
         run: git diff --exit-code HEAD
 
       - name: Reinstall exact npm for trusted publishing
+        working-directory: ${{ runner.temp }}
         run: |
           npm install -g npm@11.17.0 --ignore-scripts
           npm --version

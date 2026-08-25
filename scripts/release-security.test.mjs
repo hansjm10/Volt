@@ -857,11 +857,23 @@ test("npm policy requires the exact Iroh wrapper while quarantining third-party 
 		".github/workflows/prepare-release.yml",
 	]) {
 		const workflow = readFileSync(path, "utf8");
+		const npmPin = "npm install -g npm@11.17.0 --ignore-scripts";
 		let installSearchFrom = 0;
 		for (const match of workflow.matchAll(/npm ci\b/g)) {
-			const precedingPin = workflow.lastIndexOf("npm install -g npm@11.17.0 --ignore-scripts", match.index);
+			const precedingPin = workflow.lastIndexOf(npmPin, match.index);
 			assert.ok(precedingPin >= installSearchFrom, `${path} installs npm 11.17.0 before each dependency resolution`);
 			installSearchFrom = match.index + match[0].length;
+		}
+		const lines = workflow.split(/\r?\n/);
+		for (const [lineIndex, line] of lines.entries()) {
+			if (line.trim() !== npmPin) continue;
+			let stepStart = lineIndex - 1;
+			while (stepStart >= 0 && !lines[stepStart].trimStart().startsWith("- name:")) stepStart--;
+			assert.ok(
+				stepStart >= 0 &&
+					lines.slice(stepStart, lineIndex).some((stepLine) => stepLine.trim() === "working-directory: ${{ runner.temp }}"),
+				`${path} runs each npm bootstrap from runner.temp`,
+			);
 		}
 		assert.doesNotMatch(workflow, /npm install -g npm@(?!11\.17\.0\b)/);
 		assert.doesNotMatch(
