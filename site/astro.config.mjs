@@ -12,7 +12,9 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "Volt",
-      description: "A fast, hackable coding agent for your terminal — with remote access from your phone.",
+      description: "A coding agent that runs on your machine and follows you from terminal to phone.",
+      logo: { src: "./public/volt-icon.png", alt: "Volt" },
+      favicon: "/volt-icon.png",
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/volt-hq/Volt" }],
       sidebar,
       editLink: {

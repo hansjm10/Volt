@@ -2,9 +2,9 @@
 import { getCollection } from "astro:content";
 
 const install = "curl -fsSL https://volt-cli.dev/install.sh | sh";
-const title = "Volt — a fast, hackable coding agent for your terminal";
+const title = "Volt — a coding agent from terminal to phone";
 const description =
-  "Volt is an open-source coding agent CLI: multi-provider, extensible with skills and packages, and reachable from your phone over end-to-end encrypted remote access.";
+  "Volt is an open-source coding agent that runs on your machine, adapts to your workflow, and lets you continue the same live session from your phone.";
 const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft)).length > 0;
 ---
 
@@ -18,31 +18,31 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://volt-cli.dev/" />
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/volt-icon.png" type="image/png" />
     <link rel="alternate" type="application/rss+xml" title="Volt Blog" href="/rss.xml" />
   </head>
   <body>
     <header class="nav">
       <a class="brand" href="/">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M13 2 4.5 13.5H11L9.5 22 19 9.5h-6.5L13 2z"/></svg>
+        <img src="/volt-icon.png" width="28" height="28" alt="" />
         volt
       </a>
       <nav>
         {hasPublishedPosts && <a href="/blog/">Blog</a>}
         <a href="/docs/">Docs</a>
         <a href="/docs/quickstart/">Quickstart</a>
-        <a href="https://github.com/hansjm10/Volt">GitHub</a>
+        <a href="https://github.com/volt-hq/Volt">GitHub</a>
       </nav>
     </header>
 
     <main>
       <section class="hero">
-        <p class="badge">Preview — public beta gates in progress</p>
-        <h1>A coding agent that lives in your terminal,<br />not in someone else's cloud.</h1>
+        <p class="badge">Public beta</p>
+        <h1>Your coding agent,<br />from terminal to phone.</h1>
         <p class="sub">
-          Volt is an open-source coding agent CLI. Bring your own model — Anthropic, OpenAI,
-          or any provider — extend it with skills, extensions, and packages, and keep your
-          credential storage and tool execution on your own machine.
+          Volt keeps the agent runtime, credentials, and tools on your machine. Bring your
+          preferred model, adapt the workflow with extensions, and continue the same live
+          session from your iPhone when you step away.
         </p>
         <div class="install" id="install-box">
           <code>{install}</code>
@@ -60,10 +60,10 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
 
       <section class="features">
         <div class="card">
-          <h3>Your terminal, your rules</h3>
+          <h3>A terminal built for agents</h3>
           <p>
-            A fast TUI with differential rendering, configurable keybindings, themes, and
-            session management with compaction. Works in tmux, over SSH, even on Termux.
+            A responsive TUI with native Plan mode, subagents, configurable keybindings,
+            themes, session branching, and compaction. Works in tmux, over SSH, even on Termux.
           </p>
         </div>
         <div class="card">
@@ -109,11 +109,10 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
       <section class="remote">
         <h2>Start on your desk. Finish from anywhere.</h2>
         <p>
-          <code>volt remote host</code> exposes a local Volt runtime to your paired iPhone
-          without a Volt account. Connection traffic may traverse configured Iroh relays,
-          but session payloads remain end-to-end encrypted. Register workspaces by name,
-          scan a QR code once, and your sessions show up as tabs on your phone with live
-          transcripts and completion notifications.
+          <code>volt daemon start</code> keeps the agent runtime on your workstation. Pair
+          your iPhone from <code>/remote</code>, register workspaces by name, and continue the
+          same live sessions with transcripts and completion notifications. Iroh connects
+          devices directly when possible and falls back to end-to-end encrypted relays.
         </p>
         <a class="btn" href="/docs/usage/#remote-access-over-iroh-preview">How remote access works</a>
       </section>
@@ -123,15 +122,15 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
       <p>
         Maintained and distributed by
         <a href="https://github.com/hansjm10">Jordan Hans</a>. Derived from
-        <a href="https://github.com/badlogic/pi-mono">Mario Zechner's Pi project</a>
+        <a href="https://github.com/earendil-works/pi">Mario Zechner's Pi project</a>
         under the MIT License. Built in the open at
-        <a href="https://github.com/hansjm10/Volt">github.com/hansjm10/Volt</a>.
+        <a href="https://github.com/volt-hq/Volt">github.com/volt-hq/Volt</a>.
       </p>
       <nav>
         {hasPublishedPosts && <a href="/blog/">Blog</a>}
         <a href="/docs/">Docs</a>
         <a href="/docs/security/">Security</a>
-        <a href="https://github.com/hansjm10/Volt/blob/main/CONTRIBUTING.md">Contributing</a>
+        <a href="https://github.com/volt-hq/Volt/blob/main/CONTRIBUTING.md">Contributing</a>
       </nav>
     </footer>
 
@@ -147,24 +146,27 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
 
     <style>
       :root {
-        --bg: #0c0f0a;
-        --panel: #14181070;
-        --border: #2a3222;
-        --text: #e6ebe0;
-        --muted: #9aa78d;
-        --accent: #a3e635;
-        --accent-dim: #4d7c0f;
+        --bg: #171420;
+        --panel: #1d1a28b8;
+        --border: #39304f;
+        --text: #d4d4d4;
+        --muted: #808080;
+        --accent: #bf5af2;
+        --accent-bright: #e066ff;
+        --accent-dim: #7d6bfa;
+        --accent-soft: #322c44;
       }
       * { box-sizing: border-box; margin: 0; }
       body {
         background: var(--bg);
-        background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #1a2411, transparent);
+        background-image: radial-gradient(ellipse 80% 50% at 50% -10%, var(--accent-soft), transparent);
         color: var(--text);
         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
         line-height: 1.6;
       }
       code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
       a { color: var(--accent); text-decoration: none; }
+      a:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: 3px; }
 
       .nav {
         display: flex; justify-content: space-between; align-items: center;
@@ -174,8 +176,8 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
         display: flex; align-items: center; gap: 0.4rem;
         font-weight: 700; font-size: 1.25rem; color: var(--text);
       }
-      .brand svg { color: var(--accent); }
-      .nav nav { display: flex; gap: 1.4rem; }
+      .brand img { border-radius: 6px; }
+      .nav nav { display: flex; flex-wrap: wrap; gap: 1.4rem; }
       .nav nav a { color: var(--muted); font-size: 0.95rem; }
       .nav nav a:hover { color: var(--text); }
 
@@ -192,15 +194,15 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
 
       .install {
         display: inline-flex; align-items: center; gap: 1rem;
-        background: #0a0d08; border: 1px solid var(--border); border-radius: 10px;
+        background: #120f1a; border: 1px solid var(--border); border-radius: 10px;
         padding: 0.85rem 1.1rem; max-width: 100%;
       }
       .install code { color: var(--accent); font-size: 0.95rem; overflow-x: auto; white-space: nowrap; }
       .install button {
-        background: var(--accent); color: #0c0f0a; border: 0; border-radius: 6px;
+        background: var(--accent); color: var(--bg); border: 0; border-radius: 6px;
         padding: 0.35rem 0.9rem; font-weight: 600; cursor: pointer; flex-shrink: 0;
       }
-      .install button:hover { background: #bef264; }
+      .install button:hover { background: var(--accent-bright); }
       .install-alt { color: var(--muted); font-size: 0.82rem; margin-top: 0.8rem; }
       .install-alt code { color: var(--muted); }
 
@@ -210,8 +212,8 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
         border: 1px solid var(--border); color: var(--text); font-weight: 600;
       }
       .btn:hover { border-color: var(--accent-dim); }
-      .btn.primary { background: var(--accent); color: #0c0f0a; border-color: var(--accent); }
-      .btn.primary:hover { background: #bef264; }
+      .btn.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+      .btn.primary:hover { background: var(--accent-bright); }
 
       .features {
         display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
@@ -219,8 +221,9 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
       }
       .card {
         border: 1px solid var(--border); border-radius: 12px; padding: 1.4rem;
-        background: var(--panel);
+        background: var(--panel); transition: border-color 120ms ease;
       }
+      .card:hover { border-color: var(--accent-dim); }
       .card h3 { margin-bottom: 0.5rem; font-size: 1.05rem; }
       .card p { color: var(--muted); font-size: 0.95rem; }
 
