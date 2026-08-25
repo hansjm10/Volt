@@ -864,6 +864,11 @@ test("npm policy requires the exact Iroh wrapper while quarantining third-party 
 			installSearchFrom = match.index + match[0].length;
 		}
 		assert.doesNotMatch(workflow, /npm install -g npm@(?!11\.17\.0\b)/);
+		assert.doesNotMatch(
+			workflow,
+			/^\s+cache: npm$/m,
+			`${path} must not invoke the setup-node npm cache probe before installing pinned npm`,
+		);
 	}
 	assert.doesNotMatch(readFileSync(".github/workflows/prepare-release.yml", "utf8"), /min_release_age|--min-release-age=0/);
 });
