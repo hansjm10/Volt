@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import { REVIEW_FIX_ACTION_ID } from "../src/core/host-actions.ts";
+import { REVIEW_FIX_ACTION_ID, REVIEW_RERUN_ACTION_ID } from "../src/core/host-actions.ts";
 import type { ParsedReview } from "../src/core/review-report.ts";
 import { acknowledgeReviewRun, appendReviewRun, getReviewRun, type ReviewRunRecord } from "../src/core/review-state.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -78,6 +78,28 @@ function durableRecord(): ReviewRunRecord {
 	};
 }
 
+function durableBranchRecord(runId = "review:branch"): ReviewRunRecord {
+	const record = durableRecord();
+	return {
+		...record,
+		runId,
+		workflowAction: "review.branch",
+		target: {
+			...record.target,
+			description: "branch changes vs origin/main",
+			diffCommand: "git diff origin/main...HEAD",
+			identity: {
+				kind: "branch",
+				baseTree: "base-tree",
+				headTree: "head-tree",
+				baseCommit: "base-commit",
+				headCommit: "head-commit",
+			},
+			branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
+		},
+	};
+}
+
 describe("InteractiveMode durable review actions", () => {
 	test.each([
 		{ findingIds: "", acknowledgedAt: undefined },
@@ -129,5 +151,43 @@ describe("InteractiveMode durable review actions", () => {
 		if (testCase.acknowledgedAt !== undefined) expect(sourceAcknowledgedAt).toBe(testCase.acknowledgedAt);
 		expect(getReviewRun(replacementManager, "review:test")?.acknowledgedAt).toBe(sourceAcknowledgedAt);
 		expect(fakeThis.renderCurrentSessionState).toHaveBeenCalledOnce();
+	});
+
+	test("reruns a durable branch through its stored locator and rejects missing locators", async () => {
+		const manager = SessionManager.inMemory("/workspace");
+		appendReviewRun(manager, durableBranchRecord());
+		const runInteractiveReviewWorkflow = vi.fn(async () => ({ status: "cancelled" as const }));
+		const fakeThis = {
+			session: { sessionManager: manager },
+			getReviewToolsForRun: vi.fn(() => []),
+			runInteractiveReviewWorkflow,
+		};
+		const runInteractiveReviewLifecycleAction = Reflect.get(
+			InteractiveMode.prototype,
+			"runInteractiveReviewLifecycleAction",
+		) as (this: typeof fakeThis, action: string, args: Record<string, unknown>) => Promise<{ status: string }>;
+
+		await expect(
+			runInteractiveReviewLifecycleAction.call(fakeThis, REVIEW_RERUN_ACTION_ID, {
+				runId: "review:branch",
+				scopeMode: "incremental",
+			}),
+		).resolves.toMatchObject({ status: "cancelled" });
+		expect(runInteractiveReviewWorkflow).toHaveBeenCalledWith(
+			{
+				kind: "branch",
+				branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
+			},
+			expect.objectContaining({ parentRunId: "review:branch" }),
+		);
+
+		const missing = durableBranchRecord("review:missing-locator");
+		delete missing.target.branchBase;
+		appendReviewRun(manager, missing);
+		await expect(
+			runInteractiveReviewLifecycleAction.call(fakeThis, REVIEW_RERUN_ACTION_ID, {
+				runId: missing.runId,
+			}),
+		).rejects.toThrow("Durable branch review run does not retain a base locator.");
 	});
 });
