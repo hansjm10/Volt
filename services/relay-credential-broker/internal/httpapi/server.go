@@ -17,11 +17,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/appstore"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
 )
 
-const maxRequestBodyBytes = 4 * 1024
+const maxRequestBodyBytes = 64 * 1024
 
 type VerifiedAppCheck struct {
 	AppID           string
@@ -65,6 +66,7 @@ func (v *DevelopmentAppCheckVerifier) Verify(request *http.Request) (VerifiedApp
 type Config struct {
 	MaxConcurrentRequests         int
 	RefreshMinInterval            time.Duration
+	EntitlementReconcileInterval  time.Duration
 	MaxBootstrapRequestsPerMinute int
 	MaxApprovalRequestsPerMinute  int
 	MaxExchangeRequestsPerMinute  int
@@ -81,17 +83,20 @@ type requestBudget struct {
 }
 
 type Server struct {
-	broker            *broker.Broker
-	signer            *credential.Signer
-	appCheck          AppCheckVerifier
-	logger            *slog.Logger
-	requestSemaphore  chan struct{}
-	refreshRetryAfter string
-	readinessCheck    func(context.Context) error
-	bootstrapBudget   *requestBudget
-	approvalBudget    *requestBudget
-	exchangeBudget    *requestBudget
-	handler           http.Handler
+	broker                       *broker.Broker
+	signer                       *credential.Signer
+	appCheck                     AppCheckVerifier
+	appStore                     appstore.Verifier
+	logger                       *slog.Logger
+	requestSemaphore             chan struct{}
+	refreshRetryAfter            string
+	entitlementReconcileInterval time.Duration
+	readinessCheck               func(context.Context) error
+	now                          func() time.Time
+	bootstrapBudget              *requestBudget
+	approvalBudget               *requestBudget
+	exchangeBudget               *requestBudget
+	handler                      http.Handler
 }
 
 type createBootstrapClaimRequest struct {
@@ -105,8 +110,14 @@ type createExistingClaimRequest struct {
 }
 
 type approveClaimRequest struct {
-	AppNodeID           string `json:"appNodeId"`
-	AppRefreshTokenHash string `json:"appRefreshTokenHash"`
+	AppNodeID                    string `json:"appNodeId"`
+	AppRefreshTokenHash          string `json:"appRefreshTokenHash"`
+	SignedAppTransaction         string `json:"signedAppTransaction"`
+	AppStoreDeviceVerificationID string `json:"appStoreDeviceVerificationId"`
+}
+
+type appStoreNotificationRequest struct {
+	SignedPayload string `json:"signedPayload"`
 }
 
 type revokeAppEndpointRequest struct {
@@ -122,12 +133,20 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck AppCheckVerifier, config Config, logger *slog.Logger) (*Server, error) {
-	if brokerService == nil || signer == nil || appCheck == nil {
-		return nil, errors.New("broker, signer, and App Check verifier are required")
+func NewServer(
+	brokerService *broker.Broker,
+	signer *credential.Signer,
+	appCheck AppCheckVerifier,
+	appStore appstore.Verifier,
+	config Config,
+	logger *slog.Logger,
+) (*Server, error) {
+	if brokerService == nil || signer == nil || appCheck == nil || appStore == nil {
+		return nil, errors.New("broker, signer, App Check, and App Store verifiers are required")
 	}
-	if config.MaxConcurrentRequests <= 0 || config.RefreshMinInterval <= 0 {
-		return nil, errors.New("HTTP concurrency and refresh interval must be positive")
+	if config.MaxConcurrentRequests <= 0 || config.RefreshMinInterval <= 0 ||
+		config.EntitlementReconcileInterval <= 0 {
+		return nil, errors.New("HTTP concurrency and refresh intervals must be positive")
 	}
 	if config.MaxBootstrapRequestsPerMinute <= 0 || config.MaxApprovalRequestsPerMinute <= 0 || config.MaxExchangeRequestsPerMinute <= 0 {
 		return nil, errors.New("enrollment request budgets must be positive")
@@ -144,16 +163,19 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 
 	refreshRetryAfterSeconds := int((config.RefreshMinInterval + time.Second - 1) / time.Second)
 	server := &Server{
-		broker:            brokerService,
-		signer:            signer,
-		appCheck:          appCheck,
-		logger:            logger,
-		requestSemaphore:  make(chan struct{}, config.MaxConcurrentRequests),
-		refreshRetryAfter: strconv.Itoa(refreshRetryAfterSeconds),
-		readinessCheck:    config.ReadinessCheck,
-		bootstrapBudget:   newRequestBudget(config.MaxBootstrapRequestsPerMinute, config.Now),
-		approvalBudget:    newRequestBudget(config.MaxApprovalRequestsPerMinute, config.Now),
-		exchangeBudget:    newRequestBudget(config.MaxExchangeRequestsPerMinute, config.Now),
+		broker:                       brokerService,
+		signer:                       signer,
+		appCheck:                     appCheck,
+		appStore:                     appStore,
+		logger:                       logger,
+		requestSemaphore:             make(chan struct{}, config.MaxConcurrentRequests),
+		refreshRetryAfter:            strconv.Itoa(refreshRetryAfterSeconds),
+		entitlementReconcileInterval: config.EntitlementReconcileInterval,
+		readinessCheck:               config.ReadinessCheck,
+		now:                          config.Now,
+		bootstrapBudget:              newRequestBudget(config.MaxBootstrapRequestsPerMinute, config.Now),
+		approvalBudget:               newRequestBudget(config.MaxApprovalRequestsPerMinute, config.Now),
+		exchangeBudget:               newRequestBudget(config.MaxExchangeRequestsPerMinute, config.Now),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /livez", server.handleLive)
@@ -162,6 +184,7 @@ func NewServer(brokerService *broker.Broker, signer *credential.Signer, appCheck
 	mux.HandleFunc("POST /v1/pairing-claims", server.handleCreateClaim)
 	mux.HandleFunc("POST /v1/pairing-claims/{claimID}/approve", server.handleApproveClaim)
 	mux.HandleFunc("POST /v1/pairing-claims/{claimID}/exchange", server.handleExchangeClaim)
+	mux.HandleFunc("POST /v1/app-store/notifications", server.handleAppStoreNotification)
 	mux.HandleFunc("POST /v1/tokens/refresh", server.handleRefresh)
 	mux.HandleFunc("POST /v1/tokens/revoke", server.handleRevoke)
 	mux.HandleFunc("POST /v1/grant/endpoints/revoke", server.handleRevokeAppEndpoint)
@@ -298,17 +321,59 @@ func (s *Server) handleApproveClaim(writer http.ResponseWriter, request *http.Re
 		writeError(writer, http.StatusBadRequest, "invalid_app_refresh_token_hash")
 		return
 	}
+	entitlement, err := s.appStore.VerifyEntitlement(
+		request.Context(),
+		appstore.Proof{
+			SignedAppTransaction: body.SignedAppTransaction,
+			DeviceVerificationID: body.AppStoreDeviceVerificationID,
+		},
+	)
+	if err != nil {
+		s.writeAppStoreError(writer, err)
+		return
+	}
 	approval, err := s.broker.ApprovePairingClaim(request.Context(), request.PathValue("claimID"), broker.AppCheckProof{
 		AppID:           verifiedAppCheck.AppID,
 		JTIHash:         verifiedAppCheck.JTIHash,
 		ExpiresAt:       verifiedAppCheck.ExpiresAt,
 		ReplayProtected: verifiedAppCheck.ReplayProtected,
-	}, body.AppNodeID, appRefreshHash)
+	}, entitlement, body.AppNodeID, appRefreshHash)
 	if err != nil {
 		s.writeBrokerError(writer, err, "invalid_app_node_id")
 		return
 	}
 	writeJSON(writer, http.StatusOK, approval)
+}
+
+func (s *Server) handleAppStoreNotification(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	var body appStoreNotificationRequest
+	if err := decodeJSON(writer, request, &body); err != nil {
+		writeError(writer, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	notification, err := s.appStore.VerifyNotification(
+		request.Context(),
+		body.SignedPayload,
+	)
+	if err != nil {
+		s.writeAppStoreError(writer, err)
+		return
+	}
+	if notification.Test {
+		writer.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.broker.ApplyEntitlementNotification(
+		request.Context(),
+		notification,
+	); err != nil {
+		s.internalError(writer, "apply App Store notification", err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleExchangeClaim(writer http.ResponseWriter, request *http.Request) {
@@ -342,6 +407,46 @@ func (s *Server) handleRefresh(writer http.ResponseWriter, request *http.Request
 	if !ok {
 		writeError(writer, http.StatusUnauthorized, "refresh_token_required")
 		return
+	}
+	refreshEntitlement, err := s.broker.EntitlementForRefresh(
+		request.Context(),
+		refreshToken,
+	)
+	if err != nil {
+		s.writeAuthenticatedError(writer, err)
+		return
+	}
+	now := s.now().UTC()
+	if !refreshEntitlement.Active(now) ||
+		now.Sub(refreshEntitlement.LastVerifiedAt) >= s.entitlementReconcileInterval {
+		entitlement, reconcileErr := s.appStore.ReconcileEntitlement(
+			request.Context(),
+			refreshEntitlement.AppTransactionID,
+			refreshEntitlement.Environment,
+		)
+		if reconcileErr != nil {
+			if !refreshEntitlement.Active(now) {
+				if _, heartbeatErr := s.broker.RefreshAccessToken(
+					request.Context(),
+					refreshToken,
+				); heartbeatErr != nil &&
+					!errors.Is(heartbeatErr, broker.ErrSubscriptionRequired) {
+					s.writeAuthenticatedError(writer, heartbeatErr)
+					return
+				}
+			}
+			if !refreshEntitlement.Active(now) ||
+				!errors.Is(reconcileErr, appstore.ErrSubscriptionUnavailable) {
+				s.writeAppStoreError(writer, reconcileErr)
+				return
+			}
+		} else if err := s.broker.ApplyEntitlementReconciliation(
+			request.Context(),
+			entitlement,
+		); err != nil {
+			s.internalError(writer, "apply App Store reconciliation", err)
+			return
+		}
 	}
 	accessToken, err := s.broker.RefreshAccessToken(request.Context(), refreshToken)
 	if err != nil {
@@ -408,6 +513,23 @@ func (s *Server) handleRevokeGrant(writer http.ResponseWriter, request *http.Req
 	writer.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) writeAppStoreError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, appstore.ErrProofInvalid),
+		errors.Is(err, appstore.ErrEnvironmentInvalid),
+		errors.Is(err, appstore.ErrAppIdentifierInvalid),
+		errors.Is(err, appstore.ErrDeviceInvalid):
+		writeError(writer, http.StatusUnauthorized, "app_store_proof_invalid")
+	case errors.Is(err, appstore.ErrSubscriptionInactive):
+		writeError(writer, http.StatusPaymentRequired, "subscription_inactive")
+	case errors.Is(err, appstore.ErrSubscriptionUnavailable):
+		writer.Header().Set("Retry-After", "3600")
+		writeError(writer, http.StatusServiceUnavailable, "app_store_unavailable")
+	default:
+		s.internalError(writer, "verify App Store entitlement", err)
+	}
+}
+
 func (s *Server) writeClaimCreationError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, broker.ErrClaimCapacity):
@@ -441,6 +563,14 @@ func (s *Server) writeBrokerError(writer http.ResponseWriter, err error, invalid
 		writeError(writer, http.StatusBadRequest, invalidCode)
 	case errors.Is(err, broker.ErrRefreshExpired):
 		writeError(writer, http.StatusGone, "credential_expired")
+	case errors.Is(err, broker.ErrSubscriptionRequired):
+		writeError(writer, http.StatusPaymentRequired, "subscription_inactive")
+	case errors.Is(err, broker.ErrSubscriptionConflict):
+		writeError(writer, http.StatusConflict, "subscription_conflict")
+	case errors.Is(err, broker.ErrSubscriptionSuperseded):
+		writeError(writer, http.StatusConflict, "subscription_pairing_superseded")
+	case errors.Is(err, broker.ErrAppStoreProofReplay):
+		writeError(writer, http.StatusConflict, "app_store_proof_replayed")
 	case errors.Is(err, broker.ErrGrantRevoked), errors.Is(err, broker.ErrRefreshInvalid):
 		writeError(writer, http.StatusUnauthorized, "credential_invalid")
 	default:
@@ -454,6 +584,11 @@ func (s *Server) writeAuthenticatedError(writer http.ResponseWriter, err error) 
 		writeError(writer, http.StatusGone, "refresh_token_expired")
 	case errors.Is(err, broker.ErrRefreshInvalid), errors.Is(err, broker.ErrGrantRevoked):
 		writeError(writer, http.StatusUnauthorized, "refresh_token_invalid")
+	case errors.Is(err, broker.ErrSubscriptionRequired):
+		writer.Header().Set("Retry-After", "3600")
+		writeError(writer, http.StatusPaymentRequired, "subscription_inactive")
+	case errors.Is(err, broker.ErrSubscriptionConflict):
+		writeError(writer, http.StatusConflict, "subscription_conflict")
 	case errors.Is(err, broker.ErrEndpointNotFound):
 		writeError(writer, http.StatusNotFound, "endpoint_not_found")
 	case errors.Is(err, broker.ErrEndpointForbidden):

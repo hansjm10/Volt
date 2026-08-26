@@ -87,6 +87,7 @@ test("production registration route writes through the Firestore collection adap
 	assert.equal(writes[0].value.appId, appId);
 	assert.equal(writes[0].value.token, fcmToken);
 	assert.equal(writes[0].value.tokenHash, hashToken(fcmToken));
+	assert.equal(writes[0].value.grantId, undefined);
 	assert.equal(responseStatus, 201);
 	assert.equal(responseBody.pushTargetId, pushTargetId);
 	assert.equal(responseBody.tokenHash, hashToken(fcmToken));

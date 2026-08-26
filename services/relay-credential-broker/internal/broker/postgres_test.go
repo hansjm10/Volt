@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/appstore"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/testdatabase"
 )
@@ -49,6 +50,7 @@ func TestConcurrentApprovalIsAtomicAndReplaySafe(t *testing.T) {
 				context.Background(),
 				claim.ClaimID,
 				proofs[index],
+				postgresTestEntitlement(now, "subscription-concurrent"),
 				string(bytes.Repeat([]byte{'b'}, 64)),
 				postgresTestHash(appRefresh),
 			)
@@ -77,6 +79,7 @@ func TestConcurrentApprovalIsAtomicAndReplaySafe(t *testing.T) {
 		context.Background(),
 		claim.ClaimID,
 		proofs[0],
+		postgresTestEntitlement(now, "subscription-concurrent"),
 		string(bytes.Repeat([]byte{'b'}, 64)),
 		postgresTestHash(appRefresh),
 	); !errors.Is(err, ErrAppCheckReplay) {
@@ -88,6 +91,7 @@ func TestConcurrentApprovalIsAtomicAndReplaySafe(t *testing.T) {
 		context.Background(),
 		"missing-claim",
 		rollbackProof,
+		postgresTestEntitlement(now, "subscription-concurrent"),
 		string(bytes.Repeat([]byte{'b'}, 64)),
 		postgresTestHash(appRefresh),
 	); !errors.Is(err, ErrClaimNotFound) {
@@ -100,10 +104,208 @@ func TestConcurrentApprovalIsAtomicAndReplaySafe(t *testing.T) {
 		context.Background(),
 		claim.ClaimID,
 		rollbackProof,
+		postgresTestEntitlement(now, "subscription-concurrent"),
 		string(bytes.Repeat([]byte{'b'}, 64)),
 		postgresTestHash(appRefresh),
 	); err != nil {
 		t.Fatalf("App Check token rolled back with failed approval was not reusable: %v", err)
+	}
+}
+
+func TestNewDaemonRevokesPreviousSubscriptionGrantAndFencesStaleClaim(t *testing.T) {
+	pool := testdatabase.Open(t)
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	service := newPostgresBroker(t, pool, &now)
+	entitlement := postgresTestEntitlement(now, "subscription-transfer")
+
+	oldClaimSecret := postgresTestSecret("vpc_", 41)
+	oldHostRefresh := postgresTestSecret("vrr_", 42)
+	oldAppRefresh := postgresTestSecret("vrr_", 43)
+	oldClaim, err := service.CreateBootstrapPairingClaim(
+		context.Background(),
+		string(bytes.Repeat([]byte{'1'}, 64)),
+		postgresTestHash(oldClaimSecret),
+		postgresTestHash(oldHostRefresh),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApprovePairingClaim(
+		context.Background(),
+		oldClaim.ClaimID,
+		postgresTestAppCheck(now, "transfer-old"),
+		entitlement,
+		string(bytes.Repeat([]byte{'2'}, 64)),
+		postgresTestHash(oldAppRefresh),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ExchangePairingClaim(
+		context.Background(),
+		oldClaim.ClaimID,
+		oldClaimSecret,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	replayClaim, err := service.CreateBootstrapPairingClaim(
+		context.Background(),
+		string(bytes.Repeat([]byte{'9'}, 64)),
+		postgresTestHash(postgresTestSecret("vpc_", 60)),
+		postgresTestHash(postgresTestSecret("vrr_", 61)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApprovePairingClaim(
+		context.Background(),
+		replayClaim.ClaimID,
+		postgresTestAppCheck(now, "transfer-replay"),
+		entitlement,
+		string(bytes.Repeat([]byte{'a'}, 64)),
+		postgresTestHash(postgresTestSecret("vrr_", 62)),
+	); !errors.Is(err, ErrAppStoreProofReplay) {
+		t.Fatalf("cross-claim proof replay = %v, want %v", err, ErrAppStoreProofReplay)
+	}
+
+	now = now.Add(time.Second)
+	newClaimSecret := postgresTestSecret("vpc_", 44)
+	newHostRefresh := postgresTestSecret("vrr_", 45)
+	newAppRefresh := postgresTestSecret("vrr_", 46)
+	newClaim, err := service.CreateBootstrapPairingClaim(
+		context.Background(),
+		string(bytes.Repeat([]byte{'3'}, 64)),
+		postgresTestHash(newClaimSecret),
+		postgresTestHash(newHostRefresh),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newEntitlement := postgresTestEntitlement(now, "subscription-transfer")
+	if _, err := service.ApprovePairingClaim(
+		context.Background(),
+		newClaim.ClaimID,
+		postgresTestAppCheck(now, "transfer-new"),
+		newEntitlement,
+		string(bytes.Repeat([]byte{'4'}, 64)),
+		postgresTestHash(newAppRefresh),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RefreshAccessToken(
+		context.Background(),
+		oldHostRefresh,
+	); !errors.Is(err, ErrRefreshInvalid) {
+		t.Fatalf("old host refresh after transfer = %v, want %v", err, ErrRefreshInvalid)
+	}
+	if _, err := service.RefreshAccessToken(
+		context.Background(),
+		oldAppRefresh,
+	); !errors.Is(err, ErrRefreshInvalid) {
+		t.Fatalf("old app refresh after transfer = %v, want %v", err, ErrRefreshInvalid)
+	}
+	if _, err := service.ExchangePairingClaim(
+		context.Background(),
+		newClaim.ClaimID,
+		newClaimSecret,
+	); err != nil {
+		t.Fatalf("new daemon exchange failed: %v", err)
+	}
+
+	staleClaimSecret := postgresTestSecret("vpc_", 47)
+	staleHostRefresh := postgresTestSecret("vrr_", 48)
+	staleClaim, err := service.CreateBootstrapPairingClaim(
+		context.Background(),
+		string(bytes.Repeat([]byte{'5'}, 64)),
+		postgresTestHash(staleClaimSecret),
+		postgresTestHash(staleHostRefresh),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	latestClaimSecret := postgresTestSecret("vpc_", 49)
+	latestHostRefresh := postgresTestSecret("vrr_", 50)
+	latestClaim, err := service.CreateBootstrapPairingClaim(
+		context.Background(),
+		string(bytes.Repeat([]byte{'6'}, 64)),
+		postgresTestHash(latestClaimSecret),
+		postgresTestHash(latestHostRefresh),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latestEntitlement := postgresTestEntitlement(now, "subscription-transfer")
+	if _, err := service.ApprovePairingClaim(
+		context.Background(),
+		latestClaim.ClaimID,
+		postgresTestAppCheck(now, "transfer-latest"),
+		latestEntitlement,
+		string(bytes.Repeat([]byte{'7'}, 64)),
+		postgresTestHash(postgresTestSecret("vrr_", 51)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	staleEntitlement := latestEntitlement
+	staleEntitlement.ApprovalProofHash = sha256.Sum256(
+		[]byte("stale-transfer-proof"),
+	)
+	if _, err := service.ApprovePairingClaim(
+		context.Background(),
+		staleClaim.ClaimID,
+		postgresTestAppCheck(now, "transfer-stale"),
+		staleEntitlement,
+		string(bytes.Repeat([]byte{'8'}, 64)),
+		postgresTestHash(postgresTestSecret("vrr_", 52)),
+	); !errors.Is(err, ErrSubscriptionSuperseded) {
+		t.Fatalf("stale pairing approval = %v, want %v", err, ErrSubscriptionSuperseded)
+	}
+
+	now = now.Add(time.Second)
+	inactiveEntitlement := postgresTestEntitlement(
+		now,
+		"subscription-transfer",
+	)
+	inactiveEntitlement.Status = appstore.StatusExpired
+	inactiveEntitlement.EntitledUntil = time.Time{}
+	if err := service.ApplyEntitlementNotification(
+		context.Background(),
+		appstore.Notification{
+			UUID:        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+			Entitlement: inactiveEntitlement,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	for heartbeat := 0; heartbeat < 4; heartbeat++ {
+		if _, err := service.RefreshAccessToken(
+			context.Background(),
+			latestHostRefresh,
+		); !errors.Is(err, ErrSubscriptionRequired) {
+			t.Fatalf("inactive subscription refresh = %v, want %v", err, ErrSubscriptionRequired)
+		}
+		now = now.Add(29 * 24 * time.Hour)
+	}
+
+	now = now.Add(time.Second)
+	activeEntitlement := postgresTestEntitlement(
+		now,
+		"subscription-transfer",
+	)
+	if err := service.ApplyEntitlementNotification(
+		context.Background(),
+		appstore.Notification{
+			UUID:        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+			Entitlement: activeEntitlement,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RefreshAccessToken(
+		context.Background(),
+		latestHostRefresh,
+	); err != nil {
+		t.Fatalf("renewed subscription did not resume refresh: %v", err)
 	}
 }
 
@@ -127,6 +329,7 @@ func TestExchangeRefreshExpiryAndRevocationPersistAcrossBrokerRestart(t *testing
 		context.Background(),
 		claim.ClaimID,
 		postgresTestAppCheck(now, "restart-approval"),
+		postgresTestEntitlement(now, "subscription-restart"),
 		string(bytes.Repeat([]byte{'d'}, 64)),
 		postgresTestHash(appRefresh),
 	); err != nil {
@@ -224,6 +427,7 @@ func TestAppRefreshObservesHostInactivityExpiry(t *testing.T) {
 		context.Background(),
 		claim.ClaimID,
 		postgresTestAppCheck(now, "host-inactivity-approval"),
+		postgresTestEntitlement(now, "subscription-inactivity"),
 		string(bytes.Repeat([]byte{'f'}, 64)),
 		postgresTestHash(appRefresh),
 	); err != nil {
@@ -303,6 +507,22 @@ func postgresTestSecret(prefix string, fill byte) string {
 
 func postgresTestHash(value string) SecretHash {
 	return SecretHash(sha256.Sum256([]byte(value)))
+}
+
+func postgresTestEntitlement(now time.Time, id string) appstore.Entitlement {
+	proofHash := sha256.Sum256([]byte(id + now.String()))
+	return appstore.Entitlement{
+		AppTransactionID:    id,
+		ApprovalProofHash:   proofHash,
+		ProofCreatedAt:      now,
+		Environment:         "Sandbox",
+		ProductID:           "com.hansjm10.volt.pro.annual",
+		SubscriptionGroupID: "test-group",
+		Status:              appstore.StatusActive,
+		EntitledUntil:       now.Add(365 * 24 * time.Hour),
+		SourceSignedAt:      now,
+		VerifiedAt:          now,
+	}
 }
 
 func postgresTestAppCheck(now time.Time, jti string) AppCheckProof {

@@ -18,6 +18,9 @@ func TestLoadConfigSelectsCloudKMSSigning(t *testing.T) {
 	if len(configuration.KMSRetiringKeyVersions) != 2 {
 		t.Fatalf("retiring key versions = %v, want two", configuration.KMSRetiringKeyVersions)
 	}
+	if len(configuration.AppStoreEnvironments) != 1 || configuration.AppStoreEnvironments[0] != "Production" {
+		t.Fatalf("unsafe default App Store environments: %v", configuration.AppStoreEnvironments)
+	}
 	if configuration.MaxBootstrapRequestsPerMin != 60 || configuration.MaxApprovalRequestsPerMin != 120 || configuration.MaxExchangeRequestsPerMin != 600 {
 		t.Fatalf("unexpected enrollment request budgets: %+v", configuration)
 	}
@@ -32,6 +35,17 @@ func TestLoadConfigSelectsExplicitLocalSigning(t *testing.T) {
 	}
 	if configuration.SigningMode != "local" || configuration.SigningKeyPath != defaultSigningKey {
 		t.Fatalf("unexpected local signing configuration: %+v", configuration)
+	}
+}
+
+func TestLoadConfigRejectsDevelopmentEntitlementForProductionIssuer(t *testing.T) {
+	setMinimumEnvironment(t)
+	t.Setenv("VOLT_CREDENTIAL_SIGNING_MODE", "local")
+	t.Setenv("VOLT_CREDENTIAL_ISSUER", "https://credentials.volt-cli.dev")
+	t.Setenv("VOLT_APP_STORE_MODE", "development")
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("production issuer accepted development App Store authority")
 	}
 }
 
@@ -77,6 +91,18 @@ func setMinimumEnvironment(t *testing.T) {
 		"VOLT_CREDENTIAL_KMS_RETIRING_KEY_VERSIONS",
 		"VOLT_FIREBASE_PROJECT_NUMBER",
 		"VOLT_ALLOWED_FIREBASE_APP_IDS",
+		"VOLT_APP_STORE_MODE",
+		"VOLT_DEVELOPMENT_APP_STORE_PROOF",
+		"VOLT_APP_STORE_PRIVATE_KEY",
+		"VOLT_APP_STORE_KEY_ID",
+		"VOLT_APP_STORE_ISSUER_ID",
+		"VOLT_APP_STORE_BUNDLE_ID",
+		"VOLT_APP_STORE_APP_APPLE_ID",
+		"VOLT_APP_STORE_SUBSCRIPTION_GROUP_ID",
+		"VOLT_APP_STORE_PRODUCT_IDS",
+		"VOLT_APP_STORE_ENVIRONMENTS",
+		"VOLT_APP_STORE_RECONCILE_INTERVAL",
+		"VOLT_APP_STORE_ROOT_CERTIFICATES_BASE64",
 		"VOLT_CREDENTIAL_CLAIM_TTL",
 		"VOLT_CREDENTIAL_ACCESS_TTL",
 		"VOLT_CREDENTIAL_REFRESH_INACTIVITY_TTL",
@@ -94,4 +120,6 @@ func setMinimumEnvironment(t *testing.T) {
 	t.Setenv("VOLT_CREDENTIAL_DATABASE_URL", "postgres://test.invalid/volt")
 	t.Setenv("VOLT_APP_CHECK_MODE", "development")
 	t.Setenv("VOLT_DEVELOPMENT_APP_CHECK_TOKEN", "development-app-check-token-value")
+	t.Setenv("VOLT_APP_STORE_MODE", "development")
+	t.Setenv("VOLT_DEVELOPMENT_APP_STORE_PROOF", "development-app-store-proof-value")
 }

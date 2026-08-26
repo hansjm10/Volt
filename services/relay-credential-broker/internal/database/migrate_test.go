@@ -36,7 +36,16 @@ func TestMigrationsCreateAcceptedSchemaAndAreIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	sort.Strings(tables)
-	expected := []string{"consumed_app_check_tokens", "endpoints", "grants", "pairing_claims"}
+	expected := []string{
+		"app_store_approval_proofs",
+		"app_store_entitlements",
+		"app_store_notifications",
+		"consumed_app_check_tokens",
+		"endpoints",
+		"grant_entitlements",
+		"grants",
+		"pairing_claims",
+	}
 	if len(tables) != len(expected) {
 		t.Fatalf("tables = %v, want %v", tables, expected)
 	}
@@ -45,8 +54,8 @@ func TestMigrationsCreateAcceptedSchemaAndAreIdempotent(t *testing.T) {
 			t.Fatalf("tables = %v, want %v", tables, expected)
 		}
 	}
-	if got := testdatabase.Count(t, pool, "schema_migrations"); got != 1 {
-		t.Fatalf("migration row count = %d, want 1", got)
+	if got := testdatabase.Count(t, pool, "schema_migrations"); got != 2 {
+		t.Fatalf("migration row count = %d, want 2", got)
 	}
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO schema_migrations (version, name, checksum)

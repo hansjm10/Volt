@@ -1,6 +1,6 @@
 # Managed relay credentials production design
 
-- Status: Accepted; PostgreSQL broker, Firebase Admin verification, Cloud KMS signing, and normal daemon/iOS clients implemented
+- Status: Accepted; PostgreSQL broker, Firebase and App Store verification, Cloud KMS signing, and normal daemon/iOS clients implemented
 - Workspaces: `Volt` broker/daemon/relay integration and `volt-app` iOS client
 - Broker: `services/relay-credential-broker`
 
@@ -14,8 +14,9 @@ iOS / voltd
     -> one stateless Go credential broker
     -> one Cloud SQL PostgreSQL database
     -> one Cloud KMS Ed25519 signing key ring
+    -> App Store Server API and signed V2 notifications
 
-Iroh relays verify short-lived JWTs locally from a deployment-managed public key set.
+Iroh relays verify short-lived JWTs locally from a deployment-managed public key set. The broker, not StoreKit UI state, authorizes Volt-operated relay use.
 ```
 
 Managed deployment authority is an exact pair, not a shared Volt-wide broker allowlist:
@@ -27,7 +28,7 @@ Managed deployment authority is an exact pair, not a shared Volt-wide broker all
 
 Built-in clients reject a production/canary cross-binding or any other explicit broker origin. A custom relay set has no managed broker authority and remains self-managed. Both authority pairs are separately deployed as of 2026-08-23; managed credential client code remains unreleased until the normal product release workflow completes.
 
-The production design deliberately does not add accounts, OAuth, Redis, queues, token introspection, per-relay broker calls, device fingerprinting, or separate pairing, refresh, and signing services.
+The production design deliberately does not add Volt accounts, OAuth, Redis, queues, token introspection, per-relay broker calls, or separate pairing, refresh, and signing services. Apple `appTransactionID` supplies a stable app-scoped customer identity, and AppTransaction device verification proves that the submitted JWS belongs to the requesting device.
 
 The protocol is replaced in place before production. There are no users and no compatibility path is required for the POC exchange files or Debug-only canary bootstrap.
 
@@ -38,7 +39,7 @@ The protocol is replaced in place before production. There are no users and no c
 3. Approval replay protection and credential state are atomic across every broker replica.
 4. Clients can refresh, restart, and revoke without changing their Iroh endpoint identity.
 5. Relays remain available without a live broker request in the connection path.
-6. The initial deployment costs roughly $10-15/month and can move to regional HA without a protocol change.
+6. One subscription can move managed access between daemon identities without leaving concurrent refresh authority behind.
 
 ## Security invariants
 
@@ -46,8 +47,9 @@ The protocol is replaced in place before production. There are no users and no c
 - Host and app endpoints never share refresh authority.
 - The host relay token is never serialized into an app-facing pairing ticket.
 - Refresh and claim tokens are random 256-bit prefixed values. PostgreSQL stores only SHA-256 hashes of the complete prefixed token.
-- App approval requires a valid allowlisted Firebase App Check limited-use token.
-- App Check `jti` consumption commits in the same database transaction as approval.
+- App approval requires a valid allowlisted Firebase App Check limited-use token plus an independently verified Apple AppTransaction JWS and device digest.
+- The broker trusts only reviewed Apple roots, validates Apple's certificate OIDs and ES256 signature, requires a freshly refreshed device-bound AppTransaction, consumes its semantic payload identity for one claim only, and re-queries current subscription status from a fixed Apple API origin.
+- App Check `jti` consumption, entitlement binding, old-grant revocation, and endpoint creation commit in the same database transaction as approval.
 - Credential-bearing HTTP requests require HTTPS, reject redirects, bound request and response sizes, and never place secrets in URLs or logs.
 - Revocation stops future refreshes. Already issued access JWTs remain valid only through the short access-token TTL.
 - Relay key rotation always has an overlap period in which both active and retiring public keys are accepted.
@@ -81,9 +83,15 @@ A grant represents one persistent daemon identity, not one pairing attempt or so
 
 This matches the daemon's single persistent Iroh endpoint and single active managed host credential.
 
+### One active daemon per App Store identity
+
+A verified Apple `appTransactionID` may bind to one non-revoked daemon grant. Pairing a newer bootstrap claim for that identity atomically revokes the previous grant and every host/app endpoint before binding the replacement. Claim creation time fences delayed older approvals, so an older App Store lookup cannot steal authority back from a newer pairing. Existing access JWTs remain usable only until their short expiry.
+
+A subscription cancellation remains entitled through its paid expiration, and billing grace remains entitled through Apple's grace date. Billing retry without grace, expiry, refund, or revocation stops new JWT issuance. The broker retains the current daemon's refresh hashes while a subscription is merely inactive so signed renewal notifications can restore access without pairing again; grant transfer is the operation that revokes old keys.
+
 ## PostgreSQL schema
 
-PostgreSQL is the only durable application store. The initial schema has four state tables plus the migration table.
+PostgreSQL is the only durable application store. Entitlement and notification state live beside the existing credential tables.
 
 ### `grants`
 
@@ -144,9 +152,13 @@ Expired claims are deleted after a short operational retention window. A bootstr
 
 The primary key is the global replay barrier. Rows can be pruned after `expires_at` plus clock skew.
 
+### App Store entitlement tables
+
+`app_store_entitlements` stores one bounded record per Apple `appTransactionID`: environment, configured product/group, normalized status, effective entitlement expiry, Apple source signed time, and verification time. `grant_entitlements` has a unique subscription identity and one grant primary key, making one active daemon the database-enforced policy. `app_store_approval_proofs` hashes the verified AppTransaction payload and permits reuse only for an exact retry of the same claim; a different claim must obtain a freshly refreshed proof. `app_store_notifications` deduplicates signed V2 notifications by UUID for a bounded retention period. No compact JWS, device verification ID, Apple API token, or receipt body is persisted.
+
 ### What is not stored
 
-PostgreSQL never stores plaintext refresh tokens, claim secrets, Iroh private keys, JWT signing private keys, access JWTs, request bodies, IP addresses, or metrics.
+PostgreSQL never stores plaintext refresh tokens, claim secrets, Iroh private keys, JWT signing private keys, App Store API private keys, compact Apple JWS values, access JWTs, request bodies, IP addresses, or metrics.
 
 ## HTTP protocol
 
@@ -194,17 +206,22 @@ Requires exactly one limited-use Firebase App Check token. Body:
 ```json
 {
   "appNodeId": "<node-id>",
-  "appRefreshTokenHash": "<base64url-sha256>"
+  "appRefreshTokenHash": "<base64url-sha256>",
+  "signedAppTransaction": "<compact-Apple-JWS>",
+  "appStoreDeviceVerificationId": "<device-UUID>"
 }
 ```
 
-The approval transaction:
+Before mutation, the broker verifies the Apple chain, signature, exact app/environment, recent receipt creation time, and SHA-384 device digest, then queries Get All Subscription Statuses using the verified `appTransactionID`. The approval transaction:
 
 1. inserts the verified App Check `jti` hash;
-2. locks and validates the unexpired claim;
-3. for bootstrap, creates the grant and host endpoint;
-4. creates the app endpoint, or accepts an exact retry with the same node and refresh hash;
-5. records approval.
+2. upserts and locks the Apple entitlement without allowing an older signed or earlier-started verification to replace newer state;
+3. locks and validates the unexpired claim;
+4. consumes the verified AppTransaction payload identity for this claim, rejecting cross-claim replay while allowing exact response-loss retry;
+5. revokes any older daemon grant bound to this subscription, unless a newer claim already superseded this one;
+6. for bootstrap, creates and binds the replacement grant and host endpoint;
+7. creates the app endpoint, or accepts an exact retry with the same node and refresh hash;
+8. records approval.
 
 A reused App Check `jti` fails the entire transaction. A retry after response loss obtains a fresh App Check token and sends the same app refresh hash. After commit, KMS signs an app access JWT. If signing fails, committed approval remains retryable and no secret is lost.
 
@@ -222,9 +239,15 @@ The daemon treats a successful response as the point at which the pre-persisted 
 
 `POST /v1/tokens/refresh`
 
-Authenticated with an endpoint refresh secret and an empty body. One database transaction locks the endpoint, rejects revoked or inactive-expired records, applies the minimum refresh interval, extends the 90-day inactivity expiry, and records the refresh. KMS signs the access JWT after commit.
+Authenticated with an endpoint refresh secret and an empty body. Before issuance, the broker re-queries Apple when cached status is inactive or older than the configured reconciliation interval; this recovers missed renewal/refund notifications for every daemon actively consuming service. One database transaction then locks the endpoint, requires its grant's cached Apple entitlement to be active or in billing grace with a future expiry, applies the minimum refresh interval, extends the 90-day inactivity expiry, and records the refresh. KMS signs the access JWT after commit.
 
-The response contains only the access JWT and access expiry. The refresh secret is unchanged. Database acceptance is the linearization point: a concurrent revoke that commits later does not invalidate an access JWT already accepted for issuance.
+The response contains only the access JWT and access expiry. The refresh secret is unchanged. An inactive subscription returns `402 subscription_inactive` with a bounded retry interval; the denied request extends only the unrevoked endpoint/host inactivity deadline as a suspension heartbeat, mints no JWT, and lets the relay remove the expired JWT. Database acceptance is the linearization point: a concurrent transfer that commits later does not invalidate an access JWT already accepted for issuance.
+
+### App Store Server Notifications V2
+
+`POST /v1/app-store/notifications`
+
+The public endpoint accepts only `{ "signedPayload": "<compact-JWS>" }`. It verifies the Apple chain, notification app/environment, and nested transaction before querying current subscription status from Apple. PostgreSQL deduplicates `notificationUUID` and fences status updates by Apple signed time. Signed `TEST` notifications receive `204` without changing entitlement state. Apple retries any transient verification or status-query failure.
 
 ### Revoke endpoint
 

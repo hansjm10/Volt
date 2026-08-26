@@ -143,6 +143,7 @@ import {
 	type IrohManagedRelayAppEndpoint,
 	type IrohManagedRelayCredential,
 	type IrohManagedRelayCredentialClaim,
+	IrohRelayCredentialSubscriptionInactiveError,
 	managedRelayCredentialFailureRetryMs,
 	managedRelayCredentialPendingRetryMs,
 	managedRelayCredentialRateLimitRetryMs,
@@ -920,7 +921,10 @@ class IrohDaemonService {
 		this.stateManager = services.stateManager;
 		this.trustStore = new ProjectTrustStore(services.agentDir);
 		this.pushRelayClient = new IrohRemotePushRelayHttpClient({
-			authToken: config.pushRelayAuthToken ?? process.env.VOLT_PUSH_RELAY_AUTH_TOKEN,
+			authToken: () =>
+				this.managedRelayCredential?.accessToken ??
+				config.pushRelayAuthToken ??
+				process.env.VOLT_PUSH_RELAY_AUTH_TOKEN,
 			baseUrl: config.pushRelayUrl ?? process.env.VOLT_PUSH_RELAY_URL,
 		});
 		this.runtimes = new IntegratedRuntimeRegistry({
@@ -1824,12 +1828,13 @@ class IrohDaemonService {
 					) {
 						return;
 					}
-					const nextFailureCount = Math.min(consecutiveFailureCount + 1, 6);
+					const subscriptionInactive = error instanceof IrohRelayCredentialSubscriptionInactiveError;
+					const nextFailureCount = subscriptionInactive ? 0 : Math.min(consecutiveFailureCount + 1, 6);
 					this.log("warn", "managed Iroh relay credential refresh failed", {
 						error: error instanceof Error ? error.message : String(error),
 					});
 					this.scheduleManagedRelayCredentialRefresh(
-						managedRelayCredentialFailureRetryMs(nextFailureCount),
+						subscriptionInactive ? error.retryAfterMs : managedRelayCredentialFailureRetryMs(nextFailureCount),
 						nextFailureCount,
 					);
 				})

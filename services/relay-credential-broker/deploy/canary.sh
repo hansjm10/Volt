@@ -18,6 +18,13 @@ KMS_KEY="signing"
 ISSUER="https://credentials-canary.volt-cli.dev"
 AUDIENCE="volt-iroh-relay-canary"
 FIREBASE_APP_ID="1:546623825529:ios:9f5a707e3f4ef89154d6a8"
+APP_STORE_APP_APPLE_ID="${VOLT_APP_STORE_CANARY_APP_APPLE_ID:-}"
+APP_STORE_KEY_ID="${VOLT_APP_STORE_CANARY_KEY_ID:-}"
+APP_STORE_ISSUER_ID="${VOLT_APP_STORE_CANARY_ISSUER_ID:-}"
+APP_STORE_SUBSCRIPTION_GROUP_ID="${VOLT_APP_STORE_CANARY_SUBSCRIPTION_GROUP_ID:-}"
+APP_STORE_PRIVATE_KEY_SECRET="${VOLT_APP_STORE_CANARY_PRIVATE_KEY_SECRET:-app-store-server-api-private-key}"
+APP_STORE_ROOT_CERTIFICATES_SECRET="${VOLT_APP_STORE_CANARY_ROOT_CERTIFICATES_SECRET:-app-store-root-certificates-base64}"
+APP_STORE_PRODUCT_IDS="com.hansjm10.volt.pro.monthly,com.hansjm10.volt.pro.annual"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPOSITORY_ROOT="$(git -C "$SERVICE_DIR" rev-parse --show-toplevel)"
@@ -35,6 +42,12 @@ Environment overrides:
   VOLT_CREDENTIAL_CANARY_REGION      GCP region (default: us-central1)
   VOLT_CREDENTIAL_CANARY_IMAGE_TAG   image tag (default: current commit)
   VOLT_CREDENTIAL_CANARY_PUBLIC      set to 1 only after public-edge controls are ready
+  VOLT_APP_STORE_CANARY_APP_APPLE_ID numeric App Store app identifier
+  VOLT_APP_STORE_CANARY_KEY_ID       App Store Server API key ID
+  VOLT_APP_STORE_CANARY_ISSUER_ID    App Store Connect issuer ID
+  VOLT_APP_STORE_CANARY_SUBSCRIPTION_GROUP_ID exact Volt Pro group ID
+  VOLT_APP_STORE_CANARY_PRIVATE_KEY_SECRET Secret Manager .p8 secret name
+  VOLT_APP_STORE_CANARY_ROOT_CERTIFICATES_SECRET Secret Manager Apple roots secret name
 USAGE
 }
 
@@ -69,8 +82,18 @@ preflight() {
 		"$PROJECT_ID" "$project_number" "$REGION" "$account" "$IMAGE"
 }
 
+require_app_store_authority() {
+	if [[ -z "$APP_STORE_APP_APPLE_ID" || -z "$APP_STORE_KEY_ID" || -z "$APP_STORE_ISSUER_ID" || -z "$APP_STORE_SUBSCRIPTION_GROUP_ID" ]]; then
+		echo "App Store canary authority environment is incomplete" >&2
+		exit 1
+	fi
+	gcloud secrets describe "$APP_STORE_PRIVATE_KEY_SECRET" --project "$PROJECT_ID" >/dev/null
+	gcloud secrets describe "$APP_STORE_ROOT_CERTIFICATES_SECRET" --project "$PROJECT_ID" >/dev/null
+}
+
 provision() {
 	preflight
+	require_app_store_authority
 	gcloud services enable \
 		artifactregistry.googleapis.com \
 		cloudbuild.googleapis.com \
@@ -163,6 +186,12 @@ provision() {
 		--project "$PROJECT_ID" \
 		--member "serviceAccount:${SERVICE_ACCOUNT}" \
 		--role roles/secretmanager.secretAccessor --quiet >/dev/null
+	for secret in "$APP_STORE_PRIVATE_KEY_SECRET" "$APP_STORE_ROOT_CERTIFICATES_SECRET"; do
+		gcloud secrets add-iam-policy-binding "$secret" \
+			--project "$PROJECT_ID" \
+			--member "serviceAccount:${SERVICE_ACCOUNT}" \
+			--role roles/secretmanager.secretAccessor --quiet >/dev/null
+	done
 	gcloud kms keys add-iam-policy-binding "$KMS_KEY" \
 		--project "$PROJECT_ID" --location "$REGION" --keyring "$KMS_KEYRING" \
 		--member "serviceAccount:${SERVICE_ACCOUNT}" \
@@ -186,6 +215,7 @@ build_image() {
 
 deploy_service() {
 	preflight
+	require_app_store_authority
 	local kms_version public_flag
 	kms_version="$(gcloud kms keys versions list \
 		--project "$PROJECT_ID" --location "$REGION" --keyring "$KMS_KEYRING" \
@@ -210,11 +240,11 @@ deploy_service() {
 		--cpu 1 --memory 512Mi \
 		--concurrency 16 \
 		--min-instances 0 --max-instances 1 \
-		--timeout 15s \
+		--timeout 20s \
 		--execution-environment gen2 \
 		--add-cloudsql-instances "$CONNECTION_NAME" \
-		--set-secrets "VOLT_CREDENTIAL_DATABASE_URL=${DATABASE_SECRET}:latest" \
-		--set-env-vars "VOLT_CREDENTIAL_LISTEN=0.0.0.0:8080,VOLT_CREDENTIAL_ISSUER=${ISSUER},VOLT_CREDENTIAL_AUDIENCE=${AUDIENCE},VOLT_CREDENTIAL_SIGNING_MODE=kms,VOLT_CREDENTIAL_KMS_ACTIVE_KEY_VERSION=${kms_version},VOLT_APP_CHECK_MODE=firebase,VOLT_FIREBASE_PROJECT_NUMBER=${EXPECTED_PROJECT_NUMBER},VOLT_ALLOWED_FIREBASE_APP_IDS=${FIREBASE_APP_ID},VOLT_CREDENTIAL_MAX_CLAIMS=500,VOLT_CREDENTIAL_MAX_ENDPOINTS=5000,VOLT_CREDENTIAL_MAX_APP_ENDPOINTS_PER_GRANT=8,VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS=32,VOLT_CREDENTIAL_MAX_BOOTSTRAP_REQUESTS_PER_MINUTE=30,VOLT_CREDENTIAL_MAX_APPROVAL_REQUESTS_PER_MINUTE=60,VOLT_CREDENTIAL_MAX_EXCHANGE_REQUESTS_PER_MINUTE=300" \
+		--set-secrets "VOLT_CREDENTIAL_DATABASE_URL=${DATABASE_SECRET}:latest,VOLT_APP_STORE_PRIVATE_KEY=${APP_STORE_PRIVATE_KEY_SECRET}:latest,VOLT_APP_STORE_ROOT_CERTIFICATES_BASE64=${APP_STORE_ROOT_CERTIFICATES_SECRET}:latest" \
+		--set-env-vars "VOLT_CREDENTIAL_LISTEN=0.0.0.0:8080,VOLT_CREDENTIAL_ISSUER=${ISSUER},VOLT_CREDENTIAL_AUDIENCE=${AUDIENCE},VOLT_CREDENTIAL_SIGNING_MODE=kms,VOLT_CREDENTIAL_KMS_ACTIVE_KEY_VERSION=${kms_version},VOLT_APP_CHECK_MODE=firebase,VOLT_FIREBASE_PROJECT_NUMBER=${EXPECTED_PROJECT_NUMBER},VOLT_ALLOWED_FIREBASE_APP_IDS=${FIREBASE_APP_ID},VOLT_APP_STORE_MODE=apple,VOLT_APP_STORE_BUNDLE_ID=com.hansjm10.volt,VOLT_APP_STORE_APP_APPLE_ID=${APP_STORE_APP_APPLE_ID},VOLT_APP_STORE_KEY_ID=${APP_STORE_KEY_ID},VOLT_APP_STORE_ISSUER_ID=${APP_STORE_ISSUER_ID},VOLT_APP_STORE_SUBSCRIPTION_GROUP_ID=${APP_STORE_SUBSCRIPTION_GROUP_ID},VOLT_APP_STORE_PRODUCT_IDS=${APP_STORE_PRODUCT_IDS},VOLT_APP_STORE_ENVIRONMENTS=Sandbox,VOLT_CREDENTIAL_MAX_CLAIMS=500,VOLT_CREDENTIAL_MAX_ENDPOINTS=5000,VOLT_CREDENTIAL_MAX_APP_ENDPOINTS_PER_GRANT=8,VOLT_CREDENTIAL_MAX_CONCURRENT_REQUESTS=32,VOLT_CREDENTIAL_MAX_BOOTSTRAP_REQUESTS_PER_MINUTE=30,VOLT_CREDENTIAL_MAX_APPROVAL_REQUESTS_PER_MINUTE=60,VOLT_CREDENTIAL_MAX_EXCHANGE_REQUESTS_PER_MINUTE=300" \
 		--labels 'service=relay-credential-broker,environment=canary' \
 		"$public_flag" \
 		--quiet
