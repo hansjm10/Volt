@@ -65,6 +65,21 @@ import type { SettingsManager } from "./settings-manager.ts";
 export type { ParsedReview, ReviewCoverage, ReviewFinding, ReviewTarget };
 export type ResolvedReview = ReviewSnapshot;
 
+export function reviewTargetForRerun(record: Pick<ReviewRunRecord, "target">): ReviewTarget {
+	const identity = record.target.identity;
+	if (identity.kind === "uncommitted") return { kind: "uncommitted" };
+	if (identity.kind === "branch") {
+		if (!record.target.branchBase) {
+			throw new Error("Durable branch review run does not retain a base locator.");
+		}
+		return { kind: "branch", branchBase: structuredClone(record.target.branchBase) };
+	}
+	if (identity.kind === "pr") {
+		return { kind: "pr", number: identity.pullRequest ? String(identity.pullRequest.number) : undefined };
+	}
+	return { kind: "commit", sha: identity.headCommit };
+}
+
 export type ReviewEffort = "low" | "standard" | "high";
 export type ReviewScopeMode = "incremental" | "full";
 

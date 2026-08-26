@@ -3,6 +3,7 @@ import { minimatch } from "minimatch";
 import type { ReviewRunControls } from "./review.ts";
 import type { ParsedReview, ReviewFinding, ReviewFindingOutcomeReason, ReviewFindingStatus } from "./review-report.ts";
 import type {
+	ReviewBranchBase,
 	ReviewChangedFile,
 	ReviewSnapshot,
 	ReviewSnapshotIdentity,
@@ -63,6 +64,7 @@ export interface ReviewRunRecord {
 		description: string;
 		diffCommand: string;
 		identity: ReviewSnapshotIdentity;
+		branchBase?: ReviewBranchBase;
 		context?: ReviewRunContextMetadata;
 		files: ReviewRunFileIdentity[];
 	};
@@ -531,6 +533,7 @@ export function createReviewRunRecord(options: {
 			description: truncateUtf8(options.snapshot.description, 4_000),
 			diffCommand: truncateUtf8(options.snapshot.diffCommand, 4_000),
 			identity: boundSnapshotIdentity(options.snapshot.identity),
+			...(options.snapshot.branchBase ? { branchBase: structuredClone(options.snapshot.branchBase) } : {}),
 			...(snapshotContextMetadata(options.snapshot) ? { context: snapshotContextMetadata(options.snapshot) } : {}),
 			files: snapshotFileIdentities(options.snapshot),
 		},

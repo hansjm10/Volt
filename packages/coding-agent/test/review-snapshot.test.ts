@@ -159,6 +159,13 @@ describe("review snapshots", () => {
 	const initialGitTrace = process.env.GIT_TRACE;
 	const initialGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
 	const initialGitConfigNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+	const gitCommandConfigEnvironmentPattern = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/;
+	const initialGitCommandConfigEnvironment = Object.fromEntries(
+		Object.entries(process.env).filter(
+			(entry): entry is [string, string] =>
+				gitCommandConfigEnvironmentPattern.test(entry[0]) && entry[1] !== undefined,
+		),
+	);
 
 	afterEach(async () => {
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
@@ -175,6 +182,10 @@ describe("review snapshots", () => {
 		else process.env.GIT_CONFIG_GLOBAL = initialGitConfigGlobal;
 		if (initialGitConfigNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
 		else process.env.GIT_CONFIG_NOSYSTEM = initialGitConfigNoSystem;
+		for (const key of Object.keys(process.env)) {
+			if (gitCommandConfigEnvironmentPattern.test(key)) delete process.env[key];
+		}
+		Object.assign(process.env, initialGitCommandConfigEnvironment);
 	});
 
 	function createRepository(withCommit = true): string {
@@ -228,6 +239,45 @@ describe("review snapshots", () => {
 		git(repository, "update-ref", `refs/remotes/${remoteName}/main`, staleBase);
 		rmSync(join(repository, ".git", "FETCH_HEAD"), { force: true });
 		return { repository, remote, staleBase, authoritativeBase, headCommit };
+	}
+
+	function createRemoteOnlyBranchFixture(): {
+		repository: string;
+		upstream: string;
+		staleBase: string;
+		authoritativeBase: string;
+		headCommit: string;
+	} {
+		const upstream = createRepository();
+		const remote = join(tmpdir(), `volt-review-remote-only-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(upstream, "remote", "add", "origin", remote);
+		git(upstream, "push", "-u", "origin", "main");
+		const staleBase = git(upstream, "rev-parse", "HEAD");
+
+		const repository = join(
+			tmpdir(),
+			`volt-review-remote-only-workspace-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		tempDirectories.push(repository);
+		git(tmpdir(), "clone", remote, repository);
+		git(repository, "config", "user.email", "review@example.com");
+		git(repository, "config", "user.name", "Review Test");
+		git(repository, "checkout", "-b", "feature");
+		writeFileSync(join(repository, "feature.txt"), "feature only\n");
+		git(repository, "add", "feature.txt");
+		git(repository, "commit", "-m", "feature change");
+		const headCommit = git(repository, "rev-parse", "HEAD");
+
+		writeFileSync(join(upstream, "upstream.txt"), "advanced outside the workspace\n");
+		git(upstream, "add", "upstream.txt");
+		git(upstream, "commit", "-m", "advance remote base");
+		const authoritativeBase = git(upstream, "rev-parse", "HEAD");
+		git(upstream, "push", "origin", "main");
+		rmSync(join(repository, ".git", "FETCH_HEAD"), { force: true });
+		return { repository, upstream, staleBase, authoritativeBase, headCommit };
 	}
 
 	function createShallowBranchFixture(
@@ -731,6 +781,11 @@ describe("review snapshots", () => {
 		]) {
 			const snapshot = await resolve(target, repository);
 			expect(snapshot.description).toBe("branch changes vs origin/main");
+			expect(snapshot.branchBase).toEqual({
+				kind: "remote",
+				remote: "origin",
+				remoteRef: "refs/heads/main",
+			});
 			expect(snapshot.identity).toMatchObject({
 				baseCommit: authoritativeBase,
 				mergeBaseCommit: authoritativeBase,
@@ -742,6 +797,7 @@ describe("review snapshots", () => {
 		for (const base of ["refs/heads/main", "refs/remotes/origin/main"]) {
 			const snapshot = await resolve({ kind: "branch", base }, repository);
 			expect(snapshot.description).toBe(`branch changes vs ${base}`);
+			expect(snapshot.branchBase).toEqual({ kind: "local", ref: base });
 			expect(snapshot.identity.baseCommit).toBe(staleBase);
 			expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt", "upstream.txt"]);
 		}
@@ -749,6 +805,38 @@ describe("review snapshots", () => {
 		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
 		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
 		expect(git(repository, "rev-parse", "HEAD")).toBe(headCommit);
+		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
+	});
+
+	it("recaptures a remote-only branch base from its durable locator after snapshot disposal", async () => {
+		const { repository, upstream, staleBase, authoritativeBase, headCommit } = createRemoteOnlyBranchFixture();
+		const localObjectStatus = (oid: string): number | null =>
+			spawnSync("git", ["cat-file", "-e", `${oid}^{commit}`], { cwd: repository }).status;
+		expect(localObjectStatus(authoritativeBase)).not.toBe(0);
+
+		const first = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(first.identity).toMatchObject({ baseCommit: authoritativeBase, headCommit });
+		expect(first.branchBase).toEqual({
+			kind: "remote",
+			remote: "origin",
+			remoteRef: "refs/heads/main",
+		});
+		expect(localObjectStatus(authoritativeBase)).not.toBe(0);
+		await first.dispose();
+		expect(localObjectStatus(authoritativeBase)).not.toBe(0);
+		if (!first.branchBase) throw new Error("Expected a durable branch base locator");
+
+		writeFileSync(join(upstream, "upstream-second.txt"), "advanced again\n");
+		git(upstream, "add", "upstream-second.txt");
+		git(upstream, "commit", "-m", "advance remote base again");
+		const secondBase = git(upstream, "rev-parse", "HEAD");
+		git(upstream, "push", "origin", "main");
+
+		const rerun = await resolve({ kind: "branch", branchBase: first.branchBase }, repository);
+		expect(rerun.identity).toMatchObject({ baseCommit: secondBase, headCommit });
+		expect(rerun.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
 		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
 	});
 
@@ -823,6 +911,46 @@ describe("review snapshots", () => {
 		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
 		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
 		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+	});
+
+	it("applies command-scope URL rewrites once while preserving other command config", async () => {
+		const { repository, remote, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		const rewriteRoot = join(
+			tmpdir(),
+			`volt-review-command-url-rewrite-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		const rewrittenRemote = join(rewriteRoot, "mirror", "remote.git");
+		mkdirSync(join(rewriteRoot, "mirror"), { recursive: true });
+		renameSync(remote, rewrittenRemote);
+		tempDirectories.push(rewriteRoot);
+
+		const rawPrefix = pathToFileURL(rewriteRoot).href;
+		const rewrittenPrefix = `${rawPrefix}/mirror`;
+		git(repository, "remote", "set-url", "origin", `${rawPrefix}/remote.git`);
+		const globalConfig = join(repository, "deny-file-transport.config");
+		git(repository, "config", "--file", globalConfig, "protocol.file.allow", "never");
+		process.env.GIT_CONFIG_GLOBAL = globalConfig;
+		process.env.GIT_CONFIG_COUNT = "2";
+		process.env.GIT_CONFIG_KEY_0 = `url.${rewrittenPrefix}.insteadOf`;
+		process.env.GIT_CONFIG_VALUE_0 = rawPrefix;
+		process.env.GIT_CONFIG_KEY_1 = "protocol.file.allow";
+		process.env.GIT_CONFIG_VALUE_1 = "always";
+		expect(git(repository, "remote", "get-url", "origin")).toBe(pathToFileURL(rewrittenRemote).href);
+		const denied = spawnSync("git", ["ls-remote", pathToFileURL(rewrittenRemote).href], {
+			cwd: repository,
+			encoding: "utf8",
+			env: { ...process.env, GIT_CONFIG_COUNT: "0" },
+		});
+		expect(denied.status).not.toBe(0);
+		expect(denied.stderr).toContain("transport 'file' not allowed");
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
 	});
 
 	it("preserves repository-local fetch configuration for isolated branch and PR snapshots", async () => {

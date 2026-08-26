@@ -128,6 +128,7 @@ import {
 	type ReviewRunControls,
 	type ReviewTarget,
 	type ReviewWorkflowHooks,
+	reviewTargetForRerun,
 	runReviewWorkflow,
 	stripReviewEnvelopeForDisplay,
 } from "../../core/review.ts";
@@ -9172,15 +9173,7 @@ export class InteractiveMode {
 		}
 		if (action === REVIEW_RERUN_ACTION_ID) {
 			if (!record) throw new Error(`Unknown durable review run: ${runId}`);
-			const identity = record.target.identity;
-			const target: ReviewTarget =
-				identity.kind === "uncommitted"
-					? { kind: "uncommitted" }
-					: identity.kind === "branch"
-						? { kind: "branch", base: identity.baseCommit }
-						: identity.kind === "pr"
-							? { kind: "pr", number: identity.pullRequest ? String(identity.pullRequest.number) : undefined }
-							: { kind: "commit", sha: identity.headCommit };
+			const target = reviewTargetForRerun(record);
 			const rerun = await this.runInteractiveReviewWorkflow(target, {
 				tools: this.getReviewToolsForRun(),
 				requireConfirmation: true,
