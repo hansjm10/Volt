@@ -782,6 +782,36 @@ describe("review snapshots", () => {
 		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
 	});
 
+	it("applies insteadOf URL rewrites once when refreshing remote branch bases", async () => {
+		const { repository, remote, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		const rewriteRoot = join(
+			tmpdir(),
+			`volt-review-url-rewrite-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		const rewrittenRemote = join(rewriteRoot, "mirror", "remote.git");
+		mkdirSync(join(rewriteRoot, "mirror"), { recursive: true });
+		renameSync(remote, rewrittenRemote);
+		tempDirectories.push(rewriteRoot);
+
+		const rawPrefix = pathToFileURL(rewriteRoot).href;
+		const rewrittenPrefix = `${rawPrefix}/mirror`;
+		const rawRemote = `${rawPrefix}/remote.git`;
+		git(repository, "remote", "set-url", "origin", rawRemote);
+		git(repository, "config", "--local", `url.${rewrittenPrefix}.insteadOf`, rawPrefix);
+		expect(git(repository, "config", "--local", "--get", "remote.origin.url")).toBe(rawRemote);
+		expect(git(repository, "remote", "get-url", "origin")).toBe(pathToFileURL(rewrittenRemote).href);
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+	});
+
 	it("preserves repository-local fetch configuration for isolated branch and PR snapshots", async () => {
 		const { repository, remote, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
 		git(repository, "push", remote, `${headCommit}:refs/pull/11/head`);

@@ -533,12 +533,16 @@ interface ScopedGitConfigEntry extends FetchConfigEntry {
 	scope: string;
 }
 
+function isUrlRewriteConfigKey(key: string): boolean {
+	return key.startsWith("url.") && key.endsWith(".insteadof");
+}
+
 function isFetchConfigKey(key: string, remote: string): boolean {
 	if (key.startsWith("http.") || key.startsWith("credential.")) return true;
 	if (key === "core.askpass" || key === "core.gitproxy" || key === "core.sshcommand") return true;
 	if (key === "ssh.variant" || key === "transfer.credentialsinurl") return true;
 	if (key === "protocol.allow" || key === "protocol.version" || /^protocol\..+\.allow$/.test(key)) return true;
-	if (key.startsWith("url.") && key.endsWith(".insteadof")) return true;
+	if (isUrlRewriteConfigKey(key)) return true;
 	const remotePrefix = `remote.${remote}.`;
 	if (!key.startsWith(remotePrefix)) return false;
 	return ["proxy", "proxyauthmethod", "serveroption", "uploadpack", "vcs"].includes(key.slice(remotePrefix.length));
@@ -581,6 +585,9 @@ function parseRepositoryFetchConfig(stdout: Buffer, remote: string): ScopedFetch
 	};
 	for (const { scope, key, value } of entries) {
 		if (!isFetchConfigKey(key, remote)) continue;
+		// The isolated remote URL comes from `git remote get-url`, which has
+		// already applied these mappings. Preserve their effect, not the rules.
+		if (isUrlRewriteConfigKey(key)) continue;
 		if (scope === "system") config.system.push({ key, value });
 		else if (scope === "global") config.global.push({ key, value });
 		else if (scope === "local" || scope === "worktree") config.repository.push({ key, value });
