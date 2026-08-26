@@ -216,6 +216,55 @@ describe("review snapshots", () => {
 		return { repository, remote, staleBase, authoritativeBase, headCommit };
 	}
 
+	function createShallowBranchFixture(
+		depth: number,
+		withLocalCommit: boolean,
+	): {
+		repository: string;
+		baseCommit: string;
+		headCommit: string;
+		omittedParent: string;
+		localObjects: string;
+	} {
+		const seed = createRepository();
+		const omittedParent = git(seed, "rev-parse", "HEAD");
+		writeFileSync(join(seed, "tracked.txt"), "base\n");
+		git(seed, "commit", "-am", "base");
+		const baseCommit = git(seed, "rev-parse", "HEAD");
+		git(seed, "checkout", "-b", "feature");
+		writeFileSync(join(seed, "feature.txt"), "feature\n");
+		git(seed, "add", "feature.txt");
+		git(seed, "commit", "-m", "feature");
+
+		const remote = join(tmpdir(), `volt-review-shallow-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(seed, "remote", "add", "origin", remote);
+		git(seed, "push", "origin", "main", "feature");
+
+		const repository = join(
+			tmpdir(),
+			`volt-review-shallow-branch-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(repository, { recursive: true });
+		tempDirectories.push(repository);
+		git(repository, "init", "--initial-branch=feature");
+		git(repository, "config", "user.email", "review@example.com");
+		git(repository, "config", "user.name", "Review Test");
+		git(repository, "remote", "add", "origin", relative(repository, remote));
+		git(repository, "fetch", `--depth=${depth}`, "origin", "+refs/heads/feature:refs/remotes/origin/feature");
+		git(repository, "checkout", "-B", "feature", "refs/remotes/origin/feature");
+		if (withLocalCommit) {
+			writeFileSync(join(repository, "local.txt"), "local only\n");
+			git(repository, "add", "local.txt");
+			git(repository, "commit", "-m", "local only");
+		}
+		const headCommit = git(repository, "rev-parse", "HEAD");
+		const localObjects = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects");
+		return { repository, baseCommit, headCommit, omittedParent, localObjects };
+	}
+
 	async function resolve(
 		target: Parameters<typeof resolveReviewSnapshot>[0],
 		cwd: string,
@@ -601,6 +650,42 @@ describe("review snapshots", () => {
 		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
 		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
 		expect(git(repository, "rev-parse", "upstream/main")).toBe(staleBase);
+	});
+
+	it("preserves shallow boundaries while refreshing remote branch bases", async () => {
+		const { repository, baseCommit, headCommit, omittedParent, localObjects } = createShallowBranchFixture(2, true);
+		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
+		expect(spawnSync("git", ["cat-file", "-e", `${omittedParent}^{commit}`], { cwd: repository }).status).not.toBe(0);
+
+		const snapshot = await resolve({ kind: "branch", base: "origin/main" }, repository);
+		expect(snapshot.identity).toMatchObject({ baseCommit, mergeBaseCommit: baseCommit, headCommit });
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt", "local.txt"]);
+
+		const unavailableLocalObjects = `${localObjects}-unavailable`;
+		renameSync(localObjects, unavailableLocalObjects);
+		try {
+			expect((await readAvailableFile(snapshot, "head", "feature.txt")).content.toString()).toBe("feature\n");
+			expect((await readAvailableFile(snapshot, "head", "local.txt")).content.toString()).toBe("local only\n");
+			const checkout = await snapshot.materializeHead();
+			expect(readFileSync(join(checkout, "local.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("local only\n");
+		} finally {
+			renameSync(unavailableLocalObjects, localObjects);
+		}
+	});
+
+	it("reports when shallow history omits the remote branch merge base", async () => {
+		const { repository, baseCommit } = createShallowBranchFixture(1, false);
+		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
+		expect(spawnSync("git", ["cat-file", "-e", `${baseCommit}^{commit}`], { cwd: repository }).status).not.toBe(0);
+
+		const error =
+			"Could not resolve the branch merge base from the available shallow history. Deepen or unshallow the repository and retry.";
+		await expect(
+			resolveReviewSnapshot({ kind: "branch", base: "origin/main" }, repository, OPTIONS),
+		).resolves.toEqual({
+			error,
+			remoteError: error,
+		});
 	});
 
 	it("fails a remote base refresh without falling back and removes the temporary source", async () => {

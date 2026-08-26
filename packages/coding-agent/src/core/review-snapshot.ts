@@ -721,12 +721,14 @@ async function createRemoteBranchSource(
 	source?: GitSource;
 	baseCommit?: string;
 	temporaryDirectory?: string;
+	shallow?: boolean;
 	error?: ReviewSnapshotResolutionError;
 }> {
 	throwIfResolutionCancelled(signal);
-	const [localObjects, objectFormat, remoteUrlResult] = await Promise.all([
+	const [localObjects, objectFormat, sourceIsShallow, remoteUrlResult] = await Promise.all([
 		repositoryObjectDirectory(root, limits, signal),
 		repositoryObjectFormat(root, limits, signal),
+		repositoryIsShallow(root, limits, signal),
 		runCommand("git", ["remote", "get-url", remote], root, commandOptions(limits, signal)),
 	]);
 	throwIfResolutionCancelled(signal);
@@ -777,21 +779,46 @@ async function createRemoteBranchSource(
 		}
 
 		const objects = join(temporaryDirectory, "objects");
-		await mkdir(join(objects, "info"), { recursive: true });
-		await writeFile(join(objects, "info", "alternates"), `${resolve(localObjects)}\n`, "utf8");
+		const borrowLocalObjects = sourceIsShallow === false;
+		if (borrowLocalObjects) {
+			await mkdir(join(objects, "info"), { recursive: true });
+			await writeFile(join(objects, "info", "alternates"), `${resolve(localObjects)}\n`, "utf8");
+		}
 		throwIfResolutionCancelled(signal);
 		const source: GitSource = {
 			cwd: temporaryDirectory,
-			objectDirectories: [objects, localObjects],
+			objectDirectories: borrowLocalObjects ? [objects, localObjects] : [objects],
 			limits,
 			signal,
 		};
-		const pinHead = await git(source, ["update-ref", "refs/review/head", headCommit]);
-		if (!pinHead.ok) {
+		const captureHead = borrowLocalObjects
+			? await git(source, ["update-ref", "refs/review/head", headCommit])
+			: await git(source, [
+					"fetch",
+					"--no-tags",
+					"--no-write-fetch-head",
+					"--force",
+					"--update-shallow",
+					resolve(root),
+					"+HEAD:refs/review/head",
+				]);
+		if (!captureHead.ok) {
 			return {
 				error: {
-					...commandFailure("git update-ref failed", pinHead),
+					...commandFailure(
+						borrowLocalObjects ? "git update-ref failed" : "git fetch from workspace failed",
+						captureHead,
+					),
 					remoteError: "Could not capture the review branch endpoints.",
+				},
+			};
+		}
+		const capturedHead = await requireCanonicalCommit(source, "refs/review/head");
+		if (capturedHead !== headCommit) {
+			return {
+				error: {
+					error: "The branch head moved while Volt captured it. Retry the review.",
+					remoteError: "The branch head moved while Volt captured it. Retry the review.",
 				},
 			};
 		}
@@ -822,7 +849,12 @@ async function createRemoteBranchSource(
 			};
 		}
 		retainTemporaryDirectory = true;
-		return { source, baseCommit, temporaryDirectory };
+		return {
+			source,
+			baseCommit,
+			temporaryDirectory,
+			shallow: sourceIsShallow === true,
+		};
 	} catch (error) {
 		if (error instanceof ReviewSnapshotResolutionCancelledError || signal?.aborted) throw error;
 		return {
@@ -2614,6 +2646,7 @@ export async function resolveReviewSnapshot(
 
 				let source = localSource;
 				let baseCommit: string | undefined;
+				let remoteSourceIsShallow = false;
 				const temporaryDirectories: string[] = [];
 				if (resolvedBase.kind === "remote") {
 					options.onProgress?.(`Refreshing ${resolvedBase.displayRef}…`);
@@ -2630,6 +2663,7 @@ export async function resolveReviewSnapshot(
 					}
 					source = fetched.source;
 					baseCommit = fetched.baseCommit;
+					remoteSourceIsShallow = fetched.shallow === true;
 					temporaryDirectories.push(fetched.temporaryDirectory);
 					pendingTemporaryDirectories.add(fetched.temporaryDirectory);
 				} else {
@@ -2646,6 +2680,17 @@ export async function resolveReviewSnapshot(
 				const mergeBaseCommit = text(mergeBaseResult).trim();
 				if (!mergeBaseResult.ok || !CANONICAL_GIT_OBJECT_ID_PATTERN.test(mergeBaseCommit)) {
 					await cleanupTemporaryDirectories();
+					if (
+						remoteSourceIsShallow &&
+						mergeBaseResult.exitCode === 1 &&
+						mergeBaseResult.failure === undefined &&
+						mergeBaseResult.stdout.length === 0 &&
+						!mergeBaseResult.stderr.trim()
+					) {
+						const error =
+							"Could not resolve the branch merge base from the available shallow history. Deepen or unshallow the repository and retry.";
+						return { error, remoteError: error };
+					}
 					return {
 						error: `git merge-base failed: ${commandError(mergeBaseResult)}`,
 						remoteError: "Could not resolve the branch merge base.",
