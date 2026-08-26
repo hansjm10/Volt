@@ -69,6 +69,7 @@ function createContext() {
 		lastQuitWarningAt: 0,
 		enterDrainViewer: proto.enterDrainViewer,
 		finishDrainViewerGrant: proto.finishDrainViewerGrant,
+		handleReacquireOutcome: proto.handleReacquireOutcome,
 		absorbRemoteSessionChangesFromDisk: proto.absorbRemoteSessionChangesFromDisk,
 		exitDrainViewer: proto.exitDrainViewer,
 		isDrainViewerActive: proto.isDrainViewerActive,
@@ -148,6 +149,34 @@ describe("drain viewer (§6.3)", () => {
 		});
 		expect(proto.isDrainViewerActive.call(context)).toBe(false);
 		expect(context.drainViewerFeedId).toBeUndefined();
+	});
+
+	it("refreshes a genuine warm reconnect before recovered input resumes", async () => {
+		const context = createContext();
+		const phases: string[] = [];
+		let finishRefresh: () => void = () => {};
+		context.runtimeHost.refreshCurrentSessionFromDisk.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					phases.push("refresh-start");
+					finishRefresh = () => {
+						phases.push("refresh-end");
+						resolve({ cancelled: false, seeded: false });
+					};
+				}),
+		);
+		context.renderCurrentSessionState.mockImplementation(() => phases.push("render"));
+		context.runtimeHost.startRecoveredClientInputs.mockImplementation(async () => {
+			phases.push("recovery");
+		});
+
+		const handling = proto.handleReacquireOutcome.call(context, { kind: "granted", handoff: "warm" });
+		await vi.waitFor(() => expect(phases).toEqual(["refresh-start"]));
+		expect(context.runtimeHost.startRecoveredClientInputs).not.toHaveBeenCalled();
+
+		finishRefresh();
+		await handling;
+		expect(phases).toEqual(["refresh-start", "refresh-end", "render", "recovery"]);
 	});
 
 	it("reconstructs a mid-message snapshot with subsequent thinking and tool-call deltas", () => {

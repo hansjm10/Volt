@@ -347,7 +347,7 @@ describe("createDaemonAttach + control server integration", () => {
 		const attach = createDaemonAttach({ cwd: worktreeCwd, agentDir: harness.agentDir });
 		cleanups.push(() => attach.dispose());
 		await attach.start();
-		const outcome = await attach.acquire("s-worktree");
+		const outcome = await attach.selectSession("s-worktree");
 
 		expect(outcome).toEqual({ kind: "granted", handoff: "none" });
 		expect(attach.workspaceName()).toBe("repo");

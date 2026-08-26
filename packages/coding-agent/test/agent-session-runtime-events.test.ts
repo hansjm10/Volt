@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
@@ -728,6 +728,153 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				}),
 			]),
 		);
+	});
+
+	it("does not harden an implicitly derived shared parent during prepared reopen", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const targetManager = SessionManager.create(runtimeHost.cwd, runtimeHost.session.sessionManager.getSessionDir());
+		targetManager.appendMessage(fauxAssistantMessage("shared target"));
+		await targetManager.flush();
+		const targetFile = targetManager.getSessionFile();
+		expect(targetFile).toBeDefined();
+		const sharedDir = join(runtimeHost.cwd, "shared-session-parent");
+		mkdirSync(sharedDir, { mode: 0o777 });
+		chmodSync(sharedDir, 0o777);
+		const sharedFile = join(sharedDir, "shared-session.jsonl");
+		copyFileSync(targetFile!, sharedFile);
+		runtimeHost.setPrepareSessionReplacement(async () => ({
+			async commit() {},
+			async rollback() {},
+			async dispose() {},
+		}));
+
+		await expect(runtimeHost.switchSession(sharedFile)).resolves.toEqual({ cancelled: false, seeded: false });
+		expect(statSync(sharedDir).mode & 0o777).toBe(0o777);
+	});
+
+	it("rolls back prepared ownership when the authoritative reopen fails", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const sourceSession = runtimeHost.session;
+		const targetManager = SessionManager.create(runtimeHost.cwd, sourceSession.sessionManager.getSessionDir());
+		targetManager.appendMessage({ role: "user", content: "persist target", timestamp: 1 });
+		targetManager.appendMessage(fauxAssistantMessage("target persisted"));
+		await targetManager.flush();
+		const targetFile = targetManager.getSessionFile();
+		expect(targetFile).toBeDefined();
+
+		let prepared = false;
+		const rollback = vi.fn(async () => {});
+		const dispose = vi.fn(async () => {});
+		runtimeHost.setPrepareSessionReplacement(async () => {
+			prepared = true;
+			return { async commit() {}, rollback, dispose };
+		});
+		const originalOpen = SessionManager.open;
+		const reopen = vi.spyOn(SessionManager, "open").mockImplementation((path, sessionDir, cwdOverride) => {
+			if (prepared) throw new Error("authoritative reopen failed");
+			return originalOpen(path, sessionDir, cwdOverride);
+		});
+		try {
+			await expect(runtimeHost.switchSession(targetFile!)).rejects.toThrow("authoritative reopen failed");
+		} finally {
+			reopen.mockRestore();
+		}
+
+		expect(rollback).toHaveBeenCalledTimes(1);
+		expect(dispose).not.toHaveBeenCalled();
+		expect(runtimeHost.session).toBe(sourceSession);
+		await expect(sourceSession.prompt("source remains usable")).resolves.toBeUndefined();
+	});
+
+	it("rolls back prepared ownership when reopened session identity changes", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const sourceSession = runtimeHost.session;
+		const sessionDir = sourceSession.sessionManager.getSessionDir();
+		const targetManager = SessionManager.create(runtimeHost.cwd, sessionDir);
+		targetManager.appendMessage({ role: "user", content: "persist target", timestamp: 1 });
+		targetManager.appendMessage(fauxAssistantMessage("target persisted"));
+		await targetManager.flush();
+		const targetFile = targetManager.getSessionFile();
+		expect(targetFile).toBeDefined();
+		const wrongIdentity = SessionManager.create(runtimeHost.cwd, sessionDir);
+
+		let prepared = false;
+		const rollback = vi.fn(async () => {});
+		const dispose = vi.fn(async () => {});
+		runtimeHost.setPrepareSessionReplacement(async () => {
+			prepared = true;
+			return { async commit() {}, rollback, dispose };
+		});
+		const originalOpen = SessionManager.open;
+		const reopen = vi
+			.spyOn(SessionManager, "open")
+			.mockImplementation((path, sessionDirArg, cwdOverride) =>
+				prepared ? wrongIdentity : originalOpen(path, sessionDirArg, cwdOverride),
+			);
+		try {
+			await expect(runtimeHost.switchSession(targetFile!)).rejects.toThrow(
+				"Replacement session identity changed during ownership preparation",
+			);
+		} finally {
+			reopen.mockRestore();
+		}
+
+		expect(rollback).toHaveBeenCalledTimes(1);
+		expect(dispose).not.toHaveBeenCalled();
+		expect(runtimeHost.session).toBe(sourceSession);
+	});
+
+	it("disposes ownership exactly once when commit fails after source invalidation", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const rollback = vi.fn(async () => {});
+		const dispose = vi.fn(async () => {});
+		runtimeHost.setPrepareSessionReplacement(async () => ({
+			async commit() {
+				throw new Error("prepared connection generation changed");
+			},
+			rollback,
+			dispose,
+		}));
+
+		await expect(runtimeHost.newSession()).rejects.toThrow("prepared connection generation changed");
+		expect(rollback).not.toHaveBeenCalled();
+		expect(dispose).toHaveBeenCalledTimes(1);
+		await expect(runtimeHost.runWithStableSession(async () => {})).rejects.toThrow(
+			"no longer accepting session operations",
+		);
+	});
+
+	it("commits replacement ownership before recovered input starts", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		await runtimeHost.startRecoveredClientInputs();
+		const targetManager = SessionManager.create(runtimeHost.cwd, runtimeHost.session.sessionManager.getSessionDir());
+		targetManager.reserveClientInput("owned-recovery", "steer", { message: "older durable input" });
+		targetManager.markClientInputQueued("owned-recovery", {
+			delivery: "steer",
+			message: "older durable input",
+		});
+		await targetManager.flush();
+		const targetFile = targetManager.getSessionFile();
+		expect(targetFile).toBeDefined();
+
+		let targetLeaseHeld = false;
+		runtimeHost.setPrepareSessionReplacement(async () => ({
+			async commit() {
+				targetLeaseHeld = true;
+			},
+			async rollback() {},
+			async dispose() {},
+		}));
+		runtimeHost.setRebindSession(async (session) => {
+			const resume = session.resumeRecoveredClientInputs.bind(session);
+			vi.spyOn(session, "resumeRecoveredClientInputs").mockImplementation(async () => {
+				expect(targetLeaseHeld).toBe(true);
+				await resume();
+			});
+		});
+
+		await expect(runtimeHost.switchSession(targetFile!)).resolves.toEqual({ cancelled: false, seeded: false });
+		expect(targetLeaseHeld).toBe(true);
 	});
 
 	it("leaves the old runtime live when replacement ownership preflight rejects", async () => {

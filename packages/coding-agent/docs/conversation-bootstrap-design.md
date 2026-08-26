@@ -621,6 +621,16 @@ identity together. The reservation remains held until the feed commits its stage
 finalization runs; rollback leaves the previous identity authoritative. A direct session rekey likewise mutates the
 lease first and only then rekeys the same coordinator and all stream indexes.
 
+The TUI adapter follows the same contract without creating another lease owner. While connected, preparation either
+holds the daemon's source-to-target rekey reservation or completes an exclusive target acquisition/drain on one captured
+control-connection generation. Only then may the TUI reopen the persisted target bytes. Commit revalidates that exact
+generation and performs no acquisition; a disconnect/reconnect before commit invalidates the prepared handoff. An
+offline preparation may commit only while still offline, preserving the additive no-daemon mode. Before source runtime
+invalidation, failure rolls back and retains the source; afterward it terminally disposes the partial target. Feed
+publication, UI rebind, and recovered durable input follow ownership commit. Relay offers remain queued behind a
+separate ingress fence until the replacement lifecycle actor settles; releasing that fence is synchronous and performs
+no lease work. The focused `docs/tla/TuiSessionReplacement.tla` model checks these cross-layer transitions.
+
 Daemon shutdown first closes the service-wide admission epoch, then closes published direct streams and both offered and
 active relays through their coordinators. After the fixed admitted-operation set drains, runtime retirement uses each
 coordinator's terminal barrier before ownership is released. This keeps global admission, per-runtime structural

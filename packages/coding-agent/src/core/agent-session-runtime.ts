@@ -711,10 +711,10 @@ export class AgentSessionRuntime {
 
 	private reopenPreparedReplacementTarget(sessionManager: SessionManager): SessionManager {
 		const sessionFile = sessionManager.getSessionFile();
-		if (sessionFile === undefined) {
+		if (sessionFile === undefined || !existsSync(sessionFile)) {
 			return sessionManager;
 		}
-		const reopened = SessionManager.open(sessionFile, sessionManager.getSessionDir(), sessionManager.getCwd());
+		const reopened = SessionManager.open(sessionFile, undefined, sessionManager.getCwd());
 		if (reopened.getSessionId() !== sessionManager.getSessionId()) {
 			throw new Error("Replacement session identity changed during ownership preparation");
 		}
@@ -734,7 +734,6 @@ export class AgentSessionRuntime {
 		reason: SessionShutdownEvent["reason"];
 		previousSessionId?: string;
 		allowSameSessionIdentity?: boolean;
-		reopenTargetAfterPrepare?: boolean;
 		sessionManager: SessionManager;
 		create: (sessionManager: SessionManager) => Promise<CreateAgentSessionRuntimeResult>;
 		afterApply?: () => Promise<void>;
@@ -780,24 +779,24 @@ export class AgentSessionRuntime {
 		try {
 			await this.abortAndJoinRecoveredClientInputs(this.session);
 			this.assertStructuralOperationCurrent(options.operation);
-			// Defense in depth for unexpected re-entrant review starts after an
-			// operation-specific pre-preparation check.
-			this.assertNoActiveDetachedReview();
-			const transaction = sameSessionIdentity
-				? undefined
-				: await this.prepareSessionReplacement?.({
-						previousSessionId,
-						sessionId,
-						cwd: options.sessionManager.getCwd(),
-					});
-			const replacementSessionManager =
-				transaction && options.reopenTargetAfterPrepare
-					? this.reopenPreparedReplacementTarget(options.sessionManager)
-					: options.sessionManager;
+			let transaction: AgentSessionReplacementTransaction | undefined;
 			let invalidated = false;
 			let created: CreateAgentSessionRuntimeResult | undefined;
 			let applied = false;
 			try {
+				// Defense in depth for unexpected re-entrant review starts after an
+				// operation-specific pre-preparation check.
+				this.assertNoActiveDetachedReview();
+				transaction = sameSessionIdentity
+					? undefined
+					: await this.prepareSessionReplacement?.({
+							previousSessionId,
+							sessionId,
+							cwd: options.sessionManager.getCwd(),
+						});
+				const replacementSessionManager = transaction
+					? this.reopenPreparedReplacementTarget(options.sessionManager)
+					: options.sessionManager;
 				this.assertStructuralOperationCurrent(options.operation);
 				await this.teardownCurrent(options.reason, replacementSessionManager.getSessionFile(), () => {
 					this.assertStructuralOperationCurrent(options.operation);
@@ -1132,7 +1131,6 @@ export class AgentSessionRuntime {
 			operation,
 			reason: "resume",
 			allowSameSessionIdentity: refreshCurrentSession,
-			reopenTargetAfterPrepare: true,
 			sessionManager,
 			create: (preparedSessionManager) =>
 				this.createRuntime({
@@ -1546,7 +1544,6 @@ export class AgentSessionRuntime {
 		await this.replaceCurrentSession({
 			operation,
 			reason: "resume",
-			reopenTargetAfterPrepare: true,
 			sessionManager,
 			create: (preparedSessionManager) =>
 				this.createRuntime({

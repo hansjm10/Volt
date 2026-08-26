@@ -124,7 +124,8 @@ export interface DaemonAttachRekeyTransaction {
 export interface DaemonAttach {
 	/** Connect, resolve (or auto-register) the cwd workspace. Never throws. */
 	start(): Promise<void>;
-	acquire(sessionId: string): Promise<AcquireOutcome>;
+	/** Select and acquire one session, releasing any previously selected session. */
+	selectSession(sessionId: string): Promise<AcquireOutcome>;
 	release(sessionId: string, reason?: LeaseReleaseReason): Promise<void>;
 	prepareRekey(
 		oldSessionId: string,
@@ -329,7 +330,7 @@ export async function openDaemonWorktreeControl(
 export function createDisabledDaemonAttach(): DaemonAttach {
 	return {
 		async start() {},
-		async acquire() {
+		async selectSession() {
 			return NOOP_OUTCOME;
 		},
 		async release() {},
@@ -393,7 +394,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 	const activeRelayIds = new Map<string, string>();
 	let currentSessionId: string | undefined;
 	let heldSessionId: string | undefined;
-	let pendingRekeyTransactionId: string | undefined;
+	let rekeyIngressFence: { oldSessionId: string; newSessionId: string } | undefined;
 	const pendingRekeyRelayOffers = new Map<string, DaemonRelayOffer>();
 	let disposed = false;
 	let resolvingWorkspace: Promise<void> | undefined;
@@ -448,7 +449,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 		if (outcome.kind === "pending") {
 			void outcome.granted.then(
 				() => {
-					if (currentSessionId === sessionId && !pendingRekeyTransactionId) {
+					if (currentSessionId === sessionId && !rekeyIngressFence) {
 						heldSessionId = sessionId;
 					}
 				},
@@ -472,7 +473,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 		// A warm rekey can publish its target lease before AgentSessionRuntime
 		// applies that target. Hold every offer behind the rekey barrier, then
 		// replay only the session that remains installed after the transition.
-		if (pendingRekeyTransactionId) {
+		if (rekeyIngressFence) {
 			pendingRekeyRelayOffers.set(offer.relayId, offer);
 			return;
 		}
@@ -500,7 +501,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 	};
 
 	const completePendingRekey = (installedSessionId?: string): void => {
-		pendingRekeyTransactionId = undefined;
+		rekeyIngressFence = undefined;
 		const offers = Array.from(pendingRekeyRelayOffers.values());
 		pendingRekeyRelayOffers.clear();
 		if (installedSessionId === undefined) {
@@ -558,7 +559,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 		const sessionId = currentSessionId;
 		const workspaceName = resolvedWorkspaceName;
 		const activeClient = client;
-		if (!sessionId || !workspaceName || !activeClient || !reacquiredHandler || pendingRekeyTransactionId) {
+		if (!sessionId || !workspaceName || !activeClient || !reacquiredHandler || rekeyIngressFence) {
 			return;
 		}
 		try {
@@ -646,10 +647,34 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				state = client?.connectionState ?? "gone";
 			}
 		},
-		async acquire(sessionId: string) {
+		async selectSession(sessionId: string) {
+			if (currentSessionId === sessionId && heldSessionId === sessionId && state === "connected") {
+				return { kind: "granted", handoff: "none" };
+			}
+			if (rekeyIngressFence && currentSessionId === sessionId) {
+				return heldSessionId === sessionId && state === "connected"
+					? { kind: "granted", handoff: "none" }
+					: NOOP_OUTCOME;
+			}
+			const previousSessionId = currentSessionId;
 			currentSessionId = sessionId;
 			const workspaceName = resolvedWorkspaceName;
 			const activeClient = client;
+			if (previousSessionId !== undefined && previousSessionId !== sessionId) {
+				if (heldSessionId === previousSessionId) {
+					heldSessionId = undefined;
+				}
+				if (activeClient && workspaceName) {
+					await activeClient
+						.request({
+							type: "lease_release",
+							workspaceName,
+							sessionId: previousSessionId,
+							reason: "switch",
+						})
+						.catch(() => {});
+				}
+			}
 			if (!activeClient || !workspaceName || state !== "connected") {
 				return NOOP_OUTCOME;
 			}
@@ -690,7 +715,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			if (oldSessionId === newSessionId) {
 				return undefined;
 			}
-			if (pendingRekeyTransactionId) {
+			if (rekeyIngressFence) {
 				throw new Error("conversation lease rekey already in progress");
 			}
 			const previousWorkspaceName = resolvedWorkspaceName;
@@ -698,7 +723,9 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			const previousWorktreeId = resolvedWorktreeId;
 			const previousBoundWorktreeSessionId = boundWorktreeSessionId;
 			const activeClient = client;
-			pendingRekeyTransactionId = "resolving-context";
+			const preparedConnectionGeneration = connectionGeneration;
+			const preparedConnected = activeClient !== undefined && state === "connected";
+			rekeyIngressFence = { oldSessionId, newSessionId };
 			let targetContext: Awaited<ReturnType<typeof resolveDaemonWorkspaceForCwd>>;
 			try {
 				targetContext =
@@ -715,6 +742,13 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				completePendingRekey(oldSessionId);
 				throw error;
 			}
+			if (
+				preparedConnected &&
+				(client !== activeClient || state !== "connected" || connectionGeneration !== preparedConnectionGeneration)
+			) {
+				completePendingRekey(oldSessionId);
+				throw new Error("replacement session connection changed during ownership preparation");
+			}
 			stagedWorktreeContext = undefined;
 			resolvedContextCwd = targetCwd ?? options.cwd;
 			if (targetContext) {
@@ -728,7 +762,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			}
 			const workspaceName = resolvedWorkspaceName;
 			const contextChanged = workspaceName !== previousWorkspaceName || resolvedWorktreeId !== previousWorktreeId;
-			const sourceLeaseConnectionGeneration = connectionGeneration;
+			const sourceLeaseConnectionGeneration = preparedConnectionGeneration;
 			let targetLeasePreacquired = false;
 			let targetLeaseConnectionGeneration: number | undefined;
 			const preacquireTargetLease = async (): Promise<void> => {
@@ -760,8 +794,15 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					if (targetAcquire.kind === "pending") {
 						await targetAcquire.granted;
 					}
+					if (
+						client !== activeClient ||
+						state !== "connected" ||
+						connectionGeneration !== preparedConnectionGeneration
+					) {
+						throw new Error("replacement session lease was lost during ownership preparation");
+					}
 					targetLeasePreacquired = true;
-					targetLeaseConnectionGeneration = connectionGeneration;
+					targetLeaseConnectionGeneration = preparedConnectionGeneration;
 				} catch (error) {
 					if (targetAcquireStarted) {
 						await activeClient
@@ -796,6 +837,17 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					throw error;
 				}
 			}
+			const restorePreviousContext = (): void => {
+				resolvedWorkspaceName = previousWorkspaceName;
+				resolvedContextCwd = previousContextCwd;
+				resolvedWorktreeId = previousWorktreeId;
+				boundWorktreeSessionId = previousBoundWorktreeSessionId;
+			};
+			if (preparedConnected && !workspaceName) {
+				restorePreviousContext();
+				completePendingRekey(oldSessionId);
+				throw new Error("replacement session workspace was not resolved during ownership preparation");
+			}
 			let prepared: ControlResponse | undefined;
 			if (
 				heldSessionId === oldSessionId &&
@@ -804,12 +856,27 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				state === "connected" &&
 				!contextChanged
 			) {
-				prepared = await activeClient.request({
-					type: "lease_rekey_prepare",
-					workspaceName,
-					oldSessionId,
-					newSessionId,
-				});
+				try {
+					prepared = await activeClient.request({
+						type: "lease_rekey_prepare",
+						workspaceName,
+						oldSessionId,
+						newSessionId,
+					});
+				} catch (error) {
+					restorePreviousContext();
+					completePendingRekey(oldSessionId);
+					throw error;
+				}
+				if (
+					client !== activeClient ||
+					state !== "connected" ||
+					connectionGeneration !== preparedConnectionGeneration
+				) {
+					restorePreviousContext();
+					completePendingRekey(oldSessionId);
+					throw new Error("replacement session connection changed during rekey preparation");
+				}
 				if (prepared.type !== "lease_rekey_prepared") {
 					if (prepared.type === "error" && prepared.code === "target_in_use") {
 						try {
@@ -818,18 +885,12 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							// drain/takeover path while retaining the source for rollback.
 							await preacquireTargetLease();
 						} catch (error) {
-							resolvedWorkspaceName = previousWorkspaceName;
-							resolvedContextCwd = previousContextCwd;
-							resolvedWorktreeId = previousWorktreeId;
-							boundWorktreeSessionId = previousBoundWorktreeSessionId;
+							restorePreviousContext();
 							completePendingRekey(oldSessionId);
 							throw error;
 						}
 					} else {
-						resolvedWorkspaceName = previousWorkspaceName;
-						resolvedContextCwd = previousContextCwd;
-						resolvedWorktreeId = previousWorktreeId;
-						boundWorktreeSessionId = previousBoundWorktreeSessionId;
+						restorePreviousContext();
 						completePendingRekey(oldSessionId);
 						throw new Error(
 							prepared.type === "error"
@@ -847,58 +908,58 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				contextChanged ||
 				targetLeasePreacquired
 			) {
-				pendingRekeyTransactionId = "local";
 				const previousHeldSessionId = heldSessionId;
-				let phase: "prepared" | "committed" | "rolled_back" | "disposed" = "prepared";
+				let phase: "prepared" | "committed" | "activated" | "rolled_back" | "disposed" = "prepared";
+				const assertPreparedConnectionCurrent = (): void => {
+					if (preparedConnected) {
+						if (
+							!activeClient ||
+							!workspaceName ||
+							client !== activeClient ||
+							state !== "connected" ||
+							connectionGeneration !== preparedConnectionGeneration ||
+							!targetLeasePreacquired ||
+							targetLeaseConnectionGeneration !== preparedConnectionGeneration
+						) {
+							throw new Error("replacement session lease changed before ownership commit");
+						}
+					} else if (state === "connected") {
+						throw new Error("replacement session connected after offline ownership preparation");
+					}
+				};
 				return {
 					async commit() {
-						if (phase !== "prepared") {
-							return;
-						}
-						if (!resolvedWorkspaceName && state === "connected") await resolveWorkspace();
-						const bindClient = client;
-						const bindWorkspaceName = resolvedWorkspaceName;
+						if (phase !== "prepared") return;
+						assertPreparedConnectionCurrent();
 						if (
-							bindClient &&
-							bindWorkspaceName &&
-							!(await ensureWorktreeBinding(bindClient, bindWorkspaceName, newSessionId, false))
+							preparedConnected &&
+							!(await ensureWorktreeBinding(activeClient!, workspaceName!, newSessionId, false))
 						) {
 							throw new Error("replacement session could not be bound to its worktree");
 						}
-						currentSessionId = newSessionId;
-						heldSessionId =
-							targetLeasePreacquired && targetLeaseConnectionGeneration === connectionGeneration
-								? newSessionId
-								: undefined;
-						const connectedClient = client;
-						const connectedWorkspaceName = resolvedWorkspaceName;
-						if (connectedClient && connectedWorkspaceName && state === "connected") {
-							try {
-								await connectedClient.request({
+						assertPreparedConnectionCurrent();
+						if (preparedConnected) {
+							await activeClient!
+								.request({
 									type: "lease_release",
-									workspaceName: previousWorkspaceName ?? connectedWorkspaceName,
+									workspaceName: previousWorkspaceName ?? workspaceName!,
 									sessionId: oldSessionId,
 									reason: "switch",
-								});
-							} catch {
-								// The old connection may already have released this lease.
-							}
+								})
+								.catch(() => {});
+							assertPreparedConnectionCurrent();
 						}
+						currentSessionId = newSessionId;
+						heldSessionId = preparedConnected ? newSessionId : undefined;
 						phase = "committed";
 					},
 					activate() {
-						if (phase !== "committed") {
-							return;
-						}
+						if (phase !== "committed") return;
+						phase = "activated";
 						completePendingRekey(newSessionId);
-						if (state === "connected" && heldSessionId !== newSessionId) {
-							void ensureLeaseAfterConnected().catch(() => {});
-						}
 					},
 					async rollback() {
-						if (phase !== "prepared") {
-							return;
-						}
+						if (phase !== "prepared") return;
 						if (targetLeasePreacquired && activeClient && workspaceName) {
 							await activeClient
 								.request({
@@ -910,10 +971,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								.catch(() => {});
 						}
 						phase = "rolled_back";
-						resolvedWorkspaceName = previousWorkspaceName;
-						resolvedContextCwd = previousContextCwd;
-						resolvedWorktreeId = previousWorktreeId;
-						boundWorktreeSessionId = previousBoundWorktreeSessionId;
+						restorePreviousContext();
 						currentSessionId = oldSessionId;
 						heldSessionId =
 							state === "connected" &&
@@ -927,9 +985,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						}
 					},
 					async dispose() {
-						if (phase === "disposed" || phase === "rolled_back") {
-							return;
-						}
+						if (phase === "disposed" || phase === "rolled_back") return;
 						if (phase === "prepared" && targetLeasePreacquired && activeClient && workspaceName) {
 							await activeClient
 								.request({
@@ -940,27 +996,20 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								})
 								.catch(() => {});
 						}
-						const disposedSessionId = phase === "committed" ? newSessionId : oldSessionId;
-						const disposeClient = client;
-						const disposeWorkspaceName = phase === "committed" ? resolvedWorkspaceName : previousWorkspaceName;
-						if (disposeClient && disposeWorkspaceName) {
-							try {
-								await disposeClient.request({
+						const targetInstalled = phase === "committed" || phase === "activated";
+						const disposedSessionId = targetInstalled ? newSessionId : oldSessionId;
+						const disposeWorkspaceName = targetInstalled ? resolvedWorkspaceName : previousWorkspaceName;
+						if (client && disposeWorkspaceName) {
+							await client
+								.request({
 									type: "lease_release",
 									workspaceName: disposeWorkspaceName,
 									sessionId: disposedSessionId,
 									reason: "quit",
-								});
-							} catch {
-								// Disconnect cleanup releases any server-side owner.
-							}
+								})
+								.catch(() => {});
 						}
-						if (phase !== "committed") {
-							resolvedWorkspaceName = previousWorkspaceName;
-							resolvedContextCwd = previousContextCwd;
-							resolvedWorktreeId = previousWorktreeId;
-							boundWorktreeSessionId = previousBoundWorktreeSessionId;
-						}
+						if (!targetInstalled) restorePreviousContext();
 						phase = "disposed";
 						currentSessionId = undefined;
 						heldSessionId = undefined;
@@ -968,20 +1017,30 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					},
 				};
 			}
-			if (prepared?.type !== "lease_rekey_prepared") {
+			if (prepared?.type !== "lease_rekey_prepared" || !activeClient || !workspaceName) {
+				restorePreviousContext();
+				completePendingRekey(oldSessionId);
 				throw new Error("conversation lease rekey preflight did not reserve its target");
 			}
 			const transactionId = prepared.transactionId;
-			pendingRekeyTransactionId = transactionId;
-			let phase: "prepared" | "committed" | "rolled_back" | "disposed" = "prepared";
+			let phase: "prepared" | "committed" | "activated" | "rolled_back" | "disposed" = "prepared";
+			const assertPreparedConnectionCurrent = (): void => {
+				if (
+					client !== activeClient ||
+					state !== "connected" ||
+					connectionGeneration !== preparedConnectionGeneration
+				) {
+					throw new Error("replacement session rekey reservation changed before ownership commit");
+				}
+			};
 			return {
 				async commit() {
-					if (phase !== "prepared") {
-						return;
-					}
+					if (phase !== "prepared") return;
+					assertPreparedConnectionCurrent();
 					if (!(await ensureWorktreeBinding(activeClient, workspaceName, newSessionId, false))) {
 						throw new Error("replacement session could not be bound to its worktree");
 					}
+					assertPreparedConnectionCurrent();
 					const response = await activeClient.request({ type: "lease_rekey_commit", transactionId });
 					if (response.type !== "ok") {
 						throw new Error(
@@ -995,15 +1054,12 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					heldSessionId = newSessionId;
 				},
 				activate() {
-					if (phase !== "committed") {
-						return;
-					}
+					if (phase !== "committed") return;
+					phase = "activated";
 					completePendingRekey(newSessionId);
 				},
 				async rollback() {
-					if (phase !== "prepared") {
-						return;
-					}
+					if (phase !== "prepared") return;
 					let retained = false;
 					try {
 						const response = await activeClient.request({ type: "lease_rekey_rollback", transactionId });
@@ -1012,23 +1068,24 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 						// Disconnect cleanup rolls the reservation and lease back implicitly.
 					}
 					phase = "rolled_back";
-					resolvedWorkspaceName = previousWorkspaceName;
-					resolvedContextCwd = previousContextCwd;
-					resolvedWorktreeId = previousWorktreeId;
-					boundWorktreeSessionId = previousBoundWorktreeSessionId;
+					restorePreviousContext();
 					currentSessionId = oldSessionId;
-					heldSessionId = retained && state === "connected" ? oldSessionId : undefined;
+					heldSessionId =
+						retained &&
+						state === "connected" &&
+						client === activeClient &&
+						connectionGeneration === sourceLeaseConnectionGeneration
+							? oldSessionId
+							: undefined;
 					completePendingRekey(oldSessionId);
 					if (state === "connected" && heldSessionId !== oldSessionId) {
 						await ensureLeaseAfterConnected().catch(() => {});
 					}
 				},
 				async dispose() {
-					if (phase === "disposed" || phase === "rolled_back") {
-						return;
-					}
+					if (phase === "disposed" || phase === "rolled_back") return;
 					try {
-						if (phase === "committed") {
+						if (phase === "committed" || phase === "activated") {
 							await activeClient.request({
 								type: "lease_release",
 								workspaceName,
@@ -1041,12 +1098,7 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					} catch {
 						// Disconnect cleanup releases both reservation and lease implicitly.
 					}
-					if (phase !== "committed") {
-						resolvedWorkspaceName = previousWorkspaceName;
-						resolvedContextCwd = previousContextCwd;
-						resolvedWorktreeId = previousWorktreeId;
-						boundWorktreeSessionId = previousBoundWorktreeSessionId;
-					}
+					if (phase !== "committed" && phase !== "activated") restorePreviousContext();
 					phase = "disposed";
 					currentSessionId = undefined;
 					heldSessionId = undefined;

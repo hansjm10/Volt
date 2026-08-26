@@ -627,7 +627,6 @@ export class InteractiveMode {
 	 * served locally reads or writes host state.
 	 */
 	private readonly relayStateManager = new IrohRemoteHostStateManager();
-	private daemonLeaseSessionId: string | undefined;
 	/** Set once the user explicitly picks a theme this session; daemon theme_snapshot broadcasts then stop applying (local explicit choice wins). */
 	private localThemeOverride = false;
 	/** Read-only attach overlay while a remote turn drains (§6.3). */
@@ -1978,16 +1977,10 @@ export class InteractiveMode {
 				return undefined;
 			}
 			return {
-				commit: async () => {
-					await rekey.commit();
-					this.daemonLeaseSessionId = sessionId;
-				},
+				commit: () => rekey.commit(),
 				activate: () => rekey.activate(),
 				rollback: () => rekey.rollback(),
-				dispose: async () => {
-					await rekey.dispose();
-					this.daemonLeaseSessionId = undefined;
-				},
+				dispose: () => rekey.dispose(),
 			};
 		});
 		if (acquireOutcome.kind === "granted" || acquireOutcome.kind === "noop") {
@@ -2001,8 +1994,7 @@ export class InteractiveMode {
 		if (this.daemonAttach.connectionState() === "disabled") {
 			return { kind: "noop" };
 		}
-		this.daemonLeaseSessionId = this.session.sessionId;
-		const outcome = await this.daemonAttach.acquire(this.session.sessionId);
+		const outcome = await this.daemonAttach.selectSession(this.session.sessionId);
 		if (outcome.kind === "denied") {
 			// Multi-TUI is a non-goal: another TUI owns the session. Continue in a
 			// plain read-from-file open (no live view); the user may retry on action.
@@ -2422,24 +2414,9 @@ export class InteractiveMode {
 		await this.reconcileDaemonLease();
 	}
 
-	/**
-	 * Keep the daemon lease pointed at the currently open session. Called after
-	 * every session (re)bind: releases the previous lease and acquires the new
-	 * one when the session id changed (/new, resume, fork, tree navigation).
-	 */
+	/** Keep daemon selection aligned with the rebound runtime generation. */
 	private async reconcileDaemonLease(): Promise<void> {
-		if (this.daemonAttach.connectionState() === "disabled") {
-			return;
-		}
-		const sessionId = this.session.sessionId;
-		if (this.daemonLeaseSessionId === sessionId) {
-			return;
-		}
-		const previous = this.daemonLeaseSessionId;
-		this.daemonLeaseSessionId = sessionId;
-		if (previous !== undefined) {
-			await this.daemonAttach.release(previous).catch(() => {});
-		}
+		if (this.daemonAttach.connectionState() === "disabled") return;
 		await this.acquireCurrentSessionLease();
 	}
 

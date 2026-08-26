@@ -23,14 +23,16 @@ to its states and the close reasons it mints.
 | # | Module | Plain question it answers | Key state | Bug classes |
 |---|--------|---------------------------|-----------|-------------|
 | 1 | **`LeaseBroker`** | Who's doing the work for this chat, and how does it hand off? | lease state, owner, streamCount, relays, drain, `runtimeEntry`, pendingAttaches | split-brain runtime (I1), runtime/state coherence (I2), stuck hand-off (I5), lost turn (I6), rekey orphan (I7), relays-only-in-tui (I3), grant never settled (I4). **Written — see README.** |
-| 2 | **`RelayViewer`** | While handing off, does the relay token stay single-use and does "watch the turn finish" ever leak or wedge? | relay `{Pending,Active,Invalidated,Settled}` + `used`/`expiresAt`; feed `{Buffering,Truncated,Live,Ended}` + `subscribed`/`seq`/`connId` | lost turn (event after end; silent-cancel emits nothing), token replay/expiry, double-settle, viewer feed leaking to a non-owner, stuck drain. |
-| 3 | **`SessionTarget`** | On connect, does the phone pin the *right* session — never a stale one? | `target ∈ {last_noId,last_withId,new,session}`; `hostSession ∈ {exists,missing,liveMoved}`; wire `selection`; `requestedId?`; client `{Validated,StreamOpened,PinCommitted,RolledBack}` | ghost pin (pinned to requested vs canonical id), rekey without requestedId, requestedId leaking onto created/resumed, `target=session` silently creating a session, producer/validator tuple mismatch. |
-| 4 | **`ClientAuth`** | Can a revoked or stale phone ever get back in? Is a one-time secret really one-time? | `clients`; `revoked[node]`; `pending[secretHash]`; `tomb ∈ {consumed(node),expired}`; logical `clock`; per-hello workspace authz | revoked-client re-entry, one-time secret replayed to a *different* node, expired-secret pairing, workspace-authz cached-at-pairing, check-order regressions. |
-| 5 | **`ClientConn`** | Does the phone reconnect exactly once, never when the user said disconnect, and never confuse abort with detach? | app status; `userRequestedDisconnect`; background flag; per-pin status lattice; closure ledger; monotonic `operationToken`/`reconnectGen`/`attemptId` | ghost reconnect while user-disconnected, double reconnect loop, expected-closure marker mis-consume, abort-conflated-with-detach, stale continuation commit. |
+| 2 | **`TuiSessionReplacement`** | Can the desktop replace a session without reopening stale bytes, recovering input before it owns the target, or exposing relay ingress early? | preparation kind, connection generation, target stability/lease, reopen, source validity, target publication, recovery, relay activation | stale connected commit, pre/post-invalidation cleanup mistakes, recovery without lease, relay ingress before publication. **Written and verified green.** |
+| 3 | **`RelayViewer`** | While handing off, does the relay token stay single-use and does "watch the turn finish" ever leak or wedge? | relay `{Pending,Active,Invalidated,Settled}` + `used`/`expiresAt`; feed `{Buffering,Truncated,Live,Ended}` + `subscribed`/`seq`/`connId` | lost turn (event after end; silent-cancel emits nothing), token replay/expiry, double-settle, viewer feed leaking to a non-owner, stuck drain. |
+| 4 | **`SessionTarget`** | On connect, does the phone pin the *right* session — never a stale one? | `target ∈ {last_noId,last_withId,new,session}`; `hostSession ∈ {exists,missing,liveMoved}`; wire `selection`; `requestedId?`; client `{Validated,StreamOpened,PinCommitted,RolledBack}` | ghost pin (pinned to requested vs canonical id), rekey without requestedId, requestedId leaking onto created/resumed, `target=session` silently creating a session, producer/validator tuple mismatch. |
+| 5 | **`ClientAuth`** | Can a revoked or stale phone ever get back in? Is a one-time secret really one-time? | `clients`; `revoked[node]`; `pending[secretHash]`; `tomb ∈ {consumed(node),expired}`; logical `clock`; per-hello workspace authz | revoked-client re-entry, one-time secret replayed to a *different* node, expired-secret pairing, workspace-authz cached-at-pairing, check-order regressions. |
+| 6 | **`ClientConn`** | Does the phone reconnect exactly once, never when the user said disconnect, and never confuse abort with detach? | app status; `userRequestedDisconnect`; background flag; per-pin status lattice; closure ledger; monotonic `operationToken`/`reconnectGen`/`attemptId` | ghost reconnect while user-disconnected, double reconnect loop, expected-closure marker mis-consume, abort-conflated-with-detach, stale continuation commit. |
 
-**Build order.** `LeaseBroker` → `RelayViewer` (shares the connection-drop
-trigger; compose the two once each is green solo) → `SessionTarget` → `ClientAuth`
-→ `ClientConn` (largest state space; consumes close reasons from 1–3 as an
+**Build order.** `LeaseBroker` → `TuiSessionReplacement` (the cross-layer desktop
+handoff omitted by the broker abstraction) → `RelayViewer` (shares the
+connection-drop trigger; compose once each model is green solo) → `SessionTarget`
+→ `ClientAuth` → `ClientConn` (largest state space; consumes close reasons as an
 abstract input alphabet).
 
 ---
@@ -50,6 +52,23 @@ comment of `LeaseBroker.tla`. Summary of what it checks:
   idle-acquire disposal is a two-step `flip → disposeDone/disposeFail`, so the
   flip-before-dispose split-brain window is a reachable state (otherwise I1/I2 are
   vacuous). This is the fix the review forced on the first draft.
+
+### 2.1 `TuiSessionReplacement` (written)
+
+This focused composition model starts after the broker has either reserved a free
+target or transferred a daemon-owned target lease. It then models authoritative
+file reopen, runtime invalidation/publication, durable-input recovery, and relay
+ingress activation across disconnect/reconnect.
+
+- **Safety:** connected recovery has the target lease; relay ingress requires the
+  published target; reopen follows target stability; stale connection generations
+  cannot commit; rollback retains a pre-invalidation source; post-invalidation
+  failure is terminal.
+- **Liveness:** every prepared handoff eventually activates, rolls back, or
+  disposes under weak fairness on transaction progress.
+- **Counterexample:** `TuiSessionReplacement.deferred.cfg` enables deferred
+  acquisition and reaches recovery on a replacement connection without the target
+  lease. The baseline disables that transition and is green at 68 states/depth 8.
 
 ---
 
