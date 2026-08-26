@@ -10,6 +10,8 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative, resolve as resolvePath } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -151,11 +153,16 @@ function createSymlinkFixture(repository: string, path: string, target: string):
 describe("review snapshots", () => {
 	const tempDirectories: string[] = [];
 	const snapshots: ReviewSnapshot[] = [];
+	const servers: Server[] = [];
 	const initialPath = process.env.PATH;
 	const initialGitTrace = process.env.GIT_TRACE;
 
 	afterEach(async () => {
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
+		for (const server of servers.splice(0)) {
+			server.closeAllConnections();
+			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+		}
 		for (const directory of tempDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 		if (initialPath === undefined) delete process.env.PATH;
 		else process.env.PATH = initialPath;
@@ -263,6 +270,78 @@ describe("review snapshots", () => {
 		const headCommit = git(repository, "rev-parse", "HEAD");
 		const localObjects = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects");
 		return { repository, baseCommit, headCommit, omittedParent, localObjects };
+	}
+
+	async function serveAuthenticatedGitRepository(remote: string): Promise<{
+		url: string;
+		extraHeader: string;
+		authenticatedRequestCount(): number;
+		deniedRequestCount(): number;
+	}> {
+		const requiredHeader = 'review-"config\\secret';
+		let authenticatedRequestCount = 0;
+		let deniedRequestCount = 0;
+		const server = createServer((request, response) => {
+			if (request.headers["x-volt-auth"] !== requiredHeader) {
+				deniedRequestCount++;
+				response.writeHead(403, { "content-type": "text/plain" });
+				response.end("missing repository-local authentication header\n");
+				return;
+			}
+			authenticatedRequestCount++;
+			let pathname: string;
+			try {
+				pathname = decodeURIComponent(new URL(request.url ?? "/", "http://localhost").pathname);
+			} catch {
+				response.writeHead(400);
+				response.end();
+				return;
+			}
+			const prefix = "/remote.git/";
+			if (!pathname.startsWith(prefix)) {
+				response.writeHead(404);
+				response.end();
+				return;
+			}
+			const relativePath = pathname.slice(prefix.length);
+			if (
+				!relativePath ||
+				relativePath.split("/").some((segment) => !segment || segment === "." || segment === "..")
+			) {
+				response.writeHead(400);
+				response.end();
+				return;
+			}
+			let content: Buffer;
+			try {
+				content = readFileSync(join(remote, relativePath));
+			} catch {
+				response.writeHead(404);
+				response.end();
+				return;
+			}
+			response.writeHead(200, {
+				"cache-control": "no-cache",
+				"content-type": relativePath === "info/refs" ? "text/plain" : "application/octet-stream",
+			});
+			if (request.method === "HEAD") response.end();
+			else response.end(content);
+		});
+		await new Promise<void>((resolveListen, rejectListen) => {
+			server.once("error", rejectListen);
+			server.listen(0, "127.0.0.1", () => {
+				server.off("error", rejectListen);
+				resolveListen();
+			});
+		});
+		servers.push(server);
+		const { port } = server.address() as AddressInfo;
+		return {
+			url: `http://127.0.0.1:${port}/remote.git`,
+			extraHeader: `X-Volt-Auth: ${requiredHeader}`,
+			authenticatedRequestCount: () => authenticatedRequestCount,
+			deniedRequestCount: () => deniedRequestCount,
+		};
 	}
 
 	async function resolve(
@@ -639,6 +718,58 @@ describe("review snapshots", () => {
 		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
 	});
 
+	it("preserves repository-local fetch configuration for isolated branch and PR snapshots", async () => {
+		const { repository, remote, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		git(repository, "push", remote, `${headCommit}:refs/pull/11/head`);
+		git(remote, "update-server-info");
+		const authenticatedRemote = await serveAuthenticatedGitRepository(remote);
+		git(repository, "remote", "set-url", "origin", authenticatedRemote.url);
+		git(
+			repository,
+			"config",
+			"--local",
+			`http.${authenticatedRemote.url}.extraHeader`,
+			authenticatedRemote.extraHeader,
+		);
+
+		const branchSnapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(branchSnapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(branchSnapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		const branchRequestCount = authenticatedRemote.authenticatedRequestCount();
+		expect(branchRequestCount).toBeGreaterThan(0);
+
+		installGitHubShim(repository, {
+			view: {
+				id: "PR_local_config_11",
+				number: 11,
+				title: "Repository-local fetch config",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/11",
+				baseRefOid: authoritativeBase,
+				headRefOid: headCommit,
+			},
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+		const pullRequestSnapshot = await resolve({ kind: "pr", number: "11" }, repository);
+		expect(pullRequestSnapshot.identity.pullRequest).toMatchObject({
+			number: 11,
+			baseRefOid: authoritativeBase,
+			headRefOid: headCommit,
+		});
+		expect(pullRequestSnapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(authenticatedRemote.authenticatedRequestCount()).toBeGreaterThan(branchRequestCount);
+		expect(authenticatedRemote.deniedRequestCount()).toBe(0);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
+	});
+
 	it("refreshes a configured non-origin upstream for a plain branch name", async () => {
 		const { repository, staleBase, authoritativeBase } = createStaleBranchFixture("upstream");
 		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
@@ -701,7 +832,7 @@ describe("review snapshots", () => {
 		installNodeCommandShim(
 			bin,
 			"git",
-			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "fetch" && process.cwd().includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, process.cwd());\n  process.stderr.write("forced branch fetch failure\\n");\n  process.exitCode = 1;\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir?.includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, gitDir);\n  process.stderr.write("forced branch fetch failure\\n");\n  process.exitCode = 1;\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
 		);
 		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 
@@ -729,7 +860,7 @@ describe("review snapshots", () => {
 		installNodeCommandShim(
 			bin,
 			"git",
-			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "fetch" && process.cwd().includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(startedPath)}, String(process.pid));\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, process.cwd());\n  setInterval(() => {}, 1_000);\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir?.includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(startedPath)}, String(process.pid));\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, gitDir);\n  setInterval(() => {}, 1_000);\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
 		);
 		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 		const controller = new AbortController();
@@ -886,7 +1017,7 @@ describe("review snapshots", () => {
 		installNodeCommandShim(
 			join(repository, "bin"),
 			"git",
-			`import { appendFileSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "fetch") appendFileSync(${JSON.stringify(alternatesLog)}, readFileSync(join(process.cwd(), "objects", "info", "alternates"), "utf8"));\nconst result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\nif (result.error) throw result.error;\nprocess.exitCode = result.status ?? 1;\n`,
+			`import { appendFileSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir) appendFileSync(${JSON.stringify(alternatesLog)}, readFileSync(join(gitDir, "objects", "info", "alternates"), "utf8"));\nconst result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\nif (result.error) throw result.error;\nprocess.exitCode = result.status ?? 1;\n`,
 		);
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 

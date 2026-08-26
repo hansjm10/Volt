@@ -512,6 +512,103 @@ async function repositoryIndexFile(
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
+interface FetchConfigEntry {
+	key: string;
+	value: string;
+}
+
+function isFetchConfigKey(key: string, remote: string): boolean {
+	if (key.startsWith("http.") || key.startsWith("credential.")) return true;
+	if (key === "core.askpass" || key === "core.gitproxy" || key === "core.sshcommand") return true;
+	if (key === "ssh.variant" || key === "transfer.credentialsinurl") return true;
+	if (key === "protocol.allow" || key === "protocol.version" || /^protocol\..+\.allow$/.test(key)) return true;
+	if (key.startsWith("url.") && key.endsWith(".insteadof")) return true;
+	const remotePrefix = `remote.${remote}.`;
+	if (!key.startsWith(remotePrefix)) return false;
+	return ["proxy", "proxyauthmethod", "serveroption", "uploadpack", "vcs"].includes(key.slice(remotePrefix.length));
+}
+
+function parseFetchConfig(stdout: Buffer, remote: string): FetchConfigEntry[] {
+	const tokens = stdout.toString("utf8").split("\0");
+	if (tokens.at(-1) === "") tokens.pop();
+	if (tokens.length % 2 !== 0) throw new Error("git config returned malformed scoped output.");
+	const entries: FetchConfigEntry[] = [];
+	for (let index = 0; index < tokens.length; index += 2) {
+		const scope = tokens[index];
+		const entry = tokens[index + 1] ?? "";
+		if (scope !== "local" && scope !== "worktree") continue;
+		const separator = entry.indexOf("\n");
+		if (separator < 1) throw new Error("git config returned a malformed repository-local entry.");
+		const key = entry.slice(0, separator);
+		if (isFetchConfigKey(key, remote)) entries.push({ key, value: entry.slice(separator + 1) });
+	}
+	return entries;
+}
+
+async function repositoryFetchConfig(
+	cwd: string,
+	remote: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<FetchConfigEntry[]> {
+	throwIfResolutionCancelled(signal);
+	const result = await runCommand(
+		"git",
+		["config", "--null", "--show-scope", "--list", "--includes"],
+		cwd,
+		commandOptions(limits, signal),
+	);
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git config failed", result);
+	if (!result.ok) throw new Error(`Could not inspect repository-local Git config: ${commandError(result)}`);
+	return parseFetchConfig(result.stdout, remote);
+}
+
+function quoteGitConfigValue(value: string): string {
+	let escaped = "";
+	for (const character of value) {
+		switch (character) {
+			case "\\":
+				escaped += "\\\\";
+				break;
+			case '"':
+				escaped += '\\"';
+				break;
+			case "\n":
+				escaped += "\\n";
+				break;
+			case "\t":
+				escaped += "\\t";
+				break;
+			case "\b":
+				escaped += "\\b";
+				break;
+			default:
+				escaped += character;
+		}
+	}
+	return `"${escaped}"`;
+}
+
+function serializeFetchConfig(entries: readonly FetchConfigEntry[]): string {
+	return entries
+		.map(({ key, value }) => {
+			const firstSeparator = key.indexOf(".");
+			const lastSeparator = key.lastIndexOf(".");
+			const section = key.slice(0, firstSeparator);
+			const name = key.slice(lastSeparator + 1);
+			if (firstSeparator < 1 || !section || !name || !/^[a-z0-9-]+$/i.test(section) || !/^[a-z0-9-]+$/i.test(name)) {
+				throw new Error(`Cannot preserve malformed Git config key: ${key}`);
+			}
+			const header =
+				firstSeparator === lastSeparator
+					? `[${section}]`
+					: `[${section} ${quoteGitConfigValue(key.slice(firstSeparator + 1, lastSeparator))}]`;
+			return `${header}\n\t${name} = ${quoteGitConfigValue(value)}\n`;
+		})
+		.join("");
+}
+
 async function detectBaseBranch(
 	cwd: string,
 	limits: ReviewSnapshotLimits,
@@ -710,6 +807,30 @@ function resolveRemoteFetchUrl(root: string, remoteUrl: string): string {
 	return isAbsolute(remoteUrl) || isTildePath || isTransportUrl ? remoteUrl : resolve(root, remoteUrl);
 }
 
+async function fetchIsolatedRemote(
+	source: GitSource,
+	root: string,
+	config: readonly FetchConfigEntry[],
+	remote: string,
+	fetchUrl: string,
+	options: string[],
+	refspecs: string[],
+): Promise<CommandResult> {
+	const configPath = join(source.cwd, "volt-fetch.config");
+	try {
+		await writeFile(configPath, serializeFetchConfig([{ key: `remote.${remote}.url`, value: fetchUrl }, ...config]), {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+		const includeConfig = await git(source, ["config", "--add", "include.path", configPath]);
+		if (!includeConfig.ok) throw new Error(`Could not prepare isolated fetch config: ${commandError(includeConfig)}`);
+		return await git({ ...source, cwd: root }, [`--git-dir=${source.cwd}`, "fetch", ...options, remote, ...refspecs]);
+	} finally {
+		if (!source.signal?.aborted) await git(source, ["config", "--unset-all", "include.path"]).catch(() => {});
+		await rm(configPath, { force: true }).catch(() => {});
+	}
+}
+
 async function createRemoteBranchSource(
 	root: string,
 	remote: string,
@@ -725,11 +846,12 @@ async function createRemoteBranchSource(
 	error?: ReviewSnapshotResolutionError;
 }> {
 	throwIfResolutionCancelled(signal);
-	const [localObjects, objectFormat, sourceIsShallow, remoteUrlResult] = await Promise.all([
+	const [localObjects, objectFormat, sourceIsShallow, remoteUrlResult, fetchConfig] = await Promise.all([
 		repositoryObjectDirectory(root, limits, signal),
 		repositoryObjectFormat(root, limits, signal),
 		repositoryIsShallow(root, limits, signal),
 		runCommand("git", ["remote", "get-url", remote], root, commandOptions(limits, signal)),
+		repositoryFetchConfig(root, remote, limits, signal),
 	]);
 	throwIfResolutionCancelled(signal);
 	if (!localObjects) {
@@ -822,14 +944,15 @@ async function createRemoteBranchSource(
 				},
 			};
 		}
-		const fetch = await git(source, [
-			"fetch",
-			"--no-tags",
-			"--no-write-fetch-head",
-			"--force",
+		const fetch = await fetchIsolatedRemote(
+			source,
+			root,
+			fetchConfig,
+			remote,
 			fetchUrl,
-			`+${remoteRef}:refs/review/base`,
-		]);
+			["--no-tags", "--no-write-fetch-head", "--force"],
+			[`+${remoteRef}:refs/review/base`],
+		);
 		if (!fetch.ok) {
 			return {
 				error: {
@@ -1002,11 +1125,12 @@ async function createPullRequestSource(
 	signal?: AbortSignal,
 ): Promise<{ source?: GitSource; temporaryDirectory?: string; error?: ReviewSnapshotResolutionError }> {
 	throwIfResolutionCancelled(signal);
-	const [localObjects, objectFormat, sourceIsShallow, originResult] = await Promise.all([
+	const [localObjects, objectFormat, sourceIsShallow, originResult, fetchConfig] = await Promise.all([
 		repositoryObjectDirectory(root, limits, signal),
 		repositoryObjectFormat(root, limits, signal),
 		repositoryIsShallow(root, limits, signal),
 		runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits, signal)),
+		repositoryFetchConfig(root, "origin", limits, signal),
 	]);
 	throwIfResolutionCancelled(signal);
 	if (!localObjects) return { error: { error: "Could not resolve the Git object directory." } };
@@ -1041,14 +1165,18 @@ async function createPullRequestSource(
 			limits,
 			signal,
 		};
-		const fetch = await git(fetchSource, [
-			"fetch",
-			"--no-tags",
-			"--force",
+		const fetch = await fetchIsolatedRemote(
+			fetchSource,
+			root,
+			fetchConfig,
+			"origin",
 			fetchUrl,
-			`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
-			`+refs/pull/${pullRequest.number}/head:refs/review/head`,
-		]);
+			["--no-tags", "--force"],
+			[
+				`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
+				`+refs/pull/${pullRequest.number}/head:refs/review/head`,
+			],
+		);
 		if (!fetch.ok) {
 			return {
 				error: {
