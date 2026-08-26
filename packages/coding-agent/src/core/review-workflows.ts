@@ -67,7 +67,7 @@ export interface ReviewWorkflowExecuteHooks {
 }
 
 export interface ReviewWorkflowStartOptions {
-	prepared: Pick<PreparedReviewWorkflow, "workflowId" | "action"> & {
+	prepared: Pick<PreparedReviewWorkflow, "workflowId" | "action" | "startedAt"> & {
 		resolution: Pick<PreparedReviewWorkflow["resolution"], "description" | "workflowDescription" | "diffCommand"> &
 			Partial<Pick<PreparedReviewWorkflow["resolution"], "dispose">>;
 	};
@@ -163,7 +163,7 @@ export class ReviewWorkflowManager {
 				description: resolution.workflowDescription ?? resolution.description,
 				diffCommand: resolution.diffCommand,
 			},
-			startedAt: Date.now(),
+			startedAt: options.prepared.startedAt,
 		};
 		let settle: () => void = () => {};
 		const done = new Promise<void>((resolve) => {
@@ -333,6 +333,8 @@ export class ReviewWorkflowManager {
 			title: "Review",
 			message,
 			status: result.status,
+			startedAt: descriptor.startedAt,
+			endedAt: descriptor.endedAt,
 		});
 		entry.settle();
 	}

@@ -120,11 +120,14 @@ describe("test harness", () => {
 
 	it("event capture", async () => {
 		harness = createHarness({ responses: ["hello"] });
+		const earliestStart = Date.now();
 
 		await harness.session.prompt("hi");
 
 		const agentStarts = harness.eventsOfType("agent_start");
 		expect(agentStarts).toHaveLength(1);
+		expect(agentStarts[0].startedAt).toBeGreaterThanOrEqual(earliestStart);
+		expect(agentStarts[0].startedAt).toBeLessThanOrEqual(Date.now());
 
 		const agentEnds = harness.eventsOfType("agent_end");
 		expect(agentEnds).toHaveLength(1);

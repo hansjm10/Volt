@@ -585,6 +585,7 @@ function projectOptionalStateString(value: string | undefined): {
  * snapshot-and-subscribe cut.
  */
 export function buildRpcSessionState(session: AgentSession): RpcSessionState {
+	const activeAgentRun = session.activeAgentRun;
 	const activeCompaction = session.activeCompaction;
 	const activeToolExecutions = session.activeToolExecutions;
 	const activeTools = projectRpcActiveTools(activeToolExecutions.values(), activeToolExecutions.size);
@@ -643,6 +644,7 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 		steeringQueue: steeringQueue.value,
 		followUpQueue: followUpQueue.value,
 		...(activeTools.value.length === 0 ? {} : { activeTools: activeTools.value }),
+		...(activeAgentRun ? { activeAgentRun } : {}),
 		...(activeCompaction ? { activeCompaction } : {}),
 		...(retryAttempt === 0 || retrySettings === undefined
 			? {}

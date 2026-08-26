@@ -3933,7 +3933,7 @@ export class InteractiveMode {
 		switch (event.type) {
 			case "agent_start":
 				this.disposePendingTools();
-				this.turnStartedAt = Date.now();
+				this.turnStartedAt = event.startedAt;
 				this.startWorkingElapsedTicker();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);

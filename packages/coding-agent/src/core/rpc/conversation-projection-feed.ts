@@ -738,7 +738,9 @@ function assertCanonicalExternalEvent(event: object): asserts event is Record<st
 			!isOptionalString(event.action) ||
 			!isOptionalString(event.title) ||
 			!isOptionalString(event.message) ||
-			!isOptionalString(event.status)
+			!isOptionalString(event.status) ||
+			(event.startedAt !== undefined && !isNonNegativeFiniteNumber(event.startedAt)) ||
+			(event.endedAt !== undefined && !isNonNegativeFiniteNumber(event.endedAt))
 		) {
 			throw new Error("Conversation workflow event contains malformed optional fields");
 		}

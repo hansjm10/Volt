@@ -238,6 +238,7 @@ function startTestReview(
 		prepared: {
 			workflowId,
 			action: "review.uncommitted",
+			startedAt: 1_782_470_400_000,
 			resolution: {
 				description: "private review target",
 				workflowDescription: targetDescription,
@@ -253,6 +254,7 @@ function startTestReview(
 				title: "Review",
 				message: "Reviewing uncommitted changes.",
 				status: "running",
+				startedAt: 1_782_470_400_000,
 			});
 			return result;
 		},

@@ -69,6 +69,9 @@ export const RpcWorkflowEventSchema = Type.Object(
 		title: Type.Optional(Type.String()),
 		message: Type.Optional(Type.String()),
 		status: Type.Optional(RpcWorkflowStatusSchema),
+		/** Host-authoritative Unix epoch milliseconds for timed workflow presentation. */
+		startedAt: Type.Optional(Type.Number()),
+		endedAt: Type.Optional(Type.Number()),
 		projection: Type.Optional(RpcProjectionTruncationSchema),
 	},
 	{ additionalProperties: false },

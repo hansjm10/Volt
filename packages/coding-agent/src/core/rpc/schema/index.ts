@@ -84,6 +84,7 @@ import {
 	RpcTranscriptEntryEventSchema,
 } from "./conversation.ts";
 import {
+	RpcAgentStartEventSchema,
 	RpcExtensionErrorEventSchema,
 	RpcExtensionUIRequestSchema,
 	RpcExtensionUIResponseSchema,
@@ -217,6 +218,7 @@ import {
 	RpcTranscriptEntryTextResponseSchema,
 } from "./responses.ts";
 import {
+	RpcActiveAgentRunSchema,
 	RpcActiveCompactionSchema,
 	RpcActiveRetrySchema,
 	RpcActiveToolExecutionSchema,
@@ -302,6 +304,7 @@ export const RpcResponseSchema = Type.Union([
  * (`x-volt-open-events` in the artifact); clients must ignore unknown types.
  */
 export const RpcServerEventSchema = Type.Union([
+	RpcAgentStartEventSchema,
 	RpcConversationBootstrapEventSchema,
 	RpcMessageStartFrameSchema,
 	RpcMessageUpdateFrameSchema,
@@ -448,6 +451,7 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	// Session state + transcript + subagents + host status
 	RpcSessionListItem: RpcSessionListItemSchema,
 	RpcActiveToolExecution: RpcActiveToolExecutionSchema,
+	RpcActiveAgentRun: RpcActiveAgentRunSchema,
 	RpcActiveCompaction: RpcActiveCompactionSchema,
 	RpcActiveRetry: RpcActiveRetrySchema,
 	RpcQueuedMessage: RpcQueuedMessageSchema,
@@ -506,6 +510,7 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcTranscriptEntryEvent: RpcTranscriptEntryEventSchema,
 
 	// Events + control messages
+	RpcAgentStartEvent: RpcAgentStartEventSchema,
 	RpcHostActionMetadataValue: RpcHostActionMetadataValueSchema,
 	RpcHostActionRequest: RpcHostActionRequestSchema,
 	RpcHostActionUpdate: RpcHostActionUpdateSchema,

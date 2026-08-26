@@ -231,6 +231,16 @@ export const RpcSubagentDisposedEventSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+/** Agent provider run started with a host-authoritative presentation timestamp. */
+export const RpcAgentStartEventSchema = Type.Object(
+	{
+		type: Type.Literal("agent_start"),
+		startedAt: Type.Number(),
+		delivery: Type.Optional(RpcConversationDeliveryPositionSchema),
+	},
+	{ additionalProperties: false },
+);
+
 /** Model catalog changed; clients re-fetch get_available_models. */
 export const RpcModelsChangedEventSchema = Type.Object(
 	{ type: Type.Literal("models_changed") },

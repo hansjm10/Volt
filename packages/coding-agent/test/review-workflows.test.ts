@@ -81,6 +81,7 @@ function prepared(workflowId: string, options: { workflowDescription?: string; d
 	return {
 		workflowId,
 		action: "review.uncommitted",
+		startedAt: 1_782_470_400_000,
 		resolution: {
 			description: "uncommitted changes with private metadata",
 			...(options.workflowDescription ? { workflowDescription: options.workflowDescription } : {}),
@@ -108,6 +109,7 @@ describe("ReviewWorkflowManager", () => {
 					title: "Review",
 					message: "Reviewing.",
 					status: "running",
+					startedAt: 1_782_470_400_000,
 				});
 				return completed();
 			},
