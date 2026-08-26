@@ -706,15 +706,7 @@ async function detectBaseBranch(
 		if (ref) return ref;
 	}
 	for (const candidate of ["main", "master"]) {
-		const exists = await runCommand(
-			"git",
-			["rev-parse", "--verify", "--quiet", candidate],
-			cwd,
-			commandOptions(limits, signal),
-		);
-		throwIfResolutionCancelled(signal);
-		throwIfOutputLimited("git rev-parse failed", exists);
-		if (exists.ok) return candidate;
+		if (await resolveBranchBase(candidate, cwd, limits, signal)) return candidate;
 	}
 	return undefined;
 }

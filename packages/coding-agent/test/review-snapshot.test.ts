@@ -766,6 +766,19 @@ describe("review snapshots", () => {
 		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
 	});
 
+	it("skips tag-only names while auto-detecting a branch base", async () => {
+		const repository = createRepository();
+		git(repository, "branch", "-m", "master");
+		git(repository, "tag", "main");
+		git(repository, "checkout", "-b", "feature");
+		writeFileSync(join(repository, "tracked.txt"), "feature\n");
+		git(repository, "commit", "-am", "feature");
+
+		const snapshot = await resolve({ kind: "branch" }, repository);
+		expect(snapshot.description).toBe("branch changes vs master");
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["tracked.txt"]);
+	});
+
 	it("resolves relative filesystem URLs before refreshing branch bases", async () => {
 		const { repository, remote, staleBase, authoritativeBase } = createStaleBranchFixture("origin");
 		const relativeRemote = relative(repository, remote);
