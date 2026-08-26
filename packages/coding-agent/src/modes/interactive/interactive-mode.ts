@@ -8708,7 +8708,7 @@ export class InteractiveMode {
 		return { kind: "commit" };
 	}
 
-	/** Show a local-branch picker and return the selected base branch. */
+	/** Show logical local/upstream base branches and return the selected target. */
 	private async promptForReviewBaseBranch(): Promise<string | undefined> {
 		const branches = await listBaseBranches(this.sessionManager.getCwd());
 		if ("error" in branches) {

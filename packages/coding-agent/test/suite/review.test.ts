@@ -1406,6 +1406,16 @@ describe("review presentation and repository helpers", () => {
 			git(harness.tempDir, "commit", "-m", "initial value");
 			git(harness.tempDir, "branch", "develop");
 			expect(await listBaseBranches(harness.tempDir)).toEqual(["main", "develop"]);
+
+			const remote = join(harness.tempDir, "remote.git");
+			mkdirSync(remote);
+			git(remote, "init", "--bare", "--initial-branch=main");
+			git(harness.tempDir, "remote", "add", "origin", remote);
+			git(harness.tempDir, "branch", "remote-only");
+			git(harness.tempDir, "push", "-u", "origin", "main");
+			git(harness.tempDir, "push", "origin", "develop", "remote-only");
+			git(harness.tempDir, "branch", "-D", "remote-only");
+			expect(await listBaseBranches(harness.tempDir)).toEqual(["main", "develop", "origin/remote-only"]);
 			expect(await listRecentCommits(harness.tempDir, 1)).toMatchObject([{ subject: "initial value" }]);
 		} finally {
 			harness.cleanup();

@@ -576,7 +576,8 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 	registry.register({
 		id: REVIEW_BRANCH_ACTION_ID,
 		label: "Review branch",
-		description: "Review the current branch against its merge base.",
+		description:
+			"Review the current branch against a refreshed upstream merge base using host Git credentials and network; full refs use local cached state.",
 		category: "review",
 		presentation: {
 			kind: "card",
@@ -591,6 +592,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 				type: "string",
 				required: false,
 				placeholder: "main",
+				description: "Plain names refresh their upstream; refs/heads/* and refs/remotes/* use local cached state.",
 				completion: "gitBranches",
 			},
 			...REVIEW_OPTION_ARGUMENTS,

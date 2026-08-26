@@ -182,6 +182,39 @@ describe("review snapshots", () => {
 		return directory;
 	}
 
+	function createStaleBranchFixture(remoteName: string): {
+		repository: string;
+		staleBase: string;
+		authoritativeBase: string;
+		headCommit: string;
+	} {
+		const repository = createRepository();
+		const remote = join(tmpdir(), `volt-review-branch-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(repository, "remote", "add", remoteName, remote);
+		git(repository, "push", "-u", remoteName, "main");
+		if (remoteName === "origin") git(repository, "remote", "set-head", "origin", "main");
+		const staleBase = git(repository, "rev-parse", "main");
+
+		writeFileSync(join(repository, "upstream.txt"), "already merged upstream\n");
+		git(repository, "add", "upstream.txt");
+		git(repository, "commit", "-m", "upstream change");
+		const authoritativeBase = git(repository, "rev-parse", "HEAD");
+		git(repository, "push", remoteName, "main");
+
+		git(repository, "checkout", "-b", "feature");
+		writeFileSync(join(repository, "feature.txt"), "feature only\n");
+		git(repository, "add", "feature.txt");
+		git(repository, "commit", "-m", "feature change");
+		const headCommit = git(repository, "rev-parse", "HEAD");
+		git(repository, "branch", "-f", "main", staleBase);
+		git(repository, "update-ref", `refs/remotes/${remoteName}/main`, staleBase);
+		rmSync(join(repository, ".git", "FETCH_HEAD"), { force: true });
+		return { repository, staleBase, authoritativeBase, headCommit };
+	}
+
 	async function resolve(
 		target: Parameters<typeof resolveReviewSnapshot>[0],
 		cwd: string,
@@ -508,6 +541,110 @@ describe("review snapshots", () => {
 
 		git(repository, "checkout", "main");
 		expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("feature\n");
+	});
+
+	it("refreshes short branch bases without changing stale workspace refs", async () => {
+		const { repository, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		for (const target of [
+			{ kind: "branch" as const, base: "main" },
+			{ kind: "branch" as const, base: "origin/main" },
+			{ kind: "branch" as const },
+		]) {
+			const snapshot = await resolve(target, repository);
+			expect(snapshot.description).toBe("branch changes vs origin/main");
+			expect(snapshot.identity).toMatchObject({
+				baseCommit: authoritativeBase,
+				mergeBaseCommit: authoritativeBase,
+				headCommit,
+			});
+			expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		}
+
+		for (const base of ["refs/heads/main", "refs/remotes/origin/main"]) {
+			const snapshot = await resolve({ kind: "branch", base }, repository);
+			expect(snapshot.description).toBe(`branch changes vs ${base}`);
+			expect(snapshot.identity.baseCommit).toBe(staleBase);
+			expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt", "upstream.txt"]);
+		}
+
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "HEAD")).toBe(headCommit);
+		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
+	});
+
+	it("refreshes a configured non-origin upstream for a plain branch name", async () => {
+		const { repository, staleBase, authoritativeBase } = createStaleBranchFixture("upstream");
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.description).toBe("branch changes vs upstream/main");
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "upstream/main")).toBe(staleBase);
+	});
+
+	it("fails a remote base refresh without falling back and removes the temporary source", async () => {
+		const { repository, staleBase } = createStaleBranchFixture("origin");
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Unable to locate git executable");
+		const bin = join(repository, "failed-branch-fetch-bin");
+		const temporaryDirectoryPath = join(repository, "failed-branch-fetch-directory");
+		mkdirSync(bin);
+		installNodeCommandShim(
+			bin,
+			"git",
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "fetch" && process.cwd().includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, process.cwd());\n  process.stderr.write("forced branch fetch failure\\n");\n  process.exitCode = 1;\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+		);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+
+		const result = await resolveReviewSnapshot({ kind: "branch", base: "main" }, repository, OPTIONS);
+		expect(result).toMatchObject({
+			error: expect.stringContaining("forced branch fetch failure"),
+			remoteError: "Could not refresh the review base branch.",
+		});
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		const temporaryDirectory = readFileSync(temporaryDirectoryPath, "utf8");
+		expect(existsSync(temporaryDirectory)).toBe(false);
+	});
+
+	it("cancels a remote base fetch and removes the temporary source", async () => {
+		const { repository } = createStaleBranchFixture("origin");
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Unable to locate git executable");
+		const bin = join(repository, "delayed-branch-fetch-bin");
+		const startedPath = join(repository, "delayed-branch-fetch-started");
+		const temporaryDirectoryPath = join(repository, "delayed-branch-fetch-directory");
+		mkdirSync(bin);
+		installNodeCommandShim(
+			bin,
+			"git",
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "fetch" && process.cwd().includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(startedPath)}, String(process.pid));\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, process.cwd());\n  setInterval(() => {}, 1_000);\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+		);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+		const controller = new AbortController();
+		const resolution = resolveReviewSnapshot({ kind: "branch", base: "main" }, repository, {
+			...OPTIONS,
+			signal: controller.signal,
+		});
+		try {
+			await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true));
+			controller.abort();
+			await expect(resolution).resolves.toEqual({ error: "Review cancelled.", cancelled: true });
+			await vi.waitFor(() => expect(processIsAlive(startedPath)).toBe(false));
+			const temporaryDirectory = readFileSync(temporaryDirectoryPath, "utf8");
+			expect(existsSync(temporaryDirectory)).toBe(false);
+		} finally {
+			controller.abort();
+		}
 	});
 
 	it("reviews root commits against an empty tree and merge commits against first parent", async () => {

@@ -544,35 +544,150 @@ async function detectBaseBranch(
 	return undefined;
 }
 
-async function resolveBaseRef(
-	base: string,
+type ResolvedBranchBase =
+	| { kind: "local"; ref: string; displayRef: string }
+	| { kind: "remote"; remote: string; remoteRef: string; displayRef: string };
+
+async function listConfiguredRemotes(
 	cwd: string,
 	limits: ReviewSnapshotLimits,
 	signal?: AbortSignal,
-): Promise<string | undefined> {
+): Promise<string[]> {
+	const result = await runCommand("git", ["remote"], cwd, commandOptions(limits, signal));
 	throwIfResolutionCancelled(signal);
-	const direct = await runCommand(
+	throwIfOutputLimited("git remote failed", result);
+	if (!result.ok) throw new Error(`git remote failed: ${commandError(result)}`);
+	return text(result)
+		.split("\n")
+		.map((remote) => remote.trim())
+		.filter(Boolean)
+		.sort((left, right) => right.length - left.length || left.localeCompare(right));
+}
+
+function remoteBranchFromTrackingRef(
+	ref: string,
+	remotes: readonly string[],
+): { remote: string; remoteRef: string } | undefined {
+	for (const remote of remotes) {
+		const prefix = `refs/remotes/${remote}/`;
+		if (!ref.startsWith(prefix) || ref.length === prefix.length) continue;
+		return { remote, remoteRef: `refs/heads/${ref.slice(prefix.length)}` };
+	}
+	return undefined;
+}
+
+async function refExists(
+	ref: string,
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const result = await runCommand(
 		"git",
-		["rev-parse", "--verify", "--quiet", base],
+		["rev-parse", "--verify", "--quiet", "--end-of-options", ref],
 		cwd,
 		commandOptions(limits, signal),
 	);
 	throwIfResolutionCancelled(signal);
-	throwIfOutputLimited("git rev-parse failed", direct);
-	if (direct.ok) return base;
-	if (!base.startsWith("origin/")) {
-		const remote = `origin/${base}`;
-		const remoteExists = await runCommand(
+	throwIfOutputLimited("git rev-parse failed", result);
+	return result.ok;
+}
+
+async function resolveBranchBase(
+	base: string,
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<ResolvedBranchBase | undefined> {
+	throwIfResolutionCancelled(signal);
+	const remotes = await listConfiguredRemotes(cwd, limits, signal);
+	const symbolic = await runCommand(
+		"git",
+		["rev-parse", "--symbolic-full-name", "--verify", "--quiet", "--end-of-options", base],
+		cwd,
+		commandOptions(limits, signal),
+	);
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git rev-parse failed", symbolic);
+	const fullRef = symbolic.ok ? text(symbolic).trim() : "";
+
+	// Full refs intentionally preserve local or cached Git state. Short names use
+	// the authoritative remote-backed behavior below when one can be identified.
+	if (base.startsWith("refs/")) {
+		return symbolic.ok ? { kind: "local", ref: base, displayRef: base } : undefined;
+	}
+
+	if (fullRef.startsWith("refs/remotes/")) {
+		const remoteBranch = remoteBranchFromTrackingRef(fullRef, remotes);
+		if (remoteBranch) return { kind: "remote", ...remoteBranch, displayRef: base };
+	}
+
+	for (const remote of remotes) {
+		const prefix = `${remote}/`;
+		if (!base.startsWith(prefix) || base.length === prefix.length) continue;
+		return {
+			kind: "remote",
+			remote,
+			remoteRef: `refs/heads/${base.slice(prefix.length)}`,
+			displayRef: base,
+		};
+	}
+
+	if (fullRef === `refs/heads/${base}`) {
+		const branchName = fullRef.slice("refs/heads/".length);
+		const upstream = await runCommand(
 			"git",
-			["rev-parse", "--verify", "--quiet", remote],
+			["for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:short)", fullRef],
 			cwd,
 			commandOptions(limits, signal),
 		);
 		throwIfResolutionCancelled(signal);
-		throwIfOutputLimited("git rev-parse failed", remoteExists);
-		if (remoteExists.ok) return remote;
+		throwIfOutputLimited("git for-each-ref failed", upstream);
+		if (!upstream.ok) throw new Error(`git for-each-ref failed: ${commandError(upstream)}`);
+		const [upstreamRemote, upstreamRemoteRef, upstreamShort] = text(upstream).trim().split("\0");
+		if (upstreamRemote && upstreamRemote !== "." && upstreamRemoteRef?.startsWith("refs/heads/")) {
+			return {
+				kind: "remote",
+				remote: upstreamRemote,
+				remoteRef: upstreamRemoteRef,
+				displayRef: upstreamShort || `${upstreamRemote}/${upstreamRemoteRef.slice("refs/heads/".length)}`,
+			};
+		}
+
+		const matchingRemotes: string[] = [];
+		for (const remote of remotes) {
+			if (await refExists(`refs/remotes/${remote}/${branchName}`, cwd, limits, signal)) matchingRemotes.push(remote);
+		}
+		const remote = matchingRemotes.includes("origin")
+			? "origin"
+			: matchingRemotes.length === 1
+				? matchingRemotes[0]
+				: undefined;
+		if (remote) {
+			return {
+				kind: "remote",
+				remote,
+				remoteRef: `refs/heads/${branchName}`,
+				displayRef: `${remote}/${branchName}`,
+			};
+		}
+		return { kind: "local", ref: fullRef, displayRef: base };
 	}
-	return undefined;
+
+	if (symbolic.ok) return { kind: "local", ref: base, displayRef: base };
+
+	const matchingRemotes: string[] = [];
+	for (const remote of remotes) {
+		if (await refExists(`refs/remotes/${remote}/${base}`, cwd, limits, signal)) matchingRemotes.push(remote);
+	}
+	const remote = matchingRemotes.includes("origin")
+		? "origin"
+		: matchingRemotes.length === 1
+			? matchingRemotes[0]
+			: undefined;
+	return remote
+		? { kind: "remote", remote, remoteRef: `refs/heads/${base}`, displayRef: `${remote}/${base}` }
+		: undefined;
 }
 
 function normalizePullRequestNumber(value: string | undefined, maximum: number): string | undefined {
@@ -587,6 +702,130 @@ async function createLocalSource(root: string, limits: ReviewSnapshotLimits, sig
 	const objects = await repositoryObjectDirectory(root, limits, signal);
 	if (!objects) throw new Error("Could not resolve the Git object directory.");
 	return { cwd: root, objectDirectories: [objects], limits, signal };
+}
+
+async function createRemoteBranchSource(
+	root: string,
+	remote: string,
+	remoteRef: string,
+	headCommit: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<{
+	source?: GitSource;
+	baseCommit?: string;
+	temporaryDirectory?: string;
+	error?: ReviewSnapshotResolutionError;
+}> {
+	throwIfResolutionCancelled(signal);
+	const [localObjects, objectFormat, remoteUrlResult] = await Promise.all([
+		repositoryObjectDirectory(root, limits, signal),
+		repositoryObjectFormat(root, limits, signal),
+		runCommand("git", ["remote", "get-url", remote], root, commandOptions(limits, signal)),
+	]);
+	throwIfResolutionCancelled(signal);
+	if (!localObjects) {
+		return {
+			error: {
+				error: "Could not resolve the Git object directory.",
+				remoteError: "Could not prepare the isolated review base.",
+			},
+		};
+	}
+	if (!objectFormat) {
+		return {
+			error: {
+				error: "Could not resolve the Git object format.",
+				remoteError: "Could not prepare the isolated review base.",
+			},
+		};
+	}
+	if (!remoteUrlResult.ok || !text(remoteUrlResult).trim()) {
+		return {
+			error: {
+				error: `Could not resolve Git remote "${remote}": ${commandError(remoteUrlResult)}`,
+				remoteError: "Could not resolve the review base remote.",
+			},
+		};
+	}
+
+	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-branch-"));
+	let retainTemporaryDirectory = false;
+	try {
+		const init = await runCommand(
+			"git",
+			["init", "--bare", `--object-format=${objectFormat}`],
+			temporaryDirectory,
+			commandOptions(limits, signal),
+		);
+		throwIfResolutionCancelled(signal);
+		if (!init.ok) {
+			return {
+				error: {
+					...commandFailure("git init failed", init),
+					remoteError: "Could not prepare the isolated review base.",
+				},
+			};
+		}
+
+		const objects = join(temporaryDirectory, "objects");
+		await mkdir(join(objects, "info"), { recursive: true });
+		await writeFile(join(objects, "info", "alternates"), `${resolve(localObjects)}\n`, "utf8");
+		throwIfResolutionCancelled(signal);
+		const source: GitSource = {
+			cwd: temporaryDirectory,
+			objectDirectories: [objects, localObjects],
+			limits,
+			signal,
+		};
+		const pinHead = await git(source, ["update-ref", "refs/review/head", headCommit]);
+		if (!pinHead.ok) {
+			return {
+				error: {
+					...commandFailure("git update-ref failed", pinHead),
+					remoteError: "Could not capture the review branch endpoints.",
+				},
+			};
+		}
+		const fetch = await git(source, [
+			"fetch",
+			"--no-tags",
+			"--no-write-fetch-head",
+			"--force",
+			text(remoteUrlResult).trim(),
+			`+${remoteRef}:refs/review/base`,
+		]);
+		if (!fetch.ok) {
+			return {
+				error: {
+					error: `git fetch failed: ${commandError(fetch)}`,
+					remoteError: "Could not refresh the review base branch.",
+				},
+			};
+		}
+		const baseCommit = await requireCanonicalCommit(source, "refs/review/base");
+		const pinnedHead = await requireCanonicalCommit(source, "refs/review/head");
+		if (!baseCommit || pinnedHead !== headCommit) {
+			return {
+				error: {
+					error: "Could not pin the fetched branch review endpoints.",
+					remoteError: "Could not capture the review branch endpoints.",
+				},
+			};
+		}
+		retainTemporaryDirectory = true;
+		return { source, baseCommit, temporaryDirectory };
+	} catch (error) {
+		if (error instanceof ReviewSnapshotResolutionCancelledError || signal?.aborted) throw error;
+		return {
+			error: {
+				error: error instanceof Error ? error.message : String(error),
+				remoteError: "Could not prepare the isolated review base.",
+			},
+		};
+	} finally {
+		if (!retainTemporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+	}
 }
 
 async function createUncommittedSource(
@@ -2355,17 +2594,48 @@ export async function resolveReviewSnapshot(
 			}
 			case "branch": {
 				options.onProgress?.("Resolving branch history…");
+				const localSource = await createLocalSource(root, limits, options.signal);
+				const headCommit = await requireCanonicalCommit(localSource, "HEAD");
+				if (!headCommit) return { error: "Could not resolve the branch head." };
 				const requestedBase = target.base ?? (await detectBaseBranch(root, limits, options.signal));
 				if (!requestedBase) return { error: "Could not detect a base branch. Use /review branch <base>." };
-				const baseRef = await resolveBaseRef(requestedBase, root, limits, options.signal);
-				if (!baseRef) return { error: `Base branch "${requestedBase}" not found.` };
-				const source = await createLocalSource(root, limits, options.signal);
-				const baseCommit = await requireCanonicalCommit(source, baseRef);
-				const headCommit = await requireCanonicalCommit(source, "HEAD");
-				if (!baseCommit || !headCommit) return { error: "Could not resolve the branch endpoints." };
+				const resolvedBase = await resolveBranchBase(requestedBase, root, limits, options.signal);
+				if (!resolvedBase) return { error: `Base branch "${requestedBase}" not found.` };
+
+				let source = localSource;
+				let baseCommit: string | undefined;
+				const temporaryDirectories: string[] = [];
+				if (resolvedBase.kind === "remote") {
+					options.onProgress?.(`Refreshing ${resolvedBase.displayRef}…`);
+					const fetched = await createRemoteBranchSource(
+						root,
+						resolvedBase.remote,
+						resolvedBase.remoteRef,
+						headCommit,
+						limits,
+						options.signal,
+					);
+					if (!fetched.source || !fetched.baseCommit || !fetched.temporaryDirectory) {
+						return fetched.error ?? { error: "Could not refresh the review base branch." };
+					}
+					source = fetched.source;
+					baseCommit = fetched.baseCommit;
+					temporaryDirectories.push(fetched.temporaryDirectory);
+					pendingTemporaryDirectories.add(fetched.temporaryDirectory);
+				} else {
+					baseCommit = await requireCanonicalCommit(source, resolvedBase.ref);
+				}
+				if (!baseCommit) return { error: "Could not resolve the branch base." };
+				const cleanupTemporaryDirectories = async (): Promise<void> => {
+					for (const directory of temporaryDirectories) {
+						pendingTemporaryDirectories.delete(directory);
+						await rm(directory, { recursive: true, force: true }).catch(() => {});
+					}
+				};
 				const mergeBaseResult = await git(source, ["merge-base", baseCommit, headCommit]);
 				const mergeBaseCommit = text(mergeBaseResult).trim();
 				if (!mergeBaseResult.ok || !CANONICAL_GIT_OBJECT_ID_PATTERN.test(mergeBaseCommit)) {
+					await cleanupTemporaryDirectories();
 					return {
 						error: `git merge-base failed: ${commandError(mergeBaseResult)}`,
 						remoteError: "Could not resolve the branch merge base.",
@@ -2373,17 +2643,23 @@ export async function resolveReviewSnapshot(
 				}
 				const baseTree = await requireCanonicalTree(source, mergeBaseCommit);
 				const headTree = await requireCanonicalTree(source, headCommit);
-				if (!baseTree || !headTree) return { error: "Could not resolve the branch trees." };
-				if (baseTree === headTree) return { error: `No changes between ${baseRef} and HEAD.` };
+				if (!baseTree || !headTree) {
+					await cleanupTemporaryDirectories();
+					return { error: "Could not resolve the branch trees." };
+				}
+				if (baseTree === headTree) {
+					await cleanupTemporaryDirectories();
+					return { error: `No changes between ${resolvedBase.displayRef} and HEAD.` };
+				}
 				const logResult = await git(source, ["log", "--oneline", `${mergeBaseCommit}..${headCommit}`]);
 				init = {
-					description: `branch changes vs ${baseRef}`,
-					diffCommand: `git diff --no-textconv --no-ext-diff ${baseRef}...HEAD`,
+					description: `branch changes vs ${resolvedBase.displayRef}`,
+					diffCommand: `git diff --no-textconv --no-ext-diff ${resolvedBase.displayRef}...HEAD`,
 					extraContext: logResult.ok && text(logResult).trim() ? `Commits:\n${text(logResult).trim()}` : undefined,
 					identity: { kind: target.kind, baseCommit, mergeBaseCommit, headCommit, baseTree, headTree },
 					root,
 					source,
-					temporaryDirectories: [],
+					temporaryDirectories,
 					limits,
 				};
 				break;
