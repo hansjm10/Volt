@@ -521,6 +521,7 @@ interface ScopedFetchConfig {
 	system: FetchConfigEntry[];
 	global: FetchConfigEntry[];
 	repository: FetchConfigEntry[];
+	partialClone: boolean;
 }
 
 interface AmbientFetchConfig {
@@ -547,6 +548,14 @@ function isIncludeConfigKey(key: string): boolean {
 	return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
 }
 
+function configIndicatesPartialClone(key: string, value: string): boolean {
+	const normalizedKey = key.toLowerCase();
+	if (normalizedKey === "extensions.partialclone") return true;
+	if (/^remote\..+\.partialclonefilter$/.test(normalizedKey)) return true;
+	if (!/^remote\..+\.promisor$/.test(normalizedKey)) return false;
+	return !["false", "no", "off", "0"].includes(value.trim().toLowerCase());
+}
+
 function parseScopedGitConfig(stdout: Buffer): ScopedGitConfigEntry[] {
 	const tokens = stdout.toString("utf8").split("\0");
 	if (tokens.at(-1) === "") tokens.pop();
@@ -563,8 +572,14 @@ function parseScopedGitConfig(stdout: Buffer): ScopedGitConfigEntry[] {
 }
 
 function parseRepositoryFetchConfig(stdout: Buffer, remote: string): ScopedFetchConfig {
-	const config: ScopedFetchConfig = { system: [], global: [], repository: [] };
-	for (const { scope, key, value } of parseScopedGitConfig(stdout)) {
+	const entries = parseScopedGitConfig(stdout);
+	const config: ScopedFetchConfig = {
+		system: [],
+		global: [],
+		repository: [],
+		partialClone: entries.some(({ key, value }) => configIndicatesPartialClone(key, value)),
+	};
+	for (const { scope, key, value } of entries) {
 		if (!isFetchConfigKey(key, remote)) continue;
 		if (scope === "system") config.system.push({ key, value });
 		else if (scope === "global") config.global.push({ key, value });
@@ -960,6 +975,11 @@ async function createRemoteBranchSource(
 			},
 		};
 	}
+	if (fetchConfig.partialClone) {
+		const error =
+			"Remote-backed branch reviews are not supported from partial clones. Use a complete clone and retry.";
+		return { error: { error, remoteError: error } };
+	}
 	const remoteUrl = text(remoteUrlResult).trim();
 	if (!remoteUrlResult.ok || !remoteUrl) {
 		return {
@@ -991,7 +1011,7 @@ async function createRemoteBranchSource(
 		}
 
 		const objects = join(temporaryDirectory, "objects");
-		const borrowLocalObjects = sourceIsShallow === false;
+		const borrowLocalObjects = sourceIsShallow === false && !fetchConfig.partialClone;
 		if (borrowLocalObjects) {
 			await mkdir(join(objects, "info"), { recursive: true });
 			await writeFile(join(objects, "info", "alternates"), `${resolve(localObjects)}\n`, "utf8");
@@ -1243,7 +1263,7 @@ async function createPullRequestSource(
 		if (!init.ok) return { error: commandFailure("git init failed", init) };
 		const objects = join(temporaryDirectory, "objects");
 		const alternatesPath = join(objects, "info", "alternates");
-		const borrowLocalObjects = sourceIsShallow === false;
+		const borrowLocalObjects = sourceIsShallow === false && !fetchConfig.partialClone;
 		if (borrowLocalObjects) {
 			await mkdir(join(objects, "info"), { recursive: true });
 			await writeFile(alternatesPath, `${resolve(localObjects)}\n`, "utf8");

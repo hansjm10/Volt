@@ -14,6 +14,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join, relative, resolve as resolvePath } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { captureReviewGitHubContext } from "../src/core/github-pr-context.ts";
 import { normalizeReviewPath, type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
@@ -276,6 +277,49 @@ describe("review snapshots", () => {
 		const headCommit = git(repository, "rev-parse", "HEAD");
 		const localObjects = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects");
 		return { repository, baseCommit, headCommit, omittedParent, localObjects };
+	}
+
+	function createBloblessPartialCloneFixture(pullRequestNumber: number): {
+		repository: string;
+		baseCommit: string;
+		headCommit: string;
+		localObjects: string;
+	} {
+		const seed = createRepository();
+		const baseCommit = git(seed, "rev-parse", "HEAD");
+		git(seed, "checkout", "-b", "feature");
+		writeFileSync(join(seed, "tracked.txt"), "partial clone feature\n");
+		git(seed, "commit", "-am", "partial clone feature");
+		const headCommit = git(seed, "rev-parse", "HEAD");
+
+		const remote = join(tmpdir(), `volt-review-partial-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(remote, "config", "uploadpack.allowFilter", "true");
+		git(seed, "remote", "add", "origin", remote);
+		git(seed, "push", "origin", "main", "feature", `HEAD:refs/pull/${pullRequestNumber}/head`);
+
+		const repository = join(
+			tmpdir(),
+			`volt-review-partial-clone-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		tempDirectories.push(repository);
+		git(
+			tmpdir(),
+			"clone",
+			"--filter=blob:none",
+			"--no-checkout",
+			"--branch",
+			"feature",
+			pathToFileURL(remote).href,
+			repository,
+		);
+		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("false");
+		expect(git(repository, "config", "--local", "--get", "remote.origin.promisor")).toBe("true");
+		expect(git(repository, "rev-list", "--objects", "--all", "--missing=print")).toMatch(/^\?/m);
+		const localObjects = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects");
+		return { repository, baseCommit, headCommit, localObjects };
 	}
 
 	async function serveAuthenticatedGitRepository(remote: string): Promise<{
@@ -861,6 +905,15 @@ describe("review snapshots", () => {
 		}
 	});
 
+	it("rejects remote-backed branch reviews from partial clones before borrowing promised objects", async () => {
+		const { repository } = createBloblessPartialCloneFixture(12);
+		const error =
+			"Remote-backed branch reviews are not supported from partial clones. Use a complete clone and retry.";
+		await expect(
+			resolveReviewSnapshot({ kind: "branch", base: "origin/main" }, repository, OPTIONS),
+		).resolves.toEqual({ error, remoteError: error });
+	});
+
 	it("reports when shallow history omits the remote branch merge base", async () => {
 		const { repository, baseCommit } = createShallowBranchFixture(1, false);
 		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
@@ -1024,6 +1077,48 @@ describe("review snapshots", () => {
 			expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("pull request\n");
 			const checkout = await snapshot.materializeHead();
 			expect(readFileSync(join(checkout, "tracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("pull request\n");
+		} finally {
+			renameSync(unavailableLocalObjects, localObjects);
+		}
+	});
+
+	it("keeps PR snapshots from partial clones independent of promised local objects", async () => {
+		const pullRequestNumber = 12;
+		const { repository, baseCommit, headCommit, localObjects } = createBloblessPartialCloneFixture(pullRequestNumber);
+		installGitHubShim(repository, {
+			view: {
+				id: "PR_partial_clone_12",
+				number: pullRequestNumber,
+				title: "Partial clone snapshot",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/12",
+				baseRefOid: baseCommit,
+				headRefOid: headCommit,
+			},
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const snapshot = await resolve({ kind: "pr", number: String(pullRequestNumber) }, repository);
+		expect(snapshot.identity.pullRequest).toMatchObject({
+			number: pullRequestNumber,
+			baseRefOid: baseCommit,
+			headRefOid: headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["tracked.txt"]);
+
+		const unavailableLocalObjects = `${localObjects}-unavailable`;
+		renameSync(localObjects, unavailableLocalObjects);
+		try {
+			expect((await readAvailableFile(snapshot, "base", "tracked.txt")).content.toString()).toBe("before\n");
+			expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe(
+				"partial clone feature\n",
+			);
+			const checkout = await snapshot.materializeHead();
+			expect(readFileSync(join(checkout, "tracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe(
+				"partial clone feature\n",
+			);
 		} finally {
 			renameSync(unavailableLocalObjects, localObjects);
 		}
