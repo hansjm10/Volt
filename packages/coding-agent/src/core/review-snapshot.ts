@@ -704,6 +704,12 @@ async function createLocalSource(root: string, limits: ReviewSnapshotLimits, sig
 	return { cwd: root, objectDirectories: [objects], limits, signal };
 }
 
+function resolveRemoteFetchUrl(root: string, remoteUrl: string): string {
+	const isTildePath = /^~(?:[/\\]|[^/\\]+[/\\])/.test(remoteUrl);
+	const isTransportUrl = /^[^/\\]+:/.test(remoteUrl);
+	return isAbsolute(remoteUrl) || isTildePath || isTransportUrl ? remoteUrl : resolve(root, remoteUrl);
+}
+
 async function createRemoteBranchSource(
 	root: string,
 	remote: string,
@@ -740,7 +746,8 @@ async function createRemoteBranchSource(
 			},
 		};
 	}
-	if (!remoteUrlResult.ok || !text(remoteUrlResult).trim()) {
+	const remoteUrl = text(remoteUrlResult).trim();
+	if (!remoteUrlResult.ok || !remoteUrl) {
 		return {
 			error: {
 				error: `Could not resolve Git remote "${remote}": ${commandError(remoteUrlResult)}`,
@@ -748,6 +755,7 @@ async function createRemoteBranchSource(
 			},
 		};
 	}
+	const fetchUrl = resolveRemoteFetchUrl(root, remoteUrl);
 
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-branch-"));
 	let retainTemporaryDirectory = false;
@@ -792,7 +800,7 @@ async function createRemoteBranchSource(
 			"--no-tags",
 			"--no-write-fetch-head",
 			"--force",
-			text(remoteUrlResult).trim(),
+			fetchUrl,
 			`+${remoteRef}:refs/review/base`,
 		]);
 		if (!fetch.ok) {
@@ -971,9 +979,11 @@ async function createPullRequestSource(
 	throwIfResolutionCancelled(signal);
 	if (!localObjects) return { error: { error: "Could not resolve the Git object directory." } };
 	if (!objectFormat) return { error: { error: "Could not resolve the Git object format." } };
-	if (!originResult.ok || !text(originResult).trim()) {
+	const originUrl = text(originResult).trim();
+	if (!originResult.ok || !originUrl) {
 		return { error: { error: "Could not resolve the origin remote for the pull request snapshot." } };
 	}
+	const fetchUrl = resolveRemoteFetchUrl(root, originUrl);
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-pr-"));
 	let retainTemporaryDirectory = false;
 	try {
@@ -1003,7 +1013,7 @@ async function createPullRequestSource(
 			"fetch",
 			"--no-tags",
 			"--force",
-			text(originResult).trim(),
+			fetchUrl,
 			`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
 			`+refs/pull/${pullRequest.number}/head:refs/review/head`,
 		]);

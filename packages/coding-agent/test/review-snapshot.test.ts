@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve as resolvePath } from "node:path";
+import { delimiter, join, relative, resolve as resolvePath } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { captureReviewGitHubContext } from "../src/core/github-pr-context.ts";
 import { normalizeReviewPath, type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
@@ -184,6 +184,7 @@ describe("review snapshots", () => {
 
 	function createStaleBranchFixture(remoteName: string): {
 		repository: string;
+		remote: string;
 		staleBase: string;
 		authoritativeBase: string;
 		headCommit: string;
@@ -212,7 +213,7 @@ describe("review snapshots", () => {
 		git(repository, "branch", "-f", "main", staleBase);
 		git(repository, "update-ref", `refs/remotes/${remoteName}/main`, staleBase);
 		rmSync(join(repository, ".git", "FETCH_HEAD"), { force: true });
-		return { repository, staleBase, authoritativeBase, headCommit };
+		return { repository, remote, staleBase, authoritativeBase, headCommit };
 	}
 
 	async function resolve(
@@ -573,6 +574,22 @@ describe("review snapshots", () => {
 		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
 	});
 
+	it("resolves relative filesystem URLs before refreshing branch bases", async () => {
+		const { repository, remote, staleBase, authoritativeBase } = createStaleBranchFixture("origin");
+		const relativeRemote = relative(repository, remote);
+		git(repository, "remote", "set-url", "origin", relativeRemote);
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "remote", "get-url", "origin")).toBe(relativeRemote);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+	});
+
 	it("refreshes a configured non-origin upstream for a plain branch name", async () => {
 		const { repository, staleBase, authoritativeBase } = createStaleBranchFixture("upstream");
 		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
@@ -673,7 +690,7 @@ describe("review snapshots", () => {
 		).toContain("+feature");
 	});
 
-	it("fetches PR snapshots without borrowing from shallow repositories", async () => {
+	it("fetches PR snapshots from relative remotes without borrowing from shallow repositories", async () => {
 		const seed = createRepository();
 		const omittedParentOid = git(seed, "rev-parse", "HEAD");
 		writeFileSync(join(seed, "tracked.txt"), "base\n");
@@ -698,7 +715,7 @@ describe("review snapshots", () => {
 		mkdirSync(repository, { recursive: true });
 		tempDirectories.push(repository);
 		git(repository, "init", "--initial-branch=main");
-		git(repository, "remote", "add", "origin", remote);
+		git(repository, "remote", "add", "origin", relative(repository, remote));
 		git(repository, "fetch", "--depth=1", "origin", "main");
 		git(repository, "checkout", "-B", "main", "FETCH_HEAD");
 		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
