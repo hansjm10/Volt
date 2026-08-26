@@ -6,6 +6,10 @@ Volt is maintained and distributed by [Jordan Hans](https://github.com/hansjm10)
 It is derived from [Mario Zechner's Pi project](https://github.com/badlogic/pi-mono)
 and remains available under the MIT License.
 
+## From the Blog
+
+[Why I Forked Pi to Build Volt](https://volt-cli.dev/blog/why-i-forked-pi-to-build-volt/) explains how experiments with Pi grew into Volt and why continuing coding-agent sessions from a phone became part of the product.
+
 ## Packages
 
 | Package | Description |
