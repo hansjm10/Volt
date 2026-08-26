@@ -86,6 +86,11 @@ export interface AgentSessionReplacementTransaction {
 	commit(): Promise<void>;
 	/** Release the replacement reservation after the new projection generation is published. */
 	finalize?(): Promise<void>;
+	/**
+	 * Expose committed replacement ingress after the lifecycle actor has settled.
+	 * This callback must be synchronous and must not throw.
+	 */
+	activate?(): void;
 	rollback(): Promise<void>;
 	dispose(): Promise<void>;
 }
@@ -704,13 +709,34 @@ export class AgentSessionRuntime {
 		}
 	}
 
+	private reopenPreparedReplacementTarget(sessionManager: SessionManager): SessionManager {
+		const sessionFile = sessionManager.getSessionFile();
+		if (sessionFile === undefined) {
+			return sessionManager;
+		}
+		const reopened = SessionManager.open(sessionFile, sessionManager.getSessionDir(), sessionManager.getCwd());
+		if (reopened.getSessionId() !== sessionManager.getSessionId()) {
+			throw new Error("Replacement session identity changed during ownership preparation");
+		}
+		return reopened;
+	}
+
+	private activateReplacementAfterLifecycle(transaction: AgentSessionReplacementTransaction | undefined): void {
+		if (!transaction?.activate) {
+			return;
+		}
+		const lifecycleSettled = this.waitForSessionOperations();
+		void lifecycleSettled.then(() => transaction.activate?.());
+	}
+
 	private async replaceCurrentSession(options: {
 		operation: AgentSessionStructuralOperation;
 		reason: SessionShutdownEvent["reason"];
 		previousSessionId?: string;
 		allowSameSessionIdentity?: boolean;
+		reopenTargetAfterPrepare?: boolean;
 		sessionManager: SessionManager;
-		create: () => Promise<CreateAgentSessionRuntimeResult>;
+		create: (sessionManager: SessionManager) => Promise<CreateAgentSessionRuntimeResult>;
 		afterApply?: () => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ seeded: boolean }> {
@@ -764,18 +790,22 @@ export class AgentSessionRuntime {
 						sessionId,
 						cwd: options.sessionManager.getCwd(),
 					});
+			const replacementSessionManager =
+				transaction && options.reopenTargetAfterPrepare
+					? this.reopenPreparedReplacementTarget(options.sessionManager)
+					: options.sessionManager;
 			let invalidated = false;
 			let created: CreateAgentSessionRuntimeResult | undefined;
 			let applied = false;
 			try {
 				this.assertStructuralOperationCurrent(options.operation);
-				await this.teardownCurrent(options.reason, options.sessionManager.getSessionFile(), () => {
+				await this.teardownCurrent(options.reason, replacementSessionManager.getSessionFile(), () => {
 					this.assertStructuralOperationCurrent(options.operation);
 					invalidated = true;
 					this.sessionInvalidated = true;
 					this.lifecycleRevision++;
 				});
-				created = await options.create();
+				created = await options.create(replacementSessionManager);
 				await created.session.sessionManager.flush();
 				this.applyReplacement(created);
 				applied = true;
@@ -788,7 +818,9 @@ export class AgentSessionRuntime {
 					throw new Error("Agent session replacement changed before ownership commit");
 				}
 				await transaction?.commit();
-				return await this.finishSessionReplacement(options.withSession, transaction);
+				const replacement = await this.finishSessionReplacement(options.withSession, transaction);
+				this.activateReplacementAfterLifecycle(transaction);
+				return replacement;
 			} catch (error: unknown) {
 				const replacementError = error instanceof Error ? error : new Error(String(error));
 				if (applied) {
@@ -1100,15 +1132,16 @@ export class AgentSessionRuntime {
 			operation,
 			reason: "resume",
 			allowSameSessionIdentity: refreshCurrentSession,
+			reopenTargetAfterPrepare: true,
 			sessionManager,
-			create: () =>
+			create: (preparedSessionManager) =>
 				this.createRuntime({
-					cwd: sessionManager.getCwd(),
+					cwd: preparedSessionManager.getCwd(),
 					agentDir: this.services.agentDir,
-					sessionManager,
-					...this.getReplacementGitContextOptions(sessionManager.getCwd()),
+					sessionManager: preparedSessionManager,
+					...this.getReplacementGitContextOptions(preparedSessionManager.getCwd()),
 					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-					projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+					projectTrustContext: options?.projectTrustContextFactory?.(preparedSessionManager.getCwd()),
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
 				}),
@@ -1329,11 +1362,11 @@ export class AgentSessionRuntime {
 			operation,
 			reason: "new",
 			sessionManager,
-			create: () =>
+			create: (preparedSessionManager) =>
 				this.createRuntime({
-					cwd,
+					cwd: preparedSessionManager.getCwd(),
 					agentDir: this.services.agentDir,
-					sessionManager,
+					sessionManager: preparedSessionManager,
 					...this.getReplacementGitContextOptions(cwd),
 					...(options?.workspaceName === undefined ? {} : { workspaceName: options.workspaceName }),
 					...(options?.baseRef === undefined ? {} : { baseRef: options.baseRef }),
@@ -1399,11 +1432,11 @@ export class AgentSessionRuntime {
 					reason: "fork",
 					previousSessionId,
 					sessionManager,
-					create: () =>
+					create: (preparedSessionManager) =>
 						this.createRuntime({
-							cwd: this.cwd,
+							cwd: preparedSessionManager.getCwd(),
 							agentDir: this.services.agentDir,
-							sessionManager,
+							sessionManager: preparedSessionManager,
 							...this.getReplacementGitContextOptions(this.cwd),
 							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 							profile: this.getReplacementProfile(),
@@ -1426,12 +1459,12 @@ export class AgentSessionRuntime {
 				reason: "fork",
 				previousSessionId,
 				sessionManager,
-				create: () =>
+				create: (preparedSessionManager) =>
 					this.createRuntime({
-						cwd: sessionManager.getCwd(),
+						cwd: preparedSessionManager.getCwd(),
 						agentDir: this.services.agentDir,
-						sessionManager,
-						...this.getReplacementGitContextOptions(sessionManager.getCwd()),
+						sessionManager: preparedSessionManager,
+						...this.getReplacementGitContextOptions(preparedSessionManager.getCwd()),
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 						profile: this.getReplacementProfile(),
 						subagentContext: this.subagentContext,
@@ -1452,11 +1485,11 @@ export class AgentSessionRuntime {
 			reason: "fork",
 			previousSessionId,
 			sessionManager,
-			create: () =>
+			create: (preparedSessionManager) =>
 				this.createRuntime({
-					cwd: this.cwd,
+					cwd: preparedSessionManager.getCwd(),
 					agentDir: this.services.agentDir,
-					sessionManager,
+					sessionManager: preparedSessionManager,
 					...this.getReplacementGitContextOptions(this.cwd),
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 					profile: this.getReplacementProfile(),
@@ -1513,13 +1546,14 @@ export class AgentSessionRuntime {
 		await this.replaceCurrentSession({
 			operation,
 			reason: "resume",
+			reopenTargetAfterPrepare: true,
 			sessionManager,
-			create: () =>
+			create: (preparedSessionManager) =>
 				this.createRuntime({
-					cwd: sessionManager.getCwd(),
+					cwd: preparedSessionManager.getCwd(),
 					agentDir: this.services.agentDir,
-					sessionManager,
-					...this.getReplacementGitContextOptions(sessionManager.getCwd()),
+					sessionManager: preparedSessionManager,
+					...this.getReplacementGitContextOptions(preparedSessionManager.getCwd()),
 					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,

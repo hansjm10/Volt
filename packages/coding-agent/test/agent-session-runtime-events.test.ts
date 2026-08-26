@@ -667,6 +667,10 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				async finalize() {
 					phases.push("finalize");
 				},
+				activate() {
+					expect(runtimeHost.isSessionOperationInProgress).toBe(false);
+					phases.push("activate");
+				},
 				async rollback() {
 					phases.push("rollback");
 				},
@@ -687,7 +691,43 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		});
 
 		await runtimeHost.newSession();
-		expect(phases).toEqual(["prepare", "session_shutdown", "commit", "publish", "finalize", "rebind"]);
+		await vi.waitFor(() =>
+			expect(phases).toEqual(["prepare", "session_shutdown", "commit", "publish", "finalize", "rebind", "activate"]),
+		);
+	});
+
+	it("reopens a persisted target after ownership preparation finishes", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const targetManager = SessionManager.create(runtimeHost.cwd, runtimeHost.session.sessionManager.getSessionDir());
+		targetManager.appendMessage({ role: "user", content: "target before prepare", timestamp: 1 });
+		targetManager.appendMessage(fauxAssistantMessage("target ready"));
+		await targetManager.flush();
+		const targetFile = targetManager.getSessionFile();
+		expect(targetFile).toBeDefined();
+
+		runtimeHost.setPrepareSessionReplacement(async ({ sessionId }) => {
+			expect(sessionId).toBe(targetManager.getSessionId());
+			targetManager.appendMessage({ role: "user", content: "phone finished during prepare", timestamp: 2 });
+			targetManager.appendMessage(fauxAssistantMessage("authoritative phone reply"));
+			await targetManager.flush();
+			return {
+				async commit() {},
+				activate() {},
+				async rollback() {},
+				async dispose() {},
+			};
+		});
+
+		await expect(runtimeHost.switchSession(targetFile!)).resolves.toEqual({ cancelled: false, seeded: false });
+		expect(runtimeHost.session.messages).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ role: "user", content: "phone finished during prepare" }),
+				expect.objectContaining({
+					role: "assistant",
+					content: [{ type: "text", text: "authoritative phone reply" }],
+				}),
+			]),
+		);
 	});
 
 	it("leaves the old runtime live when replacement ownership preflight rejects", async () => {

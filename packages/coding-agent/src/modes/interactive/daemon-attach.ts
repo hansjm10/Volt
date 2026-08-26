@@ -110,6 +110,8 @@ export interface RelayNotificationDeliveryForwarder {
 
 export interface DaemonAttachRekeyTransaction {
 	commit(): Promise<void>;
+	/** Publish staged relay ingress after the host replacement lifecycle settles. */
+	activate(): void;
 	rollback(): Promise<void>;
 	dispose(): Promise<void>;
 }
@@ -728,7 +730,6 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 			const contextChanged = workspaceName !== previousWorkspaceName || resolvedWorktreeId !== previousWorktreeId;
 			const sourceLeaseConnectionGeneration = connectionGeneration;
 			let targetLeasePreacquired = false;
-			let targetLeaseHandoff: "cold" | "warm" | "none" = "none";
 			let targetLeaseConnectionGeneration: number | undefined;
 			const preacquireTargetLease = async (): Promise<void> => {
 				if (!activeClient || !workspaceName || state !== "connected") {
@@ -756,8 +757,9 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 								: "replacement session lease was not acquired",
 						);
 					}
-					targetLeaseHandoff =
-						targetAcquire.kind === "pending" ? (await targetAcquire.granted).handoff : targetAcquire.handoff;
+					if (targetAcquire.kind === "pending") {
+						await targetAcquire.granted;
+					}
 					targetLeasePreacquired = true;
 					targetLeaseConnectionGeneration = connectionGeneration;
 				} catch (error) {
@@ -774,7 +776,12 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					throw error;
 				}
 			};
-			if (contextChanged && activeClient && workspaceName && state === "connected") {
+			if (
+				(contextChanged || heldSessionId !== oldSessionId) &&
+				activeClient &&
+				workspaceName &&
+				state === "connected"
+			) {
 				try {
 					await preacquireTargetLease();
 				} catch (error) {
@@ -849,50 +856,20 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							return;
 						}
 						if (!resolvedWorkspaceName && state === "connected") await resolveWorkspace();
-						if (targetLeasePreacquired && targetLeaseConnectionGeneration !== connectionGeneration) {
-							const reconnectClient = client;
-							const reconnectWorkspaceName = resolvedWorkspaceName;
-							if (!reconnectClient || !reconnectWorkspaceName || state !== "connected") {
-								throw new Error("replacement session lease was lost during reconnect");
-							}
-							if (!(await ensureWorktreeBinding(reconnectClient, reconnectWorkspaceName, newSessionId, true))) {
-								throw new Error("replacement session lease could not be reacquired");
-							}
-							const response = await reconnectClient.request({
-								type: "lease_acquire",
-								workspaceName: reconnectWorkspaceName,
-								sessionId: newSessionId,
-							});
-							const outcome = parseAcquireResponse(
-								response as { type: string } & Record<string, unknown>,
-								(id) =>
-									reconnectClient.waitForResponse(id) as Promise<{ type: string } & Record<string, unknown>>,
-							);
-							if (outcome.kind === "denied" || outcome.kind === "noop") {
-								throw new Error("replacement session lease could not be reacquired");
-							}
-							const reacquired = outcome.kind === "pending" ? await outcome.granted : outcome;
-							if (targetLeaseHandoff === "none") {
-								targetLeaseHandoff = reacquired.handoff;
-							}
-							targetLeaseConnectionGeneration = connectionGeneration;
-						}
 						const bindClient = client;
 						const bindWorkspaceName = resolvedWorkspaceName;
 						if (
 							bindClient &&
 							bindWorkspaceName &&
-							!(await ensureWorktreeBinding(
-								bindClient,
-								bindWorkspaceName,
-								newSessionId,
-								!targetLeasePreacquired,
-							))
+							!(await ensureWorktreeBinding(bindClient, bindWorkspaceName, newSessionId, false))
 						) {
 							throw new Error("replacement session could not be bound to its worktree");
 						}
 						currentSessionId = newSessionId;
-						heldSessionId = undefined;
+						heldSessionId =
+							targetLeasePreacquired && targetLeaseConnectionGeneration === connectionGeneration
+								? newSessionId
+								: undefined;
 						const connectedClient = client;
 						const connectedWorkspaceName = resolvedWorkspaceName;
 						if (connectedClient && connectedWorkspaceName && state === "connected") {
@@ -906,35 +883,16 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 							} catch {
 								// The old connection may already have released this lease.
 							}
-							if (targetLeasePreacquired) {
-								const outcome: AcquireOutcome = { kind: "granted", handoff: targetLeaseHandoff };
-								trackAcquireOutcome(newSessionId, outcome);
-								reacquiredHandler?.(newSessionId, outcome);
-							} else {
-								try {
-									const response = await connectedClient.request({
-										type: "lease_acquire",
-										workspaceName: connectedWorkspaceName,
-										sessionId: newSessionId,
-									});
-									const outcome = parseAcquireResponse(
-										response as { type: string } & Record<string, unknown>,
-										(id) =>
-											connectedClient.waitForResponse(id) as Promise<
-												{ type: string } & Record<string, unknown>
-											>,
-									);
-									trackAcquireOutcome(newSessionId, outcome);
-									reacquiredHandler?.(newSessionId, outcome);
-								} catch {
-									// Reconnect below re-acquires the committed session id.
-								}
-							}
 						}
 						phase = "committed";
+					},
+					activate() {
+						if (phase !== "committed") {
+							return;
+						}
 						completePendingRekey(newSessionId);
 						if (state === "connected" && heldSessionId !== newSessionId) {
-							await ensureLeaseAfterConnected().catch(() => {});
+							void ensureLeaseAfterConnected().catch(() => {});
 						}
 					},
 					async rollback() {
@@ -1035,6 +993,11 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 					phase = "committed";
 					currentSessionId = newSessionId;
 					heldSessionId = newSessionId;
+				},
+				activate() {
+					if (phase !== "committed") {
+						return;
+					}
 					completePendingRekey(newSessionId);
 				},
 				async rollback() {

@@ -363,11 +363,12 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		expect(daemon.broker.lookup("ws", "old")?.state).toBe("tui-owned");
 		expect(await second.attach.acquire("fresh-new")).toMatchObject({ kind: "denied" });
 		await transaction?.commit();
+		transaction?.activate();
 		expect(daemon.broker.lookup("ws", "old")).toBeUndefined();
 		expect(daemon.broker.lookup("ws", "fresh-new")?.state).toBe("tui-owned");
 	}, 20_000);
 
-	it("preserves a drained target's warm handoff when switching to an existing daemon-owned conversation", async () => {
+	it("stages relay ingress without reporting a planned warm rekey as reacquisition", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-"));
 		const cwd = mkdtempSync(join(tmpdir(), "volt-rekey-daemon-target-ws-"));
 		cleanups.push(() => {
@@ -423,7 +424,9 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		expect(dispatchedRelaySessions).toEqual([]);
 
 		await transaction?.commit();
-		expect(tui.reacquired).toEqual([{ sessionId: "phone-session", outcome: { kind: "granted", handoff: "warm" } }]);
+		expect(tui.reacquired).toEqual([]);
+		expect(dispatchedRelaySessions).toEqual([]);
+		transaction?.activate();
 		await vi.waitFor(() => expect(dispatchedRelaySessions).toEqual(["phone-session"]));
 		expect(
 			daemon.server.sendTo(targetLease.tuiConnectionId, {
@@ -469,6 +472,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		const transaction = await tui.attach.prepareRekey("old", "new");
 		expect(transaction).toBeDefined();
 		await transaction?.commit();
+		transaction?.activate();
 
 		const daemon = await startDaemonHalf(paths.socketPath, { workspaces: [{ name: "ws", path: cwd }] });
 		cleanups.push(() => daemon.close());
@@ -497,6 +501,7 @@ describe("turn-boundary handoff (§12.3.2)", () => {
 		const transaction = await unheld.attach.prepareRekey("old", "new");
 		expect(transaction).toBeDefined();
 		await transaction?.commit();
+		transaction?.activate();
 		expect(daemon.broker.lookup("ws", "old")?.state).toBe("tui-owned");
 		expect(daemon.broker.lookup("ws", "new")?.state).toBe("tui-owned");
 	}, 20_000);

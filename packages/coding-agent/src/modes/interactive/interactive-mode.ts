@@ -1982,6 +1982,7 @@ export class InteractiveMode {
 					await rekey.commit();
 					this.daemonLeaseSessionId = sessionId;
 				},
+				activate: () => rekey.activate(),
 				rollback: () => rekey.rollback(),
 				dispose: async () => {
 					await rekey.dispose();
