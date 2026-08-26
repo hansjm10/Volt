@@ -681,12 +681,12 @@ async function refExists(
 ): Promise<boolean> {
 	const result = await runCommand(
 		"git",
-		["rev-parse", "--verify", "--quiet", "--end-of-options", ref],
+		["show-ref", "--verify", "--quiet", "--", ref],
 		cwd,
 		commandOptions(limits, signal),
 	);
 	throwIfResolutionCancelled(signal);
-	throwIfOutputLimited("git rev-parse failed", result);
+	throwIfOutputLimited("git show-ref failed", result);
 	return result.ok;
 }
 
@@ -730,11 +730,16 @@ async function resolveBranchBase(
 		};
 	}
 
-	if (fullRef === `refs/heads/${base}`) {
-		const branchName = fullRef.slice("refs/heads/".length);
+	const localBranchRef = `refs/heads/${base}`;
+	if (fullRef === localBranchRef || (await refExists(localBranchRef, cwd, limits, signal))) {
+		const branchName = base;
 		const upstream = await runCommand(
 			"git",
-			["for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:short)", fullRef],
+			[
+				"for-each-ref",
+				"--format=%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:short)",
+				localBranchRef,
+			],
 			cwd,
 			commandOptions(limits, signal),
 		);
@@ -768,10 +773,8 @@ async function resolveBranchBase(
 				displayRef: `${remote}/${branchName}`,
 			};
 		}
-		return { kind: "local", ref: fullRef, displayRef: base };
+		return { kind: "local", ref: localBranchRef, displayRef: base };
 	}
-
-	if (symbolic.ok) return { kind: "local", ref: base, displayRef: base };
 
 	const matchingRemotes: string[] = [];
 	for (const remote of remotes) {

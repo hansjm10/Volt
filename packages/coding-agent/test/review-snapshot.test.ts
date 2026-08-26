@@ -702,6 +702,20 @@ describe("review snapshots", () => {
 		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
 	});
 
+	it("ignores a colliding tag when resolving a short branch base", async () => {
+		const { repository, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		git(repository, "tag", "main", staleBase);
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.description).toBe("branch changes vs origin/main");
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+	});
+
 	it("resolves relative filesystem URLs before refreshing branch bases", async () => {
 		const { repository, remote, staleBase, authoritativeBase } = createStaleBranchFixture("origin");
 		const relativeRemote = relative(repository, remote);
