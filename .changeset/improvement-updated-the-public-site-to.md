@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-improvement(site): Updated the public site to use Volt's app icon, purple TUI palette, and current product links.
+improvement(site): Updated Volt's public branding, product links, and blog discovery.
