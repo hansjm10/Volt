@@ -517,6 +517,21 @@ interface FetchConfigEntry {
 	value: string;
 }
 
+interface ScopedFetchConfig {
+	system: FetchConfigEntry[];
+	global: FetchConfigEntry[];
+	repository: FetchConfigEntry[];
+}
+
+interface AmbientFetchConfig {
+	system: FetchConfigEntry[];
+	global: FetchConfigEntry[];
+}
+
+interface ScopedGitConfigEntry extends FetchConfigEntry {
+	scope: string;
+}
+
 function isFetchConfigKey(key: string, remote: string): boolean {
 	if (key.startsWith("http.") || key.startsWith("credential.")) return true;
 	if (key === "core.askpass" || key === "core.gitproxy" || key === "core.sshcommand") return true;
@@ -528,21 +543,44 @@ function isFetchConfigKey(key: string, remote: string): boolean {
 	return ["proxy", "proxyauthmethod", "serveroption", "uploadpack", "vcs"].includes(key.slice(remotePrefix.length));
 }
 
-function parseFetchConfig(stdout: Buffer, remote: string): FetchConfigEntry[] {
+function isIncludeConfigKey(key: string): boolean {
+	return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
+}
+
+function parseScopedGitConfig(stdout: Buffer): ScopedGitConfigEntry[] {
 	const tokens = stdout.toString("utf8").split("\0");
 	if (tokens.at(-1) === "") tokens.pop();
 	if (tokens.length % 2 !== 0) throw new Error("git config returned malformed scoped output.");
-	const entries: FetchConfigEntry[] = [];
+	const entries: ScopedGitConfigEntry[] = [];
 	for (let index = 0; index < tokens.length; index += 2) {
-		const scope = tokens[index];
+		const scope = tokens[index] ?? "";
 		const entry = tokens[index + 1] ?? "";
-		if (scope !== "local" && scope !== "worktree") continue;
 		const separator = entry.indexOf("\n");
-		if (separator < 1) throw new Error("git config returned a malformed repository-local entry.");
-		const key = entry.slice(0, separator);
-		if (isFetchConfigKey(key, remote)) entries.push({ key, value: entry.slice(separator + 1) });
+		if (separator < 1) throw new Error("git config returned a malformed scoped entry.");
+		entries.push({ scope, key: entry.slice(0, separator), value: entry.slice(separator + 1) });
 	}
 	return entries;
+}
+
+function parseRepositoryFetchConfig(stdout: Buffer, remote: string): ScopedFetchConfig {
+	const config: ScopedFetchConfig = { system: [], global: [], repository: [] };
+	for (const { scope, key, value } of parseScopedGitConfig(stdout)) {
+		if (!isFetchConfigKey(key, remote)) continue;
+		if (scope === "system") config.system.push({ key, value });
+		else if (scope === "global") config.global.push({ key, value });
+		else if (scope === "local" || scope === "worktree") config.repository.push({ key, value });
+	}
+	return config;
+}
+
+function parseAmbientFetchConfig(stdout: Buffer, remote: string): AmbientFetchConfig {
+	const config: AmbientFetchConfig = { system: [], global: [] };
+	for (const { scope, key, value } of parseScopedGitConfig(stdout)) {
+		if (isFetchConfigKey(key, remote) || isIncludeConfigKey(key)) continue;
+		if (scope === "system") config.system.push({ key, value });
+		else if (scope === "global") config.global.push({ key, value });
+	}
+	return config;
 }
 
 async function repositoryFetchConfig(
@@ -550,7 +588,7 @@ async function repositoryFetchConfig(
 	remote: string,
 	limits: ReviewSnapshotLimits,
 	signal?: AbortSignal,
-): Promise<FetchConfigEntry[]> {
+): Promise<ScopedFetchConfig> {
 	throwIfResolutionCancelled(signal);
 	const result = await runCommand(
 		"git",
@@ -560,8 +598,26 @@ async function repositoryFetchConfig(
 	);
 	throwIfResolutionCancelled(signal);
 	throwIfOutputLimited("git config failed", result);
-	if (!result.ok) throw new Error(`Could not inspect repository-local Git config: ${commandError(result)}`);
-	return parseFetchConfig(result.stdout, remote);
+	if (!result.ok) throw new Error(`Could not inspect repository Git config: ${commandError(result)}`);
+	return parseRepositoryFetchConfig(result.stdout, remote);
+}
+
+async function isolatedAmbientFetchConfig(
+	source: GitSource,
+	root: string,
+	remote: string,
+): Promise<AmbientFetchConfig> {
+	const result = await git({ ...source, cwd: root }, [
+		`--git-dir=${source.cwd}`,
+		"config",
+		"--null",
+		"--show-scope",
+		"--list",
+		"--includes",
+	]);
+	throwIfOutputLimited("git config failed", result);
+	if (!result.ok) throw new Error(`Could not inspect isolated Git config: ${commandError(result)}`);
+	return parseAmbientFetchConfig(result.stdout, remote);
 }
 
 function quoteGitConfigValue(value: string): string {
@@ -590,7 +646,7 @@ function quoteGitConfigValue(value: string): string {
 	return `"${escaped}"`;
 }
 
-function serializeFetchConfig(entries: readonly FetchConfigEntry[]): string {
+function serializeGitConfig(entries: readonly FetchConfigEntry[]): string {
 	return entries
 		.map(({ key, value }) => {
 			const firstSeparator = key.indexOf(".");
@@ -813,24 +869,55 @@ function resolveRemoteFetchUrl(root: string, remoteUrl: string): string {
 async function fetchIsolatedRemote(
 	source: GitSource,
 	root: string,
-	config: readonly FetchConfigEntry[],
+	config: ScopedFetchConfig,
 	remote: string,
 	fetchUrl: string,
 	options: string[],
 	refspecs: string[],
 ): Promise<CommandResult> {
-	const configPath = join(source.cwd, "volt-fetch.config");
+	const repositoryConfigPath = join(source.cwd, "volt-fetch.config");
+	const systemConfigPath = join(source.cwd, "volt-fetch-system.config");
+	const globalConfigPath = join(source.cwd, "volt-fetch-global.config");
 	try {
-		await writeFile(configPath, serializeFetchConfig([{ key: `remote.${remote}.url`, value: fetchUrl }, ...config]), {
-			encoding: "utf8",
-			mode: 0o600,
-		});
-		const includeConfig = await git(source, ["config", "--add", "include.path", configPath]);
+		// Rebuild protected scopes so eligible settings use the original repository
+		// context without duplicating multi-valued settings already active here.
+		const ambient = await isolatedAmbientFetchConfig(source, root, remote);
+		await Promise.all([
+			writeFile(
+				repositoryConfigPath,
+				serializeGitConfig([{ key: `remote.${remote}.url`, value: fetchUrl }, ...config.repository]),
+				{ encoding: "utf8", mode: 0o600 },
+			),
+			writeFile(systemConfigPath, serializeGitConfig([...ambient.system, ...config.system]), {
+				encoding: "utf8",
+				mode: 0o600,
+			}),
+			writeFile(globalConfigPath, serializeGitConfig([...ambient.global, ...config.global]), {
+				encoding: "utf8",
+				mode: 0o600,
+			}),
+		]);
+		const includeConfig = await git(source, ["config", "--add", "include.path", repositoryConfigPath]);
 		if (!includeConfig.ok) throw new Error(`Could not prepare isolated fetch config: ${commandError(includeConfig)}`);
-		return await git({ ...source, cwd: root }, [`--git-dir=${source.cwd}`, "fetch", ...options, remote, ...refspecs]);
+		return await git(
+			{
+				...source,
+				cwd: root,
+				env: {
+					...source.env,
+					GIT_CONFIG_SYSTEM: systemConfigPath,
+					GIT_CONFIG_GLOBAL: globalConfigPath,
+				},
+			},
+			[`--git-dir=${source.cwd}`, "fetch", ...options, remote, ...refspecs],
+		);
 	} finally {
 		if (!source.signal?.aborted) await git(source, ["config", "--unset-all", "include.path"]).catch(() => {});
-		await rm(configPath, { force: true }).catch(() => {});
+		await Promise.all([
+			rm(repositoryConfigPath, { force: true }).catch(() => {}),
+			rm(systemConfigPath, { force: true }).catch(() => {}),
+			rm(globalConfigPath, { force: true }).catch(() => {}),
+		]);
 	}
 }
 

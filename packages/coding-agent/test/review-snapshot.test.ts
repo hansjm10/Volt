@@ -156,6 +156,8 @@ describe("review snapshots", () => {
 	const servers: Server[] = [];
 	const initialPath = process.env.PATH;
 	const initialGitTrace = process.env.GIT_TRACE;
+	const initialGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
+	const initialGitConfigNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
 
 	afterEach(async () => {
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
@@ -168,6 +170,10 @@ describe("review snapshots", () => {
 		else process.env.PATH = initialPath;
 		if (initialGitTrace === undefined) delete process.env.GIT_TRACE;
 		else process.env.GIT_TRACE = initialGitTrace;
+		if (initialGitConfigGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+		else process.env.GIT_CONFIG_GLOBAL = initialGitConfigGlobal;
+		if (initialGitConfigNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+		else process.env.GIT_CONFIG_NOSYSTEM = initialGitConfigNoSystem;
 	});
 
 	function createRepository(withCommit = true): string {
@@ -782,6 +788,43 @@ describe("review snapshots", () => {
 		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
 		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
 		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
+	});
+
+	it("preserves conditionally included global fetch configuration", async () => {
+		const { repository, remote, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		git(remote, "update-server-info");
+		const authenticatedRemote = await serveAuthenticatedGitRepository(remote);
+		git(repository, "remote", "set-url", "origin", authenticatedRemote.url);
+
+		const conditionalConfig = join(repository, "conditional-global.config");
+		git(
+			repository,
+			"config",
+			"--file",
+			conditionalConfig,
+			`http.${authenticatedRemote.url}.extraHeader`,
+			authenticatedRemote.extraHeader,
+		);
+		const gitDirectory = git(repository, "rev-parse", "--absolute-git-dir");
+		process.env.GIT_CONFIG_NOSYSTEM = "1";
+		for (const [index, condition] of [`gitdir:${gitDirectory}`, "onbranch:feature"].entries()) {
+			const globalConfig = join(repository, `global-${index}.config`);
+			git(repository, "config", "--file", globalConfig, `includeIf.${condition}.path`, conditionalConfig);
+			process.env.GIT_CONFIG_GLOBAL = globalConfig;
+			expect(
+				git(repository, "config", "--show-scope", "--get-all", `http.${authenticatedRemote.url}.extraHeader`),
+			).toBe(`global\t${authenticatedRemote.extraHeader}`);
+
+			const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+			expect(snapshot.identity).toMatchObject({
+				baseCommit: authoritativeBase,
+				mergeBaseCommit: authoritativeBase,
+				headCommit,
+			});
+			expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		}
+		expect(authenticatedRemote.authenticatedRequestCount()).toBeGreaterThan(0);
+		expect(authenticatedRemote.deniedRequestCount()).toBe(0);
 	});
 
 	it("refreshes a configured non-origin upstream for a plain branch name", async () => {
