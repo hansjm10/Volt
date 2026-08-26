@@ -1149,11 +1149,26 @@ describe("review snapshots", () => {
 			...OPTIONS,
 			signal: controller.signal,
 		});
+		const waitOptions = { timeout: 15_000 };
+		let fetchStarted = false;
 		try {
-			await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true));
+			await Promise.race([
+				vi
+					.waitFor(() => expect(existsSync(startedPath)).toBe(true), waitOptions)
+					.then(() => {
+						fetchStarted = true;
+					}),
+				resolution.then(async (result) => {
+					if (fetchStarted) return;
+					if (!("error" in result)) await result.dispose();
+					throw new Error(
+						`Review resolution settled before the delayed remote fetch started: ${"error" in result ? result.error : "snapshot completed"}`,
+					);
+				}),
+			]);
 			controller.abort();
 			await expect(resolution).resolves.toEqual({ error: "Review cancelled.", cancelled: true });
-			await vi.waitFor(() => expect(processIsAlive(startedPath)).toBe(false));
+			await vi.waitFor(() => expect(processIsAlive(startedPath)).toBe(false), waitOptions);
 			const temporaryDirectory = readFileSync(temporaryDirectoryPath, "utf8");
 			expect(existsSync(temporaryDirectory)).toBe(false);
 		} finally {
