@@ -14,9 +14,12 @@ import {
 
 export type { ReviewPullRequestIdentity } from "./github-pr-context.ts";
 
+export type ReviewBranchBase = { kind: "local"; ref: string } | { kind: "remote"; remote: string; remoteRef: string };
+
 export type ReviewTarget =
 	| { kind: "uncommitted" }
-	| { kind: "branch"; base?: string }
+	| { kind: "branch"; base?: string; branchBase?: never }
+	| { kind: "branch"; branchBase: ReviewBranchBase; base?: never }
 	| { kind: "pr"; number?: string }
 	| { kind: "commit"; sha?: string };
 
@@ -134,6 +137,7 @@ export interface ReviewSnapshot {
 	extraContext?: string;
 	githubContext?: ReviewGitHubContext;
 	identity: ReviewSnapshotIdentity;
+	branchBase?: ReviewBranchBase;
 	changedFiles: ReviewChangedFile[];
 	root: string;
 	readFile(revision: ReviewSnapshotRevision, path: string): Promise<ReviewSnapshotFile | undefined>;
@@ -194,6 +198,7 @@ interface SnapshotInit {
 	extraContext?: string;
 	githubContext?: ReviewGitHubContext;
 	identity: ReviewSnapshotIdentity;
+	branchBase?: ReviewBranchBase;
 	root: string;
 	source: GitSource;
 	temporaryDirectories: string[];
@@ -512,6 +517,193 @@ async function repositoryIndexFile(
 	return result.ok ? text(result).trim() || undefined : undefined;
 }
 
+interface FetchConfigEntry {
+	key: string;
+	value: string;
+}
+
+interface ScopedFetchConfig {
+	system: FetchConfigEntry[];
+	global: FetchConfigEntry[];
+	repository: FetchConfigEntry[];
+	command: FetchConfigEntry[];
+	partialClone: boolean;
+}
+
+interface AmbientFetchConfig {
+	system: FetchConfigEntry[];
+	global: FetchConfigEntry[];
+}
+
+interface ScopedGitConfigEntry extends FetchConfigEntry {
+	scope: string;
+}
+
+function isUrlRewriteConfigKey(key: string): boolean {
+	return key.startsWith("url.") && key.endsWith(".insteadof");
+}
+
+function isFetchConfigKey(key: string, remote: string): boolean {
+	if (key.startsWith("http.") || key.startsWith("credential.")) return true;
+	if (key === "core.askpass" || key === "core.gitproxy" || key === "core.sshcommand") return true;
+	if (key === "ssh.variant" || key === "transfer.credentialsinurl") return true;
+	if (key === "protocol.allow" || key === "protocol.version" || /^protocol\..+\.allow$/.test(key)) return true;
+	if (isUrlRewriteConfigKey(key)) return true;
+	const remotePrefix = `remote.${remote}.`;
+	if (!key.startsWith(remotePrefix)) return false;
+	return ["proxy", "proxyauthmethod", "serveroption", "uploadpack", "vcs"].includes(key.slice(remotePrefix.length));
+}
+
+function isIncludeConfigKey(key: string): boolean {
+	return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
+}
+
+function configIndicatesPartialClone(key: string, value: string): boolean {
+	const normalizedKey = key.toLowerCase();
+	if (normalizedKey === "extensions.partialclone") return true;
+	if (/^remote\..+\.partialclonefilter$/.test(normalizedKey)) return true;
+	if (!/^remote\..+\.promisor$/.test(normalizedKey)) return false;
+	return !["false", "no", "off", "0"].includes(value.trim().toLowerCase());
+}
+
+function parseScopedGitConfig(stdout: Buffer): ScopedGitConfigEntry[] {
+	const tokens = stdout.toString("utf8").split("\0");
+	if (tokens.at(-1) === "") tokens.pop();
+	if (tokens.length % 2 !== 0) throw new Error("git config returned malformed scoped output.");
+	const entries: ScopedGitConfigEntry[] = [];
+	for (let index = 0; index < tokens.length; index += 2) {
+		const scope = tokens[index] ?? "";
+		const entry = tokens[index + 1] ?? "";
+		const separator = entry.indexOf("\n");
+		if (separator < 1) throw new Error("git config returned a malformed scoped entry.");
+		entries.push({ scope, key: entry.slice(0, separator), value: entry.slice(separator + 1) });
+	}
+	return entries;
+}
+
+function parseRepositoryFetchConfig(stdout: Buffer, remote: string): ScopedFetchConfig {
+	const entries = parseScopedGitConfig(stdout);
+	const config: ScopedFetchConfig = {
+		system: [],
+		global: [],
+		repository: [],
+		command: [],
+		partialClone: entries.some(({ key, value }) => configIndicatesPartialClone(key, value)),
+	};
+	for (const { scope, key, value } of entries) {
+		if (!isFetchConfigKey(key, remote)) continue;
+		// The isolated remote URL comes from `git remote get-url`, which has
+		// already applied these mappings. Preserve their effect, not the rules.
+		if (isUrlRewriteConfigKey(key)) continue;
+		if (scope === "system") config.system.push({ key, value });
+		else if (scope === "global") config.global.push({ key, value });
+		else if (scope === "local" || scope === "worktree") config.repository.push({ key, value });
+		else if (scope === "command") config.command.push({ key, value });
+	}
+	return config;
+}
+
+function parseAmbientFetchConfig(stdout: Buffer, remote: string): AmbientFetchConfig {
+	const config: AmbientFetchConfig = { system: [], global: [] };
+	for (const { scope, key, value } of parseScopedGitConfig(stdout)) {
+		if (isFetchConfigKey(key, remote) || isIncludeConfigKey(key)) continue;
+		if (scope === "system") config.system.push({ key, value });
+		else if (scope === "global") config.global.push({ key, value });
+	}
+	return config;
+}
+
+async function repositoryFetchConfig(
+	cwd: string,
+	remote: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<ScopedFetchConfig> {
+	throwIfResolutionCancelled(signal);
+	const result = await runCommand(
+		"git",
+		["config", "--null", "--show-scope", "--list", "--includes"],
+		cwd,
+		commandOptions(limits, signal),
+	);
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git config failed", result);
+	if (!result.ok) throw new Error(`Could not inspect repository Git config: ${commandError(result)}`);
+	return parseRepositoryFetchConfig(result.stdout, remote);
+}
+
+async function isolatedAmbientFetchConfig(
+	source: GitSource,
+	root: string,
+	remote: string,
+): Promise<AmbientFetchConfig> {
+	const result = await git({ ...source, cwd: root }, [
+		`--git-dir=${source.cwd}`,
+		"config",
+		"--null",
+		"--show-scope",
+		"--list",
+		"--includes",
+	]);
+	throwIfOutputLimited("git config failed", result);
+	if (!result.ok) throw new Error(`Could not inspect isolated Git config: ${commandError(result)}`);
+	return parseAmbientFetchConfig(result.stdout, remote);
+}
+
+function quoteGitConfigValue(value: string): string {
+	let escaped = "";
+	for (const character of value) {
+		switch (character) {
+			case "\\":
+				escaped += "\\\\";
+				break;
+			case '"':
+				escaped += '\\"';
+				break;
+			case "\n":
+				escaped += "\\n";
+				break;
+			case "\t":
+				escaped += "\\t";
+				break;
+			case "\b":
+				escaped += "\\b";
+				break;
+			default:
+				escaped += character;
+		}
+	}
+	return `"${escaped}"`;
+}
+
+function commandGitConfigEnvironment(entries: readonly FetchConfigEntry[]): Record<string, string> {
+	const environment: Record<string, string> = { GIT_CONFIG_COUNT: String(entries.length) };
+	for (const [index, entry] of entries.entries()) {
+		environment[`GIT_CONFIG_KEY_${index}`] = entry.key;
+		environment[`GIT_CONFIG_VALUE_${index}`] = entry.value;
+	}
+	return environment;
+}
+
+function serializeGitConfig(entries: readonly FetchConfigEntry[]): string {
+	return entries
+		.map(({ key, value }) => {
+			const firstSeparator = key.indexOf(".");
+			const lastSeparator = key.lastIndexOf(".");
+			const section = key.slice(0, firstSeparator);
+			const name = key.slice(lastSeparator + 1);
+			if (firstSeparator < 1 || !section || !name || !/^[a-z0-9-]+$/i.test(section) || !/^[a-z0-9-]+$/i.test(name)) {
+				throw new Error(`Cannot preserve malformed Git config key: ${key}`);
+			}
+			const header =
+				firstSeparator === lastSeparator
+					? `[${section}]`
+					: `[${section} ${quoteGitConfigValue(key.slice(firstSeparator + 1, lastSeparator))}]`;
+			return `${header}\n\t${name} = ${quoteGitConfigValue(value)}\n`;
+		})
+		.join("");
+}
+
 async function detectBaseBranch(
 	cwd: string,
 	limits: ReviewSnapshotLimits,
@@ -531,48 +723,203 @@ async function detectBaseBranch(
 		if (ref) return ref;
 	}
 	for (const candidate of ["main", "master"]) {
-		const exists = await runCommand(
-			"git",
-			["rev-parse", "--verify", "--quiet", candidate],
-			cwd,
-			commandOptions(limits, signal),
-		);
-		throwIfResolutionCancelled(signal);
-		throwIfOutputLimited("git rev-parse failed", exists);
-		if (exists.ok) return candidate;
+		if (await resolveBranchBase(candidate, cwd, limits, signal)) return candidate;
 	}
 	return undefined;
 }
 
-async function resolveBaseRef(
-	base: string,
+type ResolvedBranchBase =
+	| (Extract<ReviewBranchBase, { kind: "local" }> & { displayRef: string })
+	| (Extract<ReviewBranchBase, { kind: "remote" }> & { displayRef: string });
+
+async function listConfiguredRemotes(
 	cwd: string,
 	limits: ReviewSnapshotLimits,
 	signal?: AbortSignal,
-): Promise<string | undefined> {
+): Promise<string[]> {
+	const result = await runCommand("git", ["remote"], cwd, commandOptions(limits, signal));
 	throwIfResolutionCancelled(signal);
-	const direct = await runCommand(
+	throwIfOutputLimited("git remote failed", result);
+	if (!result.ok) throw new Error(`git remote failed: ${commandError(result)}`);
+	return text(result)
+		.split("\n")
+		.map((remote) => remote.trim())
+		.filter(Boolean)
+		.sort((left, right) => right.length - left.length || left.localeCompare(right));
+}
+
+function remoteBranchFromTrackingRef(
+	ref: string,
+	remotes: readonly string[],
+): { remote: string; remoteRef: string } | undefined {
+	for (const remote of remotes) {
+		const prefix = `refs/remotes/${remote}/`;
+		if (!ref.startsWith(prefix) || ref.length === prefix.length) continue;
+		return { remote, remoteRef: `refs/heads/${ref.slice(prefix.length)}` };
+	}
+	return undefined;
+}
+
+async function refExists(
+	ref: string,
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const result = await runCommand(
 		"git",
-		["rev-parse", "--verify", "--quiet", base],
+		["show-ref", "--verify", "--quiet", "--", ref],
 		cwd,
 		commandOptions(limits, signal),
 	);
 	throwIfResolutionCancelled(signal);
-	throwIfOutputLimited("git rev-parse failed", direct);
-	if (direct.ok) return base;
-	if (!base.startsWith("origin/")) {
-		const remote = `origin/${base}`;
-		const remoteExists = await runCommand(
+	throwIfOutputLimited("git show-ref failed", result);
+	return result.ok;
+}
+
+async function refNameIsValid(
+	ref: string,
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const result = await runCommand("git", ["check-ref-format", ref], cwd, commandOptions(limits, signal));
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git check-ref-format failed", result);
+	return result.ok;
+}
+
+async function resolveStoredBranchBase(
+	base: ReviewBranchBase,
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<ResolvedBranchBase | undefined> {
+	if (!base || typeof base !== "object" || (base.kind !== "local" && base.kind !== "remote")) return undefined;
+	if (base.kind === "local") {
+		if (typeof base.ref !== "string" || !base.ref.startsWith("refs/")) return undefined;
+		if (!(await refNameIsValid(base.ref, cwd, limits, signal))) return undefined;
+		return (await refExists(base.ref, cwd, limits, signal))
+			? { kind: "local", ref: base.ref, displayRef: base.ref }
+			: undefined;
+	}
+	if (
+		typeof base.remote !== "string" ||
+		typeof base.remoteRef !== "string" ||
+		!base.remoteRef.startsWith("refs/heads/") ||
+		!(await refNameIsValid(base.remoteRef, cwd, limits, signal))
+	) {
+		return undefined;
+	}
+	const remotes = await listConfiguredRemotes(cwd, limits, signal);
+	return remotes.includes(base.remote)
+		? {
+				kind: "remote",
+				remote: base.remote,
+				remoteRef: base.remoteRef,
+				displayRef: `${base.remote}/${base.remoteRef.slice("refs/heads/".length)}`,
+			}
+		: undefined;
+}
+
+async function resolveBranchBase(
+	base: string,
+	cwd: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<ResolvedBranchBase | undefined> {
+	throwIfResolutionCancelled(signal);
+	const remotes = await listConfiguredRemotes(cwd, limits, signal);
+	const symbolic = await runCommand(
+		"git",
+		["rev-parse", "--symbolic-full-name", "--verify", "--quiet", "--end-of-options", base],
+		cwd,
+		commandOptions(limits, signal),
+	);
+	throwIfResolutionCancelled(signal);
+	throwIfOutputLimited("git rev-parse failed", symbolic);
+	const fullRef = symbolic.ok ? text(symbolic).trim() : "";
+
+	// Full refs intentionally preserve local or cached Git state. Short names use
+	// the authoritative remote-backed behavior below when one can be identified.
+	if (base.startsWith("refs/")) {
+		return symbolic.ok ? { kind: "local", ref: base, displayRef: base } : undefined;
+	}
+
+	if (fullRef.startsWith("refs/remotes/")) {
+		const remoteBranch = remoteBranchFromTrackingRef(fullRef, remotes);
+		if (remoteBranch) return { kind: "remote", ...remoteBranch, displayRef: base };
+	}
+
+	for (const remote of remotes) {
+		const prefix = `${remote}/`;
+		if (!base.startsWith(prefix) || base.length === prefix.length) continue;
+		return {
+			kind: "remote",
+			remote,
+			remoteRef: `refs/heads/${base.slice(prefix.length)}`,
+			displayRef: base,
+		};
+	}
+
+	const localBranchRef = `refs/heads/${base}`;
+	if (fullRef === localBranchRef || (await refExists(localBranchRef, cwd, limits, signal))) {
+		const branchName = base;
+		const upstream = await runCommand(
 			"git",
-			["rev-parse", "--verify", "--quiet", remote],
+			[
+				"for-each-ref",
+				"--format=%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:short)",
+				localBranchRef,
+			],
 			cwd,
 			commandOptions(limits, signal),
 		);
 		throwIfResolutionCancelled(signal);
-		throwIfOutputLimited("git rev-parse failed", remoteExists);
-		if (remoteExists.ok) return remote;
+		throwIfOutputLimited("git for-each-ref failed", upstream);
+		if (!upstream.ok) throw new Error(`git for-each-ref failed: ${commandError(upstream)}`);
+		const [upstreamRemote, upstreamRemoteRef, upstreamShort] = text(upstream).trim().split("\0");
+		if (upstreamRemote && upstreamRemote !== "." && upstreamRemoteRef?.startsWith("refs/heads/")) {
+			return {
+				kind: "remote",
+				remote: upstreamRemote,
+				remoteRef: upstreamRemoteRef,
+				displayRef: upstreamShort || `${upstreamRemote}/${upstreamRemoteRef.slice("refs/heads/".length)}`,
+			};
+		}
+
+		const matchingRemotes: string[] = [];
+		for (const remote of remotes) {
+			if (await refExists(`refs/remotes/${remote}/${branchName}`, cwd, limits, signal)) matchingRemotes.push(remote);
+		}
+		const remote = matchingRemotes.includes("origin")
+			? "origin"
+			: matchingRemotes.length === 1
+				? matchingRemotes[0]
+				: undefined;
+		if (remote) {
+			return {
+				kind: "remote",
+				remote,
+				remoteRef: `refs/heads/${branchName}`,
+				displayRef: `${remote}/${branchName}`,
+			};
+		}
+		return { kind: "local", ref: localBranchRef, displayRef: base };
 	}
-	return undefined;
+
+	const matchingRemotes: string[] = [];
+	for (const remote of remotes) {
+		if (await refExists(`refs/remotes/${remote}/${base}`, cwd, limits, signal)) matchingRemotes.push(remote);
+	}
+	const remote = matchingRemotes.includes("origin")
+		? "origin"
+		: matchingRemotes.length === 1
+			? matchingRemotes[0]
+			: undefined;
+	return remote
+		? { kind: "remote", remote, remoteRef: `refs/heads/${base}`, displayRef: `${remote}/${base}` }
+		: undefined;
 }
 
 function normalizePullRequestNumber(value: string | undefined, maximum: number): string | undefined {
@@ -587,6 +934,233 @@ async function createLocalSource(root: string, limits: ReviewSnapshotLimits, sig
 	const objects = await repositoryObjectDirectory(root, limits, signal);
 	if (!objects) throw new Error("Could not resolve the Git object directory.");
 	return { cwd: root, objectDirectories: [objects], limits, signal };
+}
+
+function resolveRemoteFetchUrl(root: string, remoteUrl: string): string {
+	const isTildePath = /^~(?:[/\\]|[^/\\]+[/\\])/.test(remoteUrl);
+	const isTransportUrl = /^[^/\\]+:/.test(remoteUrl);
+	return isAbsolute(remoteUrl) || isTildePath || isTransportUrl ? remoteUrl : resolve(root, remoteUrl);
+}
+
+async function fetchIsolatedRemote(
+	source: GitSource,
+	root: string,
+	config: ScopedFetchConfig,
+	remote: string,
+	fetchUrl: string,
+	options: string[],
+	refspecs: string[],
+): Promise<CommandResult> {
+	const repositoryConfigPath = join(source.cwd, "volt-fetch.config");
+	const systemConfigPath = join(source.cwd, "volt-fetch-system.config");
+	const globalConfigPath = join(source.cwd, "volt-fetch-global.config");
+	try {
+		// Rebuild protected scopes so eligible settings use the original repository
+		// context without duplicating multi-valued settings already active here.
+		const ambient = await isolatedAmbientFetchConfig(source, root, remote);
+		await Promise.all([
+			writeFile(
+				repositoryConfigPath,
+				serializeGitConfig([{ key: `remote.${remote}.url`, value: fetchUrl }, ...config.repository]),
+				{ encoding: "utf8", mode: 0o600 },
+			),
+			writeFile(systemConfigPath, serializeGitConfig([...ambient.system, ...config.system]), {
+				encoding: "utf8",
+				mode: 0o600,
+			}),
+			writeFile(globalConfigPath, serializeGitConfig([...ambient.global, ...config.global]), {
+				encoding: "utf8",
+				mode: 0o600,
+			}),
+		]);
+		const includeConfig = await git(source, ["config", "--add", "include.path", repositoryConfigPath]);
+		if (!includeConfig.ok) throw new Error(`Could not prepare isolated fetch config: ${commandError(includeConfig)}`);
+		return await git(
+			{
+				...source,
+				cwd: root,
+				env: {
+					...source.env,
+					...commandGitConfigEnvironment(config.command),
+					GIT_CONFIG_SYSTEM: systemConfigPath,
+					GIT_CONFIG_GLOBAL: globalConfigPath,
+				},
+			},
+			[`--git-dir=${source.cwd}`, "fetch", ...options, remote, ...refspecs],
+		);
+	} finally {
+		if (!source.signal?.aborted) await git(source, ["config", "--unset-all", "include.path"]).catch(() => {});
+		await Promise.all([
+			rm(repositoryConfigPath, { force: true }).catch(() => {}),
+			rm(systemConfigPath, { force: true }).catch(() => {}),
+			rm(globalConfigPath, { force: true }).catch(() => {}),
+		]);
+	}
+}
+
+async function createRemoteBranchSource(
+	root: string,
+	remote: string,
+	remoteRef: string,
+	headCommit: string,
+	limits: ReviewSnapshotLimits,
+	signal?: AbortSignal,
+): Promise<{
+	source?: GitSource;
+	baseCommit?: string;
+	temporaryDirectory?: string;
+	shallow?: boolean;
+	error?: ReviewSnapshotResolutionError;
+}> {
+	throwIfResolutionCancelled(signal);
+	const [localObjects, objectFormat, sourceIsShallow, remoteUrlResult, fetchConfig] = await Promise.all([
+		repositoryObjectDirectory(root, limits, signal),
+		repositoryObjectFormat(root, limits, signal),
+		repositoryIsShallow(root, limits, signal),
+		runCommand("git", ["remote", "get-url", remote], root, commandOptions(limits, signal)),
+		repositoryFetchConfig(root, remote, limits, signal),
+	]);
+	throwIfResolutionCancelled(signal);
+	if (!localObjects) {
+		return {
+			error: {
+				error: "Could not resolve the Git object directory.",
+				remoteError: "Could not prepare the isolated review base.",
+			},
+		};
+	}
+	if (!objectFormat) {
+		return {
+			error: {
+				error: "Could not resolve the Git object format.",
+				remoteError: "Could not prepare the isolated review base.",
+			},
+		};
+	}
+	if (fetchConfig.partialClone) {
+		const error =
+			"Remote-backed branch reviews are not supported from partial clones. Use a complete clone and retry.";
+		return { error: { error, remoteError: error } };
+	}
+	const remoteUrl = text(remoteUrlResult).trim();
+	if (!remoteUrlResult.ok || !remoteUrl) {
+		return {
+			error: {
+				error: `Could not resolve Git remote "${remote}": ${commandError(remoteUrlResult)}`,
+				remoteError: "Could not resolve the review base remote.",
+			},
+		};
+	}
+	const fetchUrl = resolveRemoteFetchUrl(root, remoteUrl);
+
+	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-branch-"));
+	let retainTemporaryDirectory = false;
+	try {
+		const init = await runCommand(
+			"git",
+			["init", "--bare", `--object-format=${objectFormat}`],
+			temporaryDirectory,
+			commandOptions(limits, signal),
+		);
+		throwIfResolutionCancelled(signal);
+		if (!init.ok) {
+			return {
+				error: {
+					...commandFailure("git init failed", init),
+					remoteError: "Could not prepare the isolated review base.",
+				},
+			};
+		}
+
+		const objects = join(temporaryDirectory, "objects");
+		const borrowLocalObjects = sourceIsShallow === false && !fetchConfig.partialClone;
+		if (borrowLocalObjects) {
+			await mkdir(join(objects, "info"), { recursive: true });
+			await writeFile(join(objects, "info", "alternates"), `${resolve(localObjects)}\n`, "utf8");
+		}
+		throwIfResolutionCancelled(signal);
+		const source: GitSource = {
+			cwd: temporaryDirectory,
+			objectDirectories: borrowLocalObjects ? [objects, localObjects] : [objects],
+			limits,
+			signal,
+		};
+		const captureHead = borrowLocalObjects
+			? await git(source, ["update-ref", "refs/review/head", headCommit])
+			: await git(source, [
+					"fetch",
+					"--no-tags",
+					"--no-write-fetch-head",
+					"--force",
+					"--update-shallow",
+					resolve(root),
+					"+HEAD:refs/review/head",
+				]);
+		if (!captureHead.ok) {
+			return {
+				error: {
+					...commandFailure(
+						borrowLocalObjects ? "git update-ref failed" : "git fetch from workspace failed",
+						captureHead,
+					),
+					remoteError: "Could not capture the review branch endpoints.",
+				},
+			};
+		}
+		const capturedHead = await requireCanonicalCommit(source, "refs/review/head");
+		if (capturedHead !== headCommit) {
+			return {
+				error: {
+					error: "The branch head moved while Volt captured it. Retry the review.",
+					remoteError: "The branch head moved while Volt captured it. Retry the review.",
+				},
+			};
+		}
+		const fetch = await fetchIsolatedRemote(
+			source,
+			root,
+			fetchConfig,
+			remote,
+			fetchUrl,
+			["--no-tags", "--no-write-fetch-head", "--force"],
+			[`+${remoteRef}:refs/review/base`],
+		);
+		if (!fetch.ok) {
+			return {
+				error: {
+					error: `git fetch failed: ${commandError(fetch)}`,
+					remoteError: "Could not refresh the review base branch.",
+				},
+			};
+		}
+		const baseCommit = await requireCanonicalCommit(source, "refs/review/base");
+		const pinnedHead = await requireCanonicalCommit(source, "refs/review/head");
+		if (!baseCommit || pinnedHead !== headCommit) {
+			return {
+				error: {
+					error: "Could not pin the fetched branch review endpoints.",
+					remoteError: "Could not capture the review branch endpoints.",
+				},
+			};
+		}
+		retainTemporaryDirectory = true;
+		return {
+			source,
+			baseCommit,
+			temporaryDirectory,
+			shallow: sourceIsShallow === true,
+		};
+	} catch (error) {
+		if (error instanceof ReviewSnapshotResolutionCancelledError || signal?.aborted) throw error;
+		return {
+			error: {
+				error: error instanceof Error ? error.message : String(error),
+				remoteError: "Could not prepare the isolated review base.",
+			},
+		};
+	} finally {
+		if (!retainTemporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+	}
 }
 
 async function createUncommittedSource(
@@ -723,18 +1297,21 @@ async function createPullRequestSource(
 	signal?: AbortSignal,
 ): Promise<{ source?: GitSource; temporaryDirectory?: string; error?: ReviewSnapshotResolutionError }> {
 	throwIfResolutionCancelled(signal);
-	const [localObjects, objectFormat, sourceIsShallow, originResult] = await Promise.all([
+	const [localObjects, objectFormat, sourceIsShallow, originResult, fetchConfig] = await Promise.all([
 		repositoryObjectDirectory(root, limits, signal),
 		repositoryObjectFormat(root, limits, signal),
 		repositoryIsShallow(root, limits, signal),
 		runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits, signal)),
+		repositoryFetchConfig(root, "origin", limits, signal),
 	]);
 	throwIfResolutionCancelled(signal);
 	if (!localObjects) return { error: { error: "Could not resolve the Git object directory." } };
 	if (!objectFormat) return { error: { error: "Could not resolve the Git object format." } };
-	if (!originResult.ok || !text(originResult).trim()) {
+	const originUrl = text(originResult).trim();
+	if (!originResult.ok || !originUrl) {
 		return { error: { error: "Could not resolve the origin remote for the pull request snapshot." } };
 	}
+	const fetchUrl = resolveRemoteFetchUrl(root, originUrl);
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-pr-"));
 	let retainTemporaryDirectory = false;
 	try {
@@ -748,7 +1325,7 @@ async function createPullRequestSource(
 		if (!init.ok) return { error: commandFailure("git init failed", init) };
 		const objects = join(temporaryDirectory, "objects");
 		const alternatesPath = join(objects, "info", "alternates");
-		const borrowLocalObjects = sourceIsShallow === false;
+		const borrowLocalObjects = sourceIsShallow === false && !fetchConfig.partialClone;
 		if (borrowLocalObjects) {
 			await mkdir(join(objects, "info"), { recursive: true });
 			await writeFile(alternatesPath, `${resolve(localObjects)}\n`, "utf8");
@@ -760,14 +1337,18 @@ async function createPullRequestSource(
 			limits,
 			signal,
 		};
-		const fetch = await git(fetchSource, [
-			"fetch",
-			"--no-tags",
-			"--force",
-			text(originResult).trim(),
-			`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
-			`+refs/pull/${pullRequest.number}/head:refs/review/head`,
-		]);
+		const fetch = await fetchIsolatedRemote(
+			fetchSource,
+			root,
+			fetchConfig,
+			"origin",
+			fetchUrl,
+			["--no-tags", "--force"],
+			[
+				`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
+				`+refs/pull/${pullRequest.number}/head:refs/review/head`,
+			],
+		);
 		if (!fetch.ok) {
 			return {
 				error: {
@@ -1710,6 +2291,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	readonly extraContext?: string;
 	readonly githubContext?: ReviewGitHubContext;
 	readonly identity: ReviewSnapshotIdentity;
+	readonly branchBase?: ReviewBranchBase;
 	readonly root: string;
 	readonly changedFiles: ReviewChangedFile[];
 	private readonly source: GitSource;
@@ -1738,6 +2320,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.extraContext = init.extraContext;
 		this.githubContext = init.githubContext;
 		this.identity = init.identity;
+		this.branchBase = init.branchBase;
 		this.root = init.root;
 		this.source = init.source;
 		this.limits = init.limits;
@@ -2355,17 +2938,69 @@ export async function resolveReviewSnapshot(
 			}
 			case "branch": {
 				options.onProgress?.("Resolving branch history…");
-				const requestedBase = target.base ?? (await detectBaseBranch(root, limits, options.signal));
-				if (!requestedBase) return { error: "Could not detect a base branch. Use /review branch <base>." };
-				const baseRef = await resolveBaseRef(requestedBase, root, limits, options.signal);
-				if (!baseRef) return { error: `Base branch "${requestedBase}" not found.` };
-				const source = await createLocalSource(root, limits, options.signal);
-				const baseCommit = await requireCanonicalCommit(source, baseRef);
-				const headCommit = await requireCanonicalCommit(source, "HEAD");
-				if (!baseCommit || !headCommit) return { error: "Could not resolve the branch endpoints." };
+				const localSource = await createLocalSource(root, limits, options.signal);
+				const headCommit = await requireCanonicalCommit(localSource, "HEAD");
+				if (!headCommit) return { error: "Could not resolve the branch head." };
+				let resolvedBase: ResolvedBranchBase | undefined;
+				if ("branchBase" in target) {
+					resolvedBase = target.branchBase
+						? await resolveStoredBranchBase(target.branchBase, root, limits, options.signal)
+						: undefined;
+					if (!resolvedBase) return { error: "Stored branch review base is no longer valid." };
+				} else {
+					const requestedBase = target.base ?? (await detectBaseBranch(root, limits, options.signal));
+					if (!requestedBase) return { error: "Could not detect a base branch. Use /review branch <base>." };
+					resolvedBase = await resolveBranchBase(requestedBase, root, limits, options.signal);
+					if (!resolvedBase) return { error: `Base branch "${requestedBase}" not found.` };
+				}
+
+				let source = localSource;
+				let baseCommit: string | undefined;
+				let remoteSourceIsShallow = false;
+				const temporaryDirectories: string[] = [];
+				if (resolvedBase.kind === "remote") {
+					options.onProgress?.(`Refreshing ${resolvedBase.displayRef}…`);
+					const fetched = await createRemoteBranchSource(
+						root,
+						resolvedBase.remote,
+						resolvedBase.remoteRef,
+						headCommit,
+						limits,
+						options.signal,
+					);
+					if (!fetched.source || !fetched.baseCommit || !fetched.temporaryDirectory) {
+						return fetched.error ?? { error: "Could not refresh the review base branch." };
+					}
+					source = fetched.source;
+					baseCommit = fetched.baseCommit;
+					remoteSourceIsShallow = fetched.shallow === true;
+					temporaryDirectories.push(fetched.temporaryDirectory);
+					pendingTemporaryDirectories.add(fetched.temporaryDirectory);
+				} else {
+					baseCommit = await requireCanonicalCommit(source, resolvedBase.ref);
+				}
+				if (!baseCommit) return { error: "Could not resolve the branch base." };
+				const cleanupTemporaryDirectories = async (): Promise<void> => {
+					for (const directory of temporaryDirectories) {
+						pendingTemporaryDirectories.delete(directory);
+						await rm(directory, { recursive: true, force: true }).catch(() => {});
+					}
+				};
 				const mergeBaseResult = await git(source, ["merge-base", baseCommit, headCommit]);
 				const mergeBaseCommit = text(mergeBaseResult).trim();
 				if (!mergeBaseResult.ok || !CANONICAL_GIT_OBJECT_ID_PATTERN.test(mergeBaseCommit)) {
+					await cleanupTemporaryDirectories();
+					if (
+						remoteSourceIsShallow &&
+						mergeBaseResult.exitCode === 1 &&
+						mergeBaseResult.failure === undefined &&
+						mergeBaseResult.stdout.length === 0 &&
+						!mergeBaseResult.stderr.trim()
+					) {
+						const error =
+							"Could not resolve the branch merge base from the available shallow history. Deepen or unshallow the repository and retry.";
+						return { error, remoteError: error };
+					}
 					return {
 						error: `git merge-base failed: ${commandError(mergeBaseResult)}`,
 						remoteError: "Could not resolve the branch merge base.",
@@ -2373,17 +3008,27 @@ export async function resolveReviewSnapshot(
 				}
 				const baseTree = await requireCanonicalTree(source, mergeBaseCommit);
 				const headTree = await requireCanonicalTree(source, headCommit);
-				if (!baseTree || !headTree) return { error: "Could not resolve the branch trees." };
-				if (baseTree === headTree) return { error: `No changes between ${baseRef} and HEAD.` };
+				if (!baseTree || !headTree) {
+					await cleanupTemporaryDirectories();
+					return { error: "Could not resolve the branch trees." };
+				}
+				if (baseTree === headTree) {
+					await cleanupTemporaryDirectories();
+					return { error: `No changes between ${resolvedBase.displayRef} and HEAD.` };
+				}
 				const logResult = await git(source, ["log", "--oneline", `${mergeBaseCommit}..${headCommit}`]);
 				init = {
-					description: `branch changes vs ${baseRef}`,
-					diffCommand: `git diff --no-textconv --no-ext-diff ${baseRef}...HEAD`,
+					description: `branch changes vs ${resolvedBase.displayRef}`,
+					diffCommand: `git diff --no-textconv --no-ext-diff ${resolvedBase.displayRef}...HEAD`,
 					extraContext: logResult.ok && text(logResult).trim() ? `Commits:\n${text(logResult).trim()}` : undefined,
 					identity: { kind: target.kind, baseCommit, mergeBaseCommit, headCommit, baseTree, headTree },
+					branchBase:
+						resolvedBase.kind === "local"
+							? { kind: "local", ref: resolvedBase.ref }
+							: { kind: "remote", remote: resolvedBase.remote, remoteRef: resolvedBase.remoteRef },
 					root,
 					source,
-					temporaryDirectories: [],
+					temporaryDirectories,
 					limits,
 				};
 				break;

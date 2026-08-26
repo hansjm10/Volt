@@ -248,8 +248,8 @@ export async function getUiActionCompletions(
 }
 
 /**
- * Serves the `gitBranches` completion source: candidate base branches from the
- * workspace (the same local + remote-tracking set as the TUI /review picker),
+ * Serves the `gitBranches` completion source: logical base branches from the
+ * workspace (the same collapsed local/upstream set as the TUI /review picker),
  * case-insensitively prefix-filtered and bounded.
  */
 async function getGitBranchCompletions(cwd: string, prefix: string): Promise<UiActionOptionDescriptor[]> {

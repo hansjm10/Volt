@@ -78,6 +78,27 @@ function durableRecord(runId = "review:test"): ReviewRunRecord {
 	};
 }
 
+function durableBranchRecord(runId = "review:test"): ReviewRunRecord {
+	const record = durableRecord(runId);
+	return {
+		...record,
+		workflowAction: "review.branch",
+		target: {
+			...record.target,
+			description: "branch changes vs origin/main",
+			diffCommand: "git diff origin/main...HEAD",
+			identity: {
+				kind: "branch",
+				baseTree: "base-tree",
+				headTree: "head-tree",
+				baseCommit: "base-commit",
+				headCommit: "head-commit",
+			},
+			branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
+		},
+	};
+}
+
 interface ExecuteOptions {
 	prepared: { workflowId: string; action: string };
 	sessionManager?: SessionManager;
@@ -730,15 +751,18 @@ describe("RPC durable review actions", () => {
 		await closeMode(collecting, modePromise);
 	});
 
-	test("accepts an incremental durable rerun and launches it after the response", async () => {
+	test("accepts an incremental durable branch rerun through its host-only locator", async () => {
 		const manager = SessionManager.inMemory("/workspace");
-		appendReviewRun(manager, durableRecord());
+		appendReviewRun(manager, durableBranchRecord());
 		const runtimeHost = makeRuntimeHost({ manager });
 		const collecting = createCollectingTransport();
 		const modePromise = await startMode(runtimeHost, collecting.transport);
-		collecting.getLineHandler()(
-			JSON.stringify({ id: "rerun", type: "rerun_review", runId: "review:test", mode: "incremental" }),
-		);
+		const line = collecting.getLineHandler();
+		line(JSON.stringify({ id: "list-branch", type: "list_review_workflows" }));
+		await vi.waitFor(() => expect(response(collecting.writes, "list-branch")).toBeDefined());
+		expect(JSON.stringify(response(collecting.writes, "list-branch"))).not.toContain("branchBase");
+
+		line(JSON.stringify({ id: "rerun", type: "rerun_review", runId: "review:test", mode: "incremental" }));
 		await vi.waitFor(() =>
 			expect(response(collecting.writes, "rerun")).toMatchObject({
 				success: true,
@@ -748,10 +772,32 @@ describe("RPC durable review actions", () => {
 		await vi.waitFor(() => expect(reviewMocks.executeReviewWorkflow).toHaveBeenCalled());
 		expect(reviewMocks.prepareReviewWorkflow).toHaveBeenCalledWith(
 			expect.objectContaining({
+				target: {
+					kind: "branch",
+					branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
+				},
 				parentRunId: "review:test",
 				controls: expect.objectContaining({ scopeMode: "incremental" }),
 			}),
 		);
+		await closeMode(collecting, modePromise);
+	});
+
+	test("rejects a durable branch rerun without a stored locator", async () => {
+		const manager = SessionManager.inMemory("/workspace");
+		const record = durableBranchRecord("review:missing-locator");
+		delete record.target.branchBase;
+		appendReviewRun(manager, record);
+		const runtimeHost = makeRuntimeHost({ manager });
+		const collecting = createCollectingTransport();
+		const modePromise = await startMode(runtimeHost, collecting.transport);
+		collecting.getLineHandler()(JSON.stringify({ id: "rerun-missing", type: "rerun_review", runId: record.runId }));
+		await vi.waitFor(() => expect(response(collecting.writes, "rerun-missing")).toBeDefined());
+		expect(response(collecting.writes, "rerun-missing")).toMatchObject({
+			success: false,
+			error: "Durable branch review run does not retain a base locator.",
+		});
+		expect(reviewMocks.prepareReviewWorkflow).not.toHaveBeenCalled();
 		await closeMode(collecting, modePromise);
 	});
 

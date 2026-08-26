@@ -86,6 +86,7 @@ function record(runId: string, endedAt: number, findings: ReviewFinding[] = [fin
 				baseCommit: "base",
 				headCommit: `head-${runId}`,
 			},
+			branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
 			files: [
 				{
 					path: "src/value.ts",
@@ -117,6 +118,7 @@ function snapshot(headOid: string, hunkId = "hunk-1"): ReviewSnapshot {
 			baseCommit: "base",
 			headCommit: `commit-${headOid}`,
 		},
+		branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
 		changedFiles: [
 			{
 				path: "src/value.ts",
@@ -180,6 +182,7 @@ function prSnapshot(
 			headRefOid: pullRequestHeadOid,
 		},
 	};
+	delete value.branchBase;
 	value.githubContext = {
 		manifest: {
 			status: "complete",
@@ -583,6 +586,7 @@ describe("durable review state", () => {
 			runId: "review:test",
 			status: "completed",
 			target: {
+				branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
 				files: [
 					{
 						status: "modified",

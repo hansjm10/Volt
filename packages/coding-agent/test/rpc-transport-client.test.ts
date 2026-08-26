@@ -2079,6 +2079,13 @@ describe("createInProcessRpcClient", () => {
 
 	test("serves git branch completions for the review.branch base argument", async () => {
 		const repo = createTestGitRepo(["feature/login", "zeta"]);
+		const remote = mkdtempSync(join(tmpdir(), "volt-rpc-branch-remote-"));
+		gitInTestRepo(remote, "init", "--bare", "--initial-branch=main");
+		gitInTestRepo(repo, "remote", "add", "origin", remote);
+		gitInTestRepo(repo, "branch", "remote-only");
+		gitInTestRepo(repo, "push", "-u", "origin", "main");
+		gitInTestRepo(repo, "push", "origin", "feature/login", "zeta", "remote-only");
+		gitInTestRepo(repo, "branch", "-D", "remote-only");
 		const noRepoDir = mkdtempSync(join(tmpdir(), "volt-rpc-norepo-"));
 		const runtimeHost = createRuntimeHost(
 			vi.fn(async () => {}),
@@ -2098,6 +2105,7 @@ describe("createInProcessRpcClient", () => {
 				{ value: "main" },
 				{ value: "feature/login" },
 				{ value: "zeta" },
+				{ value: "origin/remote-only" },
 			]);
 			await expect(client.getUiActionCompletions(REVIEW_BRANCH_ACTION_ID, "base", "FEAT")).resolves.toEqual([
 				{ value: "feature/login" },
@@ -2122,6 +2130,7 @@ describe("createInProcessRpcClient", () => {
 		} finally {
 			await noRepoClient.stop();
 			rmSync(repo, { recursive: true, force: true });
+			rmSync(remote, { recursive: true, force: true });
 			rmSync(noRepoDir, { recursive: true, force: true });
 		}
 	});
