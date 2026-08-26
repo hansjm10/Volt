@@ -13,7 +13,13 @@ import {
 import type { PlanningState, PlanStepStatus } from "../../../core/planning.ts";
 import { theme } from "../../../core/theme/runtime.ts";
 import { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
-import { appendWrappedPlanLine, getPlanProgress, planPhaseLabel, usesAsciiPlanMarkers } from "./plan-content.ts";
+import {
+	appendWrappedPlanLine,
+	getPlanProgress,
+	getPlanStepProgress,
+	planPhaseLabel,
+	usesAsciiPlanMarkers,
+} from "./plan-content.ts";
 import type { PlanDetailsAction } from "./plan-status.ts";
 
 const READY_ACTIONS: ReadonlyArray<{ label: string; action: PlanDetailsAction }> = [
@@ -298,11 +304,18 @@ export class PlanInspectorComponent implements Component, Focusable {
 			appendWrappedPlanLine(lines, " ", theme.fg("dim", "No checklist steps yet."), width);
 			return lines;
 		}
+		const currentGroup =
+			plan.phase === "active"
+				? (plan.steps.find((step) => step.status === "in_progress") ??
+					plan.steps.find((step) => step.status === "pending"))
+				: undefined;
 		for (const [index, step] of plan.steps.entries()) {
 			const marker = theme.fg(stepColor(step.status), stepMarker(step.status));
 			const textColor = step.status === "in_progress" ? "accent" : step.status === "completed" ? "muted" : "text";
 			const prefix = ` ${index + 1}. ${marker} `;
-			appendWrappedPlanLine(lines, prefix, theme.fg(textColor, step.text), width);
+			const progress = step.substeps ? getPlanStepProgress(step) : undefined;
+			const progressText = progress ? theme.fg("dim", ` · ${progress.completed}/${progress.total} tasks`) : "";
+			appendWrappedPlanLine(lines, prefix, `${theme.fg(textColor, step.text)}${progressText}`, width);
 			if (step.note) {
 				appendWrappedPlanLine(
 					lines,
@@ -310,6 +323,25 @@ export class PlanInspectorComponent implements Component, Focusable {
 					theme.fg("muted", `Note: ${step.note}`),
 					width,
 				);
+			}
+			const showSubsteps =
+				step.substeps !== undefined &&
+				(plan.phase === "ready" || plan.phase === "draft" || currentGroup?.id === step.id);
+			if (!showSubsteps) continue;
+			for (const [substepIndex, substep] of step.substeps!.entries()) {
+				const substepMarker = theme.fg(stepColor(substep.status), stepMarker(substep.status));
+				const substepColor =
+					substep.status === "in_progress" ? "accent" : substep.status === "completed" ? "muted" : "text";
+				const substepPrefix = ` ${index + 1}.${substepIndex + 1}. ${substepMarker} `;
+				appendWrappedPlanLine(lines, substepPrefix, theme.fg(substepColor, substep.text), width);
+				if (substep.note) {
+					appendWrappedPlanLine(
+						lines,
+						" ".repeat(visibleWidth(substepPrefix)),
+						theme.fg("muted", `Note: ${substep.note}`),
+						width,
+					);
+				}
 			}
 		}
 		return lines;

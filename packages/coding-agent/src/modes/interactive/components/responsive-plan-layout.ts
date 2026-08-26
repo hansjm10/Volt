@@ -32,14 +32,14 @@ export interface ResponsivePlanDimensions {
 	planColumns: number;
 }
 
-/** Resolve the exact responsive contract, or return undefined for compact layout. */
+/** Resolve the exact responsive contract for review/execution, or keep drafts compact. */
 export function getResponsivePlanDimensions(
 	terminalColumns: number,
 	terminalRows: number,
 	planning: PlanningState,
 ): ResponsivePlanDimensions | undefined {
 	if (terminalColumns < PLAN_SPLIT_MIN_COLUMNS || terminalRows < PLAN_SPLIT_MIN_ROWS) return undefined;
-	if (planning.mode !== "plan" && planning.plan === null) return undefined;
+	if (!planning.plan || planning.plan.phase === "draft") return undefined;
 
 	const planColumns = Math.min(
 		PLAN_PANE_MAX_COLUMNS,

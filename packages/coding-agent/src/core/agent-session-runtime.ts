@@ -13,6 +13,7 @@ import type {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import {
+	clonePlanState,
 	createPlanExecutionPrompt,
 	PLAN_EXECUTION_CUSTOM_TYPE,
 	type PlanExecution,
@@ -1186,10 +1187,9 @@ export class AgentSessionRuntime {
 				sessionManager.appendPlanningState({
 					mode: "build",
 					plan: {
-						...sourcePlan,
+						...clonePlanState(sourcePlan),
 						revision: sourcePlan.revision + 1,
 						phase: "active",
-						steps: sourcePlan.steps.map((step) => ({ ...step })),
 						execution,
 					},
 				});
@@ -1214,10 +1214,9 @@ export class AgentSessionRuntime {
 				handoffManager.appendPlanningState({
 					mode: "build",
 					plan: {
-						...sourcePlan,
+						...clonePlanState(sourcePlan),
 						revision: sourcePlan.revision + 1,
 						phase: "handed_off",
-						steps: sourcePlan.steps.map((step) => ({ ...step })),
 						execution,
 					},
 				});

@@ -1,5 +1,5 @@
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@hansjm10/volt-tui";
-import type { PlanState, PlanStepStatus } from "../../../core/planning.ts";
+import { getPlanLeafSteps, type PlanState, type PlanStep, type PlanStepStatus } from "../../../core/planning.ts";
 import type { Theme } from "../../../core/theme/runtime.ts";
 
 export interface PlanProgress {
@@ -35,15 +35,31 @@ export function planPhaseLabel(plan: PlanState): string {
 }
 
 export function getPlanProgress(plan: PlanState): PlanProgress {
-	const total = plan.steps.length;
-	const completed = plan.steps.filter((step) => step.status === "completed").length;
+	const leaves = getPlanLeafSteps(plan);
+	const total = leaves.length;
+	const completed = leaves.filter((step) => step.status === "completed").length;
+	return { completed, total, percent: total === 0 ? 0 : Math.round((completed / total) * 100) };
+}
+
+export function getPlanStepProgress(step: PlanStep): PlanProgress {
+	const leaves = step.substeps ?? [step];
+	const total = leaves.length;
+	const completed = leaves.filter((item) => item.status === "completed").length;
 	return { completed, total, percent: total === 0 ? 0 : Math.round((completed / total) * 100) };
 }
 
 export function getCurrentPlanStep(plan: PlanState): string | undefined {
-	return (
-		plan.steps.find((step) => step.status === "in_progress") ?? plan.steps.find((step) => step.status === "pending")
-	)?.text;
+	for (const status of ["in_progress", "pending"] as const) {
+		for (const step of plan.steps) {
+			if (!step.substeps) {
+				if (step.status === status) return step.text;
+				continue;
+			}
+			const substep = step.substeps.find((item) => item.status === status);
+			if (substep) return `${step.text} › ${substep.text}`;
+		}
+	}
+	return undefined;
 }
 
 export function appendWrappedPlanLine(lines: string[], prefix: string, content: string, width: number): void {
@@ -110,7 +126,9 @@ export function renderPlanContentLines(
 		const marker = currentTheme.fg(markerColor(step.status), planStepMarker(step.status));
 		const textColor = step.status === "in_progress" ? "accent" : step.status === "completed" ? "muted" : "text";
 		const prefix = ` ${marker} `;
-		appendWrappedPlanLine(lines, prefix, currentTheme.fg(textColor, step.text), width);
+		const progress = step.substeps ? getPlanStepProgress(step) : undefined;
+		const progressText = progress ? currentTheme.fg("dim", ` · ${progress.completed}/${progress.total} tasks`) : "";
+		appendWrappedPlanLine(lines, prefix, `${currentTheme.fg(textColor, step.text)}${progressText}`, width);
 		if (step.note) {
 			appendWrappedPlanLine(
 				lines,
@@ -118,6 +136,21 @@ export function renderPlanContentLines(
 				currentTheme.fg("muted", `Note: ${step.note}`),
 				width,
 			);
+		}
+		for (const substep of step.substeps ?? []) {
+			const substepMarker = currentTheme.fg(markerColor(substep.status), planStepMarker(substep.status));
+			const substepColor =
+				substep.status === "in_progress" ? "accent" : substep.status === "completed" ? "muted" : "text";
+			const substepPrefix = `     ${substepMarker} `;
+			appendWrappedPlanLine(lines, substepPrefix, currentTheme.fg(substepColor, substep.text), width);
+			if (substep.note) {
+				appendWrappedPlanLine(
+					lines,
+					" ".repeat(visibleWidth(substepPrefix)),
+					currentTheme.fg("muted", `Note: ${substep.note}`),
+					width,
+				);
+			}
 		}
 	}
 	return lines;

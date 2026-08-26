@@ -102,6 +102,41 @@ describe("PlanInspectorComponent", () => {
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(48);
 	});
 
+	it("expands every group for review and only the active group during execution", () => {
+		const state = planning("active", 2);
+		state.plan!.steps = [
+			{
+				id: "group-complete",
+				text: "Completed outcome",
+				status: "completed",
+				substeps: [{ id: "completed-child", text: "Hidden completed child", status: "completed" }],
+			},
+			{
+				id: "group-active",
+				text: "Active outcome",
+				status: "in_progress",
+				substeps: [
+					{ id: "active-child", text: "Visible active child", status: "in_progress" },
+					{ id: "pending-child", text: "Visible pending child", status: "pending" },
+				],
+			},
+		];
+		const inspector = createInspector(state);
+		const executing = text(inspector);
+		expect(executing).toContain("Completed outcome");
+		expect(executing).not.toContain("Hidden completed child");
+		expect(executing).toContain("Visible active child");
+		expect(executing).toContain("Visible pending child");
+
+		state.mode = "plan";
+		state.plan!.phase = "ready";
+		delete state.plan!.execution;
+		inspector.setPlanning(state);
+		const ready = text(inspector);
+		expect(ready).toContain("Hidden completed child");
+		expect(ready).toContain("Visible active child");
+	});
+
 	it("routes ready actions without changing planning state", () => {
 		const actions: PlanDetailsAction[] = [];
 		const state = planning("ready");

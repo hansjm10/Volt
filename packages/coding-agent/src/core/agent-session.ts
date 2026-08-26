@@ -143,10 +143,14 @@ import {
 	type AgentMode,
 	assertPlanRevision,
 	clonePlanningState,
+	clonePlanState,
+	derivePlanStepStatus,
 	formatPlanCheckpoint,
 	formatPlanPolicy,
+	getPlanLeafSteps,
 	PLAN_CHECKPOINT_CUSTOM_TYPE,
 	type PlanExecution,
+	type PlanItem,
 	type PlanningState,
 	type PlanState,
 	type PlanStepStatus,
@@ -189,7 +193,13 @@ import {
 	type SubagentToolManager,
 	type SubagentToolMode,
 } from "./tools/index.ts";
-import { canonicalizePlanSteps, createPlanningToolDefinitions, NATIVE_PLAN_TOOL_NAMES } from "./tools/planning.ts";
+import {
+	canonicalizePlanSteps,
+	createPlanningToolDefinitions,
+	NATIVE_PLAN_TOOL_NAMES,
+	type PlanStepInput,
+	planStepsSemanticallyEqual,
+} from "./tools/planning.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
@@ -2800,13 +2810,14 @@ export class AgentSession {
 	}
 
 	private _draftFromExecutedPlan(plan: PlanState): PlanState {
+		const cloned = clonePlanState(plan);
 		return {
-			id: plan.id,
-			revision: plan.revision + 1,
+			id: cloned.id,
+			revision: cloned.revision + 1,
 			phase: "draft",
-			...(plan.title ? { title: plan.title } : {}),
-			...(plan.summary ? { summary: plan.summary } : {}),
-			steps: plan.steps.map((step) => ({ ...step })),
+			...(cloned.title ? { title: cloned.title } : {}),
+			...(cloned.summary ? { summary: cloned.summary } : {}),
+			steps: cloned.steps,
 		};
 	}
 
@@ -2881,19 +2892,11 @@ export class AgentSession {
 		expectedRevision?: number;
 		title?: string;
 		summary?: string;
-		steps: Array<{ id?: string; text: string }>;
+		steps: PlanStepInput[];
 	}): PlanState {
 		this._assertNoPlanningTransitionInFlight("update_plan");
 		if (this._planningState.mode !== "plan") {
 			throw new Error("update_plan is available only in Plan mode");
-		}
-		if (input.steps.length > 64) {
-			throw new Error("Plans may contain at most 64 steps");
-		}
-		for (const step of input.steps) {
-			if (!step.text.trim()) {
-				throw new Error("Plan steps must have non-empty text");
-			}
 		}
 		const previous = this._planningState.plan;
 		if (previous) {
@@ -2914,16 +2917,9 @@ export class AgentSession {
 			previous &&
 			previous.title === title &&
 			previous.summary === summary &&
-			previous.steps.length === steps.length &&
-			// Ids are deliberately ignored: identical text/status/note in the same
-			// order is the same checklist, and rejecting it keeps a resend without
-			// canonical ids from churning step ids and burning a revision.
-			previous.steps.every((step, index) => {
-				const next = steps[index];
-				return (
-					next !== undefined && step.text === next.text && step.status === next.status && step.note === next.note
-				);
-			})
+			// Ids are deliberately ignored: identical content and progress in the
+			// same hierarchy is the same checklist, so id-less resends cannot churn.
+			planStepsSemanticallyEqual(previous.steps, steps)
 		) {
 			throw new Error("Plan update made no changes; continue research or submit the current draft");
 		}
@@ -2936,7 +2932,7 @@ export class AgentSession {
 			steps,
 		};
 		this._commitPlanningState({ mode: "plan", plan });
-		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+		return clonePlanState(plan);
 	}
 
 	updatePlanProgress(input: {
@@ -2953,21 +2949,27 @@ export class AgentSession {
 			throw new Error("At least one plan progress update is required");
 		}
 		const updates = new Map<string, { status: PlanStepStatus; note?: string }>();
-		const knownIds = new Set(this._planningState.plan.steps.map((step) => step.id));
+		const executableIds = new Set(getPlanLeafSteps(this._planningState.plan).map((step) => step.id));
+		const groupIds = new Set(
+			this._planningState.plan.steps.filter((step) => step.substeps !== undefined).map((step) => step.id),
+		);
 		for (const update of input.updates) {
 			const id = update.id.trim();
-			if (!id || !knownIds.has(id)) {
-				throw new Error(`Plan progress references an unknown step id: ${update.id}`);
+			if (groupIds.has(id)) {
+				throw new Error(`Plan progress cannot update group outcome id: ${id}`);
+			}
+			if (!id || !executableIds.has(id)) {
+				throw new Error(`Plan progress references an unknown executable leaf id: ${update.id}`);
 			}
 			if (updates.has(id)) {
-				throw new Error(`Plan progress duplicates step id: ${id}`);
+				throw new Error(`Plan progress duplicates executable leaf id: ${id}`);
 			}
 			updates.set(id, {
 				status: update.status,
 				...(update.note === undefined ? {} : { note: update.note }),
 			});
 		}
-		const steps = this._planningState.plan.steps.map((step) => {
+		const applyUpdate = (step: PlanItem): PlanItem => {
 			const update = updates.get(step.id);
 			if (!update) return { ...step };
 			const note = update.note === undefined ? step.note : update.note.trim() || undefined;
@@ -2977,23 +2979,23 @@ export class AgentSession {
 				status: update.status,
 				...(note ? { note } : {}),
 			};
+		};
+		const steps: PlanState["steps"] = this._planningState.plan.steps.map((step) => {
+			if (!step.substeps) return applyUpdate(step);
+			const substeps = step.substeps.map(applyUpdate);
+			return { id: step.id, text: step.text, status: derivePlanStepStatus(substeps), substeps };
 		});
-		if (
-			this._planningState.plan.steps.every((step, index) => {
-				const next = steps[index];
-				return next !== undefined && step.status === next.status && step.note === next.note;
-			})
-		) {
+		if (planStepsSemanticallyEqual(this._planningState.plan.steps, steps)) {
 			throw new Error("Plan progress update made no changes");
 		}
 		const plan: PlanState = {
 			...this._planningState.plan,
 			revision: this._planningState.plan.revision + 1,
-			phase: steps.every((step) => step.status === "completed") ? "completed" : "active",
+			phase: getPlanLeafSteps({ steps }).every((step) => step.status === "completed") ? "completed" : "active",
 			steps,
 		};
 		this._commitPlanningState({ mode: "build", plan });
-		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+		return clonePlanState(plan);
 	}
 
 	requestReplan(input: { planId: string; expectedRevision: number; reason: string }): PlanningState {
@@ -3035,7 +3037,7 @@ export class AgentSession {
 			summary: input.summary.trim(),
 		};
 		this._commitPlanningState({ mode: "plan", plan });
-		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+		return clonePlanState(plan);
 	}
 
 	changePlan(planId: string, expectedRevision: number): PlanningState {

@@ -14,17 +14,40 @@ import type {
 	ToolRenderContext,
 	ToolRenderResultOptions,
 } from "../extensions/types.ts";
-import type { PlanningState, PlanState, PlanStepStatus } from "../planning.ts";
+import {
+	derivePlanStepStatus,
+	type PlanningState,
+	type PlanState,
+	type PlanStep,
+	type PlanStepStatus,
+	type PlanSubstep,
+} from "../planning.ts";
 import type { Theme } from "../theme/runtime.ts";
 import { getTextOutput } from "./render-utils.ts";
 
+const planSubstepInputSchema = Type.Object(
+	{
+		id: Type.Optional(Type.String({ description: "Existing canonical substep id; omit for a new substep" })),
+		text: Type.String({
+			description: "Executable action within its parent outcome; keep it independently verifiable",
+		}),
+	},
+	{ additionalProperties: false },
+);
+
 const planStepInputSchema = Type.Object(
 	{
-		id: Type.Optional(Type.String({ description: "Existing canonical step id; omit for a new step" })),
+		id: Type.Optional(Type.String({ description: "Existing canonical outcome id; omit for a new outcome" })),
 		text: Type.String({
 			description:
-				"Self-contained candidate implementation outcome naming the concrete behavior or interface to change and relevant subsystems, files, or symbols when useful; refine it as research changes",
+				"Self-contained, independently verifiable outcome grouped by behavior or subsystem; name files or symbols only when they disambiguate the work; refine it as research changes",
 		}),
+		substeps: Type.Optional(
+			Type.Array(planSubstepInputSchema, {
+				minItems: 1,
+				description: "Optional executable actions when this outcome contains multiple distinct pieces of work",
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -39,10 +62,10 @@ const updatePlanSchema = Type.Object(
 		summary: Type.Optional(
 			Type.String({
 				description:
-					"Compact, self-contained handoff covering the objective and context, concrete findings or current state, constraints, decisions, assumptions, unresolved questions, and verification intent; do not rely on prior conversation",
+					"Compact, self-contained working understanding covering the objective, decision-driving findings or current behavior, chosen direction, consequential constraints or assumptions, unresolved decisions, and verification intent; omit research chronology and low-impact detail",
 			}),
 		),
-		steps: Type.Array(planStepInputSchema, { maxItems: 64 }),
+		steps: Type.Array(planStepInputSchema),
 	},
 	{ additionalProperties: false },
 );
@@ -56,7 +79,7 @@ const submitPlanSchema = Type.Object(
 		}),
 		summary: Type.String({
 			description:
-				"Compact but complete handoff covering why the work is needed, the objective or review target, concrete findings and current state, chosen approach and constraints, remaining assumptions, and acceptance and verification criteria; it must be understandable without the planning transcript",
+				"Brief, scannable handoff covering why the work is needed, the chosen approach, consequential constraints or assumptions, and acceptance and verification criteria; include only decision-driving current-state facts and omit research chronology, exhaustive inventories, and resolved questions",
 		}),
 	},
 	{ additionalProperties: false },
@@ -64,7 +87,7 @@ const submitPlanSchema = Type.Object(
 
 const planProgressUpdateSchema = Type.Object(
 	{
-		id: Type.String({ description: "Existing approved step id" }),
+		id: Type.String({ description: "Existing approved executable leaf id" }),
 		status: Type.Union([Type.Literal("pending"), Type.Literal("in_progress"), Type.Literal("completed")]),
 		note: Type.Optional(Type.String({ description: "Concise execution evidence; an empty string clears it" })),
 	},
@@ -75,7 +98,7 @@ const updatePlanProgressSchema = Type.Object(
 	{
 		planId: Type.String(),
 		expectedRevision: Type.Integer({ minimum: 0 }),
-		updates: Type.Array(planProgressUpdateSchema, { minItems: 1, maxItems: 64 }),
+		updates: Type.Array(planProgressUpdateSchema, { minItems: 1 }),
 	},
 	{ additionalProperties: false },
 );
@@ -91,6 +114,17 @@ const requestReplanSchema = Type.Object(
 
 export const NATIVE_PLAN_TOOL_NAMES = new Set(["update_plan", "submit_plan", "update_plan_progress", "request_replan"]);
 
+export interface PlanSubstepInput {
+	id?: string;
+	text: string;
+}
+
+export interface PlanStepInput {
+	id?: string;
+	text: string;
+	substeps?: PlanSubstepInput[];
+}
+
 export interface PlanningToolController {
 	getPlanningState(): PlanningState;
 	flushPlanningState(): Promise<void>;
@@ -99,7 +133,7 @@ export interface PlanningToolController {
 		expectedRevision?: number;
 		title?: string;
 		summary?: string;
-		steps: Array<{ id?: string; text: string }>;
+		steps: PlanStepInput[];
 	}): PlanState;
 	submitPlan(input: { planId: string; expectedRevision: number; title: string; summary: string }): PlanState;
 	updatePlanProgress(input: {
@@ -171,6 +205,8 @@ class PlanningToolResultComponent implements Component {
 			appendWrappedPlanLine(lines, "", this.currentTheme.fg("error", output), width);
 			return createRenderFrame(lines);
 		}
+
+		if (!this.expanded && !this.includePlanContext) return createRenderFrame([]);
 
 		const planning = this.result.details;
 		if (!planning?.plan) {
@@ -293,8 +329,16 @@ function renderPlanningCall(
 }
 
 function updatePlanCallDetail(args: Partial<Static<typeof updatePlanSchema>> | undefined): string | undefined {
-	const stepCount = Array.isArray(args?.steps) ? args.steps.length : undefined;
-	return stepCount === undefined ? undefined : `${stepCount} ${stepCount === 1 ? "step" : "steps"}`;
+	if (!Array.isArray(args?.steps)) return undefined;
+	const outcomeCount = args.steps.length;
+	const taskCount = args.steps.reduce(
+		(count, step) => count + (Array.isArray(step?.substeps) ? step.substeps.length : 1),
+		0,
+	);
+	const hasSubsteps = args.steps.some((step) => Array.isArray(step?.substeps));
+	return hasSubsteps
+		? `${outcomeCount} ${outcomeCount === 1 ? "outcome" : "outcomes"} · ${taskCount} ${taskCount === 1 ? "task" : "tasks"}`
+		: `${outcomeCount} ${outcomeCount === 1 ? "step" : "steps"}`;
 }
 
 function progressCallDetail(args: Partial<Static<typeof updatePlanProgressSchema>> | undefined): string | undefined {
@@ -326,7 +370,7 @@ export function createPlanningToolDefinitions(
 			name: "update_plan",
 			label: "update plan",
 			description:
-				"Create or replace the current working draft after an initial orientation. The title, summary, and checklist form a handoff artifact that may be executed in a fresh session without the planning transcript. Keep them compact but self-contained, explicitly name referenced reviews and findings, and revise them whenever material evidence changes the context, scope, approach, ordering, or verification. Preserve canonical step ids only for unchanged steps. Approved execution scope cannot be changed with this tool.",
+				"Create or replace the current working draft after an initial orientation. The title, summary, and checklist form a handoff artifact that may be executed in a fresh session without the planning transcript. Keep them compact and decision-focused, explicitly name referenced reviews and findings only when they affect implementation, and revise them whenever material evidence changes the context, scope, approach, ordering, or verification. Use the fewest independently verifiable outcomes that preserve clear scope, add one level of executable substeps where useful, and allow large tasks as many items as required. Preserve canonical ids only for unchanged outcomes and substeps. Approved execution scope cannot be changed with this tool.",
 			promptSnippet: "Create or refine the self-contained working plan as research changes understanding",
 			parameters: updatePlanSchema,
 			renderCall(args, currentTheme, context) {
@@ -347,6 +391,14 @@ export function createPlanningToolDefinitions(
 					steps: input.steps.map((step) => ({
 						id: step.id?.trim() || undefined,
 						text: step.text.trim(),
+						...(step.substeps
+							? {
+									substeps: step.substeps.map((substep) => ({
+										id: substep.id?.trim() || undefined,
+										text: substep.text.trim(),
+									})),
+								}
+							: {}),
 					})),
 				});
 				await controller.flushPlanningState();
@@ -362,7 +414,7 @@ export function createPlanningToolDefinitions(
 			name: "submit_plan",
 			label: "submit plan",
 			description:
-				"Finalize and submit a researched, decision-complete, self-contained handoff artifact for user approval. Resolve discoverable facts, remove investigation-only steps and resolved questions, explicitly name the objective or review target and findings that drive the work, and record the chosen approach, remaining assumptions, acceptance criteria, and verification. The submitted title, summary, and checklist must be sufficient for execution without the planning transcript. Provide the exact canonical plan id and revision plus a non-empty title and summary. This ends the planning run.",
+				"Finalize and submit a researched, decision-complete, scannable handoff artifact for user approval. Resolve discoverable facts, remove investigation-only steps, resolved questions, research chronology, and exhaustive inventories, and retain only findings and assumptions that affect implementation. Use independently verifiable outcomes with one level of executable substeps where useful; large tasks may use as many items as required. The submitted title, summary, and checklist must be sufficient for execution without the planning transcript. Provide the exact canonical plan id and revision plus a non-empty title and summary. This ends the planning run.",
 			promptSnippet: "Submit a self-contained, decision-complete plan for user approval",
 			parameters: submitPlanSchema,
 			renderCall(args, currentTheme, context) {
@@ -397,7 +449,7 @@ export function createPlanningToolDefinitions(
 			name: "update_plan_progress",
 			label: "update plan progress",
 			description:
-				"Update only status and execution evidence for existing approved step ids. The approved title, summary, step text, order, and scope are immutable.",
+				"Update only status and execution evidence for existing approved executable leaf ids. Group outcome status is derived from its substeps. The approved title, summary, outcome and substep text, order, hierarchy, and scope are immutable.",
 			promptSnippet: "Update progress on existing approved plan steps",
 			parameters: updatePlanProgressSchema,
 			renderCall(args, currentTheme, context) {
@@ -469,17 +521,19 @@ export function createPlanningToolDefinitions(
 	];
 }
 
-export function canonicalizePlanSteps(
-	steps: Array<{ id?: string; text: string }>,
-	previous?: PlanState,
-): PlanState["steps"] {
-	const previousSteps = new Map(previous?.steps.map((step) => [step.id, step]) ?? []);
-	const used = new Set<string>();
-	return steps.map((step) => {
-		const requestedId = step.id?.trim();
-		const retained = requestedId && !used.has(requestedId) ? previousSteps.get(requestedId) : undefined;
+function canonicalizePlanSubsteps(
+	substeps: PlanSubstepInput[],
+	previous: readonly PlanSubstep[] | undefined,
+	used: Set<string>,
+): PlanSubstep[] {
+	if (substeps.length === 0) throw new Error("Plan substeps must be non-empty when provided");
+	const previousSubsteps = new Map(previous?.map((substep) => [substep.id, substep]) ?? []);
+	return substeps.map((substep) => {
+		const text = substep.text.trim();
+		if (!text) throw new Error("Plan substeps must have non-empty text");
+		const requestedId = substep.id?.trim();
+		const retained = requestedId && !used.has(requestedId) ? previousSubsteps.get(requestedId) : undefined;
 		const id = retained?.id ?? randomUUID();
-		const text = step.text.trim();
 		const preserveProgress = retained?.text === text;
 		used.add(id);
 		return {
@@ -489,4 +543,52 @@ export function canonicalizePlanSteps(
 			...(preserveProgress && retained.note ? { note: retained.note } : {}),
 		};
 	});
+}
+
+export function canonicalizePlanSteps(steps: PlanStepInput[], previous?: PlanState): PlanState["steps"] {
+	const previousSteps = new Map(previous?.steps.map((step) => [step.id, step]) ?? []);
+	const used = new Set<string>();
+	return steps.map((step) => {
+		const text = step.text.trim();
+		if (!text) throw new Error("Plan steps must have non-empty text");
+		const requestedId = step.id?.trim();
+		const retained = requestedId && !used.has(requestedId) ? previousSteps.get(requestedId) : undefined;
+		const id = retained?.id ?? randomUUID();
+		used.add(id);
+		if (step.substeps) {
+			const substeps = canonicalizePlanSubsteps(step.substeps, retained?.substeps, used);
+			return { id, text, status: derivePlanStepStatus(substeps), substeps };
+		}
+		const preserveProgress = retained?.substeps === undefined && retained?.text === text;
+		return {
+			id,
+			text,
+			status: preserveProgress ? retained.status : "pending",
+			...(preserveProgress && retained.note ? { note: retained.note } : {}),
+		};
+	});
+}
+
+function planItemsSemanticallyEqual(left: PlanStep | PlanSubstep, right: PlanStep | PlanSubstep): boolean {
+	if (left.text !== right.text || left.status !== right.status || left.note !== right.note) return false;
+	const leftSubsteps = "substeps" in left ? left.substeps : undefined;
+	const rightSubsteps = "substeps" in right ? right.substeps : undefined;
+	if (leftSubsteps === undefined || rightSubsteps === undefined) return leftSubsteps === rightSubsteps;
+	return (
+		leftSubsteps.length === rightSubsteps.length &&
+		leftSubsteps.every((substep, index) => {
+			const next = rightSubsteps[index];
+			return next !== undefined && planItemsSemanticallyEqual(substep, next);
+		})
+	);
+}
+
+export function planStepsSemanticallyEqual(left: readonly PlanStep[], right: readonly PlanStep[]): boolean {
+	return (
+		left.length === right.length &&
+		left.every((step, index) => {
+			const next = right[index];
+			return next !== undefined && planItemsSemanticallyEqual(step, next);
+		})
+	);
 }
