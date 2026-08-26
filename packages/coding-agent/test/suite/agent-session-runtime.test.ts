@@ -388,6 +388,59 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(replacementHookCalls).toBe(0);
 	});
 
+	it("refreshes the current runtime from disk after external conversation ownership", async () => {
+		let staleGenerationHookCalls = 0;
+		const { runtime, faux } = await createRuntimeForTest((volt: ExtensionAPI) => {
+			volt.on("session_before_switch", () => {
+				staleGenerationHookCalls++;
+			});
+			volt.on("session_shutdown", () => {
+				staleGenerationHookCalls++;
+			});
+		});
+		await runtime.session.prompt("before phone handoff");
+		await runtime.session.sessionManager.flush();
+
+		const staleSession = runtime.session;
+		const sessionFile = staleSession.sessionFile!;
+		const sessionId = staleSession.sessionId;
+		const previousBranchEpoch = runtime.conversationProjectionFeed.branchEpoch;
+		const externalOwner = SessionManager.open(sessionFile);
+		externalOwner.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "phone catch-up" }],
+			timestamp: Date.now(),
+		});
+		externalOwner.appendMessage(fauxAssistantMessage("phone reply"));
+		await externalOwner.flush();
+
+		await expect(runtime.refreshCurrentSessionFromDisk()).resolves.toEqual({
+			cancelled: false,
+			seeded: false,
+		});
+
+		expect(runtime.session).not.toBe(staleSession);
+		expect(runtime.session.sessionId).toBe(sessionId);
+		expect(runtime.session.sessionFile).toBe(sessionFile);
+		expect(runtime.conversationProjectionFeed.branchEpoch).not.toBe(previousBranchEpoch);
+		expect(staleSession.sessionManager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+		expect(staleGenerationHookCalls).toBe(0);
+		expect(runtime.session.messages).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ role: "user", content: [{ type: "text", text: "phone catch-up" }] }),
+				expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "phone reply" }] }),
+			]),
+		);
+
+		faux.setResponses([fauxAssistantMessage("desktop continued")]);
+		await expect(runtime.session.prompt("continue on desktop")).resolves.toBeUndefined();
+		expect(runtime.session.sessionManager.getConversationAuthorityStatus()).toEqual({ status: "available" });
+		expect(runtime.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "desktop continued" }],
+		});
+	});
+
 	it("applies new-session setup before constructing the replacement session", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 

@@ -633,6 +633,8 @@ export class InteractiveMode {
 	/** Read-only attach overlay while a remote turn drains (§6.3). */
 	private drainViewer: DrainViewerComponent | undefined;
 	private drainViewerFeedId: string | undefined;
+	/** Same-session generation refresh that fences input after remote ownership. */
+	private remoteSessionRefresh: Promise<void> | undefined;
 	private dismissSubagentInspector: (() => void) | undefined;
 	/** Timestamp of the last quit warning (phone attached + turn streaming). */
 	private lastQuitWarningAt = 0;
@@ -1949,7 +1951,9 @@ export class InteractiveMode {
 		});
 		this.daemonAttach.onRelayCountChange(() => this.updatePhoneFooterIndicator());
 		this.daemonAttach.onReacquired((_sessionId, outcome) => {
-			void this.handleReacquireOutcome(outcome);
+			void this.handleReacquireOutcome(outcome).catch((error: unknown) => {
+				this.handleRemoteSessionRefreshFailure(error);
+			});
 		});
 		this.daemonAttach.onEvent((event) => {
 			if (event.type === "theme_snapshot") {
@@ -2054,7 +2058,9 @@ export class InteractiveMode {
 		void this.daemonAttach.viewerSubscribe(pending.viewerFeedId);
 		pending.granted.then(
 			() => {
-				void this.finishDrainViewerGrant();
+				void this.finishDrainViewerGrant().catch((error: unknown) => {
+					this.handleRemoteSessionRefreshFailure(error);
+				});
 			},
 			(error: unknown) => {
 				// A transient control-socket drop rejects the grant with
@@ -2069,39 +2075,41 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Absorb transcript entries another owner (the daemon, during a drain handoff
-	 * or a reconnect gap) appended to the session file. session.reload() only
-	 * reloads settings/resources — NOT the conversation — so re-open the session
-	 * file to pull in the appended turns, rebuilding the in-process transcript and
-	 * model context. Falls back to a settings reload when there is no session file
-	 * or the re-open is cancelled.
+	 * Replace the local generation with the authoritative session bytes another
+	 * owner may have appended during a drain handoff or reconnect gap.
 	 */
 	private async absorbRemoteSessionChangesFromDisk(): Promise<void> {
-		const sessionFile = this.session.sessionFile;
-		if (!sessionFile) {
-			await this.session.reload().catch(() => {});
+		if (this.remoteSessionRefresh) {
+			await this.remoteSessionRefresh;
 			return;
 		}
-		try {
-			const result = await this.runtimeHost.switchSession(sessionFile, {
+		const refresh = this.runtimeHost
+			.refreshCurrentSessionFromDisk({
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-			});
-			if (result.cancelled) {
-				await this.session.reload().catch(() => {});
+			})
+			.then(() => undefined);
+		this.remoteSessionRefresh = refresh;
+		try {
+			await refresh;
+		} finally {
+			if (this.remoteSessionRefresh === refresh) {
+				this.remoteSessionRefresh = undefined;
 			}
-		} catch {
-			await this.session.reload().catch(() => {});
 		}
+	}
+
+	private handleRemoteSessionRefreshFailure(error: unknown): void {
+		void this.handleFatalRuntimeError("Failed to load remote conversation changes", error);
 	}
 
 	private async finishDrainViewerGrant(): Promise<void> {
 		const viewer = this.drainViewer;
+		viewer?.finish("Remote turn finished — taking over…");
+		// Keep the overlay authoritative until the replacement generation is ready;
+		// editor text survives un-submitted while the session file is reopened.
+		await this.absorbRemoteSessionChangesFromDisk();
 		this.drainViewer = undefined;
 		this.drainViewerFeedId = undefined;
-		viewer?.finish("Remote turn finished — taking over…");
-		// Load what the remote turn wrote; the file is the source of truth. The
-		// re-render drops the viewer component; editor text survives un-submitted.
-		await this.absorbRemoteSessionChangesFromDisk();
 		this.renderCurrentSessionState();
 		this.showStatus("Attached — the remote turn finished and this desktop now owns the session.");
 		this.ui.requestRender();
@@ -2125,7 +2133,7 @@ export class InteractiveMode {
 	}
 
 	private isDrainViewerActive(): boolean {
-		return this.drainViewer !== undefined;
+		return this.drainViewer !== undefined || this.remoteSessionRefresh !== undefined;
 	}
 
 	/**

@@ -1038,6 +1038,24 @@ export class AgentSessionRuntime {
 		);
 	}
 
+	/**
+	 * Replace the current generation from its authoritative session file after an
+	 * external owner has released the conversation. The old generation is retired
+	 * before teardown so stale extension hooks cannot mutate the newly handed-off
+	 * file.
+	 */
+	async refreshCurrentSessionFromDisk(
+		options?: Pick<AgentSessionSwitchOptions, "projectTrustContextFactory">,
+	): Promise<AgentSessionReplacementResult> {
+		const sessionFile = this.session.sessionFile;
+		if (sessionFile === undefined) {
+			throw new Error("Cannot refresh an in-memory session from disk");
+		}
+		return this.runStructuralOperation((operation) =>
+			this.switchSessionWithinOperation(sessionFile, options, operation, true),
+		);
+	}
+
 	private async switchSessionWithinOperation(
 		sessionPath: string,
 		options: AgentSessionSwitchOptions | undefined,
@@ -1047,9 +1065,23 @@ export class AgentSessionRuntime {
 		const resolvedSessionPath = resolvePath(sessionPath);
 		const targetsCurrentFile =
 			this.session.sessionFile !== undefined && resolvedSessionPath === resolvePath(this.session.sessionFile);
-		if (targetsCurrentFile && this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
+		const currentAuthorityAvailable =
+			this.session.sessionManager.getConversationAuthorityStatus().status === "available";
+		if (targetsCurrentFile && currentAuthorityAvailable && !refreshCurrentSession) {
 			// No replacement happens, so a requested withSession callback never runs.
 			return { cancelled: false, seeded: false };
+		}
+
+		let sessionManager: SessionManager | undefined;
+		if (targetsCurrentFile && currentAuthorityAvailable && refreshCurrentSession) {
+			// Open authoritative bytes before fencing the old generation. Once opened,
+			// retire the stale source so its switch/shutdown hooks cannot append against
+			// state written by the external owner.
+			sessionManager = SessionManager.open(resolvedSessionPath, undefined, options?.cwdOverride);
+			assertSessionCwdExists(sessionManager, this.cwd);
+			this.session.sessionManager.retireConversationAuthority(
+				new Error("Persisted session changed while another runtime owned the conversation"),
+			);
 		}
 		if (targetsCurrentFile) refreshCurrentSession = true;
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
@@ -1060,8 +1092,10 @@ export class AgentSessionRuntime {
 		this.assertNoActiveDetachedReview();
 
 		const previousSessionFile = this.session.sessionFile;
-		const sessionManager = SessionManager.open(resolvedSessionPath, undefined, options?.cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
+		if (sessionManager === undefined) {
+			sessionManager = SessionManager.open(resolvedSessionPath, undefined, options?.cwdOverride);
+			assertSessionCwdExists(sessionManager, this.cwd);
+		}
 		const replacement = await this.replaceCurrentSession({
 			operation,
 			reason: "resume",
