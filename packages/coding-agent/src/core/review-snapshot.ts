@@ -7,12 +7,14 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnProcess } from "../utils/child-process.ts";
 import { terminateProcessTree } from "../utils/shell.ts";
 import {
-	captureReviewGitHubContext,
-	type ReviewGitHubContext,
+	type CodeHostProvider,
+	githubCliCodeHostProvider,
+	type PullRequestFetchPlan,
+	type ReviewCodeHostContext,
 	type ReviewPullRequestIdentity,
-} from "./github-pr-context.ts";
+} from "./code-host/index.ts";
 
-export type { ReviewPullRequestIdentity } from "./github-pr-context.ts";
+export type { ReviewPullRequestIdentity } from "./code-host/index.ts";
 
 export type ReviewBranchBase = { kind: "local"; ref: string } | { kind: "remote"; remote: string; remoteRef: string };
 
@@ -135,7 +137,7 @@ export interface ReviewSnapshot {
 	workflowDescription?: string;
 	diffCommand: string;
 	extraContext?: string;
-	githubContext?: ReviewGitHubContext;
+	codeHostContext?: ReviewCodeHostContext;
 	identity: ReviewSnapshotIdentity;
 	branchBase?: ReviewBranchBase;
 	changedFiles: ReviewChangedFile[];
@@ -156,6 +158,7 @@ export interface ReviewSnapshotResolutionError {
 export interface ResolveReviewSnapshotOptions {
 	maxCommitRefBytes: number;
 	maxPullRequestNumber: number;
+	codeHostProvider?: CodeHostProvider;
 	limits?: Partial<ReviewSnapshotLimits>;
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
@@ -196,7 +199,7 @@ interface SnapshotInit {
 	workflowDescription?: string;
 	diffCommand: string;
 	extraContext?: string;
-	githubContext?: ReviewGitHubContext;
+	codeHostContext?: ReviewCodeHostContext;
 	identity: ReviewSnapshotIdentity;
 	branchBase?: ReviewBranchBase;
 	root: string;
@@ -1293,25 +1296,28 @@ async function captureWorktreeTree(
 async function createPullRequestSource(
 	root: string,
 	pullRequest: ReviewPullRequestIdentity,
+	fetchPlan: PullRequestFetchPlan,
 	limits: ReviewSnapshotLimits,
 	signal?: AbortSignal,
 ): Promise<{ source?: GitSource; temporaryDirectory?: string; error?: ReviewSnapshotResolutionError }> {
 	throwIfResolutionCancelled(signal);
-	const [localObjects, objectFormat, sourceIsShallow, originResult, fetchConfig] = await Promise.all([
+	const [localObjects, objectFormat, sourceIsShallow, remoteResult, fetchConfig] = await Promise.all([
 		repositoryObjectDirectory(root, limits, signal),
 		repositoryObjectFormat(root, limits, signal),
 		repositoryIsShallow(root, limits, signal),
-		runCommand("git", ["remote", "get-url", "origin"], root, commandOptions(limits, signal)),
-		repositoryFetchConfig(root, "origin", limits, signal),
+		runCommand("git", ["remote", "get-url", fetchPlan.remote], root, commandOptions(limits, signal)),
+		repositoryFetchConfig(root, fetchPlan.remote, limits, signal),
 	]);
 	throwIfResolutionCancelled(signal);
 	if (!localObjects) return { error: { error: "Could not resolve the Git object directory." } };
 	if (!objectFormat) return { error: { error: "Could not resolve the Git object format." } };
-	const originUrl = text(originResult).trim();
-	if (!originResult.ok || !originUrl) {
-		return { error: { error: "Could not resolve the origin remote for the pull request snapshot." } };
+	const remoteUrl = text(remoteResult).trim();
+	if (!remoteResult.ok || !remoteUrl) {
+		return {
+			error: { error: `Could not resolve the ${fetchPlan.remote} remote for the pull request snapshot.` },
+		};
 	}
-	const fetchUrl = resolveRemoteFetchUrl(root, originUrl);
+	const fetchUrl = resolveRemoteFetchUrl(root, remoteUrl);
 	const temporaryDirectory = await mkdtemp(join(tmpdir(), "volt-review-pr-"));
 	let retainTemporaryDirectory = false;
 	try {
@@ -1341,12 +1347,12 @@ async function createPullRequestSource(
 			fetchSource,
 			root,
 			fetchConfig,
-			"origin",
+			fetchPlan.remote,
 			fetchUrl,
 			["--no-tags", "--force"],
 			[
-				`+refs/heads/${pullRequest.baseRefName}:refs/review/base`,
-				`+refs/pull/${pullRequest.number}/head:refs/review/head`,
+				`+${fetchPlan.base.remoteRef}:${fetchPlan.base.localRef}`,
+				`+${fetchPlan.head.remoteRef}:${fetchPlan.head.localRef}`,
 			],
 		);
 		if (!fetch.ok) {
@@ -1357,8 +1363,8 @@ async function createPullRequestSource(
 				},
 			};
 		}
-		const fetchedBase = await requireCanonicalCommit(fetchSource, "refs/review/base");
-		const fetchedHead = await requireCanonicalCommit(fetchSource, "refs/review/head");
+		const fetchedBase = await requireCanonicalCommit(fetchSource, fetchPlan.base.localRef);
+		const fetchedHead = await requireCanonicalCommit(fetchSource, fetchPlan.head.localRef);
 		if (fetchedBase !== pullRequest.baseRefOid || fetchedHead !== pullRequest.headRefOid) {
 			return {
 				error: {
@@ -1384,8 +1390,8 @@ async function createPullRequestSource(
 			limits,
 			signal,
 		};
-		const detachedBase = await requireCanonicalCommit(source, "refs/review/base");
-		const detachedHead = await requireCanonicalCommit(source, "refs/review/head");
+		const detachedBase = await requireCanonicalCommit(source, fetchPlan.base.localRef);
+		const detachedHead = await requireCanonicalCommit(source, fetchPlan.head.localRef);
 		if (detachedBase !== pullRequest.baseRefOid || detachedHead !== pullRequest.headRefOid) {
 			return {
 				error: {
@@ -2289,7 +2295,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 	readonly workflowDescription?: string;
 	readonly diffCommand: string;
 	readonly extraContext?: string;
-	readonly githubContext?: ReviewGitHubContext;
+	readonly codeHostContext?: ReviewCodeHostContext;
 	readonly identity: ReviewSnapshotIdentity;
 	readonly branchBase?: ReviewBranchBase;
 	readonly root: string;
@@ -2318,7 +2324,7 @@ class GitReviewSnapshot implements ReviewSnapshot {
 		this.workflowDescription = init.workflowDescription;
 		this.diffCommand = init.diffCommand;
 		this.extraContext = init.extraContext;
-		this.githubContext = init.githubContext;
+		this.codeHostContext = init.codeHostContext;
 		this.identity = init.identity;
 		this.branchBase = init.branchBase;
 		this.root = init.root;
@@ -3077,7 +3083,8 @@ export async function resolveReviewSnapshot(
 						error: `PR number must be a canonical positive decimal no greater than ${options.maxPullRequestNumber}.`,
 					};
 				}
-				const captured = await captureReviewGitHubContext({
+				const codeHostProvider = options.codeHostProvider ?? githubCliCodeHostProvider;
+				const captured = await codeHostProvider.capturePullRequestContext({
 					cwd: root,
 					...(normalized ? { number: normalized } : {}),
 					maxPullRequestNumber: options.maxPullRequestNumber,
@@ -3086,8 +3093,12 @@ export async function resolveReviewSnapshot(
 				});
 				if (!captured.ok) return captured;
 				const { pullRequest } = captured;
+				if (pullRequest.providerId !== codeHostProvider.id) {
+					return { error: "The code-host provider returned a pull request for a different provider." };
+				}
+				const fetchPlan = codeHostProvider.getPullRequestFetchPlan(pullRequest);
 				options.onProgress?.("Fetching pull request history…");
-				const fetched = await createPullRequestSource(root, pullRequest, limits, options.signal);
+				const fetched = await createPullRequestSource(root, pullRequest, fetchPlan, limits, options.signal);
 				if (!fetched.source || !fetched.temporaryDirectory)
 					return fetched.error ?? { error: "Could not fetch pull request snapshot." };
 				pendingTemporaryDirectories.add(fetched.temporaryDirectory);
@@ -3114,8 +3125,8 @@ export async function resolveReviewSnapshot(
 				init = {
 					description: `PR #${pullRequest.number} (${pullRequest.title})`,
 					workflowDescription: `PR #${pullRequest.number}`,
-					diffCommand: `gh pr diff ${pullRequest.number}`,
-					githubContext: captured.context,
+					diffCommand: fetchPlan.diffCommand,
+					codeHostContext: captured.context,
 					identity: {
 						kind: target.kind,
 						baseCommit: pullRequest.baseRefOid,
