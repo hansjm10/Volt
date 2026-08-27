@@ -1365,13 +1365,43 @@ async function createPullRequestSource(
 		}
 		const fetchedBase = await requireCanonicalCommit(fetchSource, fetchPlan.base.localRef);
 		const fetchedHead = await requireCanonicalCommit(fetchSource, fetchPlan.head.localRef);
-		if (fetchedBase !== pullRequest.baseRefOid || fetchedHead !== pullRequest.headRefOid) {
-			return {
-				error: {
-					error: "The pull request moved while Volt captured it. Retry the review.",
-					remoteError: "The pull request changed while Volt captured it. Retry the review.",
-				},
-			};
+		const movedError = {
+			error: "The pull request moved while Volt captured it. Retry the review.",
+			remoteError: "The pull request changed while Volt captured it. Retry the review.",
+		};
+		if (fetchedHead !== pullRequest.headRefOid) return { error: movedError };
+		if (fetchedBase !== pullRequest.baseRefOid) {
+			const capturedBase = await requireCanonicalCommit(fetchSource, pullRequest.baseRefOid);
+			if (!fetchedBase || capturedBase !== pullRequest.baseRefOid) return { error: movedError };
+			const baseAdvanced = await git(fetchSource, [
+				"merge-base",
+				"--is-ancestor",
+				pullRequest.baseRefOid,
+				fetchedBase,
+			]);
+			if (!baseAdvanced.ok) {
+				if (baseAdvanced.exitCode === 1 && baseAdvanced.failure === undefined) return { error: movedError };
+				return {
+					error: {
+						error: `git merge-base --is-ancestor failed: ${commandError(baseAdvanced)}`,
+						remoteError: "Could not verify the pull request base movement.",
+					},
+				};
+			}
+			const pinBase = await git(fetchSource, [
+				"update-ref",
+				fetchPlan.base.localRef,
+				pullRequest.baseRefOid,
+				fetchedBase,
+			]);
+			if (!pinBase.ok) {
+				return {
+					error: {
+						error: `git update-ref failed: ${commandError(pinBase)}`,
+						remoteError: "Could not pin the captured pull request base.",
+					},
+				};
+			}
 		}
 		const repack = await git(fetchSource, ["repack", "-a", "-d"]);
 		if (!repack.ok) {
