@@ -113,9 +113,10 @@ describe("Plan TUI components", () => {
 		expect(rendered).not.toContain("Implement hierarchy");
 	});
 
-	it("renders grouped outcomes and substeps for review", () => {
+	it("renders grouped draft outcomes and substeps in plan details", () => {
 		initTheme("dark");
 		const grouped = readyPlan(1);
+		grouped.phase = "draft";
 		grouped.steps = [
 			{
 				id: "group-1",

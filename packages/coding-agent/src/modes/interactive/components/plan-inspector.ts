@@ -324,9 +324,7 @@ export class PlanInspectorComponent implements Component, Focusable {
 					width,
 				);
 			}
-			const showSubsteps =
-				step.substeps !== undefined &&
-				(plan.phase === "ready" || plan.phase === "draft" || currentGroup?.id === step.id);
+			const showSubsteps = step.substeps !== undefined && (plan.phase === "ready" || currentGroup?.id === step.id);
 			if (!showSubsteps) continue;
 			for (const [substepIndex, substep] of step.substeps!.entries()) {
 				const substepMarker = theme.fg(stepColor(substep.status), stepMarker(substep.status));
