@@ -227,6 +227,23 @@ describe("resolveLspLaunch", () => {
 		});
 	});
 
+	it("preserves literal quotes in POSIX PATH entries", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch(["server"], {
+			projectCwd: "/workspace/project",
+			environment: { PATH: '"/opt/lsp"' },
+			platform: "linux",
+			isExecutable: (path) => {
+				probes.push(path);
+				return path === "/opt/lsp/server";
+			},
+		});
+
+		expect(probes).toEqual(['/workspace/project/"/opt/lsp"/server']);
+		expect(launch.resolvedExecutable).toBeUndefined();
+		expect(launch.command).toEqual(["server"]);
+	});
+
 	it("does not discover project-local node_modules binaries unless PATH names them", () => {
 		const projectBinary = "/workspace/project/node_modules/.bin/server";
 		const unresolved = resolveLspLaunch(["server"], {
@@ -246,11 +263,11 @@ describe("resolveLspLaunch", () => {
 		expect(explicitPath.resolvedExecutable).toBe(projectBinary);
 	});
 
-	it("uses case-insensitive PATH and PATHEXT ordering on Windows", () => {
+	it("uses case-insensitive PATH, quoted entries, and PATHEXT ordering on Windows", () => {
 		const probes: string[] = [];
 		const launch = resolveLspLaunch(["server", "--stdio"], {
 			projectCwd: "C:\\workspace\\project",
-			environment: { Path: "tools;C:\\global", PATHEXT: ".CMD;.EXE" },
+			environment: { Path: '"tools";C:\\global', PATHEXT: ".CMD;.EXE" },
 			platform: "win32",
 			isExecutable: (path) => {
 				probes.push(path);

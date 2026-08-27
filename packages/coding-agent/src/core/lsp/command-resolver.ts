@@ -121,7 +121,7 @@ export function resolveLspLaunch(
 		const entries =
 			pathValue === undefined || pathValue === "" ? [] : pathValue.split(platform === "win32" ? ";" : ":");
 		for (const rawEntry of entries) {
-			const entry = unquotePathEntry(rawEntry);
+			const entry = platform === "win32" ? unquotePathEntry(rawEntry) : rawEntry;
 			const directory = pathApi.isAbsolute(entry) ? entry : pathApi.resolve(options.projectCwd, entry || ".");
 			resolvedExecutable = firstExecutable(
 				executableCandidates(pathApi.join(directory, requestedExecutable), platform, environment),
