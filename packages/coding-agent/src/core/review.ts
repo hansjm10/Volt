@@ -65,6 +65,21 @@ import type { SettingsManager } from "./settings-manager.ts";
 export type { ParsedReview, ReviewCoverage, ReviewFinding, ReviewTarget };
 export type ResolvedReview = ReviewSnapshot;
 
+export function reviewTargetForRerun(record: Pick<ReviewRunRecord, "target">): ReviewTarget {
+	const identity = record.target.identity;
+	if (identity.kind === "uncommitted") return { kind: "uncommitted" };
+	if (identity.kind === "branch") {
+		if (!record.target.branchBase) {
+			throw new Error("Durable branch review run does not retain a base locator.");
+		}
+		return { kind: "branch", branchBase: structuredClone(record.target.branchBase) };
+	}
+	if (identity.kind === "pr") {
+		return { kind: "pr", number: identity.pullRequest ? String(identity.pullRequest.number) : undefined };
+	}
+	return { kind: "commit", sha: identity.headCommit };
+}
+
 export type ReviewEffort = "low" | "standard" | "high";
 export type ReviewScopeMode = "incremental" | "full";
 
@@ -361,7 +376,28 @@ export async function probeCurrentBranchPullRequest(cwd: string): Promise<Curren
 	}
 }
 
-function orderBaseBranches(local: string[], remote: string[]): string[] {
+interface LocalBaseBranch {
+	ref: string;
+	upstream?: string;
+}
+
+function orderBaseBranches(local: LocalBaseBranch[], remote: string[], remotes: string[]): string[] {
+	const remoteSet = new Set(remote);
+	const collapsedRemoteRefs = new Set<string>();
+	for (const branch of local) {
+		if (branch.upstream) {
+			collapsedRemoteRefs.add(branch.upstream);
+			continue;
+		}
+		const originMatch = `origin/${branch.ref}`;
+		if (remoteSet.has(originMatch)) {
+			collapsedRemoteRefs.add(originMatch);
+			continue;
+		}
+		const matching = remotes.map((remoteName) => `${remoteName}/${branch.ref}`).filter((ref) => remoteSet.has(ref));
+		if (matching.length === 1 && matching[0]) collapsedRemoteRefs.add(matching[0]);
+	}
+
 	const scored: Array<{ ref: string; tier: number }> = [];
 	const seen = new Set<string>();
 	const add = (ref: string, tier: number): void => {
@@ -369,8 +405,10 @@ function orderBaseBranches(local: string[], remote: string[]): string[] {
 		seen.add(ref);
 		scored.push({ ref, tier });
 	};
-	for (const ref of local) add(ref, ref === "main" ? 0 : ref === "master" ? 1 : 4);
-	for (const ref of remote) add(ref, ref === "origin/main" ? 2 : ref === "origin/master" ? 3 : 5);
+	for (const { ref } of local) add(ref, ref === "main" ? 0 : ref === "master" ? 1 : 4);
+	for (const ref of remote) {
+		if (!collapsedRemoteRefs.has(ref)) add(ref, ref === "origin/main" ? 2 : ref === "origin/master" ? 3 : 5);
+	}
 	return scored
 		.sort((left, right) => (left.tier === right.tier ? left.ref.localeCompare(right.ref) : left.tier - right.tier))
 		.map((entry) => entry.ref);
@@ -383,15 +421,26 @@ function splitBranchLines(stdout: string): string[] {
 		.filter(Boolean);
 }
 
+function parseLocalBaseBranches(stdout: string): LocalBaseBranch[] {
+	return stdout.split("\n").flatMap((line) => {
+		const [ref, upstream] = line.trim().split("\0");
+		return ref ? [{ ref, ...(upstream ? { upstream } : {}) }] : [];
+	});
+}
+
 export async function listBaseBranches(cwd: string): Promise<string[] | { error: string }> {
-	const localResult = await runCommand("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd);
+	const [localResult, remoteResult, remotesResult] = await Promise.all([
+		runCommand("git", ["for-each-ref", "--format=%(refname:short)%00%(upstream:short)", "refs/heads"], cwd),
+		runCommand("git", ["for-each-ref", "--format=%(refname:short)", "refs/remotes"], cwd),
+		runCommand("git", ["remote"], cwd),
+	]);
 	if (!localResult.ok) return { error: `git branch failed: ${localResult.stderr.trim()}` };
-	const remoteResult = await runCommand("git", ["for-each-ref", "--format=%(refname:short)", "refs/remotes"], cwd);
 	return orderBaseBranches(
-		splitBranchLines(localResult.stdout),
+		parseLocalBaseBranches(localResult.stdout),
 		remoteResult.ok
 			? splitBranchLines(remoteResult.stdout).filter((ref) => ref.includes("/") && !ref.endsWith("/HEAD"))
 			: [],
+		remotesResult.ok ? splitBranchLines(remotesResult.stdout) : [],
 	);
 }
 

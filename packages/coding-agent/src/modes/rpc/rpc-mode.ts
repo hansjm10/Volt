@@ -53,6 +53,7 @@ import {
 	REMOTE_REVIEW_TOOL_NAMES,
 	type ReviewWorkflowEvent,
 	type ReviewWorkflowToolEvent,
+	reviewTargetForRerun,
 } from "../../core/review.ts";
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
@@ -1373,18 +1374,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 			if (action === REVIEW_RERUN_ACTION_ID) {
 				if (!record) throw new Error(`Unknown durable review run: ${runId}`);
-				const identity = record.target.identity;
-				const target =
-					identity.kind === "uncommitted"
-						? { kind: "uncommitted" as const }
-						: identity.kind === "branch"
-							? { kind: "branch" as const, base: identity.baseCommit }
-							: identity.kind === "pr"
-								? {
-										kind: "pr" as const,
-										number: identity.pullRequest ? String(identity.pullRequest.number) : undefined,
-									}
-								: { kind: "commit" as const, sha: identity.headCommit };
+				const target = reviewTargetForRerun(record);
 				const rerun = await createHostActionContext(
 					commandSession,
 					assertConversationGenerationCurrent,

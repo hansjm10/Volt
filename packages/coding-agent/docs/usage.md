@@ -107,7 +107,7 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 ```
 /review                                      # open a target selector
 /review uncommitted                          # staged, unstaged, deleted, and nonignored untracked files
-/review branch [base]                        # captured HEAD vs its merge base with base
+/review branch [base]                        # captured HEAD vs a refreshed upstream merge base
 /review pr [number]                          # fetched GitHub base/head OIDs (requires gh)
 /review commit [sha]                         # commit vs first parent, or empty tree for a root commit
 /review branch main --focus "authorization" # add a focused question
@@ -115,6 +115,8 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 /review branch main --effort high --full     # low|standard|high; incremental|full
 /review uncommitted --include-optional       # opt in to P3 suggestions
 ```
+
+For branch targets, Volt captures local `HEAD` first. A plain branch such as `main` resolves through its configured upstream, then a matching `origin/main` or sole matching remote branch, and fetches that remote source ref into an isolated snapshot using the host's Git credentials and network. Short remote targets such as `origin/main` are refreshed the same way. The fetch does not move the working tree, local branches, remote-tracking refs, or the workspace's `FETCH_HEAD`; a failed refresh stops the review instead of falling back to stale state. Use an explicit full ref such as `refs/heads/main` or `refs/remotes/origin/main` to intentionally review against local or cached state. Durable branch reruns recapture that resolved source: remote-backed targets refresh the same remote branch again, while explicit full refs remain local or cached.
 
 For PR targets, Volt uses the host's `gh` credentials and network to capture the authoritative closing/manual-linked issues, PR issue comments, submitted review summaries, inline review threads and replies, and linked-issue comments. It does not infer links from arbitrary text or follow relationships recursively. GitHub text is capped at 32 KiB per field, capture is capped at 20 linked issues and 200 total discussion entries, and the rendered context is capped at 256 KiB. Truncation, limits, malformed responses, and ancillary API failures are recorded as capture limitations. PR identity or fetch failures are fatal before inference, and Volt rechecks the exact head OID after context capture; if it moved, retry the review.
 

@@ -10,8 +10,11 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve as resolvePath } from "node:path";
+import { delimiter, join, relative, resolve as resolvePath } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { captureReviewGitHubContext } from "../src/core/github-pr-context.ts";
 import { normalizeReviewPath, type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
@@ -151,16 +154,38 @@ function createSymlinkFixture(repository: string, path: string, target: string):
 describe("review snapshots", () => {
 	const tempDirectories: string[] = [];
 	const snapshots: ReviewSnapshot[] = [];
+	const servers: Server[] = [];
 	const initialPath = process.env.PATH;
 	const initialGitTrace = process.env.GIT_TRACE;
+	const initialGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
+	const initialGitConfigNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+	const gitCommandConfigEnvironmentPattern = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/;
+	const initialGitCommandConfigEnvironment = Object.fromEntries(
+		Object.entries(process.env).filter(
+			(entry): entry is [string, string] =>
+				gitCommandConfigEnvironmentPattern.test(entry[0]) && entry[1] !== undefined,
+		),
+	);
 
 	afterEach(async () => {
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
+		for (const server of servers.splice(0)) {
+			server.closeAllConnections();
+			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+		}
 		for (const directory of tempDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 		if (initialPath === undefined) delete process.env.PATH;
 		else process.env.PATH = initialPath;
 		if (initialGitTrace === undefined) delete process.env.GIT_TRACE;
 		else process.env.GIT_TRACE = initialGitTrace;
+		if (initialGitConfigGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+		else process.env.GIT_CONFIG_GLOBAL = initialGitConfigGlobal;
+		if (initialGitConfigNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+		else process.env.GIT_CONFIG_NOSYSTEM = initialGitConfigNoSystem;
+		for (const key of Object.keys(process.env)) {
+			if (gitCommandConfigEnvironmentPattern.test(key)) delete process.env[key];
+		}
+		Object.assign(process.env, initialGitCommandConfigEnvironment);
 	});
 
 	function createRepository(withCommit = true): string {
@@ -180,6 +205,243 @@ describe("review snapshots", () => {
 			git(directory, "commit", "-m", "initial");
 		}
 		return directory;
+	}
+
+	function createStaleBranchFixture(remoteName: string): {
+		repository: string;
+		remote: string;
+		staleBase: string;
+		authoritativeBase: string;
+		headCommit: string;
+	} {
+		const repository = createRepository();
+		const remote = join(tmpdir(), `volt-review-branch-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(repository, "remote", "add", remoteName, remote);
+		git(repository, "push", "-u", remoteName, "main");
+		if (remoteName === "origin") git(repository, "remote", "set-head", "origin", "main");
+		const staleBase = git(repository, "rev-parse", "main");
+
+		writeFileSync(join(repository, "upstream.txt"), "already merged upstream\n");
+		git(repository, "add", "upstream.txt");
+		git(repository, "commit", "-m", "upstream change");
+		const authoritativeBase = git(repository, "rev-parse", "HEAD");
+		git(repository, "push", remoteName, "main");
+
+		git(repository, "checkout", "-b", "feature");
+		writeFileSync(join(repository, "feature.txt"), "feature only\n");
+		git(repository, "add", "feature.txt");
+		git(repository, "commit", "-m", "feature change");
+		const headCommit = git(repository, "rev-parse", "HEAD");
+		git(repository, "branch", "-f", "main", staleBase);
+		git(repository, "update-ref", `refs/remotes/${remoteName}/main`, staleBase);
+		rmSync(join(repository, ".git", "FETCH_HEAD"), { force: true });
+		return { repository, remote, staleBase, authoritativeBase, headCommit };
+	}
+
+	function createRemoteOnlyBranchFixture(): {
+		repository: string;
+		upstream: string;
+		staleBase: string;
+		authoritativeBase: string;
+		headCommit: string;
+	} {
+		const upstream = createRepository();
+		const remote = join(tmpdir(), `volt-review-remote-only-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(upstream, "remote", "add", "origin", remote);
+		git(upstream, "push", "-u", "origin", "main");
+		const staleBase = git(upstream, "rev-parse", "HEAD");
+
+		const repository = join(
+			tmpdir(),
+			`volt-review-remote-only-workspace-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		tempDirectories.push(repository);
+		git(tmpdir(), "clone", remote, repository);
+		git(repository, "config", "user.email", "review@example.com");
+		git(repository, "config", "user.name", "Review Test");
+		git(repository, "checkout", "-b", "feature");
+		writeFileSync(join(repository, "feature.txt"), "feature only\n");
+		git(repository, "add", "feature.txt");
+		git(repository, "commit", "-m", "feature change");
+		const headCommit = git(repository, "rev-parse", "HEAD");
+
+		writeFileSync(join(upstream, "upstream.txt"), "advanced outside the workspace\n");
+		git(upstream, "add", "upstream.txt");
+		git(upstream, "commit", "-m", "advance remote base");
+		const authoritativeBase = git(upstream, "rev-parse", "HEAD");
+		git(upstream, "push", "origin", "main");
+		rmSync(join(repository, ".git", "FETCH_HEAD"), { force: true });
+		return { repository, upstream, staleBase, authoritativeBase, headCommit };
+	}
+
+	function createShallowBranchFixture(
+		depth: number,
+		withLocalCommit: boolean,
+	): {
+		repository: string;
+		baseCommit: string;
+		headCommit: string;
+		omittedParent: string;
+		localObjects: string;
+	} {
+		const seed = createRepository();
+		const omittedParent = git(seed, "rev-parse", "HEAD");
+		writeFileSync(join(seed, "tracked.txt"), "base\n");
+		git(seed, "commit", "-am", "base");
+		const baseCommit = git(seed, "rev-parse", "HEAD");
+		git(seed, "checkout", "-b", "feature");
+		writeFileSync(join(seed, "feature.txt"), "feature\n");
+		git(seed, "add", "feature.txt");
+		git(seed, "commit", "-m", "feature");
+
+		const remote = join(tmpdir(), `volt-review-shallow-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(seed, "remote", "add", "origin", remote);
+		git(seed, "push", "origin", "main", "feature");
+
+		const repository = join(
+			tmpdir(),
+			`volt-review-shallow-branch-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(repository, { recursive: true });
+		tempDirectories.push(repository);
+		git(repository, "init", "--initial-branch=feature");
+		git(repository, "config", "user.email", "review@example.com");
+		git(repository, "config", "user.name", "Review Test");
+		git(repository, "remote", "add", "origin", relative(repository, remote));
+		git(repository, "fetch", `--depth=${depth}`, "origin", "+refs/heads/feature:refs/remotes/origin/feature");
+		git(repository, "checkout", "-B", "feature", "refs/remotes/origin/feature");
+		if (withLocalCommit) {
+			writeFileSync(join(repository, "local.txt"), "local only\n");
+			git(repository, "add", "local.txt");
+			git(repository, "commit", "-m", "local only");
+		}
+		const headCommit = git(repository, "rev-parse", "HEAD");
+		const localObjects = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects");
+		return { repository, baseCommit, headCommit, omittedParent, localObjects };
+	}
+
+	function createBloblessPartialCloneFixture(pullRequestNumber: number): {
+		repository: string;
+		baseCommit: string;
+		headCommit: string;
+		localObjects: string;
+	} {
+		const seed = createRepository();
+		const baseCommit = git(seed, "rev-parse", "HEAD");
+		git(seed, "checkout", "-b", "feature");
+		writeFileSync(join(seed, "tracked.txt"), "partial clone feature\n");
+		git(seed, "commit", "-am", "partial clone feature");
+		const headCommit = git(seed, "rev-parse", "HEAD");
+
+		const remote = join(tmpdir(), `volt-review-partial-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(remote, "config", "uploadpack.allowFilter", "true");
+		git(seed, "remote", "add", "origin", remote);
+		git(seed, "push", "origin", "main", "feature", `HEAD:refs/pull/${pullRequestNumber}/head`);
+
+		const repository = join(
+			tmpdir(),
+			`volt-review-partial-clone-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		tempDirectories.push(repository);
+		git(
+			tmpdir(),
+			"clone",
+			"--filter=blob:none",
+			"--no-checkout",
+			"--branch",
+			"feature",
+			pathToFileURL(remote).href,
+			repository,
+		);
+		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("false");
+		expect(git(repository, "config", "--local", "--get", "remote.origin.promisor")).toBe("true");
+		expect(git(repository, "rev-list", "--objects", "--all", "--missing=print")).toMatch(/^\?/m);
+		const localObjects = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects");
+		return { repository, baseCommit, headCommit, localObjects };
+	}
+
+	async function serveAuthenticatedGitRepository(remote: string): Promise<{
+		url: string;
+		extraHeader: string;
+		authenticatedRequestCount(): number;
+		deniedRequestCount(): number;
+	}> {
+		const requiredHeader = 'review-"config\\secret';
+		let authenticatedRequestCount = 0;
+		let deniedRequestCount = 0;
+		const server = createServer((request, response) => {
+			if (request.headers["x-volt-auth"] !== requiredHeader) {
+				deniedRequestCount++;
+				response.writeHead(403, { "content-type": "text/plain" });
+				response.end("missing repository-local authentication header\n");
+				return;
+			}
+			authenticatedRequestCount++;
+			let pathname: string;
+			try {
+				pathname = decodeURIComponent(new URL(request.url ?? "/", "http://localhost").pathname);
+			} catch {
+				response.writeHead(400);
+				response.end();
+				return;
+			}
+			const prefix = "/remote.git/";
+			if (!pathname.startsWith(prefix)) {
+				response.writeHead(404);
+				response.end();
+				return;
+			}
+			const relativePath = pathname.slice(prefix.length);
+			if (
+				!relativePath ||
+				relativePath.split("/").some((segment) => !segment || segment === "." || segment === "..")
+			) {
+				response.writeHead(400);
+				response.end();
+				return;
+			}
+			let content: Buffer;
+			try {
+				content = readFileSync(join(remote, relativePath));
+			} catch {
+				response.writeHead(404);
+				response.end();
+				return;
+			}
+			response.writeHead(200, {
+				"cache-control": "no-cache",
+				"content-type": relativePath === "info/refs" ? "text/plain" : "application/octet-stream",
+			});
+			if (request.method === "HEAD") response.end();
+			else response.end(content);
+		});
+		await new Promise<void>((resolveListen, rejectListen) => {
+			server.once("error", rejectListen);
+			server.listen(0, "127.0.0.1", () => {
+				server.off("error", rejectListen);
+				resolveListen();
+			});
+		});
+		servers.push(server);
+		const { port } = server.address() as AddressInfo;
+		return {
+			url: `http://127.0.0.1:${port}/remote.git`,
+			extraHeader: `X-Volt-Auth: ${requiredHeader}`,
+			authenticatedRequestCount: () => authenticatedRequestCount,
+			deniedRequestCount: () => deniedRequestCount,
+		};
 	}
 
 	async function resolve(
@@ -510,6 +772,410 @@ describe("review snapshots", () => {
 		expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("feature\n");
 	});
 
+	it("refreshes short branch bases without changing stale workspace refs", async () => {
+		const { repository, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		for (const target of [
+			{ kind: "branch" as const, base: "main" },
+			{ kind: "branch" as const, base: "origin/main" },
+			{ kind: "branch" as const },
+		]) {
+			const snapshot = await resolve(target, repository);
+			expect(snapshot.description).toBe("branch changes vs origin/main");
+			expect(snapshot.branchBase).toEqual({
+				kind: "remote",
+				remote: "origin",
+				remoteRef: "refs/heads/main",
+			});
+			expect(snapshot.identity).toMatchObject({
+				baseCommit: authoritativeBase,
+				mergeBaseCommit: authoritativeBase,
+				headCommit,
+			});
+			expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		}
+
+		for (const base of ["refs/heads/main", "refs/remotes/origin/main"]) {
+			const snapshot = await resolve({ kind: "branch", base }, repository);
+			expect(snapshot.description).toBe(`branch changes vs ${base}`);
+			expect(snapshot.branchBase).toEqual({ kind: "local", ref: base });
+			expect(snapshot.identity.baseCommit).toBe(staleBase);
+			expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt", "upstream.txt"]);
+		}
+
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "HEAD")).toBe(headCommit);
+		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
+	});
+
+	it("recaptures a remote-only branch base from its durable locator after snapshot disposal", async () => {
+		const { repository, upstream, staleBase, authoritativeBase, headCommit } = createRemoteOnlyBranchFixture();
+		const localObjectStatus = (oid: string): number | null =>
+			spawnSync("git", ["cat-file", "-e", `${oid}^{commit}`], { cwd: repository }).status;
+		expect(localObjectStatus(authoritativeBase)).not.toBe(0);
+
+		const first = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(first.identity).toMatchObject({ baseCommit: authoritativeBase, headCommit });
+		expect(first.branchBase).toEqual({
+			kind: "remote",
+			remote: "origin",
+			remoteRef: "refs/heads/main",
+		});
+		expect(localObjectStatus(authoritativeBase)).not.toBe(0);
+		await first.dispose();
+		expect(localObjectStatus(authoritativeBase)).not.toBe(0);
+		if (!first.branchBase) throw new Error("Expected a durable branch base locator");
+
+		writeFileSync(join(upstream, "upstream-second.txt"), "advanced again\n");
+		git(upstream, "add", "upstream-second.txt");
+		git(upstream, "commit", "-m", "advance remote base again");
+		const secondBase = git(upstream, "rev-parse", "HEAD");
+		git(upstream, "push", "origin", "main");
+
+		const rerun = await resolve({ kind: "branch", branchBase: first.branchBase }, repository);
+		expect(rerun.identity).toMatchObject({ baseCommit: secondBase, headCommit });
+		expect(rerun.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
+	});
+
+	it("ignores a colliding tag when resolving a short branch base", async () => {
+		const { repository, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		git(repository, "tag", "main", staleBase);
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.description).toBe("branch changes vs origin/main");
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+	});
+
+	it("skips tag-only names while auto-detecting a branch base", async () => {
+		const repository = createRepository();
+		git(repository, "branch", "-m", "master");
+		git(repository, "tag", "main");
+		git(repository, "checkout", "-b", "feature");
+		writeFileSync(join(repository, "tracked.txt"), "feature\n");
+		git(repository, "commit", "-am", "feature");
+
+		const snapshot = await resolve({ kind: "branch" }, repository);
+		expect(snapshot.description).toBe("branch changes vs master");
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["tracked.txt"]);
+	});
+
+	it("resolves relative filesystem URLs before refreshing branch bases", async () => {
+		const { repository, remote, staleBase, authoritativeBase } = createStaleBranchFixture("origin");
+		const relativeRemote = relative(repository, remote);
+		git(repository, "remote", "set-url", "origin", relativeRemote);
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "remote", "get-url", "origin")).toBe(relativeRemote);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+	});
+
+	it("applies insteadOf URL rewrites once when refreshing remote branch bases", async () => {
+		const { repository, remote, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		const rewriteRoot = join(
+			tmpdir(),
+			`volt-review-url-rewrite-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		const rewrittenRemote = join(rewriteRoot, "mirror", "remote.git");
+		mkdirSync(join(rewriteRoot, "mirror"), { recursive: true });
+		renameSync(remote, rewrittenRemote);
+		tempDirectories.push(rewriteRoot);
+
+		const rawPrefix = pathToFileURL(rewriteRoot).href;
+		const rewrittenPrefix = `${rawPrefix}/mirror`;
+		const rawRemote = `${rawPrefix}/remote.git`;
+		git(repository, "remote", "set-url", "origin", rawRemote);
+		git(repository, "config", "--local", `url.${rewrittenPrefix}.insteadOf`, rawPrefix);
+		expect(git(repository, "config", "--local", "--get", "remote.origin.url")).toBe(rawRemote);
+		expect(git(repository, "remote", "get-url", "origin")).toBe(pathToFileURL(rewrittenRemote).href);
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+	});
+
+	it("applies command-scope URL rewrites once while preserving other command config", async () => {
+		const { repository, remote, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		const rewriteRoot = join(
+			tmpdir(),
+			`volt-review-command-url-rewrite-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		const rewrittenRemote = join(rewriteRoot, "mirror", "remote.git");
+		mkdirSync(join(rewriteRoot, "mirror"), { recursive: true });
+		renameSync(remote, rewrittenRemote);
+		tempDirectories.push(rewriteRoot);
+
+		const rawPrefix = pathToFileURL(rewriteRoot).href;
+		const rewrittenPrefix = `${rawPrefix}/mirror`;
+		git(repository, "remote", "set-url", "origin", `${rawPrefix}/remote.git`);
+		const globalConfig = join(repository, "deny-file-transport.config");
+		git(repository, "config", "--file", globalConfig, "protocol.file.allow", "never");
+		process.env.GIT_CONFIG_GLOBAL = globalConfig;
+		process.env.GIT_CONFIG_COUNT = "2";
+		process.env.GIT_CONFIG_KEY_0 = `url.${rewrittenPrefix}.insteadOf`;
+		process.env.GIT_CONFIG_VALUE_0 = rawPrefix;
+		process.env.GIT_CONFIG_KEY_1 = "protocol.file.allow";
+		process.env.GIT_CONFIG_VALUE_1 = "always";
+		expect(git(repository, "remote", "get-url", "origin")).toBe(pathToFileURL(rewrittenRemote).href);
+		const denied = spawnSync("git", ["ls-remote", pathToFileURL(rewrittenRemote).href], {
+			cwd: repository,
+			encoding: "utf8",
+			env: { ...process.env, GIT_CONFIG_COUNT: "0" },
+		});
+		expect(denied.status).not.toBe(0);
+		expect(denied.stderr).toContain("transport 'file' not allowed");
+
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+	});
+
+	it("preserves repository-local fetch configuration for isolated branch and PR snapshots", async () => {
+		const { repository, remote, staleBase, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		git(repository, "push", remote, `${headCommit}:refs/pull/11/head`);
+		git(remote, "update-server-info");
+		const authenticatedRemote = await serveAuthenticatedGitRepository(remote);
+		git(repository, "remote", "set-url", "origin", authenticatedRemote.url);
+		git(
+			repository,
+			"config",
+			"--local",
+			`http.${authenticatedRemote.url}.extraHeader`,
+			authenticatedRemote.extraHeader,
+		);
+
+		const branchSnapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(branchSnapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+			headCommit,
+		});
+		expect(branchSnapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		const branchRequestCount = authenticatedRemote.authenticatedRequestCount();
+		expect(branchRequestCount).toBeGreaterThan(0);
+
+		installGitHubShim(repository, {
+			view: {
+				id: "PR_local_config_11",
+				number: 11,
+				title: "Repository-local fetch config",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/11",
+				baseRefOid: authoritativeBase,
+				headRefOid: headCommit,
+			},
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+		const pullRequestSnapshot = await resolve({ kind: "pr", number: "11" }, repository);
+		expect(pullRequestSnapshot.identity.pullRequest).toMatchObject({
+			number: 11,
+			baseRefOid: authoritativeBase,
+			headRefOid: headCommit,
+		});
+		expect(pullRequestSnapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(authenticatedRemote.authenticatedRequestCount()).toBeGreaterThan(branchRequestCount);
+		expect(authenticatedRemote.deniedRequestCount()).toBe(0);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "origin/main")).toBe(staleBase);
+		expect(existsSync(join(repository, ".git", "FETCH_HEAD"))).toBe(false);
+	});
+
+	it("preserves conditionally included global fetch configuration", async () => {
+		const { repository, remote, authoritativeBase, headCommit } = createStaleBranchFixture("origin");
+		git(remote, "update-server-info");
+		const authenticatedRemote = await serveAuthenticatedGitRepository(remote);
+		git(repository, "remote", "set-url", "origin", authenticatedRemote.url);
+
+		const conditionalConfig = join(repository, "conditional-global.config");
+		git(
+			repository,
+			"config",
+			"--file",
+			conditionalConfig,
+			`http.${authenticatedRemote.url}.extraHeader`,
+			authenticatedRemote.extraHeader,
+		);
+		const gitDirectory = git(repository, "rev-parse", "--absolute-git-dir");
+		process.env.GIT_CONFIG_NOSYSTEM = "1";
+		for (const [index, condition] of [`gitdir:${gitDirectory}`, "onbranch:feature"].entries()) {
+			const globalConfig = join(repository, `global-${index}.config`);
+			git(repository, "config", "--file", globalConfig, `includeIf.${condition}.path`, conditionalConfig);
+			process.env.GIT_CONFIG_GLOBAL = globalConfig;
+			expect(
+				git(repository, "config", "--show-scope", "--get-all", `http.${authenticatedRemote.url}.extraHeader`),
+			).toBe(`global\t${authenticatedRemote.extraHeader}`);
+
+			const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+			expect(snapshot.identity).toMatchObject({
+				baseCommit: authoritativeBase,
+				mergeBaseCommit: authoritativeBase,
+				headCommit,
+			});
+			expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		}
+		expect(authenticatedRemote.authenticatedRequestCount()).toBeGreaterThan(0);
+		expect(authenticatedRemote.deniedRequestCount()).toBe(0);
+	});
+
+	it("refreshes a configured non-origin upstream for a plain branch name", async () => {
+		const { repository, staleBase, authoritativeBase } = createStaleBranchFixture("upstream");
+		const snapshot = await resolve({ kind: "branch", base: "main" }, repository);
+		expect(snapshot.description).toBe("branch changes vs upstream/main");
+		expect(snapshot.identity).toMatchObject({
+			baseCommit: authoritativeBase,
+			mergeBaseCommit: authoritativeBase,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		expect(git(repository, "rev-parse", "upstream/main")).toBe(staleBase);
+	});
+
+	it("preserves shallow boundaries while refreshing remote branch bases", async () => {
+		const { repository, baseCommit, headCommit, omittedParent, localObjects } = createShallowBranchFixture(2, true);
+		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
+		expect(spawnSync("git", ["cat-file", "-e", `${omittedParent}^{commit}`], { cwd: repository }).status).not.toBe(0);
+
+		const snapshot = await resolve({ kind: "branch", base: "origin/main" }, repository);
+		expect(snapshot.identity).toMatchObject({ baseCommit, mergeBaseCommit: baseCommit, headCommit });
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["feature.txt", "local.txt"]);
+
+		const unavailableLocalObjects = `${localObjects}-unavailable`;
+		renameSync(localObjects, unavailableLocalObjects);
+		try {
+			expect((await readAvailableFile(snapshot, "head", "feature.txt")).content.toString()).toBe("feature\n");
+			expect((await readAvailableFile(snapshot, "head", "local.txt")).content.toString()).toBe("local only\n");
+			const checkout = await snapshot.materializeHead();
+			expect(readFileSync(join(checkout, "local.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("local only\n");
+		} finally {
+			renameSync(unavailableLocalObjects, localObjects);
+		}
+	});
+
+	it("rejects remote-backed branch reviews from partial clones before borrowing promised objects", async () => {
+		const { repository } = createBloblessPartialCloneFixture(12);
+		const error =
+			"Remote-backed branch reviews are not supported from partial clones. Use a complete clone and retry.";
+		await expect(
+			resolveReviewSnapshot({ kind: "branch", base: "origin/main" }, repository, OPTIONS),
+		).resolves.toEqual({ error, remoteError: error });
+	});
+
+	it("reports when shallow history omits the remote branch merge base", async () => {
+		const { repository, baseCommit } = createShallowBranchFixture(1, false);
+		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
+		expect(spawnSync("git", ["cat-file", "-e", `${baseCommit}^{commit}`], { cwd: repository }).status).not.toBe(0);
+
+		const error =
+			"Could not resolve the branch merge base from the available shallow history. Deepen or unshallow the repository and retry.";
+		await expect(
+			resolveReviewSnapshot({ kind: "branch", base: "origin/main" }, repository, OPTIONS),
+		).resolves.toEqual({
+			error,
+			remoteError: error,
+		});
+	});
+
+	it("fails a remote base refresh without falling back and removes the temporary source", async () => {
+		const { repository, staleBase } = createStaleBranchFixture("origin");
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Unable to locate git executable");
+		const bin = join(repository, "failed-branch-fetch-bin");
+		const temporaryDirectoryPath = join(repository, "failed-branch-fetch-directory");
+		mkdirSync(bin);
+		installNodeCommandShim(
+			bin,
+			"git",
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir?.includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, gitDir);\n  process.stderr.write("forced branch fetch failure\\n");\n  process.exitCode = 1;\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+		);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+
+		const result = await resolveReviewSnapshot({ kind: "branch", base: "main" }, repository, OPTIONS);
+		expect(result).toMatchObject({
+			error: expect.stringContaining("forced branch fetch failure"),
+			remoteError: "Could not refresh the review base branch.",
+		});
+		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
+		const temporaryDirectory = readFileSync(temporaryDirectoryPath, "utf8");
+		expect(existsSync(temporaryDirectory)).toBe(false);
+	});
+
+	it("cancels a remote base fetch and removes the temporary source", async () => {
+		const { repository } = createStaleBranchFixture("origin");
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Unable to locate git executable");
+		const bin = join(repository, "delayed-branch-fetch-bin");
+		const startedPath = join(repository, "delayed-branch-fetch-started");
+		const temporaryDirectoryPath = join(repository, "delayed-branch-fetch-directory");
+		mkdirSync(bin);
+		installNodeCommandShim(
+			bin,
+			"git",
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir?.includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(startedPath)}, String(process.pid));\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, gitDir);\n  setInterval(() => {}, 1_000);\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+		);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+		const controller = new AbortController();
+		const resolution = resolveReviewSnapshot({ kind: "branch", base: "main" }, repository, {
+			...OPTIONS,
+			signal: controller.signal,
+		});
+		const waitOptions = { timeout: 15_000 };
+		let fetchStarted = false;
+		try {
+			await Promise.race([
+				vi
+					.waitFor(() => expect(existsSync(startedPath)).toBe(true), waitOptions)
+					.then(() => {
+						fetchStarted = true;
+					}),
+				resolution.then(async (result) => {
+					if (fetchStarted) return;
+					if (!("error" in result)) await result.dispose();
+					throw new Error(
+						`Review resolution settled before the delayed remote fetch started: ${"error" in result ? result.error : "snapshot completed"}`,
+					);
+				}),
+			]);
+			controller.abort();
+			await expect(resolution).resolves.toEqual({ error: "Review cancelled.", cancelled: true });
+			await vi.waitFor(() => expect(processIsAlive(startedPath)).toBe(false), waitOptions);
+			const temporaryDirectory = readFileSync(temporaryDirectoryPath, "utf8");
+			expect(existsSync(temporaryDirectory)).toBe(false);
+		} finally {
+			controller.abort();
+		}
+	});
+
 	it("reviews root commits against an empty tree and merge commits against first parent", async () => {
 		const rootRepository = createRepository(false);
 		writeFileSync(join(rootRepository, "root.txt"), "root\n");
@@ -536,7 +1202,7 @@ describe("review snapshots", () => {
 		).toContain("+feature");
 	});
 
-	it("fetches PR snapshots without borrowing from shallow repositories", async () => {
+	it("fetches PR snapshots from relative remotes without borrowing from shallow repositories", async () => {
 		const seed = createRepository();
 		const omittedParentOid = git(seed, "rev-parse", "HEAD");
 		writeFileSync(join(seed, "tracked.txt"), "base\n");
@@ -561,7 +1227,7 @@ describe("review snapshots", () => {
 		mkdirSync(repository, { recursive: true });
 		tempDirectories.push(repository);
 		git(repository, "init", "--initial-branch=main");
-		git(repository, "remote", "add", "origin", remote);
+		git(repository, "remote", "add", "origin", relative(repository, remote));
 		git(repository, "fetch", "--depth=1", "origin", "main");
 		git(repository, "checkout", "-B", "main", "FETCH_HEAD");
 		expect(git(repository, "rev-parse", "--is-shallow-repository")).toBe("true");
@@ -597,6 +1263,48 @@ describe("review snapshots", () => {
 			expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe("pull request\n");
 			const checkout = await snapshot.materializeHead();
 			expect(readFileSync(join(checkout, "tracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe("pull request\n");
+		} finally {
+			renameSync(unavailableLocalObjects, localObjects);
+		}
+	});
+
+	it("keeps PR snapshots from partial clones independent of promised local objects", async () => {
+		const pullRequestNumber = 12;
+		const { repository, baseCommit, headCommit, localObjects } = createBloblessPartialCloneFixture(pullRequestNumber);
+		installGitHubShim(repository, {
+			view: {
+				id: "PR_partial_clone_12",
+				number: pullRequestNumber,
+				title: "Partial clone snapshot",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/12",
+				baseRefOid: baseCommit,
+				headRefOid: headCommit,
+			},
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const snapshot = await resolve({ kind: "pr", number: String(pullRequestNumber) }, repository);
+		expect(snapshot.identity.pullRequest).toMatchObject({
+			number: pullRequestNumber,
+			baseRefOid: baseCommit,
+			headRefOid: headCommit,
+		});
+		expect(snapshot.changedFiles.map((file) => file.path)).toEqual(["tracked.txt"]);
+
+		const unavailableLocalObjects = `${localObjects}-unavailable`;
+		renameSync(localObjects, unavailableLocalObjects);
+		try {
+			expect((await readAvailableFile(snapshot, "base", "tracked.txt")).content.toString()).toBe("before\n");
+			expect((await readAvailableFile(snapshot, "head", "tracked.txt")).content.toString()).toBe(
+				"partial clone feature\n",
+			);
+			const checkout = await snapshot.materializeHead();
+			expect(readFileSync(join(checkout, "tracked.txt"), "utf8").replaceAll("\r\n", "\n")).toBe(
+				"partial clone feature\n",
+			);
 		} finally {
 			renameSync(unavailableLocalObjects, localObjects);
 		}
@@ -647,7 +1355,7 @@ describe("review snapshots", () => {
 		installNodeCommandShim(
 			join(repository, "bin"),
 			"git",
-			`import { appendFileSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nif (args[0] === "fetch") appendFileSync(${JSON.stringify(alternatesLog)}, readFileSync(join(process.cwd(), "objects", "info", "alternates"), "utf8"));\nconst result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\nif (result.error) throw result.error;\nprocess.exitCode = result.status ?? 1;\n`,
+			`import { appendFileSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir) appendFileSync(${JSON.stringify(alternatesLog)}, readFileSync(join(gitDir, "objects", "info", "alternates"), "utf8"));\nconst result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\nif (result.error) throw result.error;\nprocess.exitCode = result.status ?? 1;\n`,
 		);
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
