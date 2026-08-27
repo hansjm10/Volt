@@ -58,6 +58,11 @@ if ($noEnv) {
 	Write-Host "Running without API keys..."
 }
 
+# Source-development reviews retain private model limitations and failed tool diagnostics.
+if (-not (Test-Path Env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS)) {
+	$env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS = "1"
+}
+
 $runnerPath = Join-Path $scriptDir "scripts/run-coding-agent-source.mjs"
 & node $runnerPath @forwardArgs
 $exitCode = $LASTEXITCODE

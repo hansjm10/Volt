@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -20,6 +20,10 @@ import {
 	runReview,
 	runReviewWorkflow,
 } from "../../src/core/review.ts";
+import {
+	getReviewPrivateDiagnosticsDirectory,
+	REVIEW_PRIVATE_DIAGNOSTICS_ENV,
+} from "../../src/core/review-private-diagnostics.ts";
 import type {
 	ReviewCandidateReport,
 	ReviewFinding,
@@ -268,11 +272,13 @@ describe("review pipeline", () => {
 	const snapshots: ReviewSnapshot[] = [];
 
 	afterEach(async () => {
+		vi.unstubAllEnvs();
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
 		for (const harness of harnesses.splice(0)) harness.cleanup();
 	});
 
 	it("keeps context-exposed prose private and presents findings from code in a fresh context", async () => {
+		vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, "1");
 		const privateMarker = "private-github-discussion-marker";
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -441,6 +447,17 @@ describe("review pipeline", () => {
 		expect(JSON.stringify(workflowEvents)).not.toContain("src/value.ts");
 		expect(JSON.stringify(workflowEvents)).not.toContain(privateMarker);
 		expect(harness.session.messages).toHaveLength(0);
+		const diagnosticsDirectory = getReviewPrivateDiagnosticsDirectory(agentDir);
+		const diagnosticFiles = readdirSync(diagnosticsDirectory);
+		expect(diagnosticFiles).toHaveLength(1);
+		const privateRecords = readFileSync(join(diagnosticsDirectory, diagnosticFiles[0]!), "utf8")
+			.trim()
+			.split("\n")
+			.map((line): unknown => JSON.parse(line));
+		expect(privateRecords).toEqual([
+			expect.objectContaining({ kind: "model_limitation", phase: "discovery", message: privateMarker }),
+			expect.objectContaining({ kind: "model_limitation", phase: "verification", message: privateMarker }),
+		]);
 	});
 
 	it("skips presentation for a no-finding PR and replaces private incomplete prose", async () => {
