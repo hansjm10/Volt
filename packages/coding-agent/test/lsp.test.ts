@@ -783,7 +783,7 @@ describe("LspManager", () => {
 		expect(manager.getStatus()[0].root).toBe(realpathSync(projectDir));
 	});
 
-	it("rejects lexical and symlink-mediated access outside projectCwd", async () => {
+	it("rejects lexical and resolved or dangling symlink access outside projectCwd", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
 		const projectDir = join(tempDir, "project");
 		const outsideDir = join(tempDir, "outside");
@@ -803,6 +803,10 @@ describe("LspManager", () => {
 		}
 		expect(await manager.fileDiagnostics(join(alias, "outside.foo"))).toContain(
 			"through a symlink outside project workspace",
+		);
+		rmSync(outsideDir, { recursive: true, force: true });
+		expect(await manager.getDiagnostics(join(alias, "outside.foo"), "ERROR\n")).toContain(
+			"through a dangling symlink",
 		);
 		expect(manager.getStatus()).toEqual([]);
 	});

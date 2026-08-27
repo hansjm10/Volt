@@ -9,7 +9,7 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnProcess, spawnProcessSync } from "../../utils/child-process.ts";
@@ -516,6 +516,19 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 					return {
 						error: `Could not resolve LSP path ${lexicalPath}: ${error instanceof Error ? error.message : String(error)}`,
 					};
+				}
+				try {
+					if ((await lstat(probe)).isSymbolicLink()) {
+						return {
+							error: `Refusing LSP access through a dangling symlink in project workspace ${this.projectCwd}: ${lexicalPath}`,
+						};
+					}
+				} catch (lstatError) {
+					if (!isMissingPathError(lstatError)) {
+						return {
+							error: `Could not resolve LSP path ${lexicalPath}: ${lstatError instanceof Error ? lstatError.message : String(lstatError)}`,
+						};
+					}
 				}
 				const parent = dirname(probe);
 				if (parent === probe) {
