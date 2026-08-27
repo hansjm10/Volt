@@ -10,7 +10,7 @@ import {
 	formatReviewForNewSession,
 	listBaseBranches,
 	listRecentCommits,
-	MAX_GITHUB_PR_NUMBER,
+	MAX_PULL_REQUEST_NUMBER,
 	normalizeReviewPullRequestNumber,
 	parseReviewCommandArgs,
 	prepareReviewWorkflow,
@@ -125,7 +125,7 @@ async function createSnapshotRepository(
 	);
 	const snapshot = await resolveReviewSnapshot({ kind: "uncommitted" }, harness.tempDir, {
 		maxCommitRefBytes: 1_024,
-		maxPullRequestNumber: MAX_GITHUB_PR_NUMBER,
+		maxPullRequestNumber: MAX_PULL_REQUEST_NUMBER,
 		...(options.maxBlobBytes === undefined ? {} : { limits: { maxBlobBytes: options.maxBlobBytes } }),
 	});
 	if ("error" in snapshot) throw new Error(snapshot.error);
@@ -133,7 +133,7 @@ async function createSnapshotRepository(
 }
 
 function attachGitHubContext(snapshot: ReviewSnapshot, marker: string): void {
-	snapshot.githubContext = {
+	snapshot.codeHostContext = {
 		manifest: {
 			status: "complete",
 			capturedAt: "2026-01-01T00:00:00Z",
@@ -177,7 +177,9 @@ describe("review command controls", () => {
 		expect(normalizeReviewPullRequestNumber(undefined)).toEqual({});
 		expect(normalizeReviewPullRequestNumber("42")).toEqual({ number: "42" });
 		expect(normalizeReviewPullRequestNumber("01")).toEqual({ error: expect.stringContaining("canonical") });
-		expect(normalizeReviewPullRequestNumber(String(MAX_GITHUB_PR_NUMBER + 1))).toEqual({ error: expect.any(String) });
+		expect(normalizeReviewPullRequestNumber(String(MAX_PULL_REQUEST_NUMBER + 1))).toEqual({
+			error: expect.any(String),
+		});
 	});
 
 	it("rejects controls that cannot be persisted losslessly before resolving the target", async () => {
@@ -278,7 +280,7 @@ describe("review pipeline", () => {
 		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(join(agentDir, "REVIEW.md"), "USER REVIEW POLICY\n");
 		const snapshot = await createSnapshotRepository(harness);
-		snapshot.githubContext = {
+		snapshot.codeHostContext = {
 			manifest: {
 				status: "complete",
 				capturedAt: "2026-01-01T00:00:00Z",
@@ -408,9 +410,9 @@ describe("review pipeline", () => {
 		expect(requestSnapshots[2]?.tools).not.toContain("bash");
 		expect(requestSnapshots[2]?.messages).not.toContain(privateMarker);
 		expect(requestSnapshots[2]?.systemPrompt).not.toContain(privateMarker);
-		expect(requestSnapshots[0]?.messages).toContain("github_context_manifest");
-		expect(requestSnapshots[1]?.messages).toContain("github_context_manifest");
-		expect(requestSnapshots[2]?.messages).not.toContain("github_context_manifest");
+		expect(requestSnapshots[0]?.messages).toContain("code_host_context_manifest");
+		expect(requestSnapshots[1]?.messages).toContain("code_host_context_manifest");
+		expect(requestSnapshots[2]?.messages).not.toContain("code_host_context_manifest");
 		const discoveryFinal = usageSnapshots.filter((usage) => usage.pass === "discovery").at(-1);
 		const verificationSnapshots = usageSnapshots.filter((usage) => usage.pass === "verification");
 		const verificationFinal = verificationSnapshots.at(-1);
@@ -857,7 +859,7 @@ describe("review pipeline", () => {
 		snapshots.push(remoteSnapshot);
 		const localSnapshot = await resolveReviewSnapshot({ kind: "uncommitted" }, harness.tempDir, {
 			maxCommitRefBytes: 1_024,
-			maxPullRequestNumber: MAX_GITHUB_PR_NUMBER,
+			maxPullRequestNumber: MAX_PULL_REQUEST_NUMBER,
 		});
 		if ("error" in localSnapshot) throw new Error(localSnapshot.error);
 		snapshots.push(localSnapshot);

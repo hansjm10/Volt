@@ -191,7 +191,7 @@ describe("structured review reports", () => {
 			}).join(" "),
 		).toContain("did not inspect changed hunk");
 
-		snapshot.githubContext = {
+		snapshot.codeHostContext = {
 			manifest: {
 				status: "complete",
 				capturedAt: "2026-01-01T00:00:00Z",
@@ -429,7 +429,7 @@ describe("structured review reports", () => {
 
 	it("withholds correctness when PR context capture or either pass inspection is incomplete", async () => {
 		const snapshot = await setup();
-		snapshot.githubContext = {
+		snapshot.codeHostContext = {
 			manifest: {
 				status: "incomplete",
 				capturedAt: "2026-01-01T00:00:00Z",
@@ -485,8 +485,8 @@ describe("structured review reports", () => {
 		});
 		expect(parsed.coverage.uncheckedAreas).toEqual(
 			expect.arrayContaining([
-				"GitHub pull request context capture was incomplete.",
-				"Discovery did not page GitHub pull request context to completion.",
+				"Code-host pull request context capture was incomplete.",
+				"Discovery did not page code-host pull request context to completion.",
 			]),
 		);
 	});

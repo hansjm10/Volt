@@ -1248,7 +1248,7 @@ describe("runRpcMode", () => {
 			);
 			expect(reviewPullRequestAction).toEqual(
 				expect.objectContaining({
-					description: expect.stringContaining("GitHub credentials and network"),
+					description: expect.stringContaining("GitHub CLI code-host provider"),
 					category: "review",
 					presentation: expect.objectContaining({ kind: "card", group: "Review" }),
 					requiresConfirmation: true,

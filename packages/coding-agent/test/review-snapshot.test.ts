@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join, relative, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { captureReviewGitHubContext } from "../src/core/github-pr-context.ts";
+import { capturePullRequestContextWithGitHubCli } from "../src/core/code-host/github-cli-context.ts";
 import { normalizeReviewPath, type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
 
 const OPTIONS = { maxCommitRefBytes: 1_024, maxPullRequestNumber: 2_147_483_647 };
@@ -1362,7 +1362,7 @@ describe("review snapshots", () => {
 		const snapshot = await resolve({ kind: "pr", number: "7" }, repository);
 		expect(readFileSync(alternatesLog, "utf8").trim()).toBe(resolvePath(localObjects));
 		expect(snapshot.identity.pullRequest).toMatchObject({ number: 7, baseRefOid: baseOid, headRefOid: headOid });
-		expect(snapshot.githubContext?.manifest).toMatchObject({ status: "complete", fingerprint: expect.any(String) });
+		expect(snapshot.codeHostContext?.manifest).toMatchObject({ status: "complete", fingerprint: expect.any(String) });
 		expect(
 			snapshot.changedFiles
 				.flatMap((file) => file.hunks)
@@ -1406,7 +1406,7 @@ describe("review snapshots", () => {
 		installGitHubShim(repository, { view });
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 		const captureFingerprint = async (): Promise<string> => {
-			const captured = await captureReviewGitHubContext({
+			const captured = await capturePullRequestContextWithGitHubCli({
 				cwd: repository,
 				number: "7",
 				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1555,7 +1555,7 @@ describe("review snapshots", () => {
 		});
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
-		const capturePromise = captureReviewGitHubContext({
+		const capturePromise = capturePullRequestContextWithGitHubCli({
 			cwd: repository,
 			number: "7",
 			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1716,7 +1716,7 @@ describe("review snapshots", () => {
 		const logPath = installGitHubShim(repository, { view, graphql, maximumGraphqlRequests: 16 });
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
-		const captured = await captureReviewGitHubContext({
+		const captured = await capturePullRequestContextWithGitHubCli({
 			cwd: repository,
 			number: "10",
 			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1811,7 +1811,7 @@ describe("review snapshots", () => {
 		});
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
-		const captured = await captureReviewGitHubContext({
+		const captured = await capturePullRequestContextWithGitHubCli({
 			cwd: repository,
 			number: "8",
 			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1858,7 +1858,7 @@ describe("review snapshots", () => {
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
 		const capture = async () => {
-			const captured = await captureReviewGitHubContext({
+			const captured = await capturePullRequestContextWithGitHubCli({
 				cwd: repository,
 				number: "9",
 				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1920,10 +1920,10 @@ describe("review snapshots", () => {
 				]),
 			},
 		});
-		installGitHubShim(repository, configFor(31_637));
+		installGitHubShim(repository, configFor(31_615));
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 		const capture = async () => {
-			const captured = await captureReviewGitHubContext({
+			const captured = await capturePullRequestContextWithGitHubCli({
 				cwd: repository,
 				number: "274",
 				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1949,7 +1949,7 @@ describe("review snapshots", () => {
 			limitations: [],
 		});
 
-		writeFileSync(configPath, JSON.stringify(configFor(31_638)));
+		writeFileSync(configPath, JSON.stringify(configFor(31_616)));
 		const overLimit = await capture();
 		expect(overLimit.manifest).toMatchObject({
 			status: "incomplete",
