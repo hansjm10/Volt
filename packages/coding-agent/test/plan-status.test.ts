@@ -84,6 +84,57 @@ describe("Plan TUI components", () => {
 		expect(plain(rendered)).toContain("4/12 · 33%");
 	});
 
+	it("summarizes a working draft without exposing authored content", () => {
+		initTheme("dark");
+		const draft = { ...readyPlan(), phase: "draft" as const };
+		const rendered = plain(new PlanStatusComponent({ mode: "plan", plan: draft }).render(120).lines);
+		expect(rendered).toContain("PLAN DRAFT");
+		expect(rendered).toContain("12 proposed steps");
+		expect(rendered).toContain("Working draft · revision 4 · /plan-details to inspect");
+		expect(rendered).not.toContain("Plan step");
+	});
+
+	it("counts grouped draft outcomes and executable tasks", () => {
+		initTheme("dark");
+		const draft = { ...readyPlan(1), phase: "draft" as const };
+		draft.steps = [
+			{
+				id: "group-1",
+				text: "Implement hierarchy",
+				status: "pending",
+				substeps: [
+					{ id: "substep-1", text: "Persist hierarchy", status: "pending" },
+					{ id: "substep-2", text: "Render hierarchy", status: "pending" },
+				],
+			},
+		];
+		const rendered = plain(new PlanStatusComponent({ mode: "plan", plan: draft }).render(120).lines);
+		expect(rendered).toContain("1 outcome · 2 tasks");
+		expect(rendered).not.toContain("Implement hierarchy");
+	});
+
+	it("renders grouped draft outcomes and substeps in plan details", () => {
+		initTheme("dark");
+		const grouped = readyPlan(1);
+		grouped.phase = "draft";
+		grouped.steps = [
+			{
+				id: "group-1",
+				text: "Implement hierarchy",
+				status: "in_progress",
+				substeps: [
+					{ id: "substep-1", text: "Persist hierarchy", status: "completed", note: "Stored" },
+					{ id: "substep-2", text: "Render hierarchy", status: "in_progress" },
+				],
+			},
+		];
+		const rendered = normalized(createDetails(grouped, 30).render(80).lines);
+		expect(rendered).toContain("Implement hierarchy · 1/2 tasks");
+		expect(rendered).toContain("Persist hierarchy");
+		expect(rendered).toContain("Note: Stored");
+		expect(rendered).toContain("Render hierarchy");
+	});
+
 	it("wraps all authored plan content at compact and wide widths", () => {
 		initTheme("dark");
 		for (const width of [80, 120]) {

@@ -54,7 +54,7 @@ describe("planning tool TUI rendering", () => {
 		initTheme("dark");
 	});
 
-	it("shows semantic collapsed state and expands the checklist without repeating plan context", () => {
+	it("keeps draft updates to one collapsed line and expands the checklist on demand", () => {
 		const planning: PlanningState = { mode: "plan", plan: createPlan() };
 		const definition = createPlanningToolDefinitions(createController(planning))[0];
 		const component = new ToolExecutionComponent(
@@ -88,8 +88,8 @@ describe("planning tool TUI rendering", () => {
 		);
 
 		const collapsed = normalized(component);
-		expect(collapsed).toContain("update plan · 3 steps [success]");
-		expect(collapsed).toContain("DRAFT · revision 7 · 1/3 complete");
+		expect(collapsed.trim()).toBe("update plan · 3 steps [success]");
+		expect(collapsed).not.toContain("DRAFT · revision 7");
 		expect(collapsed).not.toContain("planId");
 		expect(collapsed).not.toContain("EXPANDED_STEP_TAIL");
 
@@ -98,6 +98,7 @@ describe("planning tool TUI rendering", () => {
 		const expandedPlainLines = expandedLines.map(stripAnsi);
 		const expanded = expandedPlainLines.join("\n").replace(/\s+/g, " ");
 		expect(expanded).toContain("update plan · 3 steps [success]");
+		expect(expanded).toContain("DRAFT · revision 7");
 		expect(expanded).not.toContain("Readable planning tools");
 		expect(expanded).not.toContain("complete expanded summary");
 		expect(expanded).toContain("Checklist · 1/3 complete");
@@ -112,8 +113,14 @@ describe("planning tool TUI rendering", () => {
 		{
 			index: 0,
 			name: "update_plan",
-			args: { title: "Improve the viewer", steps: [{ text: "Implement wrapping" }, { text: "Verify" }] },
-			expected: "update plan · 2 steps",
+			args: {
+				title: "Improve the viewer",
+				steps: [
+					{ text: "Implement wrapping", substeps: [{ text: "Render groups" }, { text: "Render leaves" }] },
+					{ text: "Verify" },
+				],
+			},
+			expected: "update plan · 2 outcomes · 3 tasks",
 		},
 		{
 			index: 1,

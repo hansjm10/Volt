@@ -7,7 +7,7 @@ export const RpcPlanPhaseSchema = stringEnum(["draft", "ready", "active", "compl
 export const RpcPlanStepStatusSchema = stringEnum(["pending", "in_progress", "completed"]);
 export const RpcPlanExecutionStrategySchema = stringEnum(["retain_context", "new_session"]);
 
-export const RpcPlanStepSchema = Type.Object(
+export const RpcPlanSubstepSchema = Type.Object(
 	{
 		id: Type.String({ minLength: 1 }),
 		text: Type.String({ minLength: 1 }),
@@ -16,6 +16,19 @@ export const RpcPlanStepSchema = Type.Object(
 	},
 	{ additionalProperties: false },
 );
+
+export const RpcPlanStepSchema = Type.Union([
+	RpcPlanSubstepSchema,
+	Type.Object(
+		{
+			id: Type.String({ minLength: 1 }),
+			text: Type.String({ minLength: 1 }),
+			status: RpcPlanStepStatusSchema,
+			substeps: Type.Array(RpcPlanSubstepSchema, { minItems: 1 }),
+		},
+		{ additionalProperties: false },
+	),
+]);
 
 export const RpcPlanExecutionSchema = Type.Object(
 	{
@@ -33,7 +46,7 @@ const rpcPlanStateFields = {
 	revision: Type.Integer({ minimum: 0 }),
 	title: Type.Optional(Type.String({ minLength: 1 })),
 	summary: Type.Optional(Type.String({ minLength: 1 })),
-	steps: Type.Array(RpcPlanStepSchema, { maxItems: 64 }),
+	steps: Type.Array(RpcPlanStepSchema),
 };
 
 export const RpcPlanStateSchema = Type.Unsafe<PlanState>(

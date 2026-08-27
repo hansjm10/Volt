@@ -78,9 +78,26 @@ const plan: PlanState = {
 		{ id: "step-4", text: "Keep the footer full-width below both panes", status: "completed" },
 		{
 			id: "step-5",
-			text: "Integrate focus, resize recovery, ready actions, and a complete long checklist item across wrapped visual rows",
+			text: "Integrate the hierarchical plan presentation",
 			status: phase === "completed" || phase === "handed_off" ? "completed" : "in_progress",
-			note: "Verified against exact responsive boundaries and compact fallback",
+			substeps: [
+				{
+					id: "step-5-1",
+					text: "Keep working drafts compact without hiding canonical state",
+					status: "completed",
+					note: "Verified against exact responsive boundaries and compact fallback",
+				},
+				{
+					id: "step-5-2",
+					text: "Render grouped outcomes and wrapped executable substeps",
+					status: phase === "completed" || phase === "handed_off" ? "completed" : "in_progress",
+				},
+				{
+					id: "step-5-3",
+					text: "Collapse inactive execution groups while retaining their progress",
+					status: phase === "completed" || phase === "handed_off" ? "completed" : "pending",
+				},
+			],
 		},
 		{
 			id: "step-6",
@@ -103,6 +120,8 @@ const details = new PlanDetailsComponent({
 	onClose: () => undefined,
 	requestRender: () => tui.requestRender(),
 });
+const detailsContainer = new Container();
+if (process.env.VOLT_PLAN_DETAILS === "1") detailsContainer.addChild(details);
 const editor = new Editor(tui, getEditorTheme(), {
 	topBorderLabel: planning.mode === "plan" ? "PLAN · AGENT READ-ONLY" : "ASK VOLT · BUILD",
 	placeholder: "Tell Volt what to change",
@@ -148,7 +167,13 @@ const tool = new ToolExecutionComponent(
 	{
 		title: plan.title,
 		summary: plan.summary,
-		steps: plan.steps.map((step) => ({ id: step.id, text: step.text })),
+		steps: plan.steps.map((step) => ({
+			id: step.id,
+			text: step.text,
+			...(step.substeps
+				? { substeps: step.substeps.map((substep) => ({ id: substep.id, text: substep.text })) }
+				: {}),
+		})),
 	},
 	{},
 	updatePlanDefinition,
@@ -167,7 +192,11 @@ tool.setExpanded(process.env.VOLT_PLAN_EXPANDED === "1");
 
 const transcript = new Container();
 transcript.addChild(
-	new Text(theme.fg("muted", "Conversation transcript remains available while the plan stays visible."), 1, 0),
+	new Text(
+		theme.fg("muted", "Conversation transcript remains available while planning state stays accessible."),
+		1,
+		0,
+	),
 );
 if (process.env.VOLT_PLAN_SCENARIO === "tools") transcript.addChild(tool);
 if (process.env.VOLT_PLAN_SCENARIO === "scrollback") {
@@ -199,7 +228,7 @@ layout = new ResponsivePlanLayoutComponent({
 	planning,
 	transcriptComponents: [transcript],
 	controlComponents: [editorContainer],
-	compactComponents: [transcript, statusContainer, details, editorContainer],
+	compactComponents: [transcript, statusContainer, detailsContainer, editorContainer],
 	fullscreenConversation,
 	inspector,
 	footer,
