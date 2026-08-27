@@ -197,7 +197,6 @@ import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipb
 import { writeDurableAtomicFileSync } from "../../utils/durable-atomic-write.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
-import { resolvePath } from "../../utils/paths.ts";
 import {
 	createPrivateTempDirectorySync,
 	ensurePrivateDirectorySync,
@@ -8210,7 +8209,7 @@ export class InteractiveMode {
 					await this.closeLspTrace();
 					let tracePath: string;
 					if (traceArg && traceArg.length > 0) {
-						tracePath = resolvePath(traceArg, this.session.sessionManager.getCwd());
+						tracePath = traceArg;
 					} else {
 						const scratchDirectory = this.createScratchDirectory("volt-lsp-trace-");
 						this.lspTraceScratchDirectory = scratchDirectory;
@@ -8218,7 +8217,8 @@ export class InteractiveMode {
 					}
 					try {
 						await this.session.setLspTraceFile(tracePath);
-						info = `LSP tracing enabled: ${tracePath}\nUse /lsp trace off to disable.`;
+						const resolvedTracePath = this.session.getLspStatus().traceFile ?? tracePath;
+						info = `LSP tracing enabled: ${resolvedTracePath}\nUse /lsp trace off to disable.`;
 					} catch (error) {
 						if (this.lspTraceScratchDirectory) {
 							this.removeScratchDirectory(this.lspTraceScratchDirectory);
@@ -8230,14 +8230,19 @@ export class InteractiveMode {
 		} else if (!status.enabled) {
 			info = "LSP is disabled. Run with --lsp or set lsp.enabled=true in settings.";
 		} else if (status.servers.length === 0) {
-			info = `${theme.bold("LSP Servers")}\n\nNo servers running. Servers spawn on first use of a matching file.`;
+			info = `${theme.bold("LSP Servers")}\n\n${theme.fg("dim", "Workspace root:")} ${status.workspaceRoot}\nNo servers running. Servers spawn on first use of a matching file.`;
 		} else {
 			info = `${theme.bold("LSP Servers")}\n`;
 			for (const server of status.servers) {
-				info += `\n${theme.bold(server.name)} ${server.alive ? theme.fg("success", "running") : theme.fg("error", "dead")}\n`;
-				info += `${theme.fg("dim", "Root:")} ${server.root}\n`;
+				info += `\n${theme.bold(server.name)} ${server.alive ? theme.fg("success", "running") : theme.fg("error", "failed")}\n`;
+				info += `${theme.fg("dim", "Workspace root:")} ${server.workspaceRoot}\n`;
+				info += `${theme.fg("dim", "Server root:")} ${server.root}\n`;
+				info += `${theme.fg("dim", "Executable:")} ${server.resolvedExecutable ?? `unresolved: ${server.unresolvedCommand}`}\n`;
+				info += `${theme.fg("dim", "Launch source:")} ${server.launchSource}\n`;
+				info += `${theme.fg("dim", "Start attempts:")} ${server.attempts}\n`;
 				info += `${theme.fg("dim", "Open documents:")} ${server.openDocuments}\n`;
 				info += `${theme.fg("dim", "Idle:")} ${formatIdle(server.idleMs)}\n`;
+				if (server.lastError) info += `${theme.fg("error", server.lastError)}\n`;
 			}
 			if (status.traceFile) {
 				info += `\n${theme.fg("dim", "Trace:")} ${status.traceFile}\n`;

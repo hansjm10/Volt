@@ -727,6 +727,47 @@ describe("LSP WorkspaceEdit integration", () => {
 		}
 	});
 
+	it("bounds WorkspaceEdits to projectCwd rather than a nested server root", async () => {
+		const projectRoot = await createTempDir();
+		const serverRoot = join(projectRoot, "package");
+		await mkdir(serverRoot);
+		await writeFile(join(serverRoot, ".root"), "", "utf-8");
+		const manager = new LspManager({
+			cwd: serverRoot,
+			projectCwd: projectRoot,
+			config: resolveLspConfig({
+				servers: {
+					typescript: { enabled: false },
+					python: { enabled: false },
+					go: { enabled: false },
+					rust: { enabled: false },
+					fake: {
+						command: [process.execPath, FAKE_SERVER],
+						fileExtensions: [".foo"],
+						rootMarkers: [".root"],
+					},
+				},
+			}),
+		});
+		try {
+			const source = join(serverRoot, "source.foo");
+			const sibling = join(projectRoot, "sibling.foo");
+			await writeFile(source, `OUTSIDE_EDIT ${uri(sibling)}\n`, "utf-8");
+			await writeFile(sibling, "SECRET\n", "utf-8");
+
+			const result = await manager.codeFix(source, { line: 1 });
+
+			expect(result).toContain('Applied "Edit outside workspace"');
+			expect(await readFile(sibling, "utf-8")).toBe("PWNED\n");
+			expect(manager.getStatus()[0]).toMatchObject({
+				workspaceRoot: projectRoot,
+				root: serverRoot,
+			});
+		} finally {
+			manager.dispose();
+		}
+	});
+
 	it("advances sequential command edits, rejects stale ones, and isolates concurrent summaries", async () => {
 		const root = await createTempDir();
 		const manager = new LspManager({
