@@ -112,6 +112,15 @@ describe("PlanInspectorComponent", () => {
 				substeps: [{ id: "completed-child", text: "Hidden completed child", status: "completed" }],
 			},
 			{
+				id: "group-partial",
+				text: "Earlier partial outcome",
+				status: "in_progress",
+				substeps: [
+					{ id: "partial-complete", text: "Hidden partial completed child", status: "completed" },
+					{ id: "partial-pending", text: "Hidden partial pending child", status: "pending" },
+				],
+			},
+			{
 				id: "group-active",
 				text: "Active outcome",
 				status: "in_progress",
@@ -125,6 +134,8 @@ describe("PlanInspectorComponent", () => {
 		const executing = text(inspector);
 		expect(executing).toContain("Completed outcome");
 		expect(executing).not.toContain("Hidden completed child");
+		expect(executing).not.toContain("Hidden partial completed child");
+		expect(executing).not.toContain("Hidden partial pending child");
 		expect(executing).toContain("Visible active child");
 		expect(executing).toContain("Visible pending child");
 
@@ -134,6 +145,7 @@ describe("PlanInspectorComponent", () => {
 		inspector.setPlanning(state);
 		const ready = text(inspector);
 		expect(ready).toContain("Hidden completed child");
+		expect(ready).toContain("Hidden partial pending child");
 		expect(ready).toContain("Visible active child");
 	});
 

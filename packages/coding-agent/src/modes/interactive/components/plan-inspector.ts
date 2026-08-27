@@ -306,8 +306,8 @@ export class PlanInspectorComponent implements Component, Focusable {
 		}
 		const currentGroup =
 			plan.phase === "active"
-				? (plan.steps.find((step) => step.status === "in_progress") ??
-					plan.steps.find((step) => step.status === "pending"))
+				? (plan.steps.find((step) => (step.substeps ?? [step]).some((item) => item.status === "in_progress")) ??
+					plan.steps.find((step) => (step.substeps ?? [step]).some((item) => item.status === "pending")))
 				: undefined;
 		for (const [index, step] of plan.steps.entries()) {
 			const marker = theme.fg(stepColor(step.status), stepMarker(step.status));
