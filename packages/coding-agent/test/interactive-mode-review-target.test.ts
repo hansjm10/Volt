@@ -59,7 +59,7 @@ describe("InteractiveMode review target selection", () => {
 			"Current PR #42 — Fix selector behavior",
 			"Against base branch",
 			"Uncommitted changes",
-			"GitHub pull request",
+			"Pull request",
 			"Specific commit",
 		]);
 	});
@@ -75,7 +75,7 @@ describe("InteractiveMode review target selection", () => {
 		expect(context.showExtensionSelector).toHaveBeenCalledWith("Review what?", [
 			"Against base branch",
 			"Uncommitted changes",
-			"GitHub pull request",
+			"Pull request",
 			"Specific commit",
 		]);
 	});

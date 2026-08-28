@@ -8674,7 +8674,7 @@ export class InteractiveMode {
 	private async promptForReviewTarget(): Promise<ReviewTarget | undefined> {
 		const branchLabel = "Against base branch";
 		const uncommittedLabel = "Uncommitted changes";
-		const prLabel = "GitHub pull request";
+		const prLabel = "Pull request";
 		const commitLabel = "Specific commit";
 		const currentPullRequest = await probeCurrentBranchPullRequest(this.sessionManager.getCwd());
 		const currentPullRequestLabel = currentPullRequest
@@ -9198,7 +9198,7 @@ export class InteractiveMode {
 			if (!record) throw new Error(`Unknown durable review run: ${runId}`);
 			const confirmed = await this.showExtensionConfirm(
 				"Publish pull request review",
-				`Publish complete review ${record.runId} to GitHub? The PR head will be rechecked first.`,
+				`Publish complete review ${record.runId} to its code host? The PR head will be rechecked first.`,
 			);
 			if (!confirmed) return { action, status: "cancelled", message: "Review publishing cancelled" };
 			const published = await publishReviewRun(this.sessionManager.getCwd(), record);

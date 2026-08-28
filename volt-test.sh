@@ -54,6 +54,11 @@ if [[ "$NO_ENV" == "true" ]]; then
   echo "Running without API keys..."
 fi
 
+# Source-development reviews retain private model limitations and failed tool diagnostics.
+if [[ -z "${VOLT_REVIEW_PRIVATE_DIAGNOSTICS+x}" ]]; then
+  export VOLT_REVIEW_PRIVATE_DIAGNOSTICS=1
+fi
+
 NODE_BIN="node"
 if ! command -v "$NODE_BIN" >/dev/null 2>&1; then
   if command -v node.exe >/dev/null 2>&1; then

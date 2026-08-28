@@ -172,6 +172,7 @@ function prSnapshot(
 		...value.identity,
 		kind: "pr",
 		pullRequest: {
+			providerId: "github",
 			number: 7,
 			title: "Context",
 			body: "Bounded identity body",
@@ -183,7 +184,7 @@ function prSnapshot(
 		},
 	};
 	delete value.branchBase;
-	value.githubContext = {
+	value.codeHostContext = {
 		manifest: {
 			status: "complete",
 			capturedAt: "2026-01-01T00:00:00Z",
@@ -434,7 +435,7 @@ describe("durable review state", () => {
 			planIncrementalReview(manager, prSnapshot("blob-context", "2".repeat(64), "changed"), controls),
 		).toMatchObject({
 			mode: "full",
-			fallbackReason: "The pull request GitHub context changed since the prior review.",
+			fallbackReason: "The pull request code-host context changed since the prior review.",
 		});
 	});
 

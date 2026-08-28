@@ -51,7 +51,7 @@ describe("review snapshot tools", () => {
 		});
 		if ("error" in resolved) throw new Error(resolved.error);
 		if (withContext) {
-			resolved.githubContext = {
+			resolved.codeHostContext = {
 				manifest: {
 					status: "complete",
 					capturedAt: "2026-01-01T00:00:00Z",
