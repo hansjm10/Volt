@@ -69,11 +69,13 @@ function windowsExecutableCandidates(path: string, pathExt: string | undefined):
 		.split(";")
 		.map((extension) => extension.trim())
 		.map((extension) => (extension === "" || extension.startsWith(".") ? extension : `.${extension}`));
-	const lowerPath = path.toLowerCase();
-	if (extensions.some((extension) => extension !== "" && lowerPath.endsWith(extension.toLowerCase()))) {
-		return [path];
+	const pathExtCandidates = extensions.map((extension) => `${path}${extension}`);
+	if (win32.extname(path) === "") {
+		return pathExtCandidates;
 	}
-	return extensions.map((extension) => `${path}${extension}`);
+
+	const lowerPath = path.toLowerCase();
+	return [path, ...pathExtCandidates.filter((candidate) => candidate.toLowerCase() !== lowerPath)];
 }
 
 function executableCandidates(path: string, platform: NodeJS.Platform, environment: NodeJS.ProcessEnv): string[] {

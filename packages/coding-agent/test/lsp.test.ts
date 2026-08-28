@@ -401,6 +401,23 @@ describe("resolveLspLaunch", () => {
 		expect(relative.resolvedExecutable).toBe("C:\\workspace\\project\\tools\\server.EXE");
 	});
 
+	it("does not treat dots in Windows directory names as executable extensions", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch(["C:\\tools.v1\\server"], {
+			projectCwd: "C:\\workspace\\project",
+			environment: { PATH: "", PATHEXT: ".CMD;.EXE" },
+			platform: "win32",
+			probeExecutable: (path) => {
+				probes.push(path);
+				if (path === "C:\\tools.v1\\server") return "executable";
+				return path === "C:\\tools.v1\\server.EXE" ? "executable" : "missing";
+			},
+		});
+
+		expect(probes).toEqual(["C:\\tools.v1\\server.CMD", "C:\\tools.v1\\server.EXE"]);
+		expect(launch.resolvedExecutable).toBe("C:\\tools.v1\\server.EXE");
+	});
+
 	it("probes an explicitly suffixed Windows command directly without appending PATHEXT", () => {
 		const probes: string[] = [];
 		const launch = resolveLspLaunch(["server.cmd"], {
@@ -415,6 +432,88 @@ describe("resolveLspLaunch", () => {
 
 		expect(probes).toEqual(["C:\\tools\\server.cmd"]);
 		expect(launch.resolvedExecutable).toBe("C:\\tools\\server.cmd");
+	});
+
+	it.each([
+		{
+			label: "absolute",
+			command: "C:\\tools\\server.exe",
+			expected: "C:\\tools\\server.exe",
+			source: "absolute" as const,
+		},
+		{
+			label: "project-relative",
+			command: ".\\tools\\server.exe",
+			expected: "C:\\workspace\\project\\tools\\server.exe",
+			source: "project-relative" as const,
+		},
+		{
+			label: "bare PATH",
+			command: "server.exe",
+			expected: "C:\\bin\\server.exe",
+			source: "path" as const,
+		},
+		{
+			label: "UNC absolute",
+			command: "\\\\host\\share\\server.exe",
+			expected: "\\\\host\\share\\server.exe",
+			source: "absolute" as const,
+		},
+	])("probes an explicitly named $label Windows executable before PATHEXT", ({ command, expected, source }) => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch([command, "--stdio"], {
+			projectCwd: "C:\\workspace\\project",
+			environment: { PATH: "C:\\bin", PATHEXT: ".CMD" },
+			platform: "win32",
+			probeExecutable: (path) => {
+				probes.push(path);
+				return path.toLowerCase() === expected.toLowerCase() ? "executable" : "missing";
+			},
+		});
+
+		expect(probes).toEqual([expected]);
+		expect(launch).toMatchObject({
+			command: [expected, "--stdio"],
+			resolvedExecutable: expected,
+			source,
+		});
+	});
+
+	it("falls back through PATHEXT without reprobing a missing explicitly named Windows executable", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch(["C:\\tools\\server.exe"], {
+			projectCwd: "C:\\workspace\\project",
+			environment: { PATH: "", PATHEXT: ".CMD;;.BAT" },
+			platform: "win32",
+			probeExecutable: (path) => {
+				probes.push(path);
+				return path === "C:\\tools\\server.exe.BAT" ? "executable" : "missing";
+			},
+		});
+
+		expect(probes).toEqual(["C:\\tools\\server.exe", "C:\\tools\\server.exe.CMD", "C:\\tools\\server.exe.BAT"]);
+		expect(launch.resolvedExecutable).toBe("C:\\tools\\server.exe.BAT");
+	});
+
+	it("retains an unusable explicitly named Windows executable after PATHEXT fallbacks are missing", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch([".\\tools\\server.exe"], {
+			projectCwd: "C:\\workspace\\project",
+			environment: { PATH: "", PATHEXT: ".CMD;.BAT" },
+			platform: "win32",
+			probeExecutable: (path) => {
+				probes.push(path);
+				return path === "C:\\workspace\\project\\tools\\server.exe" ? "unusable" : "missing";
+			},
+		});
+
+		expect(probes).toEqual([
+			"C:\\workspace\\project\\tools\\server.exe",
+			"C:\\workspace\\project\\tools\\server.exe.CMD",
+			"C:\\workspace\\project\\tools\\server.exe.BAT",
+		]);
+		expect(launch.resolvedExecutable).toBeUndefined();
+		expect(launch.unusableExecutable).toBe("C:\\workspace\\project\\tools\\server.exe");
 	});
 
 	it("honors an explicit extensionless entry within PATHEXT order", () => {
@@ -465,6 +564,23 @@ describe("LspManager", () => {
 		manager = undefined;
 		if (tempDir) {
 			await removeTempDir(tempDir);
+		}
+	});
+
+	it("starts an explicitly named Windows executable whose extension is absent from PATHEXT", async () => {
+		if (process.platform !== "win32") return;
+		const previousPathExt = process.env.PATHEXT;
+		process.env.PATHEXT = ".CMD";
+		try {
+			const manager = setup();
+			const filePath = join(tempDir, "test.foo");
+			writeFileSync(filePath, "class FakeClass\n");
+
+			expect(await manager.documentSymbols(filePath)).toContain("FakeClass");
+			expect(manager.getStatus()[0].resolvedExecutable?.toLowerCase()).toBe(process.execPath.toLowerCase());
+		} finally {
+			if (previousPathExt === undefined) delete process.env.PATHEXT;
+			else process.env.PATHEXT = previousPathExt;
 		}
 	});
 
