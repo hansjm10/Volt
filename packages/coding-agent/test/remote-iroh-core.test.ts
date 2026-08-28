@@ -2019,6 +2019,13 @@ describe("Iroh remote core helpers", () => {
 			workspace: { name: "alpha", path: "/alpha" },
 		});
 
+		const authorized = await hostEngine.authorizeHello(makeHello("alpha"), "client-node");
+		if (!authorized.ok) {
+			throw new Error(authorized.error);
+		}
+		expect(authorized.workspaceNames).toEqual(["alpha"]);
+		expect(authorized.workspaces).toEqual([{ name: "alpha", status: "available" }]);
+
 		await expect(hostEngine.authorizeHello(makeHello("beta"), "client-node")).resolves.toEqual({
 			ok: false,
 			client: expect.objectContaining({
@@ -2032,7 +2039,7 @@ describe("Iroh remote core helpers", () => {
 			workspace: { name: "beta", path: "/beta" },
 		});
 		expect((await stateManager.getState()).clients).toEqual([
-			expect.objectContaining({ nodeId: "client-node", allowedWorkspaces: ["alpha"], lastSeenAt: 20 }),
+			expect.objectContaining({ nodeId: "client-node", allowedWorkspaces: ["alpha"], lastSeenAt: 200 }),
 		]);
 	});
 
@@ -2749,11 +2756,8 @@ describe("Iroh remote core helpers", () => {
 		if (!authorized.ok) {
 			throw new Error(authorized.error);
 		}
-		expect(authorized.workspaceNames).toEqual(["volt", "other-project"]);
-		expect(authorized.workspaces).toEqual([
-			{ name: "volt", status: "available" },
-			{ name: "other-project", status: "available" },
-		]);
+		expect(authorized.workspaceNames).toEqual(["volt"]);
+		expect(authorized.workspaces).toEqual([{ name: "volt", status: "available" }]);
 		authorized.client.allowedWorkspaces.push("mutated");
 		authorized.workspace.path = "/mutated-workspace";
 		authorized.workspaceNames.push("mutated");
@@ -2792,7 +2796,17 @@ describe("Iroh remote core helpers", () => {
 						{ name: "missing", path: missingPath },
 						{ name: "unavailable", path: unavailablePath },
 					],
-					clients: [],
+					clients: [
+						{
+							nodeId: "client-node",
+							label: "phone",
+							allowedWorkspaces: ["available", "missing"],
+							allowedTools: "read",
+							rpcGrant: CODING_RPC_GRANT,
+							pairedAt: 1,
+							lastSeenAt: 2,
+						},
+					],
 				},
 			});
 			const authorized = await stateManager.authorizeClient(makeHello("available", "secret"), "client-node", {
@@ -2809,7 +2823,6 @@ describe("Iroh remote core helpers", () => {
 			expect(authorized.workspaces).toEqual([
 				{ name: "available", status: "available" },
 				{ name: "missing", status: "missing" },
-				{ name: "unavailable", status: "unavailable" },
 			]);
 			const metadata = createIrohRemoteHostMetadata({
 				authorization: authorized,
@@ -3135,7 +3148,7 @@ describe("Iroh remote core helpers", () => {
 						{
 							nodeId: "client-node",
 							label: "phone",
-							allowedWorkspaces: [],
+							allowedWorkspaces: ["alpha", "beta"],
 							allowedTools: "read",
 							rpcGrant: CODING_RPC_GRANT,
 							pairedAt: 1,
@@ -3180,6 +3193,7 @@ describe("Iroh remote core helpers", () => {
 				{ id: "remove-beta", type: "unregister_workspace", workspaceName: "beta" },
 				{
 					classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
+					client: { allowedWorkspaces: ["alpha", "beta"] },
 					stateManager,
 				},
 			);
@@ -3188,10 +3202,7 @@ describe("Iroh remote core helpers", () => {
 				handled: true,
 				metadata: {
 					workspaceNames: ["alpha"],
-					workspaces: [
-						{ name: "alpha", status: "available" },
-						{ name: "missing", status: "missing" },
-					],
+					workspaces: [{ name: "alpha", status: "available" }],
 				},
 				response: {
 					id: "remove-beta",
@@ -3201,10 +3212,7 @@ describe("Iroh remote core helpers", () => {
 					data: {
 						removedWorkspace: "beta",
 						workspaceNames: ["alpha"],
-						workspaces: [
-							{ name: "alpha", status: "available" },
-							{ name: "missing", status: "missing" },
-						],
+						workspaces: [{ name: "alpha", status: "available" }],
 					},
 				},
 			});
@@ -3232,7 +3240,7 @@ describe("Iroh remote core helpers", () => {
 		await expect(
 			handleIrohRemoteWorkspaceUnregisterRpcCommand(
 				{ id: "remove-missing", type: "unregister_workspace", workspaceName: "missing" },
-				{ stateManager },
+				{ client: { allowedWorkspaces: [] }, stateManager },
 			),
 		).resolves.toEqual({
 			handled: true,
@@ -3248,7 +3256,7 @@ describe("Iroh remote core helpers", () => {
 		await expect(
 			handleIrohRemoteWorkspaceUnregisterRpcCommand(
 				{ id: "remove-path", type: "unregister_workspace", workspaceName: "alpha", path: "/alpha" },
-				{ stateManager },
+				{ client: { allowedWorkspaces: [] }, stateManager },
 			),
 		).resolves.toEqual({
 			handled: true,

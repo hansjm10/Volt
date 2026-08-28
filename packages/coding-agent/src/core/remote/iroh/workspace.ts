@@ -2,13 +2,18 @@ import { stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { isIrohRemoteWorkspaceName } from "./handshake.ts";
 import { normalizeIrohRemoteAllowTools } from "./protocol.ts";
-import type { IrohRemoteHostState, IrohRemoteWorkspace } from "./state.ts";
+import type { IrohRemoteClient, IrohRemoteHostState, IrohRemoteWorkspace } from "./state.ts";
 
 export type IrohRemoteWorkspaceAvailabilityStatus = "available" | "missing" | "unavailable";
 
 export interface IrohRemoteWorkspaceStatus {
 	name: string;
 	status: IrohRemoteWorkspaceAvailabilityStatus;
+}
+
+export interface IrohRemoteWorkspaceMetadataSnapshot {
+	workspaceNames: string[];
+	workspaces: IrohRemoteWorkspaceStatus[];
 }
 
 export type IrohRemoteWorkspaceAvailabilityClassifier = (
@@ -125,6 +130,21 @@ export async function getIrohRemoteWorkspaceStatuses(
 
 export function getAvailableIrohRemoteWorkspaceNames(workspaces: readonly IrohRemoteWorkspaceStatus[]): string[] {
 	return workspaces.filter((entry) => entry.status === "available").map((entry) => entry.name);
+}
+
+/** Scope host workspace metadata to the catalog visible to one paired client. */
+export function createAuthorizedIrohRemoteWorkspaceMetadata(
+	workspaces: readonly IrohRemoteWorkspaceStatus[],
+	client: Pick<IrohRemoteClient, "allowedWorkspaces">,
+): IrohRemoteWorkspaceMetadataSnapshot {
+	const allowedWorkspaceNames = client.allowedWorkspaces.length === 0 ? undefined : new Set(client.allowedWorkspaces);
+	const authorizedWorkspaces = workspaces
+		.filter((workspace) => allowedWorkspaceNames === undefined || allowedWorkspaceNames.has(workspace.name))
+		.map((workspace) => ({ ...workspace }));
+	return {
+		workspaceNames: getAvailableIrohRemoteWorkspaceNames(authorizedWorkspaces),
+		workspaces: authorizedWorkspaces,
+	};
 }
 
 async function getIrohRemoteWorkspaceStatus(

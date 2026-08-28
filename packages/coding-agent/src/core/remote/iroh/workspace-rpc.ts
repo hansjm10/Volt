@@ -1,21 +1,17 @@
 import { createIrohRemoteRpcErrorResponse, type IrohRemoteRpcErrorResponse } from "./rpc-command-filter.ts";
+import type { IrohRemoteClient } from "./state.ts";
 import {
 	IROH_REMOTE_WORKSPACE_HAS_WORKTREES_ERROR,
 	type IrohRemoteHostStateManager,
 	isIrohRemoteWorkspaceHasWorktreesError,
 } from "./state-manager.ts";
 import {
-	getAvailableIrohRemoteWorkspaceNames,
+	createAuthorizedIrohRemoteWorkspaceMetadata,
 	type IrohRemoteWorkspaceAvailabilityClassifier,
-	type IrohRemoteWorkspaceStatus,
+	type IrohRemoteWorkspaceMetadataSnapshot,
 } from "./workspace.ts";
 
 export const IROH_REMOTE_UNREGISTER_WORKSPACE_RPC_TYPE = "unregister_workspace";
-
-export interface IrohRemoteWorkspaceMetadataSnapshot {
-	workspaceNames: string[];
-	workspaces: IrohRemoteWorkspaceStatus[];
-}
 
 export interface IrohRemoteWorkspaceUnregisterRpcData extends IrohRemoteWorkspaceMetadataSnapshot {
 	removedWorkspace: string;
@@ -41,6 +37,7 @@ export type IrohRemoteWorkspaceUnregisterRpcResult =
 
 export interface HandleIrohRemoteWorkspaceUnregisterRpcCommandOptions {
 	classifyWorkspaceAvailability?: IrohRemoteWorkspaceAvailabilityClassifier;
+	client: Pick<IrohRemoteClient, "allowedWorkspaces">;
 	stateManager: IrohRemoteHostStateManager;
 }
 
@@ -91,10 +88,7 @@ export async function handleIrohRemoteWorkspaceUnregisterRpcCommand(
 	const workspaces = await options.stateManager.listWorkspaceStatuses({
 		classifyWorkspaceAvailability: options.classifyWorkspaceAvailability,
 	});
-	const metadata: IrohRemoteWorkspaceMetadataSnapshot = {
-		workspaceNames: getAvailableIrohRemoteWorkspaceNames(workspaces),
-		workspaces,
-	};
+	const metadata = createAuthorizedIrohRemoteWorkspaceMetadata(workspaces, options.client);
 	return {
 		handled: true,
 		metadata,

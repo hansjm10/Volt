@@ -63,7 +63,10 @@ import {
 	type IrohRemoteHostStateManager,
 	isIrohRemoteWorkspaceHasWorktreesError,
 } from "../core/remote/iroh/state-manager.ts";
-import { getIrohRemoteWorkspaceAvailabilityStatus } from "../core/remote/iroh/workspace.ts";
+import {
+	getIrohRemoteWorkspaceAvailabilityStatus,
+	type IrohRemoteWorkspaceMetadataSnapshot,
+} from "../core/remote/iroh/workspace.ts";
 import type { IrohRemoteWorktreeRpcBackend } from "../core/remote/iroh/worktree-rpc.ts";
 import type { IrohBiStreamLike } from "../core/rpc/iroh-transport.ts";
 import { getDefaultSessionDir } from "../core/session-manager.ts";
@@ -3412,6 +3415,8 @@ class IrohDaemonService {
 					rpcGrant: authorization.client.rpcGrant,
 					workspaceName,
 					workspacePath: authorization.workspace.path,
+					workspaceNames: [...authorization.workspaceNames],
+					workspaces: authorization.workspaces.map((workspace) => ({ ...workspace })),
 					...(boundWorktree === undefined
 						? {}
 						: {
@@ -5133,7 +5138,7 @@ class IrohDaemonService {
 		| {
 				ok: true;
 				response: Record<string, unknown>;
-				workspaceMetadata?: { workspaceNames: string[]; workspaces: Array<{ name: string; status: string }> };
+				workspaceMetadata?: IrohRemoteWorkspaceMetadataSnapshot;
 		  }
 		| { ok: false; code: string; message: string }
 	> {
@@ -5172,6 +5177,7 @@ class IrohDaemonService {
 		if (!workspace) {
 			return { ok: false, code: "not_found", message: `no registered workspace named ${request.workspaceName}` };
 		}
+		const relayWorkspaceMetadata = relayAuthorization.relay.preamble.authorization;
 		const authorization: IrohRemoteClientAuthorizationSuccess = {
 			ok: true,
 			allowTools: normalizeIrohRemoteAllowTools(client.allowedTools),
@@ -5179,8 +5185,8 @@ class IrohDaemonService {
 			paired: true,
 			pairingSecretConsumed: false,
 			workspace,
-			workspaceNames: [workspace.name],
-			workspaces: [{ name: workspace.name, status: "available" }],
+			workspaceNames: [...relayWorkspaceMetadata.workspaceNames],
+			workspaces: relayWorkspaceMetadata.workspaces.map((entry) => ({ ...entry })),
 		};
 		const responseId = getRpcResponseId(command);
 		if (command.type === "set_keep_awake" || command.type === "get_keep_awake") {

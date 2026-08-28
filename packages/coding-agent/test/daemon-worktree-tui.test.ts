@@ -499,6 +499,8 @@ describe("relay sanitization root switching (§5.2.3)", () => {
 		clientNodeId: "n-1",
 		workspaceName: "repo",
 		workspacePath: HOST_PARENT_PATH,
+		workspaceNames: ["repo"],
+		workspaces: [{ name: "repo", status: "available" }],
 		allowedTools: "read",
 		rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
 	} satisfies RelayPreamble["authorization"];

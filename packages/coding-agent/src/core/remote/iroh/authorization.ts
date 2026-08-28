@@ -20,7 +20,11 @@ import type {
 	IrohRemoteRevokedClient,
 	IrohRemoteWorkspace,
 } from "./state.ts";
-import type { IrohRemoteWorkspaceAvailabilityClassifier, IrohRemoteWorkspaceStatus } from "./workspace.ts";
+import {
+	createAuthorizedIrohRemoteWorkspaceMetadata,
+	type IrohRemoteWorkspaceAvailabilityClassifier,
+	type IrohRemoteWorkspaceStatus,
+} from "./workspace.ts";
 
 export const DEFAULT_IROH_REMOTE_PAIRING_SECRET_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -92,8 +96,7 @@ export function authorizeIrohRemoteClient(
 		state.workspaces.find((entry) => entry.name === hello.workspace) ??
 		(options.workspace?.name === hello.workspace ? options.workspace : undefined);
 	const workspaceName = registeredWorkspace?.name ?? options.workspace?.name ?? hello.workspace;
-	const workspaces = getIrohRemoteWorkspaceStatuses(state, options.workspaceStatuses);
-	const workspaceNames = workspaces.filter((entry) => entry.status === "available").map((entry) => entry.name);
+	const workspaceCatalog = getIrohRemoteWorkspaceStatuses(state, options.workspaceStatuses);
 	const now = options.now ?? Date.now();
 	const revokedClient = findIrohRemoteRevokedClient(state, remoteNodeId);
 	const existingClient = revokedClient ? undefined : findIrohRemoteClient(state, remoteNodeId);
@@ -196,7 +199,7 @@ export function authorizeIrohRemoteClient(
 	}
 
 	if (!workspace) {
-		const workspaceStatus = workspaces.find((entry) => entry.name === hello.workspace)?.status;
+		const workspaceStatus = workspaceCatalog.find((entry) => entry.name === hello.workspace)?.status;
 		if (workspaceStatus === "missing") {
 			return {
 				ok: false,
@@ -350,8 +353,7 @@ export function authorizeIrohRemoteClient(
 			pairingSecretConsumed: true,
 			workspace,
 			...getWorkspaceGenerationProperty(state, workspace.name),
-			workspaceNames,
-			workspaces,
+			...createAuthorizedIrohRemoteWorkspaceMetadata(workspaceCatalog, client),
 		};
 	}
 
@@ -371,8 +373,7 @@ export function authorizeIrohRemoteClient(
 		pairingSecretConsumed: false,
 		workspace,
 		...getWorkspaceGenerationProperty(state, workspace.name),
-		workspaceNames,
-		workspaces,
+		...createAuthorizedIrohRemoteWorkspaceMetadata(workspaceCatalog, existingClient),
 	};
 }
 

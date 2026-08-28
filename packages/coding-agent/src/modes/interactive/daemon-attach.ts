@@ -1,10 +1,13 @@
 import { basename, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { VERSION } from "../../config.ts";
+import { parseIrohRemoteRpcGrant } from "../../core/remote/iroh/access-grant.ts";
+import type { IrohRemoteClientAuthorizationSuccess } from "../../core/remote/iroh/authorization.ts";
 import type {
 	IrohRemotePushNotificationDeliveryStatus,
 	IrohRemotePushNotificationIntent,
 } from "../../core/remote/iroh/push.ts";
+import type { IrohRemoteWorkspaceMetadataSnapshot } from "../../core/remote/iroh/workspace.ts";
 import { createDaemonClient, type DaemonClient } from "../../daemon/control-client.ts";
 import {
 	CONTROL_RPC_GRANTS_CAPABILITY,
@@ -55,7 +58,7 @@ export interface RelayRpcForwardResult {
 	/** verbatim RPC response object to forward to the phone */
 	response: Record<string, unknown>;
 	/** refreshed workspace metadata after a successful unregister_workspace */
-	workspaceMetadata?: { workspaceNames: string[]; workspaces: Array<{ name: string; status: string }> };
+	workspaceMetadata?: IrohRemoteWorkspaceMetadataSnapshot;
 }
 
 export interface RelayWorkspaceUnregisterRetirement {
@@ -208,6 +211,31 @@ export async function resolveDaemonWorkspaceForCwd(
 		return { name: candidate, path: resolvedCwd };
 	}
 	return undefined;
+}
+
+/** Rehydrate the daemon-authorized relay snapshot without recomputing its workspace scope in the TUI. */
+export function createTuiRelayAuthorization(
+	authorization: RelayPreamble["authorization"],
+): IrohRemoteClientAuthorizationSuccess {
+	const rpcGrant = parseIrohRemoteRpcGrant(authorization.rpcGrant, "relay rpcGrant");
+	return {
+		ok: true,
+		allowTools: authorization.allowedTools,
+		client: {
+			nodeId: authorization.clientNodeId,
+			label: authorization.clientNodeId,
+			allowedWorkspaces: authorization.workspaces.map((workspace) => workspace.name),
+			allowedTools: authorization.allowedTools,
+			rpcGrant,
+			pairedAt: 0,
+			lastSeenAt: 0,
+		},
+		paired: true,
+		pairingSecretConsumed: false,
+		workspace: { name: authorization.workspaceName, path: authorization.workspacePath },
+		workspaceNames: [...authorization.workspaceNames],
+		workspaces: authorization.workspaces.map((workspace) => ({ ...workspace })),
+	};
 }
 
 /**
