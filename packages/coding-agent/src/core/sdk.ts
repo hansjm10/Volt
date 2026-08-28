@@ -248,7 +248,8 @@ function getDefaultAgentDir(): string {
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
-	const projectCwd = canonicalizePath(resolvePath(options.projectCwd ?? cwd));
+	const lexicalProjectCwd = resolvePath(options.projectCwd ?? cwd);
+	const projectCwd = canonicalizePath(lexicalProjectCwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
@@ -506,7 +507,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		settingsManager,
 		gitContextProvider,
 		cwd,
-		projectCwd,
+		projectCwd: lexicalProjectCwd,
 		agentDir,
 		scopedModels: options.scopedModels,
 		resourceLoader,

@@ -69,7 +69,7 @@ import {
 import { getAgentDir } from "../config.ts";
 import { writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
-import { canonicalizePath, resolvePath } from "../utils/paths.ts";
+import { resolvePath } from "../utils/paths.ts";
 import { PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../utils/private-files.ts";
 import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
@@ -679,7 +679,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition<any, any>[];
 	private _baseToolDefinitions: Map<string, ToolDefinition<any, any>> = new Map();
 	private _cwd: string;
-	private _projectCwd: string;
+	private _lexicalProjectCwd: string;
 	private _agentDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -775,7 +775,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = resolvePath(config.cwd);
-		this._projectCwd = canonicalizePath(resolvePath(config.projectCwd ?? this._cwd));
+		this._lexicalProjectCwd = resolvePath(config.projectCwd ?? this._cwd);
 		this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
 		this._modelRegistry = config.modelRegistry;
 		const restoredContext = this.sessionManager.buildSessionContext();
@@ -6257,7 +6257,7 @@ export class AgentSession {
 		if (lspConfig.enabled) {
 			this._lspManager = new LspManager({
 				cwd: this._cwd,
-				projectCwd: this._projectCwd,
+				projectCwd: this._lexicalProjectCwd,
 				config: lspConfig,
 				hostInteraction: this._hostInteraction,
 			});

@@ -96,7 +96,6 @@ const MAX_SYMBOL_LINES = 200;
 const MAX_CROSS_FILE_REPORTS = 5;
 const LSP_INSTALL_REQUEST_TIMEOUT_MS = 10 * 60_000;
 const MAX_INSTALL_OUTPUT_CHARS = 12000;
-const PROCESS_INSTALL_ATTEMPTS = new Map<string, Promise<LspInstallAttemptResult>>();
 
 function uriToPath(uri: string): string {
 	try {
@@ -470,6 +469,8 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	private hostInteraction: HostInteraction | undefined;
 	private installRunner: LspInstallRunner;
 	private installPromptsUsed = new Set<string>();
+	private installAttempts = new Map<string, Promise<LspInstallAttemptResult>>();
+	private installAbortController = new AbortController();
 	private disposed = false;
 	private commandQueues = new Map<LspClient, Promise<void>>();
 	private commandApplyContexts = new Map<
@@ -770,6 +771,8 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 
 	dispose(): void {
 		this.disposed = true;
+		this.installAbortController.abort();
+		this.installAttempts.clear();
 		if (this.idleTimer) {
 			clearInterval(this.idleTimer);
 			this.idleTimer = undefined;
@@ -1523,19 +1526,50 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	): Promise<LspInstallAttemptResult> {
 		const interaction = this.hostInteraction;
 		const identity = installRecipeIdentity(recipe);
-		const existing = PROCESS_INSTALL_ATTEMPTS.get(identity);
+		const existing = this.installAttempts.get(identity);
 		if (existing) {
-			return existing.catch((error: unknown) => this.createInstallAttemptFailure(error));
+			return this.waitForInstallAttempt(existing, signal);
 		}
 		if (!interaction || this.installPromptsUsed.has(identity)) {
 			return { retry: false };
 		}
 
-		const attempt = this.runInstallPrompt(server, recipe, identity, interaction, signal).finally(() => {
-			if (PROCESS_INSTALL_ATTEMPTS.get(identity) === attempt) PROCESS_INSTALL_ATTEMPTS.delete(identity);
+		const attempt = this.runInstallPrompt(
+			server,
+			recipe,
+			identity,
+			interaction,
+			this.installAbortController.signal,
+		).finally(() => {
+			if (this.installAttempts.get(identity) === attempt) this.installAttempts.delete(identity);
 		});
-		PROCESS_INSTALL_ATTEMPTS.set(identity, attempt);
-		return attempt.catch((error: unknown) => this.createInstallAttemptFailure(error));
+		this.installAttempts.set(identity, attempt);
+		return this.waitForInstallAttempt(attempt, signal);
+	}
+
+	private waitForInstallAttempt(
+		attempt: Promise<LspInstallAttemptResult>,
+		signal?: AbortSignal,
+	): Promise<LspInstallAttemptResult> {
+		const guardedAttempt = attempt.catch((error: unknown) => this.createInstallAttemptFailure(error));
+		if (!signal) return guardedAttempt;
+		const cancelled = { retry: false, message: "LSP install cancelled." } as const;
+		if (signal.aborted) return Promise.resolve(cancelled);
+
+		return new Promise((resolveAttempt) => {
+			let settled = false;
+			const finish = (result: LspInstallAttemptResult): void => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				resolveAttempt(result);
+			};
+			function onAbort(): void {
+				finish(cancelled);
+			}
+			signal.addEventListener("abort", onAbort, { once: true });
+			void guardedAttempt.then(finish);
+		});
 	}
 
 	private createInstallAttemptFailure(error: unknown): LspInstallAttemptResult {
