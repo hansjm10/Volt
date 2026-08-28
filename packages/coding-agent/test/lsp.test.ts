@@ -369,13 +369,68 @@ describe("resolveLspLaunch", () => {
 			platform: "win32",
 			probeExecutable: (path) => {
 				probes.push(path);
-				if (path === "C:\\workspace\\project\\tools\\server") return "unusable";
+				if (path === "C:\\workspace\\project\\tools\\server") return "executable";
 				return path === "C:\\workspace\\project\\tools\\server.CMD" ? "executable" : "missing";
 			},
 		});
-		expect(probes).toEqual(["C:\\workspace\\project\\tools\\server", "C:\\workspace\\project\\tools\\server.CMD"]);
+		expect(probes).toEqual(["C:\\workspace\\project\\tools\\server.CMD"]);
 		expect(launch.resolvedExecutable).toBe("C:\\workspace\\project\\tools\\server.CMD");
 		expect(launch.command).toEqual(["C:\\workspace\\project\\tools\\server.CMD", "--stdio"]);
+	});
+
+	it("applies PATHEXT rules to extensionless absolute and project-relative Windows commands", () => {
+		const executablePaths = new Set([
+			"C:\\tools\\server",
+			"C:\\tools\\server.EXE",
+			"C:\\workspace\\project\\tools\\server",
+			"C:\\workspace\\project\\tools\\server.EXE",
+		]);
+		const probeExecutable = (path: string): "executable" | "missing" =>
+			executablePaths.has(path) ? "executable" : "missing";
+		const options = {
+			projectCwd: "C:\\workspace\\project",
+			environment: { PATH: "", PATHEXT: ".CMD;.EXE" },
+			platform: "win32" as const,
+			probeExecutable,
+		};
+
+		const absolute = resolveLspLaunch(["C:\\tools\\server"], options);
+		expect(absolute.resolvedExecutable).toBe("C:\\tools\\server.EXE");
+
+		const relative = resolveLspLaunch([".\\tools\\server"], options);
+		expect(relative.resolvedExecutable).toBe("C:\\workspace\\project\\tools\\server.EXE");
+	});
+
+	it("probes an explicitly suffixed Windows command directly without appending PATHEXT", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch(["server.cmd"], {
+			projectCwd: "C:\\workspace\\project",
+			environment: { PATH: "C:\\tools", PATHEXT: ".CMD;.EXE" },
+			platform: "win32",
+			probeExecutable: (path) => {
+				probes.push(path);
+				return path.toLowerCase() === "c:\\tools\\server.cmd" ? "executable" : "missing";
+			},
+		});
+
+		expect(probes).toEqual(["C:\\tools\\server.cmd"]);
+		expect(launch.resolvedExecutable).toBe("C:\\tools\\server.cmd");
+	});
+
+	it("honors an explicit extensionless entry within PATHEXT order", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch(["server"], {
+			projectCwd: "C:\\workspace\\project",
+			environment: { PATH: "C:\\tools", PATHEXT: ".CMD;;.EXE" },
+			platform: "win32",
+			probeExecutable: (path) => {
+				probes.push(path);
+				return path === "C:\\tools\\server" ? "executable" : "missing";
+			},
+		});
+
+		expect(probes).toEqual(["C:\\tools\\server.CMD", "C:\\tools\\server"]);
+		expect(launch.resolvedExecutable).toBe("C:\\tools\\server");
 	});
 
 	it("retains unresolved launch identity for missing commands", () => {
@@ -898,6 +953,47 @@ describe("LspManager", () => {
 			workspaceRoot: realpathSync(realProjectDir),
 			root: realpathSync(realProjectDir),
 		});
+	});
+
+	it("rejects unregistered external aliases even when they resolve into the project workspace", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const projectDir = join(tempDir, "project");
+		const externalAlias = join(tempDir, "external-alias");
+		mkdirSync(projectDir);
+		writeFileSync(join(projectDir, "test.foo"), "has ERROR\n");
+		try {
+			symlinkSync(projectDir, externalAlias, directorySymlinkType());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+			throw error;
+		}
+		manager = new LspManager({ cwd: projectDir, projectCwd: projectDir, config: fakeServerConfig() });
+
+		expect(await manager.fileDiagnostics(join(externalAlias, "test.foo"))).toContain("outside project workspace");
+	});
+
+	it("accepts case-variant existing and missing paths on case-insensitive macOS filesystems", async () => {
+		if (process.platform !== "darwin") return;
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const projectDir = join(tempDir, "CaseSensitiveSpelling");
+		const caseVariantDir = join(tempDir, "casesensitivespelling");
+		mkdirSync(projectDir);
+		const existingFile = join(projectDir, "existing.foo");
+		writeFileSync(existingFile, "has ERROR\n");
+		try {
+			realpathSync(join(caseVariantDir, "existing.foo"));
+		} catch {
+			// A case-sensitive macOS volume cannot reproduce this platform-specific path spelling.
+			return;
+		}
+		manager = new LspManager({ cwd: projectDir, projectCwd: projectDir, config: fakeServerConfig() });
+
+		expect(await manager.fileDiagnostics(join(caseVariantDir, "existing.foo"))).toContain(
+			"error: found ERROR on line 1",
+		);
+		expect(await manager.getDiagnostics(join(caseVariantDir, "missing.foo"), "has ERROR\n")).toContain(
+			"error: found ERROR on line 1",
+		);
 	});
 
 	it("does not refresh tracked documents through symlinks outside projectCwd", async () => {
@@ -1642,6 +1738,69 @@ describe("LspManager", () => {
 		}
 	});
 
+	it("does not let repeated same-root caller cancellation trip the shared install breaker", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const binDir = join(tempDir, "bin");
+		mkdirSync(binDir);
+		const previousPath = process.env.PATH;
+		process.env.PATH = binDir;
+		const promptStarted = createDeferred<void>();
+		const promptDecision = createDeferred<HostActionDecision>();
+		const installFinished = createDeferred<void>();
+		let requests = 0;
+		let installs = 0;
+		try {
+			manager = new LspManager({
+				cwd: tempDir,
+				config: builtInTypescriptInstallConfig(),
+				hostInteraction: {
+					requestAction: async () => {
+						requests++;
+						promptStarted.resolve();
+						return promptDecision.promise;
+					},
+				},
+				installRunner: async () => {
+					installs++;
+					writeFakeServerExecutable(binDir, "typescript-language-server");
+					installFinished.resolve();
+					return { exitCode: 0, output: "installed\n" };
+				},
+			});
+			const filePath = join(tempDir, "test.foo");
+			const content = "ERROR\n";
+			writeFileSync(filePath, content);
+
+			const cancelledResults: Array<string | undefined> = [];
+			for (let attempt = 0; attempt < 3; attempt++) {
+				const controller = new AbortController();
+				const operation = manager.getDiagnostics(filePath, content, controller.signal);
+				if (attempt === 0) await promptStarted.promise;
+				controller.abort();
+				cancelledResults.push(await operation);
+			}
+			expect(cancelledResults).toEqual([
+				"LSP install cancelled.",
+				"LSP install cancelled.",
+				"LSP install cancelled.",
+			]);
+			expect(manager.getStatus()).toEqual([]);
+
+			const successfulOperation = manager.getDiagnostics(filePath, content);
+			promptDecision.resolve({ decision: "approved" });
+			await installFinished.promise;
+			expect(await successfulOperation).toContain("error: found ERROR on line 1");
+			expect(requests).toBe(1);
+			expect(installs).toBe(1);
+			expect(manager.getStatus()[0].lastError).toBeUndefined();
+		} finally {
+			promptDecision.resolve({ decision: "dismissed" });
+			installFinished.resolve();
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	});
+
 	it("cancels a pending install interaction when its manager is disposed", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
 		const previousPath = process.env.PATH;
@@ -1682,6 +1841,7 @@ describe("LspManager", () => {
 			await operation;
 
 			expect(settledBeforeFallback).toBe(true);
+			expect(manager.getStatus()).toEqual([]);
 		} finally {
 			manualDecision.resolve({ decision: "dismissed" });
 			if (previousPath === undefined) delete process.env.PATH;

@@ -88,6 +88,7 @@ type LspClientErrorResult = { retry: true } | { retry: false; message?: string }
 interface LspInstallAttemptResult {
 	retry: boolean;
 	message?: string;
+	cancelled?: boolean;
 }
 
 const MAX_START_ATTEMPTS = 3;
@@ -512,11 +513,9 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 
 	private async canonicalizeRequestedPath(inputPath: string): Promise<{ path: string } | { error: string }> {
 		const lexicalPath = resolvePath(inputPath, this.cwd);
-		if (!this.lexicalWorkspaceRoots.some((root) => isPathAtOrInside(root, lexicalPath))) {
-			return {
-				error: `Refusing LSP access outside project workspace ${this.projectCwd}: ${lexicalPath}`,
-			};
-		}
+		const lexicallyInside =
+			this.lexicalWorkspaceRoots.some((root) => isPathAtOrInside(root, lexicalPath)) ||
+			this.lexicalWorkspaceRoots.some((root) => isPathAtOrInside(root.toLowerCase(), lexicalPath.toLowerCase()));
 
 		let probe = lexicalPath;
 		const missingSuffix: string[] = [];
@@ -534,7 +533,9 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 				try {
 					if ((await lstat(probe)).isSymbolicLink()) {
 						return {
-							error: `Refusing LSP access through a dangling symlink in project workspace ${this.projectCwd}: ${lexicalPath}`,
+							error: lexicallyInside
+								? `Refusing LSP access through a dangling symlink in project workspace ${this.projectCwd}: ${lexicalPath}`
+								: `Refusing LSP access outside project workspace ${this.projectCwd}: ${lexicalPath}`,
 						};
 					}
 				} catch (lstatError) {
@@ -551,6 +552,11 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 				missingSuffix.unshift(probe.slice(parent.length + (parent.endsWith("/") || parent.endsWith("\\") ? 0 : 1)));
 				probe = parent;
 			}
+		}
+		if (!lexicallyInside) {
+			return {
+				error: `Refusing LSP access outside project workspace ${this.projectCwd}: ${lexicalPath}`,
+			};
 		}
 		if (!isPathAtOrInside(this.projectCwd, canonicalPath)) {
 			return {
@@ -1473,9 +1479,12 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		const recipe = server.installRecipe;
 		const installEligible =
 			error.launch.bare && recipe !== undefined && recipe.binary === error.launch.requestedExecutable;
-		if (!this.disposed && !failure?.reported && installEligible) {
+		const installPending = recipe && this.installAttempts.has(installRecipeIdentity(recipe));
+		if (!this.disposed && installEligible && (!failure?.reported || installPending)) {
 			const installResult = await this.tryInstallMissingServer(server, recipe, signal);
+			if (this.disposed) return { retry: false };
 			if (installResult.retry) return { retry: true };
+			if (installResult.cancelled) return { retry: false, message: installResult.message };
 			return {
 				retry: false,
 				message: this.recordStartFailure(server, error.key, error.message, installResult.message),
@@ -1557,7 +1566,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	): Promise<LspInstallAttemptResult> {
 		const guardedAttempt = attempt.catch((error: unknown) => this.createInstallAttemptFailure(error));
 		if (!signal) return guardedAttempt;
-		const cancelled = { retry: false, message: "LSP install cancelled." } as const;
+		const cancelled = { retry: false, message: "LSP install cancelled.", cancelled: true } as const;
 		if (signal.aborted) return Promise.resolve(cancelled);
 
 		return new Promise((resolveAttempt) => {

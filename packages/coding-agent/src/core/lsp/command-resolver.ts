@@ -68,9 +68,12 @@ function windowsExecutableCandidates(path: string, pathExt: string | undefined):
 	const extensions = (pathExt ?? ".COM;.EXE;.BAT;.CMD")
 		.split(";")
 		.map((extension) => extension.trim())
-		.filter(Boolean)
-		.map((extension) => (extension.startsWith(".") ? extension : `.${extension}`));
-	return [path, ...extensions.map((extension) => `${path}${extension}`)];
+		.map((extension) => (extension === "" || extension.startsWith(".") ? extension : `.${extension}`));
+	const lowerPath = path.toLowerCase();
+	if (extensions.some((extension) => extension !== "" && lowerPath.endsWith(extension.toLowerCase()))) {
+		return [path];
+	}
+	return extensions.map((extension) => `${path}${extension}`);
 }
 
 function executableCandidates(path: string, platform: NodeJS.Platform, environment: NodeJS.ProcessEnv): string[] {
