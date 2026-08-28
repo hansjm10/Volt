@@ -818,7 +818,7 @@ describe("LspManager", () => {
 
 			const result = await manager.codeFix(filePath, { line: 1 });
 
-			expect(result).toContain("Refusing to apply LSP workspace edit outside workspace root");
+			expect(result).toContain("Refusing LSP access outside project workspace");
 			expect(readFileSync(outsideFile, "utf-8")).toBe("SECRET\n");
 		} finally {
 			rmSync(outsideDir, { recursive: true, force: true });
@@ -964,7 +964,7 @@ describe("LspManager", () => {
 		const status = manager.getStatus();
 		expect(status).toHaveLength(1);
 		expect(status[0].name).toBe("fake");
-		expect(status[0].root).toBe(tempDir);
+		expect(status[0].root).toBe(realpathSync(tempDir));
 		expect(status[0].alive).toBe(true);
 		expect(status[0].openDocuments).toBe(1);
 		expect(status[0].idleMs).toBeGreaterThanOrEqual(0);
@@ -1050,6 +1050,7 @@ describe("LspManager", () => {
 		const siblingFile = join(projectAlias, "packages", "shared", "test.foo");
 		mkdirSync(realRuntimeDir, { recursive: true });
 		mkdirSync(join(realProjectDir, "packages", "shared"), { recursive: true });
+		writeFileSync(join(realRuntimeDir, "runtime.foo"), "has ERROR\n");
 		writeFileSync(join(realProjectDir, "packages", "shared", "test.foo"), "has ERROR\n");
 		try {
 			symlinkSync(realProjectDir, projectAlias, directorySymlinkType());
@@ -1064,6 +1065,9 @@ describe("LspManager", () => {
 		});
 
 		expect(await manager.fileDiagnostics(siblingFile)).toContain("error: found ERROR on line 1");
+		expect(await manager.fileDiagnostics(join(runtimeDir, "runtime.foo"))).toContain(
+			"runtime.foo(1,5): error: found ERROR on line 1",
+		);
 		expect(manager.getWorkspaceRoot()).toBe(realpathSync(realProjectDir));
 		expect(manager.getStatus()[0]).toMatchObject({
 			workspaceRoot: realpathSync(realProjectDir),
