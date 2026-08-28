@@ -58,9 +58,22 @@ if ($noEnv) {
 	Write-Host "Running without API keys..."
 }
 
-$runnerPath = Join-Path $scriptDir "scripts/run-coding-agent-source.mjs"
-& node $runnerPath @forwardArgs
-$exitCode = $LASTEXITCODE
+# Source-development reviews retain private model limitations and failed tool diagnostics.
+$privateDiagnosticsWasSet = Test-Path Env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS
+if (-not $privateDiagnosticsWasSet) {
+	$env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS = "1"
+}
+
+try {
+	$runnerPath = Join-Path $scriptDir "scripts/run-coding-agent-source.mjs"
+	& node $runnerPath @forwardArgs
+	$exitCode = $LASTEXITCODE
+} finally {
+	if (-not $privateDiagnosticsWasSet) {
+		Remove-Item Env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS -ErrorAction SilentlyContinue
+	}
+}
+
 if ($exitCode -ne 0) {
 	exit $exitCode
 }
