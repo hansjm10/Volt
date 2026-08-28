@@ -9261,6 +9261,7 @@ export class InteractiveMode {
 				confirm: ({ title, message }) => this.showExtensionConfirm(title, message),
 				onReviewModelWarning: (message) => this.showWarning(message),
 				createHooks: () => this.createReviewWorkflowHooks(),
+				workflowManager: this.runtimeHost.reviewWorkflows,
 			});
 
 			if (result.status !== "completed") {

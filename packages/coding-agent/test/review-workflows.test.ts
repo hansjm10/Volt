@@ -117,8 +117,10 @@ describe("ReviewWorkflowManager", () => {
 		expect(executed).toBe(false);
 		started.launch();
 		started.launch();
+		const terminalRecord = await started.finished;
 		await manager.waitForIdle();
 		expect(executed).toBe(true);
+		expect(terminalRecord).toMatchObject({ status: "completed", findingsCount: 1 });
 		expect(manager.get("review:one")).toMatchObject({
 			status: "completed",
 			findingsCount: 1,

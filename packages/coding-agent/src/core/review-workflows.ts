@@ -83,6 +83,8 @@ export interface StartedReviewWorkflow {
 	 * workflow_start on shared ordered lanes.
 	 */
 	launch: () => void;
+	/** Resolves with the retained terminal record after workflow_end is emitted. */
+	finished: Promise<ReviewWorkflowResultRecord>;
 }
 
 interface ActiveReviewWorkflow {
@@ -90,8 +92,8 @@ interface ActiveReviewWorkflow {
 	abortController: AbortController;
 	fastModeEnabled: boolean;
 	launched: boolean;
-	done: Promise<void>;
-	settle: () => void;
+	done: Promise<ReviewWorkflowResultRecord>;
+	settle: (record: ReviewWorkflowResultRecord) => void;
 	disposePending: () => Promise<void>;
 }
 
@@ -165,8 +167,8 @@ export class ReviewWorkflowManager {
 			},
 			startedAt: options.prepared.startedAt,
 		};
-		let settle: () => void = () => {};
-		const done = new Promise<void>((resolve) => {
+		let settle: (record: ReviewWorkflowResultRecord) => void = () => {};
+		const done = new Promise<ReviewWorkflowResultRecord>((resolve) => {
 			settle = resolve;
 		});
 		const entry: ActiveReviewWorkflow = {
@@ -210,7 +212,7 @@ export class ReviewWorkflowManager {
 				this.finish(entry, result);
 			})();
 		};
-		return { descriptor, launch };
+		return { descriptor, launch, finished: done };
 	}
 
 	/** Abort a running review workflow. Throws for unknown or finished workflows. */
@@ -336,6 +338,6 @@ export class ReviewWorkflowManager {
 			startedAt: descriptor.startedAt,
 			endedAt: descriptor.endedAt,
 		});
-		entry.settle();
+		entry.settle(record);
 	}
 }

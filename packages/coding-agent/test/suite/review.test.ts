@@ -250,6 +250,44 @@ describe("review command controls", () => {
 		}
 	});
 
+	it("registers a TUI review so an attached client can cancel it", async () => {
+		const harness = await createHarness();
+		git(harness.tempDir, "init", "--initial-branch=main");
+		git(harness.tempDir, "config", "user.email", "review@example.com");
+		git(harness.tempDir, "config", "user.name", "Review Test");
+		writeFileSync(join(harness.tempDir, "file.txt"), "before\n");
+		git(harness.tempDir, "add", "file.txt");
+		git(harness.tempDir, "commit", "-m", "initial");
+		writeFileSync(join(harness.tempDir, "file.txt"), "after\n");
+		const workflowManager = new ReviewWorkflowManager();
+		const newSession = vi.fn();
+		let workflowId: string | undefined;
+		workflowManager.attachSink((event) => {
+			if (event.type !== "workflow_start") return;
+			workflowId = event.workflowId;
+			workflowManager.cancel(event.workflowId);
+		});
+		try {
+			const result = await runReviewWorkflow({
+				target: { kind: "uncommitted" },
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				session: harness.session,
+				newSession,
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				workflowManager,
+			});
+			expect(result.status).toBe("cancelled");
+			if (!workflowId) throw new Error("Expected the managed review to emit workflow_start");
+			expect(workflowManager.get(workflowId)?.status).toBe("cancelled");
+			expect(newSession).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("emits capability-aware immutable-tool instructions", async () => {
 		const harness = await createHarness();
 		const snapshot = await createSnapshotRepository(harness);
