@@ -16,6 +16,7 @@ import type { CustomMessageInput } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import { findExactModelReferenceMatch } from "./model-resolver.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
+import { createReviewPrivateDiagnostics } from "./review-private-diagnostics.ts";
 import {
 	buildParsedReview,
 	createReviewCandidateReportCollector,
@@ -1352,6 +1353,11 @@ async function runReviewPass<TReport>(options: ReviewPassOptions<TReport>): Prom
 
 export async function runReview(options: RunReviewOptions): Promise<ReviewRunResult> {
 	const snapshot = options.resolved;
+	const privateDiagnostics = createReviewPrivateDiagnostics({
+		agentDir: options.agentDir,
+		workflowId: options.workflowId,
+		workflowAction: options.workflowAction,
+	});
 	const controls = controlsWithDefaults(options.controls);
 	const inScopeHunkIds = new Set(
 		snapshot.changedFiles
@@ -1377,7 +1383,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 		const contextFiles = await loadReviewContextFiles(snapshot, options.cwd, options.agentDir);
 		const discoverySnapshotTools = createReviewSnapshotTools(snapshot, discoveryTracker);
 		const sharedActiveTools = [...discoverySnapshotTools.map((tool) => tool.name), ...requestedAuxiliaryTools];
-		const onSessionEvent = (event: AgentSessionEvent): void => {
+		const onSessionEvent = (phase: ReviewPass, event: AgentSessionEvent): void => {
 			options.onSessionEvent?.(event);
 			if (event.type === "tool_execution_start") {
 				const summary = summarizeToolArgs(event.args);
@@ -1395,7 +1401,14 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 			} else if (event.type === "tool_execution_end") {
 				const command = pendingCommands.get(event.toolCallId);
 				if (command && !event.isError) commandRuns.push(command);
-				if (event.isError) failedVerificationAttempts.push(command ? `bash: ${command}` : event.toolName);
+				if (event.isError) {
+					failedVerificationAttempts.push(command ? `bash: ${command}` : event.toolName);
+					privateDiagnostics.recordToolFailure(phase, {
+						toolName: event.toolName,
+						...(command ? { command } : {}),
+						result: event.result,
+					});
+				}
 				pendingCommands.delete(event.toolCallId);
 				emitReviewWorkflowToolEvent(options.onEvent, options, event);
 			}
@@ -1428,10 +1441,11 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 			},
 			priorUsage: EMPTY_SESSION_USAGE,
 			signal: options.signal,
-			onEvent: onSessionEvent,
+			onEvent: (event) => onSessionEvent("discovery", event),
 			onUsage: options.onUsage,
 		});
 		const candidateReport = candidatePass.report;
+		privateDiagnostics.recordModelLimitations("discovery", candidateReport.limitations);
 		const verificationTracker = new ReviewCoverageTracker();
 		const verificationSnapshotTools = createReviewSnapshotTools(snapshot, verificationTracker);
 		const verificationCollector = createReviewVerificationReportCollector();
@@ -1464,10 +1478,11 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 					: ["report_review_verification was not called with a valid payload"],
 			priorUsage: candidatePass.usage,
 			signal: options.signal,
-			onEvent: onSessionEvent,
+			onEvent: (event) => onSessionEvent("verification", event),
 			onUsage: options.onUsage,
 		});
 		const verificationReport = verificationPass.report;
+		privateDiagnostics.recordModelLimitations("verification", verificationReport.limitations);
 		const suppressedFingerprints = new Set(options.incrementalPlan?.suppressedDismissedFingerprints ?? []);
 		const declassifiedFindings = declassifyReviewFindings(validatedCandidates, verificationReport).filter(
 			(finding) => !suppressedFingerprints.has(finding.fingerprint),
@@ -1500,7 +1515,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 						: ["report_review_presentations was not called with a valid payload"],
 				priorUsage: verificationPass.usage,
 				signal: options.signal,
-				onEvent: onSessionEvent,
+				onEvent: (event) => onSessionEvent("presentation", event),
 				onUsage: options.onUsage,
 			});
 			presentationReport = presentationPass.report;
@@ -1553,6 +1568,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 			return { aborted: true, raw: "" };
 		return { aborted: false, raw: "", errorMessage: error instanceof Error ? error.message : String(error) };
 	} finally {
+		await privateDiagnostics.flush().catch(() => undefined);
 		await snapshot.dispose();
 	}
 }
