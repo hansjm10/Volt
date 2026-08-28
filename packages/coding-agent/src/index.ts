@@ -200,6 +200,8 @@ export {
 	type LspInstallCommandResult,
 	type LspInstallRecipe,
 	type LspInstallRunner,
+	type LspLaunchDescriptor,
+	type LspLaunchSource,
 	LspManager,
 	type LspManagerOptions,
 	type LspServerSettings,
@@ -211,7 +213,9 @@ export {
 	languageIdForExtension,
 	type ResolvedLspConfig,
 	type ResolvedLspServerConfig,
+	type ResolveLspLaunchOptions,
 	resolveLspConfig,
+	resolveLspLaunch,
 	runDefaultLspInstallCommand,
 } from "./core/lsp/index.ts";
 export {

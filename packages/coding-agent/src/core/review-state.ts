@@ -495,7 +495,7 @@ export function snapshotFileIdentities(snapshot: ReviewSnapshot): ReviewRunFileI
 }
 
 function snapshotContextMetadata(snapshot: ReviewSnapshot): ReviewRunContextMetadata | undefined {
-	const manifest = snapshot.githubContext?.manifest;
+	const manifest = snapshot.codeHostContext?.manifest;
 	if (!manifest) return undefined;
 	return {
 		captureStatus: manifest.status,
@@ -632,9 +632,9 @@ export function planIncrementalReview(
 		return fullReviewPlan(snapshot, "The prior review target or base tree is incompatible.");
 	}
 	const previousContextFingerprint = previousRun.target.context?.fingerprint;
-	const currentContextFingerprint = snapshot.githubContext?.manifest.fingerprint;
+	const currentContextFingerprint = snapshot.codeHostContext?.manifest.fingerprint;
 	if (previousContextFingerprint !== currentContextFingerprint) {
-		return fullReviewPlan(snapshot, "The pull request GitHub context changed since the prior review.");
+		return fullReviewPlan(snapshot, "The pull request code-host context changed since the prior review.");
 	}
 	if (!controlsCompatible(previousRun.options, controls)) {
 		return fullReviewPlan(snapshot, "The prior review controls are incompatible with this run.");

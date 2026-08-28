@@ -17,6 +17,7 @@ import { McpOutputStore } from "../src/core/mcp/output-store.ts";
 import type { McpClientConnection } from "../src/core/mcp/types.ts";
 import {
 	createPlanExecutionPrompt,
+	formatPlanCheckpoint,
 	PLAN_MAX_SERIALIZED_BYTES,
 	parsePlanningState,
 	StalePlanRevisionError,
@@ -207,7 +208,7 @@ describe("native planning state", () => {
 		expect(policy).toContain("Research before finalizing, not before drafting.");
 		expect(policy).toContain("create an initial working draft with update_plan");
 		expect(policy).toContain("context-dependent references");
-		expect(policy).toContain("Write checklist steps as executable outcomes.");
+		expect(policy).toContain("Write the checklist as coherent, independently verifiable outcomes.");
 		expect(policy).toContain("revise the draft whenever evidence materially changes");
 		expect(policy).toContain("Do not update it mechanically after every read.");
 		expect(policy).toContain("executor reading only the submitted plan");
@@ -1039,7 +1040,7 @@ describe("native planning state", () => {
 				expectedRevision: progressed.revision,
 				updates: [{ id: "unknown", status: "completed" }],
 			}),
-		).toThrow("unknown step id");
+		).toThrow("unknown executable leaf id");
 
 		const replanning = session.requestReplan({
 			planId: progressed.id,
@@ -1091,6 +1092,84 @@ describe("native planning state", () => {
 		expect(completed.phase).toBe("completed");
 		expect(session.getActiveToolNames()).not.toContain("update_plan_progress");
 		expect(session.getActiveToolNames()).not.toContain("request_replan");
+		session.dispose();
+		await session.waitForClosed();
+	});
+
+	it("tracks hierarchical substeps as executable leaves and derives group progress", async () => {
+		const { session } = await createPlanningSession();
+		const draft = session.updatePlan({
+			title: "Implement grouped planning",
+			summary: "Group related executable work without limiting checklist size.",
+			steps: [
+				{
+					text: "Implement hierarchical planning",
+					substeps: [{ text: "Persist substeps" }, { text: "Render grouped progress" }],
+				},
+				{ text: "Verify the integrated workflow" },
+			],
+		});
+		const group = draft.steps[0]!;
+		expect(group).toMatchObject({ status: "pending" });
+		expect(group.substeps).toHaveLength(2);
+		expect(new Set([group.id, ...group.substeps!.map((substep) => substep.id)]).size).toBe(3);
+		const detached = session.planningState;
+		detached.plan!.steps[0]!.substeps![0]!.text = "Mutated projection";
+		expect(session.planningState.plan!.steps[0]!.substeps![0]!.text).toBe("Persist substeps");
+
+		const ready = session.submitPlan({
+			planId: draft.id,
+			expectedRevision: draft.revision,
+			title: draft.title!,
+			summary: draft.summary!,
+		});
+		const activated = await session.activatePlan(ready.id, ready.revision, {
+			id: "hierarchical-execution",
+			approvedRevision: ready.revision,
+			strategy: "retain_context",
+			sourceSessionId: session.sessionId,
+			targetSessionId: session.sessionId,
+		});
+		const active = activated.planning.plan!;
+		expect(() =>
+			session.updatePlanProgress({
+				planId: active.id,
+				expectedRevision: active.revision,
+				updates: [{ id: active.steps[0]!.id, status: "completed" }],
+			}),
+		).toThrow("cannot update group outcome id");
+
+		const firstSubstep = active.steps[0]!.substeps![0]!;
+		const started = session.updatePlanProgress({
+			planId: active.id,
+			expectedRevision: active.revision,
+			updates: [{ id: firstSubstep.id, status: "in_progress", note: "Started persistence" }],
+		});
+		expect(started.steps[0]).toMatchObject({ status: "in_progress" });
+		expect(started.steps[0]!.substeps![0]).toMatchObject({
+			status: "in_progress",
+			note: "Started persistence",
+		});
+
+		const groupedComplete = session.updatePlanProgress({
+			planId: started.id,
+			expectedRevision: started.revision,
+			updates: started.steps[0]!.substeps!.map((substep) => ({
+				id: substep.id,
+				status: "completed" as const,
+			})),
+		});
+		expect(groupedComplete.phase).toBe("active");
+		expect(groupedComplete.steps[0]).toMatchObject({ status: "completed" });
+		expect(formatPlanCheckpoint({ mode: "build", plan: groupedComplete })).toContain("1.1. [x] Persist substeps");
+
+		const completed = session.updatePlanProgress({
+			planId: groupedComplete.id,
+			expectedRevision: groupedComplete.revision,
+			updates: [{ id: groupedComplete.steps[1]!.id, status: "completed" }],
+		});
+		expect(completed.phase).toBe("completed");
+		expect(completed.steps[0]!.substeps?.every((substep) => substep.status === "completed")).toBe(true);
 		session.dispose();
 		await session.waitForClosed();
 	});
@@ -1258,22 +1337,75 @@ describe("native planning state", () => {
 		await session.waitForClosed();
 	});
 
-	it("rejects too many steps and oversized semantic state", () => {
+	it("rejects invalid hierarchy depth, duplicate ids, and non-derived group status", () => {
+		const groupedPlan = {
+			id: "plan",
+			revision: 1,
+			phase: "draft",
+			steps: [
+				{
+					id: "group",
+					text: "Grouped outcome",
+					status: "pending",
+					substeps: [{ id: "leaf", text: "Executable leaf", status: "completed" }],
+				},
+			],
+		};
+		expect(() => parsePlanningState({ mode: "plan", plan: groupedPlan })).toThrow("derived substep status");
 		expect(() =>
 			parsePlanningState({
 				mode: "plan",
 				plan: {
-					id: "plan",
-					revision: 1,
-					phase: "draft",
-					steps: Array.from({ length: 65 }, (_, index) => ({
-						id: `step-${index}`,
-						text: `Step ${index}`,
-						status: "pending",
-					})),
+					...groupedPlan,
+					steps: [
+						{
+							...groupedPlan.steps[0],
+							status: "completed",
+							substeps: [{ id: "group", text: "Duplicate id", status: "completed" }],
+						},
+					],
 				},
 			}),
-		).toThrow("at most 64 steps");
+		).toThrow("Plan item id is duplicated");
+		expect(() =>
+			parsePlanningState({
+				mode: "plan",
+				plan: {
+					...groupedPlan,
+					steps: [
+						{
+							...groupedPlan.steps[0],
+							status: "pending",
+							substeps: [
+								{
+									id: "leaf",
+									text: "Nested leaf",
+									status: "pending",
+									substeps: [],
+								},
+							],
+						},
+					],
+				},
+			}),
+		).toThrow("unsupported field: substeps");
+	});
+
+	it("accepts long checklists and rejects oversized semantic state", () => {
+		const longChecklist = parsePlanningState({
+			mode: "plan",
+			plan: {
+				id: "plan",
+				revision: 1,
+				phase: "draft",
+				steps: Array.from({ length: 65 }, (_, index) => ({
+					id: `step-${index}`,
+					text: `Step ${index}`,
+					status: "pending",
+				})),
+			},
+		});
+		expect(longChecklist.plan?.steps).toHaveLength(65);
 
 		expect(() =>
 			parsePlanningState({

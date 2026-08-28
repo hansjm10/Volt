@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join, relative, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { captureReviewGitHubContext } from "../src/core/github-pr-context.ts";
+import { capturePullRequestContextWithGitHubCli } from "../src/core/code-host/github-cli-context.ts";
 import { normalizeReviewPath, type ReviewSnapshot, resolveReviewSnapshot } from "../src/core/review-snapshot.ts";
 
 const OPTIONS = { maxCommitRefBytes: 1_024, maxPullRequestNumber: 2_147_483_647 };
@@ -1310,6 +1310,72 @@ describe("review snapshots", () => {
 		}
 	});
 
+	it("keeps the captured PR base when the base branch advances during context capture", async () => {
+		const repository = createRepository();
+		const remote = join(tmpdir(), `volt-review-advanced-base-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(remote, { recursive: true });
+		tempDirectories.push(remote);
+		git(remote, "init", "--bare", "--initial-branch=main");
+		git(repository, "remote", "add", "origin", remote);
+		git(repository, "push", "origin", "main");
+		const capturedBase = git(repository, "rev-parse", "main");
+
+		git(repository, "checkout", "-b", "feature");
+		writeFileSync(join(repository, "feature.txt"), "pull request change\n");
+		git(repository, "add", "feature.txt");
+		git(repository, "commit", "-m", "pull request change");
+		const headOid = git(repository, "rev-parse", "HEAD");
+		git(repository, "push", "origin", "HEAD:refs/pull/7/head");
+		git(repository, "checkout", "main");
+
+		const graphqlGatePath = join(repository, "release-base-advance-context");
+		const logPath = installGitHubShim(repository, {
+			view: {
+				id: "PR_advanced_base_7",
+				number: 7,
+				title: "Advanced base",
+				body: "Body",
+				baseRefName: "main",
+				headRefName: "feature",
+				url: "https://example.test/pr/7",
+				baseRefOid: capturedBase,
+				headRefOid: headOid,
+			},
+			graphqlGatePath,
+		});
+		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+		const resolution = resolveReviewSnapshot({ kind: "pr", number: "7" }, repository, OPTIONS);
+		await vi.waitFor(() => {
+			const initialRequests = readFileSync(logPath, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { variables?: { cursor?: unknown } })
+				.filter((request) => request.variables?.cursor === null);
+			expect(initialRequests).toHaveLength(5);
+		});
+
+		writeFileSync(join(repository, "main-only.txt"), "later main change\n");
+		git(repository, "add", "main-only.txt");
+		git(repository, "commit", "-m", "advance main");
+		const advancedBase = git(repository, "rev-parse", "HEAD");
+		git(repository, "push", "origin", "main");
+		writeFileSync(graphqlGatePath, "release\n");
+
+		const result = await resolution;
+		if ("error" in result) throw new Error(result.error);
+		snapshots.push(result);
+		expect(result.identity).toMatchObject({
+			baseCommit: capturedBase,
+			mergeBaseCommit: capturedBase,
+			headCommit: headOid,
+		});
+		expect(result.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+		expect(await result.readFile("base", "main-only.txt")).toBeUndefined();
+		expect(await result.readFile("head", "main-only.txt")).toBeUndefined();
+		expect(git(remote, "rev-parse", "main")).toBe(advancedBase);
+	});
+
 	it("detaches fetched PR snapshots from borrowed local objects and rejects moved metadata", async () => {
 		const repository = createRepository();
 		const remote = join(tmpdir(), `volt-review-snapshot-remote-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -1362,7 +1428,7 @@ describe("review snapshots", () => {
 		const snapshot = await resolve({ kind: "pr", number: "7" }, repository);
 		expect(readFileSync(alternatesLog, "utf8").trim()).toBe(resolvePath(localObjects));
 		expect(snapshot.identity.pullRequest).toMatchObject({ number: 7, baseRefOid: baseOid, headRefOid: headOid });
-		expect(snapshot.githubContext?.manifest).toMatchObject({ status: "complete", fingerprint: expect.any(String) });
+		expect(snapshot.codeHostContext?.manifest).toMatchObject({ status: "complete", fingerprint: expect.any(String) });
 		expect(
 			snapshot.changedFiles
 				.flatMap((file) => file.hunks)
@@ -1406,7 +1472,7 @@ describe("review snapshots", () => {
 		installGitHubShim(repository, { view });
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 		const captureFingerprint = async (): Promise<string> => {
-			const captured = await captureReviewGitHubContext({
+			const captured = await capturePullRequestContextWithGitHubCli({
 				cwd: repository,
 				number: "7",
 				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1555,7 +1621,7 @@ describe("review snapshots", () => {
 		});
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
-		const capturePromise = captureReviewGitHubContext({
+		const capturePromise = capturePullRequestContextWithGitHubCli({
 			cwd: repository,
 			number: "7",
 			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1716,7 +1782,7 @@ describe("review snapshots", () => {
 		const logPath = installGitHubShim(repository, { view, graphql, maximumGraphqlRequests: 16 });
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
-		const captured = await captureReviewGitHubContext({
+		const captured = await capturePullRequestContextWithGitHubCli({
 			cwd: repository,
 			number: "10",
 			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1811,7 +1877,7 @@ describe("review snapshots", () => {
 		});
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
-		const captured = await captureReviewGitHubContext({
+		const captured = await capturePullRequestContextWithGitHubCli({
 			cwd: repository,
 			number: "8",
 			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1858,7 +1924,7 @@ describe("review snapshots", () => {
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
 		const capture = async () => {
-			const captured = await captureReviewGitHubContext({
+			const captured = await capturePullRequestContextWithGitHubCli({
 				cwd: repository,
 				number: "9",
 				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1920,10 +1986,10 @@ describe("review snapshots", () => {
 				]),
 			},
 		});
-		installGitHubShim(repository, configFor(31_637));
+		installGitHubShim(repository, configFor(31_615));
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 		const capture = async () => {
-			const captured = await captureReviewGitHubContext({
+			const captured = await capturePullRequestContextWithGitHubCli({
 				cwd: repository,
 				number: "274",
 				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
@@ -1949,7 +2015,7 @@ describe("review snapshots", () => {
 			limitations: [],
 		});
 
-		writeFileSync(configPath, JSON.stringify(configFor(31_638)));
+		writeFileSync(configPath, JSON.stringify(configFor(31_616)));
 		const overLimit = await capture();
 		expect(overLimit.manifest).toMatchObject({
 			status: "incomplete",

@@ -286,11 +286,11 @@ See [LSP Diagnostics](lsp.md) for the full reference, including built-in server 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `lsp.enabled` | boolean | `true` | Run language servers and append diagnostics to `edit`/`write` results; set `false` to disable (`--lsp` force-enables per run) |
-| `lsp.servers` | object | built-ins | Server definitions keyed by name, merged over the built-in defaults |
+| `lsp.servers` | object | built-ins | Server definitions keyed by name, merged over the built-in defaults. Command paths and root discovery are confined to the canonical project workspace |
 | `lsp.settleMs` | number | `1500` | How long to wait for published diagnostics after a change |
 | `lsp.firstSettleMs` | number | `10000` | Wait window for the first diagnostics from a freshly started server |
 | `lsp.idleShutdownMs` | number | `600000` | Shut down servers idle for this long; `0` disables |
-| `lsp.traceFile` | string | | Append LSP protocol traffic and server stderr to this file |
+| `lsp.traceFile` | string | | Append LSP protocol traffic, server stderr, and launch context to this file; relative paths resolve from the canonical project workspace |
 | `lsp.maxDiagnostics` | number | `20` | Maximum diagnostics reported per tool call |
 | `lsp.severity` | string | `"error"` | Minimum severity to report: `error`, `warning`, `information`, or `hint` |
 

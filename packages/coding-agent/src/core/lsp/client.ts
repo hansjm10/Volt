@@ -7,11 +7,13 @@
  * (textDocument/diagnostic) when the server advertises support.
  */
 
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import type { ChildProcess } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
+import { spawnProcess, spawnProcessSync } from "../../utils/child-process.ts";
+import { getSubprocessEnv } from "../../utils/process-env.ts";
+import type { LspLaunchSource } from "./command-resolver.ts";
 import { languageIdForExtension } from "./config.ts";
 import type { LspTracer } from "./trace.ts";
 import type { AppliedWorkspaceChange, WorkspaceEditDocumentSnapshot } from "./workspace-edit-applier.ts";
@@ -38,6 +40,15 @@ export interface LspClientOptions {
 	serverName: string;
 	command: string[];
 	rootDir: string;
+	/** Exact inherited environment used to resolve and launch the executable. */
+	environment?: NodeJS.ProcessEnv;
+	/** Launch context included in protocol traces. */
+	launchContext?: {
+		configuredCommand: string[];
+		source: LspLaunchSource;
+		workspaceRoot: string;
+		attempt: number;
+	};
 	initializationOptions?: unknown;
 	/**
 	 * Server configuration. Sent via workspace/didChangeConfiguration after the
@@ -50,6 +61,10 @@ export interface LspClientOptions {
 	onApplyEdit?: (edit: unknown) => Promise<boolean | LspApplyEditResult>;
 	/** Protocol tracer. Can also be set later via setTracer(). */
 	tracer?: LspTracer;
+	/** @internal Injectable process spawner for deterministic transport tests. */
+	serverSpawner?: (command: string[], cwd: string, environment: NodeJS.ProcessEnv) => ChildProcess;
+	/** @internal Revalidate and resolve a tracked path immediately before disk refresh. */
+	resolveTrackedDocumentPath?: (absolutePath: string) => Promise<string | undefined>;
 }
 
 export interface LspApplyEditResult {
@@ -103,6 +118,9 @@ interface JsonRpcMessage {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+const MAX_STARTUP_STDERR_CHARS = 8000;
+const STARTUP_STDERR_IDLE_GRACE_MS = 100;
+const STARTUP_STDERR_MAX_DRAIN_MS = 1000;
 
 /**
  * How long to re-wait for a fresher publish after an unversioned one when the
@@ -126,35 +144,60 @@ class LspResponseError extends Error {
 	}
 }
 
-function quoteWindowsArg(arg: string): string {
-	return /\s/.test(arg) ? `"${arg}"` : arg;
+function spawnServer(command: string[], cwd: string, environment: NodeJS.ProcessEnv): ChildProcess {
+	return spawnProcess(command[0], command.slice(1), {
+		cwd,
+		env: environment,
+		stdio: ["pipe", "pipe", "pipe"],
+	});
 }
 
-/**
- * Whether a command binary is resolvable on Windows. Spawning through a shell
- * masks missing binaries as exit code 1, so we pre-check PATH/PATHEXT to
- * produce a proper ENOENT-style failure (which also carries install hints).
- */
-function windowsCommandExists(binary: string): boolean {
-	if (!binary) {
-		return false;
-	}
-	const extensions = ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)];
-	if (binary.includes("/") || binary.includes("\\")) {
-		return extensions.some((ext) => existsSync(binary + ext));
-	}
-	const pathDirs = (process.env.PATH ?? "").split(";").filter(Boolean);
-	return pathDirs.some((dir) => extensions.some((ext) => existsSync(join(dir, binary + ext))));
-}
-
-function spawnServer(command: string[], cwd: string): ChildProcess {
-	if (process.platform === "win32") {
-		// Many language servers are installed as .cmd shims on Windows, which
-		// cannot be spawned directly without a shell.
-		const commandLine = command.map(quoteWindowsArg).join(" ");
-		return spawn(commandLine, { cwd, shell: true, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-	}
-	return spawn(command[0], command.slice(1), { cwd, stdio: ["pipe", "pipe", "pipe"] });
+function waitForStartupStderrDrain(child: ChildProcess): Promise<void> {
+	const stderr = child.stderr;
+	if (!stderr || stderr.readableEnded || stderr.destroyed) return Promise.resolve();
+	return new Promise((resolve) => {
+		let settled = false;
+		let terminated = child.exitCode !== null || child.signalCode !== null;
+		let idleTimer: NodeJS.Timeout | undefined;
+		let deadlineTimer: NodeJS.Timeout | undefined;
+		const cleanup = (): void => {
+			if (idleTimer) clearTimeout(idleTimer);
+			if (deadlineTimer) clearTimeout(deadlineTimer);
+			stderr.removeListener("data", onData);
+			stderr.removeListener("end", finish);
+			child.removeListener("error", onTermination);
+			child.removeListener("exit", onTermination);
+			child.removeListener("close", finish);
+		};
+		const finish = (): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve();
+		};
+		const armIdleTimer = (): void => {
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(finish, STARTUP_STDERR_IDLE_GRACE_MS);
+			idleTimer.unref();
+		};
+		const onData = (): void => {
+			if (terminated) armIdleTimer();
+		};
+		const onTermination = (): void => {
+			terminated = true;
+			if (!deadlineTimer) {
+				deadlineTimer = setTimeout(finish, STARTUP_STDERR_MAX_DRAIN_MS);
+				deadlineTimer.unref();
+			}
+			armIdleTimer();
+		};
+		stderr.on("data", onData);
+		stderr.once("end", finish);
+		child.once("error", onTermination);
+		child.once("exit", onTermination);
+		child.once("close", finish);
+		if (terminated) onTermination();
+	});
 }
 
 function killProcessTree(child: ChildProcess): void {
@@ -163,7 +206,10 @@ function killProcessTree(child: ChildProcess): void {
 	}
 	try {
 		if (process.platform === "win32") {
-			spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+			spawnProcessSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+				encoding: "utf-8",
+				stdio: "ignore",
+			});
 		} else {
 			child.kill("SIGKILL");
 		}
@@ -212,6 +258,10 @@ export class LspClient {
 	private alive = false;
 	private disposed = false;
 	private exitError: Error | undefined;
+	private startupComplete = false;
+	private startupStderr = "";
+	private startupProcessTerminated = false;
+	private startupStderrDrained: Promise<void> = Promise.resolve();
 
 	private nextRequestId = 1;
 	private pendingRequests = new Map<number, PendingRequest>();
@@ -249,37 +299,49 @@ export class LspClient {
 	/** Spawn the server process and run the initialize handshake. Memoized. */
 	start(): Promise<void> {
 		if (!this.startPromise) {
-			this.startPromise = this.doStart();
-			this.startPromise.catch(() => {
+			this.startPromise = this.doStart().catch(async (error: unknown) => {
 				this.startFailure = true;
+				if (this.startupProcessTerminated) await this.startupStderrDrained;
+				const original = error instanceof Error ? error : new Error(String(error));
+				const stderr = this.startupStderr.trim();
+				const enriched = stderr ? new Error(`${original.message}\nStartup stderr:\n${stderr}`) : original;
+				this.exitError = enriched;
+				throw enriched;
 			});
 		}
 		return this.startPromise;
 	}
 
 	private async doStart(): Promise<void> {
-		if (process.platform === "win32" && !windowsCommandExists(this.options.command[0] ?? "")) {
-			const error = new Error(
-				`Failed to start LSP server "${this.options.serverName}": spawn ${this.options.command[0]} ENOENT`,
-			);
-			this.tracer?.log(this.options.serverName, "info", error.message);
-			this.handleExit(error);
-			throw this.exitError ?? error;
-		}
+		const launch = this.options.launchContext;
+		this.tracer?.log(
+			this.options.serverName,
+			"info",
+			launch
+				? `workspace: ${launch.workspaceRoot}; server root: ${this.options.rootDir}; configured argv: ${JSON.stringify(launch.configuredCommand)}; executable: ${this.options.command[0]}; source: ${launch.source}; attempt: ${launch.attempt}`
+				: `server root: ${this.options.rootDir}; executable: ${this.options.command[0]}`,
+		);
 		this.tracer?.log(
 			this.options.serverName,
 			"info",
 			`spawning: ${this.options.command.join(" ")} (root: ${this.options.rootDir})`,
 		);
-		const child = spawnServer(this.options.command, this.options.rootDir);
+		const child = (this.options.serverSpawner ?? spawnServer)(
+			this.options.command,
+			this.options.rootDir,
+			this.options.environment ?? getSubprocessEnv(),
+		);
 		this.child = child;
+		this.startupStderrDrained = waitForStartupStderrDrain(child);
 
 		const spawnFailure = new Promise<never>((_, reject) => {
 			child.once("error", (error) => {
+				this.startupProcessTerminated = true;
 				this.handleExit(new Error(`Failed to start LSP server "${this.options.serverName}": ${error.message}`));
 				reject(this.exitError);
 			});
 			child.once("exit", (code) => {
+				this.startupProcessTerminated = true;
 				if (!this.disposed && !this.alive) {
 					this.handleExit(
 						new Error(
@@ -296,7 +358,13 @@ export class LspClient {
 		child.stdout?.on("data", (chunk: Buffer) => this.onData(chunk));
 		// Drain stderr so the server cannot block on a full pipe.
 		child.stderr?.on("data", (chunk: Buffer) => {
-			this.tracer?.log(this.options.serverName, "stderr", chunk.toString("utf-8"));
+			const text = chunk.toString("utf-8");
+			if (!this.startupComplete) {
+				const next = this.startupStderr + text;
+				this.startupStderr =
+					next.length <= MAX_STARTUP_STDERR_CHARS ? next : next.slice(next.length - MAX_STARTUP_STDERR_CHARS);
+			}
+			this.tracer?.log(this.options.serverName, "stderr", text);
 		});
 		child.stdin?.on("error", () => {});
 		child.on("exit", (code) => {
@@ -358,6 +426,7 @@ export class LspClient {
 		if (this.options.settings !== undefined) {
 			this.notify("workspace/didChangeConfiguration", { settings: this.options.settings });
 		}
+		this.startupComplete = true;
 	}
 
 	/**
@@ -467,19 +536,36 @@ export class LspClient {
 		}
 		const excludeKey = excludePath ? normalizeUri(pathToFileURL(excludePath).toString()) : undefined;
 		const refreshed: Array<{ uri: string; type: number; absolutePath: string }> = [];
+		const closeDocument = (key: string, document: TrackedDocument): void => {
+			this.documents.delete(key);
+			this.published.delete(key);
+			this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
+			refreshed.push({ uri: document.uri, type: FILE_CHANGE_TYPE_DELETED, absolutePath: document.absolutePath });
+		};
 		for (const [key, document] of [...this.documents]) {
 			if (key === excludeKey) {
 				continue;
 			}
+			let refreshPath = document.absolutePath;
+			if (this.options.resolveTrackedDocumentPath) {
+				try {
+					const resolvedPath = await this.options.resolveTrackedDocumentPath(document.absolutePath);
+					if (!resolvedPath) {
+						closeDocument(key, document);
+						continue;
+					}
+					refreshPath = resolvedPath;
+				} catch {
+					closeDocument(key, document);
+					continue;
+				}
+			}
 			let fileStat: { mtimeMs: number; size: number };
 			try {
-				fileStat = await stat(document.absolutePath);
+				fileStat = await stat(refreshPath);
 			} catch {
 				// File was deleted (or became unreadable): close it on the server.
-				this.documents.delete(key);
-				this.published.delete(key);
-				this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
-				refreshed.push({ uri: document.uri, type: FILE_CHANGE_TYPE_DELETED, absolutePath: document.absolutePath });
+				closeDocument(key, document);
 				continue;
 			}
 			if (fileStat.mtimeMs === document.mtimeMs && fileStat.size === document.size) {
@@ -487,7 +573,7 @@ export class LspClient {
 			}
 			let content: string;
 			try {
-				content = await readFile(document.absolutePath, "utf-8");
+				content = await readFile(refreshPath, "utf-8");
 			} catch {
 				continue;
 			}
@@ -667,8 +753,8 @@ export class LspClient {
 		killTimer.unref();
 		child.once("exit", () => clearTimeout(killTimer));
 		if (process.platform === "win32") {
-			// On Windows the server runs under a shell, so child.kill() would only
-			// terminate the shell and orphan the actual server process.
+			// cross-spawn may launch a command shim process, so terminate the whole
+			// process tree instead of risking an orphaned language server.
 			killProcessTree(child);
 			clearTimeout(killTimer);
 			return;

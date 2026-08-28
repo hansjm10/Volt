@@ -224,10 +224,11 @@ export function resolveLspConfig(settings: LspSettings | undefined): ResolvedLsp
 		if (!command || command.length === 0 || !fileExtensions || fileExtensions.length === 0) {
 			continue;
 		}
-		const commandBinary = basename(command[0] ?? "");
-		const builtInBinary = defaults ? basename(defaults.command[0] ?? "") : undefined;
-		const usesBuiltInBinary = builtInBinary !== undefined && commandBinary === builtInBinary;
-		const installRecipe = usesBuiltInBinary ? installRecipeForCommand(command) : undefined;
+		const usesBuiltInCommand =
+			defaults !== undefined &&
+			command.length === defaults.command.length &&
+			command.every((argument, index) => argument === defaults.command[index]);
+		const installRecipe = usesBuiltInCommand ? installRecipeForCommand(command) : undefined;
 		const installHint = installHintForCommand(command);
 		servers.push({
 			name,

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,7 +10,7 @@ import {
 	formatReviewForNewSession,
 	listBaseBranches,
 	listRecentCommits,
-	MAX_GITHUB_PR_NUMBER,
+	MAX_PULL_REQUEST_NUMBER,
 	normalizeReviewPullRequestNumber,
 	parseReviewCommandArgs,
 	prepareReviewWorkflow,
@@ -20,6 +20,10 @@ import {
 	runReview,
 	runReviewWorkflow,
 } from "../../src/core/review.ts";
+import {
+	getReviewPrivateDiagnosticsDirectory,
+	REVIEW_PRIVATE_DIAGNOSTICS_ENV,
+} from "../../src/core/review-private-diagnostics.ts";
 import type {
 	ReviewCandidateReport,
 	ReviewFinding,
@@ -125,7 +129,7 @@ async function createSnapshotRepository(
 	);
 	const snapshot = await resolveReviewSnapshot({ kind: "uncommitted" }, harness.tempDir, {
 		maxCommitRefBytes: 1_024,
-		maxPullRequestNumber: MAX_GITHUB_PR_NUMBER,
+		maxPullRequestNumber: MAX_PULL_REQUEST_NUMBER,
 		...(options.maxBlobBytes === undefined ? {} : { limits: { maxBlobBytes: options.maxBlobBytes } }),
 	});
 	if ("error" in snapshot) throw new Error(snapshot.error);
@@ -133,7 +137,7 @@ async function createSnapshotRepository(
 }
 
 function attachGitHubContext(snapshot: ReviewSnapshot, marker: string): void {
-	snapshot.githubContext = {
+	snapshot.codeHostContext = {
 		manifest: {
 			status: "complete",
 			capturedAt: "2026-01-01T00:00:00Z",
@@ -177,7 +181,9 @@ describe("review command controls", () => {
 		expect(normalizeReviewPullRequestNumber(undefined)).toEqual({});
 		expect(normalizeReviewPullRequestNumber("42")).toEqual({ number: "42" });
 		expect(normalizeReviewPullRequestNumber("01")).toEqual({ error: expect.stringContaining("canonical") });
-		expect(normalizeReviewPullRequestNumber(String(MAX_GITHUB_PR_NUMBER + 1))).toEqual({ error: expect.any(String) });
+		expect(normalizeReviewPullRequestNumber(String(MAX_PULL_REQUEST_NUMBER + 1))).toEqual({
+			error: expect.any(String),
+		});
 	});
 
 	it("rejects controls that cannot be persisted losslessly before resolving the target", async () => {
@@ -266,11 +272,13 @@ describe("review pipeline", () => {
 	const snapshots: ReviewSnapshot[] = [];
 
 	afterEach(async () => {
+		vi.unstubAllEnvs();
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
 		for (const harness of harnesses.splice(0)) harness.cleanup();
 	});
 
 	it("keeps context-exposed prose private and presents findings from code in a fresh context", async () => {
+		vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, "1");
 		const privateMarker = "private-github-discussion-marker";
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -278,7 +286,7 @@ describe("review pipeline", () => {
 		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(join(agentDir, "REVIEW.md"), "USER REVIEW POLICY\n");
 		const snapshot = await createSnapshotRepository(harness);
-		snapshot.githubContext = {
+		snapshot.codeHostContext = {
 			manifest: {
 				status: "complete",
 				capturedAt: "2026-01-01T00:00:00Z",
@@ -408,9 +416,9 @@ describe("review pipeline", () => {
 		expect(requestSnapshots[2]?.tools).not.toContain("bash");
 		expect(requestSnapshots[2]?.messages).not.toContain(privateMarker);
 		expect(requestSnapshots[2]?.systemPrompt).not.toContain(privateMarker);
-		expect(requestSnapshots[0]?.messages).toContain("github_context_manifest");
-		expect(requestSnapshots[1]?.messages).toContain("github_context_manifest");
-		expect(requestSnapshots[2]?.messages).not.toContain("github_context_manifest");
+		expect(requestSnapshots[0]?.messages).toContain("code_host_context_manifest");
+		expect(requestSnapshots[1]?.messages).toContain("code_host_context_manifest");
+		expect(requestSnapshots[2]?.messages).not.toContain("code_host_context_manifest");
 		const discoveryFinal = usageSnapshots.filter((usage) => usage.pass === "discovery").at(-1);
 		const verificationSnapshots = usageSnapshots.filter((usage) => usage.pass === "verification");
 		const verificationFinal = verificationSnapshots.at(-1);
@@ -439,6 +447,17 @@ describe("review pipeline", () => {
 		expect(JSON.stringify(workflowEvents)).not.toContain("src/value.ts");
 		expect(JSON.stringify(workflowEvents)).not.toContain(privateMarker);
 		expect(harness.session.messages).toHaveLength(0);
+		const diagnosticsDirectory = getReviewPrivateDiagnosticsDirectory(agentDir);
+		const diagnosticFiles = readdirSync(diagnosticsDirectory);
+		expect(diagnosticFiles).toHaveLength(1);
+		const privateRecords = readFileSync(join(diagnosticsDirectory, diagnosticFiles[0]!), "utf8")
+			.trim()
+			.split("\n")
+			.map((line): unknown => JSON.parse(line));
+		expect(privateRecords).toEqual([
+			expect.objectContaining({ kind: "model_limitation", phase: "discovery", message: privateMarker }),
+			expect.objectContaining({ kind: "model_limitation", phase: "verification", message: privateMarker }),
+		]);
 	});
 
 	it("skips presentation for a no-finding PR and replaces private incomplete prose", async () => {
@@ -857,7 +876,7 @@ describe("review pipeline", () => {
 		snapshots.push(remoteSnapshot);
 		const localSnapshot = await resolveReviewSnapshot({ kind: "uncommitted" }, harness.tempDir, {
 			maxCommitRefBytes: 1_024,
-			maxPullRequestNumber: MAX_GITHUB_PR_NUMBER,
+			maxPullRequestNumber: MAX_PULL_REQUEST_NUMBER,
 		});
 		if ("error" in localSnapshot) throw new Error(localSnapshot.error);
 		snapshots.push(localSnapshot);

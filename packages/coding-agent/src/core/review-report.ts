@@ -658,7 +658,7 @@ export function hostReviewSummary(completionStatus: ReviewCompletionStatus, find
 }
 
 export function buildParsedReview(options: BuildParsedReviewOptions): ParsedReview {
-	const protectedContext = options.snapshot.githubContext !== undefined;
+	const protectedContext = options.snapshot.codeHostContext !== undefined;
 	const declassifiedFindings =
 		options.declassifiedFindings ?? declassifyReviewFindings(options.validatedCandidates, options.verificationReport);
 	const presentationReport =
@@ -728,15 +728,15 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 	const expectedHunks = expectedReviewableHunkIds(options.snapshot, excluded);
 	const inspected = new Set(options.verificationCoverage.hunksInspected);
 	const uninspectedHunks = expectedHunks.filter((hunkId) => !inspected.has(hunkId));
-	const contextCoverage = options.snapshot.githubContext
+	const contextCoverage = options.snapshot.codeHostContext
 		? {
-				captureStatus: options.snapshot.githubContext.manifest.status,
-				linkedIssueCount: options.snapshot.githubContext.manifest.linkedIssueCount,
-				discussionEntryCount: options.snapshot.githubContext.manifest.discussionEntryCount,
+				captureStatus: options.snapshot.codeHostContext.manifest.status,
+				linkedIssueCount: options.snapshot.codeHostContext.manifest.linkedIssueCount,
+				discussionEntryCount: options.snapshot.codeHostContext.manifest.discussionEntryCount,
 				limitationCodes: [
-					...new Set(options.snapshot.githubContext.manifest.limitations.map((limitation) => limitation.code)),
+					...new Set(options.snapshot.codeHostContext.manifest.limitations.map((limitation) => limitation.code)),
 				].sort(),
-				fingerprint: options.snapshot.githubContext.manifest.fingerprint,
+				fingerprint: options.snapshot.codeHostContext.manifest.fingerprint,
 				discoveryInspectionComplete: options.discoveryCoverage.contextInspectionComplete,
 				verificationInspectionComplete: options.verificationCoverage.contextInspectionComplete,
 			}
@@ -751,13 +751,13 @@ export function buildParsedReview(options: BuildParsedReviewOptions): ParsedRevi
 			? []
 			: ["Changed-file inventory was not paged to completion."]),
 		...(contextCoverage?.captureStatus === "incomplete"
-			? ["GitHub pull request context capture was incomplete."]
+			? ["Code-host pull request context capture was incomplete."]
 			: []),
 		...(contextCoverage && !contextCoverage.discoveryInspectionComplete
-			? ["Discovery did not page GitHub pull request context to completion."]
+			? ["Discovery did not page code-host pull request context to completion."]
 			: []),
 		...(contextCoverage && !contextCoverage.verificationInspectionComplete
-			? ["Verification did not page GitHub pull request context to completion."]
+			? ["Verification did not page code-host pull request context to completion."]
 			: []),
 		...uninspectedHunks.map((hunkId) => `Changed hunk was not fully inspected: ${hunkId}`),
 	];

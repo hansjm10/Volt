@@ -5943,8 +5943,7 @@
 							"type": "array",
 							"items": {
 								"$ref": "#/$defs/RpcPlanStep"
-							},
-							"maxItems": 64
+							}
 						},
 						"phase": {
 							"type": "string",
@@ -5986,8 +5985,7 @@
 							"type": "array",
 							"items": {
 								"$ref": "#/$defs/RpcPlanStep"
-							},
-							"maxItems": 64
+							}
 						},
 						"phase": {
 							"type": "string",
@@ -6006,30 +6004,87 @@
 			]
 		},
 		"RpcPlanStep": {
-			"type": "object",
-			"required": [
-				"id",
-				"text",
-				"status"
-			],
-			"properties": {
-				"id": {
-					"type": "string",
-					"minLength": 1
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"id",
+						"text",
+						"status"
+					],
+					"properties": {
+						"id": {
+							"type": "string",
+							"minLength": 1
+						},
+						"text": {
+							"type": "string",
+							"minLength": 1
+						},
+						"status": {
+							"$ref": "#/$defs/RpcPlanStepStatus"
+						},
+						"note": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"additionalProperties": false
 				},
-				"text": {
-					"type": "string",
-					"minLength": 1
-				},
-				"status": {
-					"$ref": "#/$defs/RpcPlanStepStatus"
-				},
-				"note": {
-					"type": "string",
-					"minLength": 1
+				{
+					"type": "object",
+					"required": [
+						"id",
+						"text",
+						"status",
+						"substeps"
+					],
+					"properties": {
+						"id": {
+							"type": "string",
+							"minLength": 1
+						},
+						"text": {
+							"type": "string",
+							"minLength": 1
+						},
+						"status": {
+							"$ref": "#/$defs/RpcPlanStepStatus"
+						},
+						"substeps": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"required": [
+									"id",
+									"text",
+									"status"
+								],
+								"properties": {
+									"id": {
+										"type": "string",
+										"minLength": 1
+									},
+									"text": {
+										"type": "string",
+										"minLength": 1
+									},
+									"status": {
+										"$ref": "#/$defs/RpcPlanStepStatus"
+									},
+									"note": {
+										"type": "string",
+										"minLength": 1
+									}
+								},
+								"additionalProperties": false
+							},
+							"minItems": 1
+						}
+					},
+					"additionalProperties": false
 				}
-			},
-			"additionalProperties": false
+			]
 		},
 		"RpcPlanStepStatus": {
 			"type": "string",
