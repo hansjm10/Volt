@@ -1,5 +1,6 @@
 import {
 	chmodSync,
+	copyFileSync,
 	existsSync,
 	linkSync,
 	lstatSync,
@@ -94,6 +95,27 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		expect(mode(sharedDir)).toBe(0o777);
 		expect(mode(sessionFile)).toBe(0o600);
 		expect(readFileSync(sessionFile, "utf8")).toBe(original);
+	});
+
+	it("preserves an implicitly derived shared parent across a fresh reopen", async () => {
+		const privateDir = join(root, "private-sessions");
+		const source = SessionManager.create(cwd, privateDir);
+		source.appendCustomMessageEntry("test", "persisted", true);
+		await source.flush();
+		const sourceFile = source.getSessionFile();
+		expect(sourceFile).toBeDefined();
+
+		const sharedDir = join(root, "shared-reopen");
+		mkdirSync(sharedDir, { mode: 0o777 });
+		chmodSync(sharedDir, 0o777);
+		const sharedFile = join(sharedDir, "session.jsonl");
+		copyFileSync(sourceFile!, sharedFile);
+
+		const opened = SessionManager.open(sharedFile);
+		const reopened = SessionManager.open(opened.getSessionFile()!, undefined, opened.getCwd());
+		expect(reopened.getSessionId()).toBe(opened.getSessionId());
+		expect(mode(sharedDir)).toBe(0o777);
+		expect(mode(sharedFile)).toBe(0o600);
 	});
 
 	it("rejects linked session sources", async () => {

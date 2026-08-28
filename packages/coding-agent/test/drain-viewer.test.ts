@@ -42,6 +42,7 @@ function createContext() {
 	const context = {
 		drainViewer: undefined as DrainViewerComponent | undefined,
 		drainViewerFeedId: undefined as string | undefined,
+		remoteSessionRefresh: undefined as Promise<void> | undefined,
 		ui: { requestRender: vi.fn() },
 		chatContainer: { addChild: vi.fn() },
 		settingsManager: { getShowImages: () => false, getImageWidthCells: () => 40 },
@@ -56,15 +57,19 @@ function createContext() {
 			relayCount: () => 0,
 		},
 		session: { reload: vi.fn(async () => {}), isStreaming: false },
-		runtimeHost: { startRecoveredClientInputs: vi.fn(async () => {}) },
+		runtimeHost: {
+			refreshCurrentSessionFromDisk: vi.fn(async () => ({ cancelled: false, seeded: false })),
+			startRecoveredClientInputs: vi.fn(async () => {}),
+		},
+		createProjectTrustContext: vi.fn(() => ({})),
 		renderCurrentSessionState: vi.fn(),
 		showStatus: vi.fn(),
 		showWarning: vi.fn(),
+		handleRemoteSessionRefreshFailure: vi.fn(),
 		lastQuitWarningAt: 0,
 		enterDrainViewer: proto.enterDrainViewer,
 		finishDrainViewerGrant: proto.finishDrainViewerGrant,
-		// finishDrainViewerGrant reloads the session through this; the mock session
-		// has no sessionFile, so it takes the settings-reload fallback (session.reload).
+		handleReacquireOutcome: proto.handleReacquireOutcome,
 		absorbRemoteSessionChangesFromDisk: proto.absorbRemoteSessionChangesFromDisk,
 		exitDrainViewer: proto.exitDrainViewer,
 		isDrainViewerActive: proto.isDrainViewerActive,
@@ -123,14 +128,55 @@ describe("drain viewer (§6.3)", () => {
 		expect(rendered).toContain("remote says hi from the phone");
 		expect(rendered).toContain("finishing remote turn");
 
-		// Warm grant: reload from file, re-render, overlay dismissed.
+		// Warm grant: keep input fenced until a fresh same-session generation is
+		// installed from disk, then re-render and dismiss the overlay.
+		let finishRefresh: (value: { cancelled: false; seeded: false }) => void = () => {};
+		context.runtimeHost.refreshCurrentSessionFromDisk.mockReturnValue(
+			new Promise((resolve) => {
+				finishRefresh = resolve;
+			}),
+		);
 		grant.resolve({ handoff: "warm" });
 		await vi.waitFor(() => {
-			expect(context.session.reload).toHaveBeenCalledTimes(1);
+			expect(context.runtimeHost.refreshCurrentSessionFromDisk).toHaveBeenCalledTimes(1);
+		});
+		expect(proto.isDrainViewerActive.call(context)).toBe(true);
+		expect(context.renderCurrentSessionState).not.toHaveBeenCalled();
+
+		finishRefresh({ cancelled: false, seeded: false });
+		await vi.waitFor(() => {
 			expect(context.renderCurrentSessionState).toHaveBeenCalledTimes(1);
 		});
 		expect(proto.isDrainViewerActive.call(context)).toBe(false);
 		expect(context.drainViewerFeedId).toBeUndefined();
+	});
+
+	it("refreshes a genuine warm reconnect before recovered input resumes", async () => {
+		const context = createContext();
+		const phases: string[] = [];
+		let finishRefresh: () => void = () => {};
+		context.runtimeHost.refreshCurrentSessionFromDisk.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					phases.push("refresh-start");
+					finishRefresh = () => {
+						phases.push("refresh-end");
+						resolve({ cancelled: false, seeded: false });
+					};
+				}),
+		);
+		context.renderCurrentSessionState.mockImplementation(() => phases.push("render"));
+		context.runtimeHost.startRecoveredClientInputs.mockImplementation(async () => {
+			phases.push("recovery");
+		});
+
+		const handling = proto.handleReacquireOutcome.call(context, { kind: "granted", handoff: "warm" });
+		await vi.waitFor(() => expect(phases).toEqual(["refresh-start"]));
+		expect(context.runtimeHost.startRecoveredClientInputs).not.toHaveBeenCalled();
+
+		finishRefresh();
+		await handling;
+		expect(phases).toEqual(["refresh-start", "refresh-end", "render", "recovery"]);
 	});
 
 	it("reconstructs a mid-message snapshot with subsequent thinking and tool-call deltas", () => {
@@ -345,6 +391,21 @@ describe("drain viewer (§6.3)", () => {
 		} finally {
 			disposeSpy.mockRestore();
 		}
+	});
+
+	it("keeps input fenced and reports a failed authoritative refresh", async () => {
+		const context = createContext();
+		const grant = deferredGrant();
+		const refreshError = new Error("authoritative refresh failed");
+		context.runtimeHost.refreshCurrentSessionFromDisk.mockRejectedValue(refreshError);
+		proto.enterDrainViewer.call(context, { kind: "pending", viewerFeedId: "vf-refresh", granted: grant.promise });
+
+		grant.resolve({ handoff: "warm" });
+		await vi.waitFor(() => {
+			expect(context.handleRemoteSessionRefreshFailure).toHaveBeenCalledWith(refreshError);
+		});
+		expect(proto.isDrainViewerActive.call(context)).toBe(true);
+		expect(context.renderCurrentSessionState).not.toHaveBeenCalled();
 	});
 
 	it("drain failure exits the overlay with a warning instead of taking over", async () => {

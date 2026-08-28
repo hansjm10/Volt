@@ -28,15 +28,17 @@ via `./check.sh <Module>`.
 | Module | What it covers (plain) | State |
 |--------|------------------------|-------|
 | **`LeaseBroker`** | Who holds a conversation (daemon vs terminal) and how it hands off. | **Verified green** (40,804 states). `LeaseBroker.tla` / `.cfg` |
+| **`TuiSessionReplacement`** | Whether a prepared desktop session replacement keeps lease, disk refresh, recovery, and relay ingress in one safe order. | **Verified green** (68 states, depth 8). `TuiSessionReplacement.tla` / `.cfg` |
 | **`RelayViewer`** | The relay token + the "watch the turn finish" viewer feed during a hand-off. | **Verified green** (207,025 states). `RelayViewer.tla` / `.cfg` |
 | **`SessionTarget`** | Picking the right session on connect, so a phone never pins the wrong one. | **Verified green** (28 states). `SessionTarget.tla` / `.cfg` |
 | **`ClientAuth`** | Pairing, revoking, and re-pairing a phone. | **Verified green** (9,678 states). `ClientAuth.tla` / `.cfg` |
 | **`ClientConn`** | The phone's own connect / reconnect / detach / abort behavior. | **Verified green** (176 states). `ClientConn.tla` / `.cfg` |
 
-**Running the checker.** `./check.sh` runs TLC on `LeaseBroker` (it auto-downloads
-`tla2tools.jar` on first run; needs a JDK 17+ via `JAVA_HOME` or `java` on PATH).
-The baseline has been **verified green with TLC**: 40,804 distinct states, depth
-27, all invariants and both liveness properties hold. See [How to run](#how-to-run).
+**Running the checker.** `./check.sh` runs TLC on `LeaseBroker`; pass a module name
+to check another model (it auto-downloads `tla2tools.jar` on first run and needs a
+JDK 17+ via `JAVA_HOME` or `java` on PATH). The lease baseline has been **verified
+green with TLC** at 40,804 distinct states/depth 27. `TuiSessionReplacement` is
+green at 68 distinct states/depth 8. See [How to run](#how-to-run).
 
 ---
 
@@ -138,11 +140,41 @@ abstractions; the ownership logic itself is kept exact.
 
 ---
 
+## The `TuiSessionReplacement` module
+
+`TuiSessionReplacement.tla` composes the TUI-visible ownership facts that the
+broker-only model deliberately abstracts away: a stable target reservation or
+preacquired lease, authoritative disk reopen, source invalidation, target runtime
+publication, recovered durable input, and post-lifecycle relay activation.
+
+Its green configuration rejects a connection-generation change before commit.
+`TuiSessionReplacement.deferred.cfg` intentionally enables the reviewed behavior
+that commits after such a change and defers acquisition; TLC reaches
+`ConnectedRecoveryHasTargetLease` in nine steps through prepare, reopen,
+disconnect/reconnect, commit, publish, and recovery. Keep the failing config as a
+counterexample witness rather than a CI baseline.
+
+Checked safety invariants:
+
+- `ConnectedRecoveryHasTargetLease`
+- `RelayIngressRequiresPublishedTarget`
+- `ReopenFollowsTargetStability`
+- `StaleConnectionCannotCommit`
+- `PreInvalidationFailureRetainsSource`
+- `PostInvalidationFailureIsTerminal`
+
+`PreparedHandoffEventuallySettles` checks liveness under weak fairness on the
+transaction progress action.
+
+---
+
 ## How to run
 
 ```bash
-./check.sh                 # LeaseBroker, baseline config (auto-fetches tla2tools.jar)
-./check.sh RelayViewer     # the relay + viewer-feed module
+./check.sh                                # LeaseBroker baseline
+./check.sh TuiSessionReplacement          # generation-fenced replacement baseline
+./check.sh TuiSessionReplacement TuiSessionReplacement.deferred.cfg  # expected counterexample
+./check.sh RelayViewer                    # relay + viewer-feed module
 ```
 
 `check.sh` needs a JDK 17+ (via `JAVA_HOME` or `java` on PATH). Equivalently, by hand:

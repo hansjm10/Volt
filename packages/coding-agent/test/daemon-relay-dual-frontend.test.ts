@@ -352,7 +352,7 @@ async function startOwnedRelayDaemonHarness(): Promise<OwnedRelayDaemonHarness> 
 	);
 	const attach = createDaemonAttach({ cwd: workspaceDir, agentDir, autoStart: false });
 	await attach.start();
-	expect(await attach.acquire(SESSION_ID)).toMatchObject({ kind: "granted" });
+	expect(await attach.selectSession(SESSION_ID)).toMatchObject({ kind: "granted" });
 	cleanups.push(async () => {
 		await attach.dispose();
 		await Promise.all(
