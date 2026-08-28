@@ -368,6 +368,8 @@ export interface AgentSessionConfig {
 	settingsManager: SettingsManager;
 	gitContextProvider?: GitContextProvider;
 	cwd: string;
+	/** Project/config root and hard LSP workspace boundary. Defaults to cwd. */
+	projectCwd?: string;
 	/** Global config directory used for session-owned artifacts. Default: ~/.volt/agent */
 	agentDir?: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
@@ -677,6 +679,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition<any, any>[];
 	private _baseToolDefinitions: Map<string, ToolDefinition<any, any>> = new Map();
 	private _cwd: string;
+	private _lexicalProjectCwd: string;
 	private _agentDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -771,7 +774,8 @@ export class AgentSession {
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
-		this._cwd = config.cwd;
+		this._cwd = resolvePath(config.cwd);
+		this._lexicalProjectCwd = resolvePath(config.projectCwd ?? this._cwd);
 		this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
 		this._modelRegistry = config.modelRegistry;
 		const restoredContext = this.sessionManager.buildSessionContext();
@@ -836,9 +840,10 @@ export class AgentSession {
 	}
 
 	/** LSP status for the /lsp command. */
-	getLspStatus(): { enabled: boolean; servers: LspServerStatus[]; traceFile?: string } {
+	getLspStatus(): { enabled: boolean; workspaceRoot?: string; servers: LspServerStatus[]; traceFile?: string } {
 		return {
 			enabled: this._lspManager !== undefined,
+			workspaceRoot: this._lspManager?.getWorkspaceRoot(),
 			servers: this._lspManager?.getStatus() ?? [],
 			traceFile: this._lspManager?.getTraceFile(),
 		};
@@ -6252,6 +6257,7 @@ export class AgentSession {
 		if (lspConfig.enabled) {
 			this._lspManager = new LspManager({
 				cwd: this._cwd,
+				projectCwd: this._lexicalProjectCwd,
 				config: lspConfig,
 				hostInteraction: this._hostInteraction,
 			});

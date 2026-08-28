@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { AgentHarnessStreamOptions, AgentMessage, StreamFn, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@hansjm10/volt-ai";
 import { getAgentDir } from "../config.ts";
-import { resolvePath } from "../utils/paths.ts";
+import { canonicalizePath, resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { AuthStorage } from "./auth-storage.ts";
@@ -248,7 +248,8 @@ function getDefaultAgentDir(): string {
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
-	const projectCwd = resolvePath(options.projectCwd ?? cwd);
+	const lexicalProjectCwd = resolvePath(options.projectCwd ?? cwd);
+	const projectCwd = canonicalizePath(lexicalProjectCwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
@@ -506,6 +507,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		settingsManager,
 		gitContextProvider,
 		cwd,
+		projectCwd: lexicalProjectCwd,
 		agentDir,
 		scopedModels: options.scopedModels,
 		resourceLoader,

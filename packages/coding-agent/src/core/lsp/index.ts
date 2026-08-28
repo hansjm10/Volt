@@ -1,5 +1,11 @@
 export { LspClient, type LspClientOptions, type LspDiagnostic } from "./client.ts";
 export {
+	type LspLaunchDescriptor,
+	type LspLaunchSource,
+	type ResolveLspLaunchOptions,
+	resolveLspLaunch,
+} from "./command-resolver.ts";
+export {
 	installHintForCommand,
 	installRecipeForCommand,
 	type LspInstallRecipe,

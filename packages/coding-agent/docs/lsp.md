@@ -20,15 +20,16 @@ Use `volt --lsp` to force-enable LSP for a run when settings disable it.
 
 ## How It Works
 
-- Servers are spawned lazily: the first `edit`/`write` to a file with a matching extension starts the server for that file's project root.
-- The project root is found by walking up from the edited file looking for the server's `rootMarkers` (falling back to the working directory). Markers are priority-ordered: for TypeScript, a `tsconfig.json` anywhere up the tree wins over a closer `package.json`, so monorepo subpackages resolve to the directory carrying the language configuration.
+- Servers are spawned lazily: the first `edit`/`write` to a file with a matching extension starts the server for that file's server root.
+- Volt has one canonical project workspace for LSP. It is normally the startup directory; remote and managed-worktree runtimes may run tools from a nested directory while retaining the registered workspace or checkout as the project workspace. Requested files are resolved through their existing path or nearest existing ancestor before lexical and canonical boundary checks, so valid case-variant spellings on case-insensitive filesystems are accepted while unregistered aliases and paths that resolve outside the workspace are rejected. The same boundary applies to diagnostics, navigation, refactoring, and server-initiated edits.
+- The server root is found by walking up from the requested file looking for the server's `rootMarkers`, but the search stops at the project workspace and falls back to it. Markers are priority-ordered entry names: for TypeScript, a `tsconfig.json` anywhere inside the workspace wins over a closer `package.json`, so monorepo subpackages resolve to the directory carrying the language configuration. Markers above the configured project workspace are intentionally ignored.
 - After each successful `edit`/`write`, volt syncs the new file content to the server and collects diagnostics, using pull diagnostics (`textDocument/diagnostic`) when the server supports them, otherwise waiting up to `settleMs` for the server to publish. The first collection on a freshly started server waits up to `firstSettleMs` instead, because servers like tsserver publish nothing until the project has loaded.
 - Before every diagnostics collection or navigation query, volt re-syncs any previously opened file whose on-disk content changed outside the `edit`/`write` tools (e.g. via `bash`: `git checkout`, codegen). Deleted files are closed on the server, and servers are notified via `workspace/didChangeWatchedFiles`.
 - Diagnostics at or above the configured `severity` are appended to the tool result and shown in the TUI. Other open files that go from clean to failing as a result of the change are reported in a `Newly failing in other open files` section (capped at 5 files; best-effort, depends on the server republishing within the settle window).
-- One client runs per (server, project root) pair. Servers shut down when the session ends or reloads, and after `idleShutdownMs` without use (they respawn lazily on the next operation).
-- `/lsp` shows the status of running servers (root, open documents, idle time); `/lsp restart` stops them all so they respawn fresh on next use.
-- `/lsp trace [path]` enables protocol tracing at runtime (`/lsp trace off` disables): JSON-RPC traffic in both directions, server stderr, and lifecycle events are appended to the trace file with timestamps. Use this to debug a misbehaving server. Persistent tracing: set `lsp.traceFile`.
-- A server that fails to start because its binary is missing can trigger a host confirmation prompt for trusted built-in install recipes (including post-`edit`/`write` diagnostics). If approved, Volt runs the host-owned install command, clears the start failure, retries the server, and resumes diagnostics. If denied or unsupported, the missing-server message includes install instructions and is then silenced; after three failed starts the server is disabled for the session.
+- One client runs per canonical `(server, server root)` pair. A failure in one nested root does not disable that server in another root. Servers shut down when the session ends or reloads, and after `idleShutdownMs` without use (they respawn lazily on the next operation).
+- `/lsp` shows the project workspace, server root, resolved executable (or unresolved command), launch source, start attempts, open documents, idle time, and retained startup error. `/lsp restart` stops all owned processes and clears failed-start breakers so servers resolve and spawn fresh on next use.
+- `/lsp trace [path]` enables protocol tracing at runtime (`/lsp trace off` disables): JSON-RPC traffic in both directions, server stderr, workspace/server roots, resolved launch context, attempts, and lifecycle events are appended with timestamps. Relative runtime paths and persistent `lsp.traceFile` paths resolve from the canonical project workspace, not the process invocation directory or nested runtime cwd.
+- Only a genuinely missing bare command from an unchanged built-in server definition can trigger a trusted automatic install prompt. Install prompts and concurrent attempts coalesce by reviewed recipe; cancelling one caller stops only its wait, while the shared install continues without affecting that root's startup breaker. After success Volt searches PATH again before retrying. Explicit paths, custom commands, manual-install-only servers, and present-but-broken executables are never auto-installed. Their retained status includes the resolved command, bounded startup stderr, and manual repair guidance. After three failed starts only that `(server, root)` record is disabled until `/lsp restart` or `/reload`.
 
 Diagnostics are best-effort: server failures or timeouts never fail the edit itself.
 
@@ -52,11 +53,13 @@ When LSP is enabled, the `lsp` tool is active by default (it still respects `--t
 
 The symbol is located by name: volt finds its position in the file (preferring a word-boundary match on the hinted `line`) and issues the positional LSP request. Errors such as a missing server or symbol are returned as text so the model can react.
 
-`rename` and `fix` write the server's `WorkspaceEdit` to disk (including create/rename/delete file operations), re-sync changed open documents, and report a per-file summary. Command-based code actions are executed via `workspace/executeCommand` with server-initiated `workspace/applyEdit` requests applied the same way.
+`rename` and `fix` write the server's `WorkspaceEdit` to disk (including create/rename/delete file operations), re-sync changed open documents, and report a per-file summary. Every edit is validated against the canonical project workspace, even when the client was initialized with a narrower nested server root. Command-based code actions are executed via `workspace/executeCommand` with server-initiated `workspace/applyEdit` requests applied through the same boundary.
 
 ## Built-in Servers
 
-The matching server must be installed and on your `PATH`. When a trusted built-in server binary is missing, interactive and capable RPC hosts can ask to install it automatically, then retry the LSP operation. Non-interactive hosts, clients that do not advertise host action support, custom commands, and manual-install-only servers fall back to a one-time install hint. Built-in defaults:
+The matching server must be installed on the exact inherited `PATH`. Volt does not implicitly execute `node_modules/.bin`. Bare commands are searched in PATH order; relative PATH entries are based at the canonical project workspace. On Windows, commands with an explicit filename extension are probed as named before any `PATHEXT`-derived fallback, while extensionless commands use `PATHEXT` order for PATH, project-relative, and absolute launch forms. Commands containing `/` or `\\` resolve from the project workspace. All remaining command entries are passed as literal argv through Volt's cross-platform spawn wrapper, without shell joining.
+
+When a trusted built-in bare command is missing, interactive and capable RPC hosts can ask to install it automatically, then search PATH again and retry the LSP operation. Non-interactive hosts, clients that do not advertise host action support, overridden command argv, custom commands, explicit paths, and manual-install-only servers fall back to repair context or an install hint. Built-in defaults:
 
 | Name | Command | Extensions | Root markers | Install |
 |------|---------|------------|--------------|---------|
@@ -67,7 +70,7 @@ The matching server must be installed and on your `PATH`. When a trusted built-i
 | `cpp` | `clangd` | `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.hh` | `compile_commands.json`, `compile_flags.txt`, `.clangd` | [clangd.llvm.org/installation](https://clangd.llvm.org/installation) |
 | `zig` | `zls` | `.zig` | `build.zig` | [github.com/zigtools/zls](https://github.com/zigtools/zls) |
 | `lua` | `lua-language-server` | `.lua` | `.luarc.json`, `.luarc.jsonc` | [luals.github.io/#install](https://luals.github.io/#install) |
-| `bash` | `bash-language-server start` | `.sh` `.bash` | (working directory) | `npm install -g bash-language-server` |
+| `bash` | `bash-language-server start` | `.sh` `.bash` | (project workspace fallback) | `npm install -g bash-language-server` |
 
 ## Configuration
 
@@ -102,7 +105,7 @@ All settings live under `lsp` in `settings.json`:
 | `settleMs` | number | `1500` | How long to wait for published diagnostics after a change (servers without pull diagnostics) |
 | `firstSettleMs` | number | `10000` | Wait window for the first diagnostics from a freshly started server (project load time) |
 | `idleShutdownMs` | number | `600000` | Shut down servers idle for this long (10 minutes); `0` disables idle shutdown |
-| `traceFile` | string | | Append protocol traffic, server stderr, and lifecycle events to this file (also `/lsp trace` at runtime) |
+| `traceFile` | string | | Append protocol traffic, server stderr, resolved launch context, and lifecycle events to this file; relative paths resolve from the canonical project workspace (also `/lsp trace` at runtime) |
 | `maxDiagnostics` | number | `20` | Maximum diagnostics per tool call; the rest are summarized as `... and N more` |
 | `severity` | string | `"error"` | Minimum severity to report: `error`, `warning`, `information`, or `hint` |
 | `servers.<name>` | object | | Server definition, merged over the built-in default with the same name |
@@ -111,9 +114,9 @@ Per-server fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `command` | string[] | Launch command, argv-style |
+| `command` | string[] | Launch argv. Absolute executables are preserved, explicit relative executables resolve from the project workspace, and bare names use only inherited PATH/PATHEXT; no shell or implicit `node_modules/.bin` lookup |
 | `fileExtensions` | string[] | File extensions routed to this server |
-| `rootMarkers` | string[] | Files/directories marking the project root, searched upward from the edited file |
+| `rootMarkers` | string[] | Priority-ordered file/directory entry names marking a server root, searched upward only to the project workspace ceiling |
 | `initializationOptions` | any | Passed to the server in the `initialize` request |
 | `settings` | object | Server configuration: sent via `workspace/didChangeConfiguration` after startup and used to answer `workspace/configuration` section requests (dot-separated section paths look up into this object) |
 | `enabled` | boolean | Set `false` to disable a built-in server |

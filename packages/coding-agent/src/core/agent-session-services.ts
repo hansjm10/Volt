@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { Model } from "@hansjm10/volt-ai";
 import { getAgentDir } from "../config.ts";
-import { resolvePath } from "../utils/paths.ts";
+import { canonicalizePath, resolvePath } from "../utils/paths.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { GitContextProvider } from "./git-context-provider.ts";
@@ -89,7 +89,10 @@ export interface CreateAgentSessionFromServicesOptions {
  */
 export interface AgentSessionServices {
 	cwd: string;
+	/** Canonical project root used by project-scoped services. */
 	projectCwd: string;
+	/** Original absolute project-root spelling retained for lexical LSP validation. */
+	lexicalProjectCwd: string;
 	agentDir: string;
 	authStorage: AuthStorage;
 	settingsManager: SettingsManager;
@@ -158,7 +161,8 @@ export async function createAgentSessionServices(
 	options: CreateAgentSessionServicesOptions,
 ): Promise<AgentSessionServices> {
 	const cwd = resolvePath(options.cwd);
-	const projectCwd = resolvePath(options.projectCwd ?? cwd);
+	const lexicalProjectCwd = resolvePath(options.projectCwd ?? cwd);
+	const projectCwd = canonicalizePath(lexicalProjectCwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
 	const authStorage = options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"));
 	const settingsManager =
@@ -198,6 +202,7 @@ export async function createAgentSessionServices(
 	return {
 		cwd,
 		projectCwd,
+		lexicalProjectCwd,
 		agentDir,
 		authStorage,
 		settingsManager,
@@ -222,7 +227,7 @@ export async function createAgentSessionFromServices(
 ): Promise<CreateAgentSessionResult> {
 	return createAgentSession({
 		cwd: options.services.cwd,
-		projectCwd: options.services.projectCwd,
+		projectCwd: options.services.lexicalProjectCwd,
 		agentDir: options.services.agentDir,
 		authStorage: options.services.authStorage,
 		settingsManager: options.services.settingsManager,

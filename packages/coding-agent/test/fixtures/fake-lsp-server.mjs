@@ -44,6 +44,8 @@ const state = {
 	configResponses: undefined,
 	initializeCapabilities: undefined,
 	applyEditResponses: [],
+	launchArgv: process.argv.slice(2),
+	launchEnvironment: process.env.VOLT_LSP_TEST_ENV,
 };
 
 process.stderr.write("fake-lsp-server ready\n");
