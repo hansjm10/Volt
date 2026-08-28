@@ -1,3 +1,5 @@
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
 	chmodSync,
 	mkdirSync,
@@ -10,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { HostActionRequest, HostActionUpdate, HostInteraction } from "../src/core/host-interaction.ts";
@@ -137,6 +140,30 @@ describe("resolveLspConfig", () => {
 		expect(config.servers.find((s) => s.name === "custom")?.settings).toEqual({ custom: { level: 3 } });
 	});
 
+	it("attaches automatic install recipes only to the complete built-in command", () => {
+		const resolveTypescript = (command?: string[]) =>
+			resolveLspConfig({
+				servers: {
+					typescript: {
+						...(command ? { command } : {}),
+						fileExtensions: [".foo"],
+					},
+				},
+			}).servers.find((server) => server.name === "typescript");
+
+		expect(resolveTypescript()?.installRecipe).toBeDefined();
+		expect(resolveTypescript(["typescript-language-server", "--stdio"])?.installRecipe).toBeDefined();
+		for (const command of [
+			["typescript-language-server"],
+			["typescript-language-server", "--custom-mode"],
+			["typescript-language-server", "--stdio", "--extra"],
+		]) {
+			const server = resolveTypescript(command);
+			expect(server?.installRecipe, command.join(" ")).toBeUndefined();
+			expect(server?.installHint, command.join(" ")).toContain("npm install -g typescript-language-server");
+		}
+	});
+
 	it("skips user servers without a command or file extensions", () => {
 		const config = resolveLspConfig({ servers: { broken: { command: ["x"] } } });
 		expect(config.servers.find((s) => s.name === "broken")).toBeUndefined();
@@ -176,13 +203,14 @@ describe("resolveLspLaunch", () => {
 	it("resolves absolute and explicit project-relative executables without process cwd input", () => {
 		const environment = { PATH: "/ignored" };
 		const executablePaths = new Set(["/opt/lsp/server", "/workspace/project/tools/server"]);
-		const isExecutable = (path: string) => executablePaths.has(path);
+		const probeExecutable = (path: string): "executable" | "missing" =>
+			executablePaths.has(path) ? "executable" : "missing";
 
 		const absolute = resolveLspLaunch(["/opt/lsp/server", "--stdio"], {
 			projectCwd: "/workspace/project",
 			environment,
 			platform: "linux",
-			isExecutable,
+			probeExecutable,
 		});
 		expect(absolute).toMatchObject({
 			command: ["/opt/lsp/server", "--stdio"],
@@ -196,7 +224,7 @@ describe("resolveLspLaunch", () => {
 			projectCwd: "/workspace/project",
 			environment,
 			platform: "linux",
-			isExecutable,
+			probeExecutable,
 		});
 		expect(relative).toMatchObject({
 			command: ["/workspace/project/tools/server", "space value", "a&b"],
@@ -212,9 +240,9 @@ describe("resolveLspLaunch", () => {
 			projectCwd: "/workspace/project",
 			environment: { PATH: "/first:relative-bin:/last" },
 			platform: "linux",
-			isExecutable: (path) => {
+			probeExecutable: (path) => {
 				probes.push(path);
-				return path === "/workspace/project/relative-bin/server";
+				return path === "/workspace/project/relative-bin/server" ? "executable" : "missing";
 			},
 		});
 
@@ -227,15 +255,52 @@ describe("resolveLspLaunch", () => {
 		});
 	});
 
+	it("distinguishes unusable PATH candidates from missing executables", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch(["server", "--stdio"], {
+			projectCwd: "/workspace/project",
+			environment: { PATH: "/first:/second" },
+			platform: "linux",
+			probeExecutable: (path) => {
+				probes.push(path);
+				return path === "/first/server" ? "unusable" : "missing";
+			},
+		});
+
+		expect(probes).toEqual(["/first/server", "/second/server"]);
+		expect(launch.resolvedExecutable).toBeUndefined();
+		expect(launch.unusableExecutable).toBe("/first/server");
+		expect(launch.command).toEqual(["server", "--stdio"]);
+	});
+
+	it("continues PATH search after an unusable candidate", () => {
+		const probes: string[] = [];
+		const launch = resolveLspLaunch(["server"], {
+			projectCwd: "/workspace/project",
+			environment: { PATH: "/first:/second:/third" },
+			platform: "linux",
+			probeExecutable: (path) => {
+				probes.push(path);
+				if (path === "/first/server") return "unusable";
+				if (path === "/second/server") return "executable";
+				return "missing";
+			},
+		});
+
+		expect(probes).toEqual(["/first/server", "/second/server"]);
+		expect(launch.resolvedExecutable).toBe("/second/server");
+		expect(launch.unusableExecutable).toBeUndefined();
+	});
+
 	it("preserves literal quotes in POSIX PATH entries", () => {
 		const probes: string[] = [];
 		const launch = resolveLspLaunch(["server"], {
 			projectCwd: "/workspace/project",
 			environment: { PATH: '"/opt/lsp"' },
 			platform: "linux",
-			isExecutable: (path) => {
+			probeExecutable: (path) => {
 				probes.push(path);
-				return path === "/opt/lsp/server";
+				return path === "/opt/lsp/server" ? "executable" : "missing";
 			},
 		});
 
@@ -250,7 +315,7 @@ describe("resolveLspLaunch", () => {
 			projectCwd: "/workspace/project",
 			environment: { PATH: "" },
 			platform: "linux",
-			isExecutable: (path) => path === projectBinary,
+			probeExecutable: (path) => (path === projectBinary ? "executable" : "missing"),
 		});
 		expect(unresolved.resolvedExecutable).toBeUndefined();
 
@@ -258,7 +323,7 @@ describe("resolveLspLaunch", () => {
 			projectCwd: "/workspace/project",
 			environment: { PATH: "node_modules/.bin" },
 			platform: "linux",
-			isExecutable: (path) => path === projectBinary,
+			probeExecutable: (path) => (path === projectBinary ? "executable" : "missing"),
 		});
 		expect(explicitPath.resolvedExecutable).toBe(projectBinary);
 	});
@@ -269,9 +334,10 @@ describe("resolveLspLaunch", () => {
 			projectCwd: "C:\\workspace\\project",
 			environment: { Path: '"tools";C:\\global', PATHEXT: ".CMD;.EXE" },
 			platform: "win32",
-			isExecutable: (path) => {
+			probeExecutable: (path) => {
 				probes.push(path);
-				return path === "C:\\workspace\\project\\tools\\server.CMD";
+				if (path === "C:\\workspace\\project\\tools\\server") return "unusable";
+				return path === "C:\\workspace\\project\\tools\\server.CMD" ? "executable" : "missing";
 			},
 		});
 		expect(probes).toEqual(["C:\\workspace\\project\\tools\\server", "C:\\workspace\\project\\tools\\server.CMD"]);
@@ -284,7 +350,7 @@ describe("resolveLspLaunch", () => {
 			projectCwd: "/workspace/project",
 			environment: { PATH: "/bin" },
 			platform: "linux",
-			isExecutable: () => false,
+			probeExecutable: () => "missing",
 		});
 		expect(launch).toMatchObject({
 			command: ["missing-server"],
@@ -1037,6 +1103,94 @@ describe("LspManager", () => {
 		expect(status.lastError!.length).toBeLessThan(9500);
 	});
 
+	it("does not prompt for a built-in server whose launch arguments were overridden", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const previousPath = process.env.PATH;
+		process.env.PATH = tempDir;
+		const requests: HostActionRequest[] = [];
+		try {
+			manager = new LspManager({
+				cwd: tempDir,
+				config: resolveLspConfig({
+					servers: {
+						typescript: {
+							command: ["typescript-language-server", "--custom-mode"],
+							fileExtensions: [".foo"],
+							rootMarkers: [],
+						},
+					},
+				}),
+				hostInteraction: {
+					requestAction: async (request) => {
+						requests.push(request);
+						return { decision: "denied" };
+					},
+				},
+			});
+			const filePath = join(tempDir, "test.foo");
+			const first = await manager.getDiagnostics(filePath, "ERROR\n");
+
+			expect(first).toContain("Install with: npm install -g typescript-language-server typescript");
+			expect(requests).toEqual([]);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	});
+
+	it("does not prompt for a present but unusable built-in server", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
+		const binDir = join(tempDir, "bin");
+		mkdirSync(binDir);
+		const unusablePath = join(
+			binDir,
+			process.platform === "win32" ? "typescript-language-server.CMD" : "typescript-language-server",
+		);
+		if (process.platform === "win32") {
+			mkdirSync(unusablePath);
+		} else {
+			writeFileSync(unusablePath, "#!/bin/sh\nexit 0\n");
+			chmodSync(unusablePath, 0o644);
+		}
+		const previousPath = process.env.PATH;
+		const previousPathExt = process.env.PATHEXT;
+		process.env.PATH = binDir;
+		if (process.platform === "win32") process.env.PATHEXT = ".CMD";
+		const requests: HostActionRequest[] = [];
+		try {
+			manager = new LspManager({
+				cwd: tempDir,
+				config: resolveLspConfig({
+					servers: {
+						typescript: {
+							fileExtensions: [".foo"],
+							rootMarkers: [],
+						},
+					},
+				}),
+				hostInteraction: {
+					requestAction: async (request) => {
+						requests.push(request);
+						return { decision: "denied" };
+					},
+				},
+			});
+			const filePath = join(tempDir, "test.foo");
+			const first = await manager.getDiagnostics(filePath, "ERROR\n");
+
+			expect(first).toContain("is present but not executable");
+			expect(first).toContain("EACCES");
+			expect(first).not.toContain("ENOENT");
+			expect(requests).toEqual([]);
+			expect(manager.getStatus()[0].lastError).toContain(`Unusable executable: ${unusablePath}`);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousPathExt === undefined) delete process.env.PATHEXT;
+			else process.env.PATHEXT = previousPathExt;
+		}
+	});
+
 	it("does not prompt for custom servers that use a known built-in binary", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
 		const previousPath = process.env.PATH;
@@ -1368,6 +1522,74 @@ describe("LspClient disk sync", () => {
 		configChanges: unknown[];
 		configResponses?: unknown[];
 	}
+
+	it("retains startup stderr delivered after the process exit event", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const processEvents = new EventEmitter();
+		let exitCode: number | null = null;
+		Object.assign(processEvents, { stdin, stdout, stderr, pid: undefined, kill: () => true });
+		Object.defineProperties(processEvents, {
+			exitCode: { get: () => exitCode },
+			signalCode: { get: () => null },
+		});
+		const child = processEvents as unknown as ChildProcess;
+		client = new LspClient({
+			serverName: "ordered-exit",
+			command: ["fake-server"],
+			rootDir: tempDir,
+			serverSpawner: () => {
+				setTimeout(() => {
+					stderr.write("early startup detail\n");
+					exitCode = 2;
+					processEvents.emit("exit", 2, null);
+					setTimeout(() => {
+						stderr.end("late startup detail\n");
+						processEvents.emit("close", 2, null);
+					}, 25);
+				}, 0);
+				return child;
+			},
+		});
+
+		await expect(client.start()).rejects.toThrow(
+			/LSP server "ordered-exit" exited.*early startup detail.*late startup detail/s,
+		);
+	});
+
+	it("bounds startup stderr drainage when the stream remains open after exit", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const processEvents = new EventEmitter();
+		let exitCode: number | null = null;
+		Object.assign(processEvents, { stdin, stdout, stderr, pid: undefined, kill: () => true });
+		Object.defineProperties(processEvents, {
+			exitCode: { get: () => exitCode },
+			signalCode: { get: () => null },
+		});
+		const child = processEvents as unknown as ChildProcess;
+		client = new LspClient({
+			serverName: "held-stderr",
+			command: ["fake-server"],
+			rootDir: tempDir,
+			serverSpawner: () => {
+				setTimeout(() => {
+					stderr.write("available startup detail\n");
+					exitCode = 2;
+					processEvents.emit("exit", 2, null);
+				}, 0);
+				return child;
+			},
+		});
+		const startedAt = Date.now();
+
+		await expect(client.start()).rejects.toThrow(/available startup detail/);
+		expect(Date.now() - startedAt).toBeLessThan(1000);
+	});
 
 	it("passes exact launch environment and argv metacharacters without shell interpretation", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));

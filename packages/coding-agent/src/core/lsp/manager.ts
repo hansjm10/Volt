@@ -360,6 +360,19 @@ class MissingLspExecutableError extends Error {
 	}
 }
 
+class UnusableLspExecutableError extends Error {
+	readonly key: string;
+	readonly launch: LspLaunchDescriptor;
+
+	constructor(serverName: string, key: string, launch: LspLaunchDescriptor) {
+		super(
+			`Failed to start LSP server "${serverName}": ${launch.requestedExecutable} is present but not executable: ${launch.unusableExecutable ?? launch.requestedExecutable} (EACCES)`,
+		);
+		this.key = key;
+		this.launch = launch;
+	}
+}
+
 /** Normalize definition results: Location | Location[] | LocationLink[] | null. */
 function normalizeLocations(result: unknown): LspLocation[] {
 	if (!result) {
@@ -568,7 +581,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 				idleMs: now - (this.lastUsedAt.get(key) ?? now),
 				...(launch?.resolvedExecutable
 					? { resolvedExecutable: launch.resolvedExecutable }
-					: { unresolvedCommand: launch?.requestedExecutable ?? "unknown" }),
+					: { unresolvedCommand: launch?.unusableExecutable ?? launch?.requestedExecutable ?? "unknown" }),
 				launchSource: launch?.source ?? "path",
 				attempts: this.startAttempts.get(key) ?? 0,
 				...(failure ? { lastError: failure.lastError } : {}),
@@ -673,6 +686,9 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			try {
 				client = this.getClient(server, root);
 			} catch (error) {
+				if (error instanceof UnusableLspExecutableError) {
+					return this.handleUnusableExecutable(server, error).message;
+				}
 				if (!(error instanceof MissingLspExecutableError)) throw error;
 				const result = await this.handleMissingExecutable(server, error, signal);
 				if (result.retry) continue;
@@ -1033,6 +1049,10 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			try {
 				client = this.getClient(server, root);
 			} catch (error) {
+				if (error instanceof UnusableLspExecutableError) {
+					const result = this.handleUnusableExecutable(server, error);
+					return { error: result.message ?? `lsp(${server.name}): ${error.message}` };
+				}
 				if (!(error instanceof MissingLspExecutableError)) throw error;
 				const result = await this.handleMissingExecutable(server, error, signal);
 				if (result.retry) continue;
@@ -1370,6 +1390,9 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		const attempt = (this.startAttempts.get(key) ?? 0) + 1;
 		this.startAttempts.set(key, attempt);
 		if (!launch.resolvedExecutable) {
+			if (launch.unusableExecutable) {
+				throw new UnusableLspExecutableError(server.name, key, launch);
+			}
 			throw new MissingLspExecutableError(server.name, key, launch, this.projectCwd);
 		}
 
@@ -1408,6 +1431,13 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		clientRef = client;
 		this.clients.set(key, client);
 		return client;
+	}
+
+	private handleUnusableExecutable(
+		server: ResolvedLspServerConfig,
+		error: UnusableLspExecutableError,
+	): { retry: false; message?: string } {
+		return { retry: false, message: this.recordStartFailure(server, error.key, error.message) };
 	}
 
 	private async handleClientError(
@@ -1463,7 +1493,9 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		const launch = this.launches.get(key);
 		const commandContext = launch?.resolvedExecutable
 			? `Resolved executable: ${launch.resolvedExecutable}`
-			: `Unresolved command: ${launch?.requestedExecutable ?? server.command[0]}`;
+			: launch?.unusableExecutable
+				? `Unusable executable: ${launch.unusableExecutable}`
+				: `Unresolved command: ${launch?.requestedExecutable ?? server.command[0]}`;
 		const sourceContext = launch ? `Launch source: ${launch.source}` : undefined;
 		const repairContext = `Project workspace: ${this.projectCwd}; ${commandContext}${sourceContext ? `; ${sourceContext}` : ""}`;
 		const hint = server.installHint;

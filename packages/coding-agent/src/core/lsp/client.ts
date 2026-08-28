@@ -61,6 +61,8 @@ export interface LspClientOptions {
 	onApplyEdit?: (edit: unknown) => Promise<boolean | LspApplyEditResult>;
 	/** Protocol tracer. Can also be set later via setTracer(). */
 	tracer?: LspTracer;
+	/** @internal Injectable process spawner for deterministic transport tests. */
+	serverSpawner?: (command: string[], cwd: string, environment: NodeJS.ProcessEnv) => ChildProcess;
 }
 
 export interface LspApplyEditResult {
@@ -115,6 +117,7 @@ interface JsonRpcMessage {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const MAX_STARTUP_STDERR_CHARS = 8000;
+const STARTUP_STDERR_IDLE_GRACE_MS = 100;
 
 /**
  * How long to re-wait for a fresher publish after an unversioned one when the
@@ -143,6 +146,48 @@ function spawnServer(command: string[], cwd: string, environment: NodeJS.Process
 		cwd,
 		env: environment,
 		stdio: ["pipe", "pipe", "pipe"],
+	});
+}
+
+function waitForStartupStderrDrain(child: ChildProcess): Promise<void> {
+	const stderr = child.stderr;
+	if (!stderr || stderr.readableEnded || stderr.destroyed) return Promise.resolve();
+	return new Promise((resolve) => {
+		let settled = false;
+		let terminated = child.exitCode !== null || child.signalCode !== null;
+		let idleTimer: NodeJS.Timeout | undefined;
+		const cleanup = (): void => {
+			if (idleTimer) clearTimeout(idleTimer);
+			stderr.removeListener("data", onData);
+			stderr.removeListener("end", finish);
+			child.removeListener("error", onTermination);
+			child.removeListener("exit", onTermination);
+			child.removeListener("close", finish);
+		};
+		const finish = (): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve();
+		};
+		const armIdleTimer = (): void => {
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(finish, STARTUP_STDERR_IDLE_GRACE_MS);
+			idleTimer.unref();
+		};
+		const onData = (): void => {
+			if (terminated) armIdleTimer();
+		};
+		const onTermination = (): void => {
+			terminated = true;
+			armIdleTimer();
+		};
+		stderr.on("data", onData);
+		stderr.once("end", finish);
+		child.once("error", onTermination);
+		child.once("exit", onTermination);
+		child.once("close", finish);
+		if (terminated) armIdleTimer();
 	});
 }
 
@@ -206,6 +251,8 @@ export class LspClient {
 	private exitError: Error | undefined;
 	private startupComplete = false;
 	private startupStderr = "";
+	private startupProcessTerminated = false;
+	private startupStderrDrained: Promise<void> = Promise.resolve();
 
 	private nextRequestId = 1;
 	private pendingRequests = new Map<number, PendingRequest>();
@@ -243,8 +290,9 @@ export class LspClient {
 	/** Spawn the server process and run the initialize handshake. Memoized. */
 	start(): Promise<void> {
 		if (!this.startPromise) {
-			this.startPromise = this.doStart().catch((error: unknown) => {
+			this.startPromise = this.doStart().catch(async (error: unknown) => {
 				this.startFailure = true;
+				if (this.startupProcessTerminated) await this.startupStderrDrained;
 				const original = error instanceof Error ? error : new Error(String(error));
 				const stderr = this.startupStderr.trim();
 				const enriched = stderr ? new Error(`${original.message}\nStartup stderr:\n${stderr}`) : original;
@@ -269,19 +317,22 @@ export class LspClient {
 			"info",
 			`spawning: ${this.options.command.join(" ")} (root: ${this.options.rootDir})`,
 		);
-		const child = spawnServer(
+		const child = (this.options.serverSpawner ?? spawnServer)(
 			this.options.command,
 			this.options.rootDir,
 			this.options.environment ?? getSubprocessEnv(),
 		);
 		this.child = child;
+		this.startupStderrDrained = waitForStartupStderrDrain(child);
 
 		const spawnFailure = new Promise<never>((_, reject) => {
 			child.once("error", (error) => {
+				this.startupProcessTerminated = true;
 				this.handleExit(new Error(`Failed to start LSP server "${this.options.serverName}": ${error.message}`));
 				reject(this.exitError);
 			});
 			child.once("exit", (code) => {
+				this.startupProcessTerminated = true;
 				if (!this.disposed && !this.alive) {
 					this.handleExit(
 						new Error(

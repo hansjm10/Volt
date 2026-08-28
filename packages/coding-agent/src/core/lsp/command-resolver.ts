@@ -3,12 +3,15 @@ import { posix, win32 } from "node:path";
 import { getSubprocessEnv } from "../../utils/process-env.ts";
 
 export type LspLaunchSource = "absolute" | "project-relative" | "path";
+export type LspExecutableProbeResult = "missing" | "unusable" | "executable";
 
 export interface LspLaunchDescriptor {
 	configuredCommand: string[];
 	command: string[];
 	requestedExecutable: string;
 	resolvedExecutable?: string;
+	/** First candidate found on disk when no launchable executable resolved. */
+	unusableExecutable?: string;
 	source: LspLaunchSource;
 	environment: NodeJS.ProcessEnv;
 	/** Bare commands are the only launch form eligible for a reviewed automatic install. */
@@ -22,18 +25,33 @@ export interface ResolveLspLaunchOptions {
 	environment?: NodeJS.ProcessEnv;
 	/** Injectable for deterministic cross-platform tests. */
 	platform?: NodeJS.Platform;
-	/** Injectable filesystem probe. Defaults to a regular, executable file check. */
-	isExecutable?: (path: string, platform: NodeJS.Platform) => boolean;
+	/** Injectable filesystem probe. Defaults to distinguishing missing, unusable, and executable candidates. */
+	probeExecutable?: (path: string, platform: NodeJS.Platform) => LspExecutableProbeResult;
 }
 
-function defaultIsExecutable(path: string, platform: NodeJS.Platform): boolean {
+function missingProbeResult(error: unknown): LspExecutableProbeResult {
+	return typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error.code === "ENOENT" || error.code === "ENOTDIR")
+		? "missing"
+		: "unusable";
+}
+
+function defaultProbeExecutable(path: string, platform: NodeJS.Platform): LspExecutableProbeResult {
 	try {
-		if (!statSync(path).isFile()) return false;
-		if (platform !== "win32") accessSync(path, constants.X_OK);
-		return true;
-	} catch {
-		return false;
+		if (!statSync(path).isFile()) return "unusable";
+	} catch (error) {
+		return missingProbeResult(error);
 	}
+	if (platform !== "win32") {
+		try {
+			accessSync(path, constants.X_OK);
+		} catch (error) {
+			return missingProbeResult(error);
+		}
+	}
+	return "executable";
 }
 
 function environmentValue(
@@ -61,12 +79,18 @@ function executableCandidates(path: string, platform: NodeJS.Platform, environme
 		: [path];
 }
 
-function firstExecutable(
+function probeCandidates(
 	candidates: readonly string[],
 	platform: NodeJS.Platform,
-	isExecutable: (path: string, platform: NodeJS.Platform) => boolean,
-): string | undefined {
-	return candidates.find((candidate) => isExecutable(candidate, platform));
+	probeExecutable: (path: string, platform: NodeJS.Platform) => LspExecutableProbeResult,
+): { executable?: string; unusable?: string } {
+	let unusable: string | undefined;
+	for (const candidate of candidates) {
+		const result = probeExecutable(candidate, platform);
+		if (result === "executable") return { executable: candidate };
+		if (result === "unusable" && unusable === undefined) unusable = candidate;
+	}
+	return unusable ? { unusable } : {};
 }
 
 function unquotePathEntry(entry: string): string {
@@ -90,30 +114,35 @@ export function resolveLspLaunch(
 	const platform = options.platform ?? process.platform;
 	const pathApi = platform === "win32" ? win32 : posix;
 	const environment = options.environment ?? getSubprocessEnv();
-	const isExecutable = options.isExecutable ?? defaultIsExecutable;
+	const probeExecutable = options.probeExecutable ?? defaultProbeExecutable;
 	const requestedExecutable = configuredCommand[0];
 	const explicitRelative = requestedExecutable.includes("/") || requestedExecutable.includes("\\");
 	let source: LspLaunchSource;
 	let bare: boolean;
 	let resolvedExecutable: string | undefined;
+	let unusableExecutable: string | undefined;
 
 	if (pathApi.isAbsolute(requestedExecutable)) {
 		source = "absolute";
 		bare = false;
-		resolvedExecutable = firstExecutable(
+		const result = probeCandidates(
 			executableCandidates(requestedExecutable, platform, environment),
 			platform,
-			isExecutable,
+			probeExecutable,
 		);
+		resolvedExecutable = result.executable;
+		unusableExecutable = result.unusable;
 	} else if (explicitRelative) {
 		source = "project-relative";
 		bare = false;
 		const projectRelative = pathApi.resolve(options.projectCwd, requestedExecutable);
-		resolvedExecutable = firstExecutable(
+		const result = probeCandidates(
 			executableCandidates(projectRelative, platform, environment),
 			platform,
-			isExecutable,
+			probeExecutable,
 		);
+		resolvedExecutable = result.executable;
+		unusableExecutable = result.unusable;
 	} else {
 		source = "path";
 		bare = true;
@@ -123,12 +152,16 @@ export function resolveLspLaunch(
 		for (const rawEntry of entries) {
 			const entry = platform === "win32" ? unquotePathEntry(rawEntry) : rawEntry;
 			const directory = pathApi.isAbsolute(entry) ? entry : pathApi.resolve(options.projectCwd, entry || ".");
-			resolvedExecutable = firstExecutable(
+			const result = probeCandidates(
 				executableCandidates(pathApi.join(directory, requestedExecutable), platform, environment),
 				platform,
-				isExecutable,
+				probeExecutable,
 			);
-			if (resolvedExecutable) break;
+			if (result.executable) {
+				resolvedExecutable = result.executable;
+				break;
+			}
+			unusableExecutable ??= result.unusable;
 		}
 	}
 
@@ -137,6 +170,7 @@ export function resolveLspLaunch(
 		command: [resolvedExecutable ?? requestedExecutable, ...configuredCommand.slice(1)],
 		requestedExecutable,
 		...(resolvedExecutable ? { resolvedExecutable } : {}),
+		...(!resolvedExecutable && unusableExecutable ? { unusableExecutable } : {}),
 		source,
 		environment,
 		bare,
