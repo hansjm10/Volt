@@ -59,13 +59,21 @@ if ($noEnv) {
 }
 
 # Source-development reviews retain private model limitations and failed tool diagnostics.
-if (-not (Test-Path Env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS)) {
+$privateDiagnosticsWasSet = Test-Path Env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS
+if (-not $privateDiagnosticsWasSet) {
 	$env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS = "1"
 }
 
-$runnerPath = Join-Path $scriptDir "scripts/run-coding-agent-source.mjs"
-& node $runnerPath @forwardArgs
-$exitCode = $LASTEXITCODE
+try {
+	$runnerPath = Join-Path $scriptDir "scripts/run-coding-agent-source.mjs"
+	& node $runnerPath @forwardArgs
+	$exitCode = $LASTEXITCODE
+} finally {
+	if (-not $privateDiagnosticsWasSet) {
+		Remove-Item Env:VOLT_REVIEW_PRIVATE_DIAGNOSTICS -ErrorAction SilentlyContinue
+	}
+}
+
 if ($exitCode -ne 0) {
 	exit $exitCode
 }
