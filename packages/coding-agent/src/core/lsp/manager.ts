@@ -1414,6 +1414,10 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 			initializationOptions: server.initializationOptions,
 			settings: server.settings,
 			tracer: this.tracer,
+			resolveTrackedDocumentPath: async (absolutePath) => {
+				const canonical = await this.canonicalizeRequestedPath(absolutePath);
+				return "error" in canonical ? undefined : canonical.path;
+			},
 			onApplyEdit: async (edit) => {
 				const context = this.commandApplyContexts.get(clientRef);
 				const snapshots = context?.snapshots ?? clientRef.captureWorkspaceEditSnapshots();

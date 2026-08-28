@@ -63,6 +63,8 @@ export interface LspClientOptions {
 	tracer?: LspTracer;
 	/** @internal Injectable process spawner for deterministic transport tests. */
 	serverSpawner?: (command: string[], cwd: string, environment: NodeJS.ProcessEnv) => ChildProcess;
+	/** @internal Revalidate and resolve a tracked path immediately before disk refresh. */
+	resolveTrackedDocumentPath?: (absolutePath: string) => Promise<string | undefined>;
 }
 
 export interface LspApplyEditResult {
@@ -118,6 +120,7 @@ interface JsonRpcMessage {
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const MAX_STARTUP_STDERR_CHARS = 8000;
 const STARTUP_STDERR_IDLE_GRACE_MS = 100;
+const STARTUP_STDERR_MAX_DRAIN_MS = 1000;
 
 /**
  * How long to re-wait for a fresher publish after an unversioned one when the
@@ -156,8 +159,10 @@ function waitForStartupStderrDrain(child: ChildProcess): Promise<void> {
 		let settled = false;
 		let terminated = child.exitCode !== null || child.signalCode !== null;
 		let idleTimer: NodeJS.Timeout | undefined;
+		let deadlineTimer: NodeJS.Timeout | undefined;
 		const cleanup = (): void => {
 			if (idleTimer) clearTimeout(idleTimer);
+			if (deadlineTimer) clearTimeout(deadlineTimer);
 			stderr.removeListener("data", onData);
 			stderr.removeListener("end", finish);
 			child.removeListener("error", onTermination);
@@ -180,6 +185,10 @@ function waitForStartupStderrDrain(child: ChildProcess): Promise<void> {
 		};
 		const onTermination = (): void => {
 			terminated = true;
+			if (!deadlineTimer) {
+				deadlineTimer = setTimeout(finish, STARTUP_STDERR_MAX_DRAIN_MS);
+				deadlineTimer.unref();
+			}
 			armIdleTimer();
 		};
 		stderr.on("data", onData);
@@ -187,7 +196,7 @@ function waitForStartupStderrDrain(child: ChildProcess): Promise<void> {
 		child.once("error", onTermination);
 		child.once("exit", onTermination);
 		child.once("close", finish);
-		if (terminated) armIdleTimer();
+		if (terminated) onTermination();
 	});
 }
 
@@ -527,19 +536,36 @@ export class LspClient {
 		}
 		const excludeKey = excludePath ? normalizeUri(pathToFileURL(excludePath).toString()) : undefined;
 		const refreshed: Array<{ uri: string; type: number; absolutePath: string }> = [];
+		const closeDocument = (key: string, document: TrackedDocument): void => {
+			this.documents.delete(key);
+			this.published.delete(key);
+			this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
+			refreshed.push({ uri: document.uri, type: FILE_CHANGE_TYPE_DELETED, absolutePath: document.absolutePath });
+		};
 		for (const [key, document] of [...this.documents]) {
 			if (key === excludeKey) {
 				continue;
 			}
+			let refreshPath = document.absolutePath;
+			if (this.options.resolveTrackedDocumentPath) {
+				try {
+					const resolvedPath = await this.options.resolveTrackedDocumentPath(document.absolutePath);
+					if (!resolvedPath) {
+						closeDocument(key, document);
+						continue;
+					}
+					refreshPath = resolvedPath;
+				} catch {
+					closeDocument(key, document);
+					continue;
+				}
+			}
 			let fileStat: { mtimeMs: number; size: number };
 			try {
-				fileStat = await stat(document.absolutePath);
+				fileStat = await stat(refreshPath);
 			} catch {
 				// File was deleted (or became unreadable): close it on the server.
-				this.documents.delete(key);
-				this.published.delete(key);
-				this.notify("textDocument/didClose", { textDocument: { uri: document.uri } });
-				refreshed.push({ uri: document.uri, type: FILE_CHANGE_TYPE_DELETED, absolutePath: document.absolutePath });
+				closeDocument(key, document);
 				continue;
 			}
 			if (fileStat.mtimeMs === document.mtimeMs && fileStat.size === document.size) {
@@ -547,7 +573,7 @@ export class LspClient {
 			}
 			let content: string;
 			try {
-				content = await readFile(document.absolutePath, "utf-8");
+				content = await readFile(refreshPath, "utf-8");
 			} catch {
 				continue;
 			}

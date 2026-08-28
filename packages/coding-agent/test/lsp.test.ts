@@ -900,6 +900,77 @@ describe("LspManager", () => {
 		});
 	});
 
+	it("does not refresh tracked documents through symlinks outside projectCwd", async () => {
+		const manager = setup();
+		const outsideDir = mkdtempSync(join(tmpdir(), "volt-lsp-outside-test-"));
+		try {
+			const dependencyDir = join(tempDir, "dependency");
+			const dependencyPath = join(dependencyDir, "dependency.foo");
+			const checkedPath = join(tempDir, "checked.foo");
+			const checkedContent = "watch CROSS here\n";
+			const outsidePath = join(outsideDir, "dependency.foo");
+			mkdirSync(dependencyDir);
+			writeFileSync(dependencyPath, "clean dependency\n");
+			writeFileSync(checkedPath, checkedContent);
+			writeFileSync(outsidePath, "outside ERROR must not be read\n");
+			expect(await manager.getDiagnostics(dependencyPath, "clean dependency\n")).toBeUndefined();
+			expect(await manager.getDiagnostics(checkedPath, checkedContent)).toBeUndefined();
+
+			rmSync(dependencyDir, { recursive: true });
+			symlinkSync(outsideDir, dependencyDir, directorySymlinkType());
+
+			expect(await manager.getDiagnostics(checkedPath, checkedContent)).toBeUndefined();
+			expect(manager.getStatus()[0].openDocuments).toBe(1);
+		} finally {
+			rmSync(outsideDir, { recursive: true, force: true });
+		}
+	});
+
+	it("closes escaped tracked documents before navigation-triggered refreshes", async () => {
+		const manager = setup();
+		const outsideDir = mkdtempSync(join(tmpdir(), "volt-lsp-outside-test-"));
+		try {
+			const dependencyDir = join(tempDir, "dependency");
+			const dependencyPath = join(dependencyDir, "dependency.foo");
+			const checkedPath = join(tempDir, "checked.foo");
+			mkdirSync(dependencyDir);
+			writeFileSync(dependencyPath, "original dependency\n");
+			writeFileSync(checkedPath, "checked symbol\n");
+			writeFileSync(join(outsideDir, "dependency.foo"), "outsideSecretSymbol\n");
+			await manager.documentSymbols(dependencyPath);
+
+			rmSync(dependencyDir, { recursive: true });
+			symlinkSync(outsideDir, dependencyDir, directorySymlinkType());
+
+			expect(await manager.workspaceSymbols(checkedPath, "outsideSecretSymbol")).toContain(
+				'No workspace symbols matching "outsideSecretSymbol"',
+			);
+			expect(manager.getStatus()[0].openDocuments).toBe(1);
+		} finally {
+			rmSync(outsideDir, { recursive: true, force: true });
+		}
+	});
+
+	it("continues refreshing tracked documents redirected within projectCwd", async () => {
+		const manager = setup();
+		const dependencyDir = join(tempDir, "dependency");
+		const redirectedDir = join(tempDir, "redirected");
+		const dependencyPath = join(dependencyDir, "dependency.foo");
+		const checkedPath = join(tempDir, "checked.foo");
+		mkdirSync(dependencyDir);
+		mkdirSync(redirectedDir);
+		writeFileSync(dependencyPath, "original dependency\n");
+		writeFileSync(join(redirectedDir, "dependency.foo"), "redirectedSymbol\n");
+		writeFileSync(checkedPath, "checked symbol\n");
+		await manager.documentSymbols(dependencyPath);
+
+		rmSync(dependencyDir, { recursive: true });
+		symlinkSync(redirectedDir, dependencyDir, directorySymlinkType());
+
+		expect(await manager.workspaceSymbols(checkedPath, "redirectedSymbol")).toContain("redirectedSymbol");
+		expect(manager.getStatus()[0].openDocuments).toBe(2);
+	});
+
 	it("does not inherit root markers above projectCwd", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
 		const projectDir = join(tempDir, "project");
@@ -1847,6 +1918,129 @@ describe("LspClient disk sync", () => {
 		await expect(client.start()).rejects.toThrow(/available startup detail/);
 		expect(Date.now() - startedAt).toBeLessThan(1000);
 	});
+
+	it("stops draining startup stderr at an absolute deadline", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const processEvents = new EventEmitter();
+		let exitCode: number | null = null;
+		let stderrWriter: NodeJS.Timeout | undefined;
+		Object.assign(processEvents, { stdin, stdout, stderr, pid: undefined, kill: () => true });
+		Object.defineProperties(processEvents, {
+			exitCode: { get: () => exitCode },
+			signalCode: { get: () => null },
+		});
+		const child = processEvents as unknown as ChildProcess;
+		client = new LspClient({
+			serverName: "continuous-stderr",
+			command: ["fake-server"],
+			rootDir: tempDir,
+			serverSpawner: () => {
+				setTimeout(() => {
+					exitCode = 2;
+					processEvents.emit("exit", 2, null);
+					stderrWriter = setInterval(() => stderr.write("continuous startup detail\n"), 25);
+				}, 0);
+				return child;
+			},
+		});
+		const startResult = client.start().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		const completedBeforeDeadline = await Promise.race([
+			startResult.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 1500)),
+		]);
+		if (stderrWriter) clearInterval(stderrWriter);
+		stderr.end();
+		processEvents.emit("close", 2, null);
+		const error = await startResult;
+
+		expect(completedBeforeDeadline).toBe(true);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("continuous startup detail");
+	}, 5000);
+
+	it("applies the startup stderr deadline after a process error", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const processEvents = new EventEmitter();
+		let stderrWriter: NodeJS.Timeout | undefined;
+		Object.assign(processEvents, { stdin, stdout, stderr, pid: undefined, kill: () => true });
+		Object.defineProperties(processEvents, {
+			exitCode: { get: () => null },
+			signalCode: { get: () => null },
+		});
+		const child = processEvents as unknown as ChildProcess;
+		client = new LspClient({
+			serverName: "errored-continuous-stderr",
+			command: ["fake-server"],
+			rootDir: tempDir,
+			serverSpawner: () => {
+				setTimeout(() => {
+					processEvents.emit("error", new Error("synthetic spawn failure"));
+					stderrWriter = setInterval(() => stderr.write("x".repeat(5000)), 25);
+				}, 0);
+				return child;
+			},
+		});
+		const startResult = client.start().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		const completedBeforeDeadline = await Promise.race([
+			startResult.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 1500)),
+		]);
+		if (stderrWriter) clearInterval(stderrWriter);
+		stderr.end();
+		processEvents.emit("close", null, null);
+		const error = await startResult;
+
+		expect(completedBeforeDeadline).toBe(true);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("synthetic spawn failure");
+		expect((error as Error).message).toContain("Startup stderr:");
+		expect((error as Error).message.length).toBeLessThan(9000);
+	}, 5000);
+
+	it("starts the startup stderr deadline when the process terminates", async () => {
+		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const processEvents = new EventEmitter();
+		let exitCode: number | null = null;
+		Object.assign(processEvents, { stdin, stdout, stderr, pid: undefined, kill: () => true });
+		Object.defineProperties(processEvents, {
+			exitCode: { get: () => exitCode },
+			signalCode: { get: () => null },
+		});
+		const child = processEvents as unknown as ChildProcess;
+		client = new LspClient({
+			serverName: "delayed-exit",
+			command: ["fake-server"],
+			rootDir: tempDir,
+			serverSpawner: () => {
+				setTimeout(() => {
+					exitCode = 2;
+					processEvents.emit("exit", 2, null);
+					setTimeout(() => {
+						stderr.end("late startup detail after delayed exit\n");
+						processEvents.emit("close", 2, null);
+					}, 25);
+				}, 1250);
+				return child;
+			},
+		});
+
+		await expect(client.start()).rejects.toThrow(/late startup detail after delayed exit/);
+	}, 5000);
 
 	it("passes exact launch environment and argv metacharacters without shell interpretation", async () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-client-test-"));
