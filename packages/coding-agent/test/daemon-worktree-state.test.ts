@@ -379,7 +379,7 @@ describe("workspace unregister RPC safety", () => {
 
 		const result = await handleIrohRemoteWorkspaceUnregisterRpcCommand(
 			{ id: "remove-ws", type: "unregister_workspace", workspaceName: "ws" },
-			{ stateManager: manager },
+			{ client: { allowedWorkspaces: [] }, stateManager: manager },
 		);
 
 		expect(result).toEqual({

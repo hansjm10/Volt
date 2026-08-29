@@ -14,6 +14,7 @@ import {
 	parseIrohRemotePushNotificationIntent,
 } from "../core/remote/iroh/push.ts";
 import type { IrohRemoteClient } from "../core/remote/iroh/state.ts";
+import type { IrohRemoteWorkspaceMetadataSnapshot } from "../core/remote/iroh/workspace.ts";
 
 /**
  * Wire types and framing for the voltd control plane: JSONL over the unix
@@ -379,7 +380,7 @@ export type ControlResponse =
 			/** verbatim RPC response object for the TUI to forward to the phone */
 			response: Record<string, unknown>;
 			/** refreshed workspace metadata after a successful unregister_workspace */
-			workspaceMetadata?: { workspaceNames: string[]; workspaces: Array<{ name: string; status: string }> };
+			workspaceMetadata?: IrohRemoteWorkspaceMetadataSnapshot;
 	  }
 	| { type: "relay_push_delivery_result"; id: string; status: IrohRemotePushNotificationDeliveryStatus };
 
@@ -444,7 +445,7 @@ export interface RelayPreamble {
 	/** verbatim phone handshake JSON as received (parsed object, re-serialized) */
 	handshake: unknown;
 	/** authorization subset — everything the TUI needs to serve the stream */
-	authorization: {
+	authorization: IrohRemoteWorkspaceMetadataSnapshot & {
 		clientNodeId: string;
 		workspaceName: string;
 		workspacePath: string;
@@ -636,6 +637,20 @@ function isPushDeliveryStatus(value: unknown): value is IrohRemotePushNotificati
 
 function isPushNotificationIntent(value: unknown): value is IrohRemotePushNotificationIntent {
 	return parseIrohRemotePushNotificationIntent(value) !== undefined;
+}
+
+function isWorkspaceMetadataSnapshot(value: Record<string, unknown>): boolean {
+	return (
+		Array.isArray(value.workspaceNames) &&
+		value.workspaceNames.every((workspaceName) => typeof workspaceName === "string") &&
+		Array.isArray(value.workspaces) &&
+		value.workspaces.every(
+			(workspace) =>
+				isRecord(workspace) &&
+				typeof workspace.name === "string" &&
+				(workspace.status === "available" || workspace.status === "missing" || workspace.status === "unavailable"),
+		)
+	);
 }
 
 export function parseHelloMessage(value: unknown): HelloMessage | undefined {
@@ -837,7 +852,11 @@ export function isControlResponse(value: unknown): value is ControlResponse {
 		case "keep_awake_result":
 			return isRecord(value.keepAwake);
 		case "relay_rpc_result":
-			return isRecord(value.response);
+			return (
+				isRecord(value.response) &&
+				(value.workspaceMetadata === undefined ||
+					(isRecord(value.workspaceMetadata) && isWorkspaceMetadataSnapshot(value.workspaceMetadata)))
+			);
 		case "relay_push_delivery_result":
 			return isPushDeliveryStatus(value.status);
 		default:
@@ -880,7 +899,13 @@ export function isRelayPreamble(value: unknown): value is RelayPreamble {
 		return false;
 	}
 	try {
-		if (typeof value.authorization.allowedTools !== "string") {
+		if (
+			typeof value.authorization.clientNodeId !== "string" ||
+			typeof value.authorization.workspaceName !== "string" ||
+			typeof value.authorization.workspacePath !== "string" ||
+			typeof value.authorization.allowedTools !== "string" ||
+			!isWorkspaceMetadataSnapshot(value.authorization)
+		) {
 			return false;
 		}
 		parseIrohRemoteRpcGrant(value.authorization.rpcGrant, "relay rpcGrant");

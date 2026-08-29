@@ -63,6 +63,12 @@ const RELAY_AUTHORIZATION = {
 	clientNodeId: "n-phone-a",
 	workspaceName: "ws",
 	workspacePath: "/tmp/ws",
+	workspaceNames: ["ws", "beta"],
+	workspaces: [
+		{ name: "ws", status: "available" as const },
+		{ name: "beta", status: "available" as const },
+		{ name: "offline", status: "missing" as const },
+	],
 	allowedTools: "read",
 	rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
 };

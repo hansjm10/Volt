@@ -35,6 +35,7 @@ interface ApplyWorkspaceEditOptions {
 	rootDir: string;
 	edit: LspWorkspaceEdit;
 	snapshots: readonly WorkspaceEditDocumentSnapshot[];
+	canonicalizePath?: (absolutePath: string) => Promise<string>;
 }
 
 interface OperationPath {
@@ -93,7 +94,12 @@ function operationUris(operation: NormalizedWorkspaceOperation): string[] {
 	return [operation.uri];
 }
 
-function operationPath(rootDir: string, uri: string, operationIndex: number): OperationPath {
+async function operationPath(
+	rootDir: string,
+	uri: string,
+	operationIndex: number,
+	canonicalizePath?: (absolutePath: string) => Promise<string>,
+): Promise<OperationPath> {
 	let absolutePath: string;
 	try {
 		absolutePath = resolve(fileURLToPath(uri));
@@ -102,6 +108,13 @@ function operationPath(rootDir: string, uri: string, operationIndex: number): Op
 			operationIndex,
 			`Invalid LSP workspace edit URI ${uri}: ${error instanceof Error ? error.message : String(error)}`,
 		);
+	}
+	if (canonicalizePath) {
+		try {
+			absolutePath = resolve(await canonicalizePath(absolutePath));
+		} catch (error) {
+			throw new WorkspaceEditValidationError(operationIndex, error instanceof Error ? error.message : String(error));
+		}
 	}
 	if (!isPathWithinRoot(rootDir, absolutePath)) {
 		throw new WorkspaceEditValidationError(
@@ -586,8 +599,12 @@ export async function applyWorkspaceEdit(options: ApplyWorkspaceEditOptions): Pr
 	let pathsByOperation: OperationPath[][];
 	try {
 		operations = normalizeWorkspaceEdit(options.edit);
-		pathsByOperation = operations.map((operation, index) =>
-			operationUris(operation).map((uri) => operationPath(rootDir, uri, index)),
+		pathsByOperation = await Promise.all(
+			operations.map((operation, index) =>
+				Promise.all(
+					operationUris(operation).map((uri) => operationPath(rootDir, uri, index, options.canonicalizePath)),
+				),
+			),
 		);
 	} catch (error) {
 		return failedResult(error, error instanceof WorkspaceEditValidationError ? error.operationIndex : 0);

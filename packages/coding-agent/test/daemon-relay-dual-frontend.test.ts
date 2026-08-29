@@ -14,13 +14,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-grant.ts";
-import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import type { IrohRemoteHandshakeSuccess, IrohRemoteHello } from "../src/core/remote/iroh/handshake.ts";
 import { writeIrohRemoteHandshakeResponse } from "../src/core/remote/iroh/handshake-reader.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
 import type { RpcConversationAuthority } from "../src/core/rpc/types.ts";
 import { createDaemonClient, type DaemonClient } from "../src/daemon/control-client.ts";
-import type { ControlRequest } from "../src/daemon/control-protocol.ts";
+import type { ControlRequest, RelayPreamble } from "../src/daemon/control-protocol.ts";
 import { type ControlConnection, type ControlServer, startControlServer } from "../src/daemon/control-server.ts";
 import {
 	handleIntegratedConversationRpcCommand,
@@ -37,6 +36,7 @@ import { type RelayLifecycleOwner, type RelayOutcome, RelayRegistry } from "../s
 import {
 	createDaemonAttach,
 	createRelayWorkspaceUnregisterRetirement,
+	createTuiRelayAuthorization,
 	type DaemonAttach,
 	type DaemonRelayOffer,
 	type OpenedRelay,
@@ -50,6 +50,19 @@ import { createTestSocketEndpoint } from "./socket-test-helpers.ts";
 const SESSION_ID = "s-relay";
 const WORKSPACE = { name: "ws", path: "/tmp/ws" };
 const RPC_GRANT = createIrohRemotePresetAccess("full").rpcGrant;
+const RELAY_WORKSPACE_NAMES = [WORKSPACE.name, "beta"];
+const RELAY_WORKSPACES: RelayPreamble["authorization"]["workspaces"] = [
+	{ name: WORKSPACE.name, status: "available" },
+	{ name: "beta", status: "available" },
+	{ name: "offline", status: "missing" },
+];
+
+function createRelayWorkspaceMetadata(): Pick<RelayPreamble["authorization"], "workspaceNames" | "workspaces"> {
+	return {
+		workspaceNames: [...RELAY_WORKSPACE_NAMES],
+		workspaces: RELAY_WORKSPACES.map((workspace) => ({ ...workspace })),
+	};
+}
 
 function getPhoneConversationAuthority(phone: FakePhoneIrohStream): RpcConversationAuthority {
 	const bootstrap = phone
@@ -99,34 +112,13 @@ function createFanoutSession(sessionId: string) {
 	});
 	const abort = vi.fn(async () => {});
 	return {
-		session: Object.assign(session, { abort }),
+		session: Object.assign(session, { abort, getAvailableThinkingLevels: () => [session.thinkingLevel] }),
 		abort,
 		emit(event: AgentSessionEvent) {
 			for (const handler of Array.from(subscribers)) {
 				handler(event);
 			}
 		},
-	};
-}
-
-function createAuthorization(clientNodeId: string): IrohRemoteClientAuthorizationSuccess {
-	return {
-		ok: true,
-		allowTools: "",
-		client: {
-			nodeId: clientNodeId,
-			label: clientNodeId,
-			allowedWorkspaces: [WORKSPACE.name],
-			allowedTools: "",
-			rpcGrant: RPC_GRANT,
-			pairedAt: 1,
-			lastSeenAt: 2,
-		},
-		paired: true,
-		pairingSecretConsumed: false,
-		workspace: WORKSPACE,
-		workspaceNames: [WORKSPACE.name],
-		workspaces: [{ name: WORKSPACE.name, status: "available" }],
 	};
 }
 
@@ -383,6 +375,7 @@ function mintPhoneRelay(registry: RelayRegistry, clientNodeId: string, streamId:
 				clientNodeId,
 				workspaceName: WORKSPACE.name,
 				workspacePath: WORKSPACE.path,
+				...createRelayWorkspaceMetadata(),
 				allowedTools: "",
 				rpcGrant: RPC_GRANT,
 			},
@@ -435,6 +428,7 @@ function mintOwnedPhoneRelay(harness: OwnedRelayDaemonHarness, clientNodeId: str
 				clientNodeId,
 				workspaceName: WORKSPACE.name,
 				workspacePath: harness.workspaceDir,
+				...createRelayWorkspaceMetadata(),
 				allowedTools: "",
 				rpcGrant: RPC_GRANT,
 			},
@@ -484,7 +478,7 @@ async function serveRelayFromTui(
 	const relayedStream = adaptRelaySocketToIrohStream(opened.stream);
 	const handshake = opened.preamble.handshake as { hello: IrohRemoteHello; response: IrohRemoteHandshakeSuccess };
 	const authorizationSubset = opened.preamble.authorization;
-	const authorization = createAuthorization(authorizationSubset.clientNodeId);
+	const authorization = createTuiRelayAuthorization(authorizationSubset);
 	// The phone verifies the saved host node id in the relayed handshake
 	// response, so the TUI must echo the daemon's identity from the preamble.
 	const responseContext = { hostNodeId: opened.preamble.hostNodeId, relayMode: opened.preamble.relayMode };
@@ -544,7 +538,7 @@ async function serveOwnedRelayFromTui(
 	const relayedStream = adaptRelaySocketToIrohStream(opened.stream);
 	const handshake = opened.preamble.handshake as { hello: IrohRemoteHello; response: IrohRemoteHandshakeSuccess };
 	const authorizationSubset = opened.preamble.authorization;
-	const authorization = createAuthorization(authorizationSubset.clientNodeId);
+	const authorization = createTuiRelayAuthorization(authorizationSubset);
 	const responseContext = { hostNodeId: opened.preamble.hostNodeId, relayMode: opened.preamble.relayMode };
 	const resolvedTarget = opened.preamble.resolvedTarget;
 	const sessionSelection: IntegratedConversationSessionSelection =
@@ -593,7 +587,7 @@ async function serveOwnedRelayFromTui(
 						authorization.workspaceNames = [...forwarded.workspaceMetadata.workspaceNames];
 						authorization.workspaces = forwarded.workspaceMetadata.workspaces.map((workspace) => ({
 							...workspace,
-						})) as typeof authorization.workspaces;
+						}));
 					}
 					return forwarded.response;
 				}
@@ -679,6 +673,12 @@ describe("dual-frontend relayed conversation (§12.3.3)", () => {
 				// Saved-host identity verification: the relayed handshake response
 				// must prove the daemon's node id, not the TUI's absence of one.
 				expect(first?.hostNodeId).toBe("n-daemon-host");
+				expect(first).toMatchObject({
+					remoteHost: {
+						workspaceNames: RELAY_WORKSPACE_NAMES,
+						workspaces: RELAY_WORKSPACES,
+					},
+				});
 				expect(frames[1]).toMatchObject({
 					type: "conversation_bootstrap",
 					delivery: { cursor: 0 },
@@ -686,6 +686,24 @@ describe("dual-frontend relayed conversation (§12.3.3)", () => {
 					reason: "bootstrap",
 				});
 			}
+		});
+
+		// The TUI keeps using the preamble catalog before any command is forwarded
+		// to daemon-owned state.
+		attachA.phone.sendLine({ id: "initial-state", type: "get_state" });
+		await vi.waitFor(() => {
+			const stateResponse = attachA.phone
+				.receivedFrames()
+				.find((frame) => frame.id === "initial-state" && frame.command === "get_state");
+			expect(stateResponse).toMatchObject({
+				success: true,
+				data: {
+					remoteHost: {
+						workspaceNames: RELAY_WORKSPACE_NAMES,
+						workspaces: RELAY_WORKSPACES,
+					},
+				},
+			});
 		});
 
 		// Phone A prompts; the TUI's in-process runtime receives it.

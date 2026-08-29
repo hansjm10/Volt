@@ -599,6 +599,8 @@ describe("voltd lifecycle", () => {
 							clientNodeId: "n-phone",
 							workspaceName: "ws",
 							workspacePath: "/tmp/ws",
+							workspaceNames: ["ws"],
+							workspaces: [{ name: "ws", status: "available" }],
 							allowedTools: "",
 							rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
 						},

@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import {
 	type IrohRemoteHandshakeSuccess,
 	type IrohRemoteHello,
@@ -52,6 +51,7 @@ import { getDaemonPaths } from "../src/daemon/paths.ts";
 import type { IrohManagedRelayCredential } from "../src/daemon/relay-credential.ts";
 import { type DaemonProbeResult, probeDaemon } from "../src/daemon/spawn.ts";
 import { readLineFromIroh } from "../src/daemon/workspace-streams.ts";
+import { createTuiRelayAuthorization } from "../src/modes/interactive/daemon-attach.ts";
 
 const native = loadIrohModule();
 const nativeAvailable = native.iroh !== undefined;
@@ -1171,7 +1171,6 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 			if (clients.type !== "clients_result" || !clients.clients[0]) {
 				throw new Error("paired client missing");
 			}
-			const pairedClient = clients.clients[0];
 			tui = createDaemonClient({
 				socketPath: status.socketPath,
 				client: "tui",
@@ -1262,24 +1261,7 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 				response: IrohRemoteHandshakeSuccess;
 			};
 			const authorizationSubset = aliasRelay.preamble.authorization;
-			const authorization = {
-				ok: true as const,
-				allowTools: authorizationSubset.allowedTools,
-				client: {
-					nodeId: pairedClient.clientNodeId,
-					label: pairedClient.label ?? pairedClient.clientNodeId,
-					allowedWorkspaces: ["ws"],
-					allowedTools: authorizationSubset.allowedTools,
-					rpcGrant: authorizationSubset.rpcGrant,
-					pairedAt: pairedClient.pairedAtMs,
-					lastSeenAt: pairedClient.lastSeenAtMs ?? pairedClient.pairedAtMs,
-				},
-				paired: true,
-				pairingSecretConsumed: false,
-				workspace: { name: "ws", path: workspaceDir },
-				workspaceNames: ["ws"],
-				workspaces: [{ name: "ws", status: "available" as const }],
-			} satisfies IrohRemoteClientAuthorizationSuccess;
+			const authorization = createTuiRelayAuthorization(authorizationSubset);
 			const handshakeResponse = createIntegratedConversationHandshakeResponse(
 				relayHandshake,
 				authorization,
