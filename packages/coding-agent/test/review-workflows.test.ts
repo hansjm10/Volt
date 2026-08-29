@@ -160,6 +160,42 @@ describe("ReviewWorkflowManager", () => {
 		expect(JSON.stringify(descriptor)).not.toContain("private metadata");
 	});
 
+	test("updates a launched provisional workflow and retains it until cancellation settles", async () => {
+		const dispose = vi.fn(async () => {});
+		let releasePreparation!: () => void;
+		const preparationGate = new Promise<void>((resolve) => {
+			releasePreparation = resolve;
+		});
+		const manager = new ReviewWorkflowManager();
+		const started = manager.start({
+			provisional: true,
+			prepared: prepared("review:preparing", { workflowDescription: "Preparing pull request review" }),
+			execute: async (hooks) => {
+				await preparationGate;
+				if (hooks.signal.aborted) {
+					await dispose();
+					return { status: "cancelled" };
+				}
+				return completed();
+			},
+		});
+		started.launch();
+		expect(started.signal.aborted).toBe(false);
+		expect(manager.get("review:preparing")?.target.description).toBe("Preparing pull request review");
+
+		started.updatePrepared(prepared("review:preparing", { workflowDescription: "PR #7", dispose }));
+		expect(manager.get("review:preparing")?.target.description).toBe("PR #7");
+		manager.cancel("review:preparing");
+		const remainedActiveUntilPreparationSettled = manager.hasActiveWorkflows;
+		releasePreparation();
+		await started.finished;
+
+		expect(remainedActiveUntilPreparationSettled).toBe(true);
+		expect(started.signal.aborted).toBe(true);
+		expect(dispose).toHaveBeenCalledOnce();
+		expect(manager.get("review:preparing")?.status).toBe("cancelled");
+	});
+
 	test("records thrown failures", async () => {
 		const manager = new ReviewWorkflowManager();
 		const started = manager.start({

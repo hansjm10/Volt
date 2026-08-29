@@ -32,7 +32,7 @@ import type {
 } from "../../src/core/review-report.ts";
 import { type ReviewSnapshot, resolveReviewSnapshot } from "../../src/core/review-snapshot.ts";
 import { getReviewRun, listReviewRuns } from "../../src/core/review-state.ts";
-import { ReviewWorkflowManager } from "../../src/core/review-workflows.ts";
+import { MAX_ACTIVE_REVIEW_WORKFLOWS, ReviewWorkflowManager } from "../../src/core/review-workflows.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -40,6 +40,16 @@ function git(cwd: string, ...args: string[]): string {
 	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
 	if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
 	return result.stdout.trim();
+}
+
+function initializeUncommittedReviewRepository(cwd: string): void {
+	git(cwd, "init", "--initial-branch=main");
+	git(cwd, "config", "user.email", "review@example.com");
+	git(cwd, "config", "user.name", "Review Test");
+	writeFileSync(join(cwd, "file.txt"), "before\n");
+	git(cwd, "add", "file.txt");
+	git(cwd, "commit", "-m", "initial");
+	writeFileSync(join(cwd, "file.txt"), "after\n");
 }
 
 function candidateReport(path = "src/value.ts"): ReviewCandidateReport {
@@ -246,6 +256,260 @@ describe("review command controls", () => {
 			expect(harness.faux.state.callCount).toBe(0);
 			expect(listReviewRuns(harness.session.sessionManager!).runs).toEqual([]);
 		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("exposes and cancels a shared TUI review during snapshot preparation", async () => {
+		const harness = await createHarness();
+		initializeUncommittedReviewRepository(harness.tempDir);
+		const localController = new AbortController();
+		const events: Array<Record<string, unknown>> = [];
+		const workflowManager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+		const newSession = vi.fn();
+		const onPrepared = vi.fn();
+		let workflowId: string | undefined;
+		let remainedActiveAfterCancellation = false;
+		try {
+			const result = await runReviewWorkflow({
+				target: { kind: "uncommitted" },
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				session: harness.session,
+				newSession,
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				workflowManager,
+				createHooks: () => ({
+					signal: localController.signal,
+					onProgress: (message) => {
+						if (message !== "Capturing uncommitted changes…") return;
+						const active = workflowManager.list().find((workflow) => workflow.status === "running");
+						workflowId = active?.workflowId;
+						if (active) {
+							workflowManager.cancel(active.workflowId);
+							remainedActiveAfterCancellation = workflowManager.hasActiveWorkflows;
+						} else localController.abort();
+					},
+					onPrepared,
+				}),
+			});
+			expect(result.status).toBe("cancelled");
+			if (!workflowId) throw new Error("Expected the shared review to be listed during preparation");
+			expect(remainedActiveAfterCancellation).toBe(true);
+			expect(workflowManager.get(workflowId)).toMatchObject({
+				workflowId,
+				action: "review.uncommitted",
+				status: "cancelled",
+			});
+			expect(events).toContainEqual(
+				expect.objectContaining({ type: "workflow_end", workflowId, status: "cancelled" }),
+			);
+			expect(onPrepared).not.toHaveBeenCalled();
+			expect(newSession).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			await workflowManager.abortAll();
+			harness.cleanup();
+		}
+	});
+
+	it("publishes local TUI cancellation during snapshot preparation", async () => {
+		const harness = await createHarness();
+		initializeUncommittedReviewRepository(harness.tempDir);
+		const localController = new AbortController();
+		const events: Array<Record<string, unknown>> = [];
+		const workflowManager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+		let workflowId: string | undefined;
+		try {
+			const result = await runReviewWorkflow({
+				target: { kind: "uncommitted" },
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				session: harness.session,
+				newSession: vi.fn(),
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				workflowManager,
+				createHooks: () => ({
+					signal: localController.signal,
+					onProgress: (message) => {
+						if (message !== "Capturing uncommitted changes…") return;
+						workflowId = workflowManager.list().find((workflow) => workflow.status === "running")?.workflowId;
+						localController.abort();
+					},
+				}),
+			});
+			expect(result.status).toBe("cancelled");
+			if (!workflowId) throw new Error("Expected local cancellation to find the preparing workflow");
+			expect(workflowManager.get(workflowId)?.status).toBe("cancelled");
+			expect(events).toContainEqual(
+				expect.objectContaining({ type: "workflow_end", workflowId, status: "cancelled" }),
+			);
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			await workflowManager.abortAll();
+			harness.cleanup();
+		}
+	});
+
+	it("exposes and cancels a shared TUI review while onPrepared is pending", async () => {
+		const harness = await createHarness();
+		initializeUncommittedReviewRepository(harness.tempDir);
+		const localController = new AbortController();
+		const events: Array<Record<string, unknown>> = [];
+		const workflowManager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+		const newSession = vi.fn();
+		let workflowId: string | undefined;
+		try {
+			const result = await runReviewWorkflow({
+				target: { kind: "uncommitted" },
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				session: harness.session,
+				newSession,
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				workflowManager,
+				createHooks: () => ({
+					signal: localController.signal,
+					onPrepared: () => {
+						const active = workflowManager.list().find((workflow) => workflow.status === "running");
+						workflowId = active?.workflowId;
+						if (active) workflowManager.cancel(active.workflowId);
+						else localController.abort();
+					},
+				}),
+			});
+			expect(result.status).toBe("cancelled");
+			if (!workflowId) throw new Error("Expected the shared review to be listed during onPrepared");
+			expect(workflowManager.get(workflowId)?.status).toBe("cancelled");
+			expect(events).toContainEqual(
+				expect.objectContaining({ type: "workflow_end", workflowId, status: "cancelled" }),
+			);
+			expect(listReviewRuns(harness.session.sessionManager!).runs).toMatchObject([
+				{ runId: workflowId, status: "cancelled" },
+			]);
+			expect(newSession).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			await workflowManager.abortAll();
+			harness.cleanup();
+		}
+	});
+
+	it("settles an early shared TUI preparation failure in the workflow manager", async () => {
+		const harness = await createHarness();
+		initializeUncommittedReviewRepository(harness.tempDir);
+		const events: Array<Record<string, unknown>> = [];
+		const workflowManager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+		try {
+			await expect(
+				runReviewWorkflow({
+					target: { kind: "commit" },
+					cwd: harness.tempDir,
+					agentDir: harness.tempDir,
+					session: harness.session,
+					newSession: vi.fn(),
+					authStorage: harness.authStorage,
+					settingsManager: harness.settingsManager,
+					workflowManager,
+				}),
+			).rejects.toThrow("Missing commit ref");
+			const failed = workflowManager.list().find((workflow) => workflow.status === "failed");
+			expect(failed).toMatchObject({ action: "review.commit", status: "failed" });
+			expect(events).toContainEqual(
+				expect.objectContaining({
+					type: "workflow_end",
+					workflowId: failed?.workflowId,
+					status: "failed",
+				}),
+			);
+			expect(workflowManager.hasActiveWorkflows).toBe(false);
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			await workflowManager.abortAll();
+			harness.cleanup();
+		}
+	});
+
+	it("uses a safe provisional descriptor while resolving an untrusted commit ref", async () => {
+		const harness = await createHarness();
+		initializeUncommittedReviewRepository(harness.tempDir);
+		const privateRef = "PRIVATE_UNRESOLVED_COMMIT_REF";
+		const localController = new AbortController();
+		const workflowManager = new ReviewWorkflowManager();
+		let descriptorText: string | undefined;
+		try {
+			const result = await runReviewWorkflow({
+				target: { kind: "commit", sha: privateRef },
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				session: harness.session,
+				newSession: vi.fn(),
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				workflowManager,
+				createHooks: () => ({
+					signal: localController.signal,
+					onProgress: (message) => {
+						if (message !== "Resolving commit…") return;
+						const active = workflowManager.list().find((workflow) => workflow.status === "running");
+						descriptorText = active ? JSON.stringify(active) : undefined;
+						if (active) workflowManager.cancel(active.workflowId);
+						else localController.abort();
+					},
+				}),
+			});
+			expect(result.status).toBe("cancelled");
+			expect(descriptorText).toEqual(expect.any(String));
+			expect(descriptorText).not.toContain(privateRef);
+			expect(descriptorText).not.toContain(harness.tempDir);
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			await workflowManager.abortAll();
+			harness.cleanup();
+		}
+	});
+
+	it("applies the shared workflow concurrency cap before snapshot preparation", async () => {
+		const harness = await createHarness();
+		initializeUncommittedReviewRepository(harness.tempDir);
+		const workflowManager = new ReviewWorkflowManager();
+		for (let index = 0; index < MAX_ACTIVE_REVIEW_WORKFLOWS; index++) {
+			workflowManager.start({
+				prepared: {
+					workflowId: `review:blocking-${index}`,
+					action: "review.uncommitted",
+					startedAt: index,
+					resolution: {
+						description: "blocking review",
+						diffCommand: "git diff",
+						dispose: async () => {},
+					},
+				},
+				execute: async () => ({ status: "cancelled" }),
+			});
+		}
+		const onProgress = vi.fn();
+		try {
+			await expect(
+				runReviewWorkflow({
+					target: { kind: "uncommitted" },
+					cwd: harness.tempDir,
+					agentDir: harness.tempDir,
+					session: harness.session,
+					newSession: vi.fn(),
+					authStorage: harness.authStorage,
+					settingsManager: harness.settingsManager,
+					workflowManager,
+					createHooks: () => ({ onProgress }),
+				}),
+			).rejects.toThrow(`Too many running reviews (max ${MAX_ACTIVE_REVIEW_WORKFLOWS})`);
+			expect(onProgress).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			await workflowManager.abortAll();
 			harness.cleanup();
 		}
 	});
