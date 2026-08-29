@@ -460,6 +460,7 @@ function findSymbolPosition(content: string, symbol: string, line?: number): Lsp
 
 export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvider {
 	private cwd: string;
+	private displayCwd: string;
 	private projectCwd: string;
 	private lexicalWorkspaceRoots: string[];
 	private config: ResolvedLspConfig;
@@ -487,6 +488,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		const lexicalProjectCwd = resolvePath(options.projectCwd ?? this.cwd);
 		this.projectCwd = canonicalizePath(lexicalProjectCwd);
 		const canonicalRuntimeCwd = canonicalizePath(this.cwd);
+		this.displayCwd = canonicalRuntimeCwd;
 		this.lexicalWorkspaceRoots = [
 			...new Set([
 				lexicalProjectCwd,
@@ -1280,7 +1282,16 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 		edit: LspWorkspaceEdit,
 		snapshots: readonly WorkspaceEditDocumentSnapshot[],
 	): Promise<WorkspaceEditApplyResult> {
-		const result = await applyWorkspaceEditToDisk({ rootDir: this.projectCwd, edit, snapshots });
+		const result = await applyWorkspaceEditToDisk({
+			rootDir: this.projectCwd,
+			edit,
+			snapshots,
+			canonicalizePath: async (absolutePath) => {
+				const canonical = await this.canonicalizeRequestedPath(absolutePath);
+				if ("error" in canonical) throw new Error(canonical.error);
+				return canonical.path;
+			},
+		});
 		await client.applyWorkspaceChanges(result.changes);
 		return result;
 	}
@@ -1347,7 +1358,7 @@ export class LspManager implements ToolDiagnosticsProvider, LspNavigationProvide
 	}
 
 	private displayPath(absolutePath: string): string {
-		const rel = relative(this.cwd, absolutePath);
+		const rel = relative(this.displayCwd, absolutePath);
 		return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : absolutePath;
 	}
 
