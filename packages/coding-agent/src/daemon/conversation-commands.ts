@@ -15,7 +15,10 @@ import {
 	type IrohRemoteTranscriptTextLayout,
 	sanitizeIrohRemoteTranscriptText,
 } from "../core/remote/iroh/transcript-text.ts";
-import { getIrohRemoteWorkspaceAvailabilityStatus } from "../core/remote/iroh/workspace.ts";
+import {
+	getIrohRemoteWorkspaceAvailabilityStatus,
+	type IrohRemoteWorkspaceMetadataSnapshot,
+} from "../core/remote/iroh/workspace.ts";
 import {
 	handleIrohRemoteWorkspaceUnregisterRpcCommand,
 	IROH_REMOTE_UNREGISTER_WORKSPACE_RPC_TYPE,
@@ -1947,12 +1950,12 @@ async function createRemoteUploadDeviceLogsRpcResponse(
 
 function updateAuthorizationWorkspaceMetadata(
 	authorization: IrohRemoteClientAuthorizationSuccess,
-	metadata: { workspaceNames: string[]; workspaces: Array<{ name: string; status: string }> },
+	metadata: IrohRemoteWorkspaceMetadataSnapshot,
 ): void {
 	authorization.workspaceNames = [...metadata.workspaceNames];
 	authorization.workspaces = metadata.workspaces.map((workspace) => ({
 		...workspace,
-	})) as typeof authorization.workspaces;
+	}));
 }
 
 export async function handleRemoteHostRpcCommand(
@@ -2003,6 +2006,7 @@ export async function handleRemoteHostRpcCommand(
 	try {
 		result = await handleIrohRemoteWorkspaceUnregisterRpcCommand(command, {
 			classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
+			client: authorization.client,
 			stateManager: context.stateManager,
 		});
 	} catch (error) {

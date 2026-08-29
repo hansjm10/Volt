@@ -187,6 +187,14 @@ describe("control protocol framing", () => {
 			expect(decoded).toEqual(response);
 			expect(isControlResponse(decoded), `response ${response.type}`).toBe(true);
 		}
+		expect(
+			isControlResponse({
+				type: "relay_rpc_result",
+				id: "invalid-catalog",
+				response: {},
+				workspaceMetadata: { workspaceNames: ["volt"], workspaces: [{ name: "volt", status: "unknown" }] },
+			}),
+		).toBe(false);
 	});
 
 	it("requires structured remote transport health on status responses", () => {
@@ -345,6 +353,11 @@ describe("control protocol framing", () => {
 				clientNodeId: "n-1",
 				workspaceName: "volt",
 				workspacePath: "/tmp/volt",
+				workspaceNames: ["volt"],
+				workspaces: [
+					{ name: "volt", status: "available" },
+					{ name: "offline", status: "missing" },
+				],
 				allowedTools: "read",
 				rpcGrant: RPC_GRANT,
 			},
@@ -373,6 +386,21 @@ describe("control protocol framing", () => {
 			isRelayPreamble({
 				...preamble,
 				authorization: { ...preamble.authorization, rpcGrant: undefined },
+			}),
+		).toBe(false);
+		expect(
+			isRelayPreamble({
+				...preamble,
+				authorization: { ...preamble.authorization, workspaceNames: undefined },
+			}),
+		).toBe(false);
+		expect(
+			isRelayPreamble({
+				...preamble,
+				authorization: {
+					...preamble.authorization,
+					workspaces: [{ name: "volt", status: "unknown" }],
+				},
 			}),
 		).toBe(false);
 	});

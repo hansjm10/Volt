@@ -109,8 +109,6 @@ import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
 import { type ConfiguredPackage, DefaultPackageManager } from "../../core/package-manager.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.ts";
-import { parseIrohRemoteRpcGrant } from "../../core/remote/iroh/access-grant.ts";
-import type { IrohRemoteClientAuthorizationSuccess } from "../../core/remote/iroh/authorization.ts";
 import type { IrohRemoteHandshakeSuccess, IrohRemoteHello } from "../../core/remote/iroh/handshake.ts";
 import { writeIrohRemoteHandshakeResponse } from "../../core/remote/iroh/handshake-reader.ts";
 import { createIrohRemoteRpcErrorResponse } from "../../core/remote/iroh/rpc-command-filter.ts";
@@ -236,6 +234,7 @@ import {
 	createDaemonAttach,
 	createDisabledDaemonAttach,
 	createRelayWorkspaceUnregisterRetirement,
+	createTuiRelayAuthorization,
 	type DaemonAttach,
 	type DaemonRelayOffer,
 	type DaemonWorktreeControl,
@@ -2148,28 +2147,11 @@ export class InteractiveMode {
 			initialInput?: number[];
 		};
 		const authorizationSubset = preamble.authorization;
-		const rpcGrant = parseIrohRemoteRpcGrant(authorizationSubset.rpcGrant, "relay rpcGrant");
+		const authorization = createTuiRelayAuthorization(authorizationSubset);
+		const rpcGrant = authorization.client.rpcGrant;
 		// Worktree-bound conversations sanitize with the worktree checkout as the
 		// root; the parent checkout and the worktrees root must also redact.
 		const sanitizerOptions = getRelayServingSanitizerOptions(authorizationSubset, getAgentDir());
-		const authorization = {
-			ok: true as const,
-			allowTools: "",
-			client: {
-				nodeId: authorizationSubset.clientNodeId,
-				label: authorizationSubset.clientNodeId,
-				allowedWorkspaces: [authorizationSubset.workspaceName],
-				allowedTools: "",
-				rpcGrant,
-				pairedAt: 0,
-				lastSeenAt: 0,
-			},
-			paired: true,
-			pairingSecretConsumed: false,
-			workspace: { name: authorizationSubset.workspaceName, path: authorizationSubset.workspacePath },
-			workspaceNames: [authorizationSubset.workspaceName],
-			workspaces: [{ name: authorizationSubset.workspaceName, status: "available" as const }],
-		} satisfies IrohRemoteClientAuthorizationSuccess;
 
 		// The daemon's identity from the preamble: the phone verifies the saved
 		// host node id in the handshake response and every notification destination.
@@ -2278,7 +2260,7 @@ export class InteractiveMode {
 								authorization.workspaceNames = [...forwarded.workspaceMetadata.workspaceNames];
 								authorization.workspaces = forwarded.workspaceMetadata.workspaces.map((workspace) => ({
 									...workspace,
-								})) as typeof authorization.workspaces;
+								}));
 							}
 							return forwarded.response;
 						}
