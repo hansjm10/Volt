@@ -62,6 +62,13 @@ export interface GitContextProviderOptions {
 
 export type GitContextListener = (snapshot: RpcGitContext | null) => void;
 
+/** Result of one Git scan, separating authoritative absence from a retryable failure. */
+export type GitContextObservation =
+	| { readonly status: "definitive"; readonly gitContext: RpcGitContext | null }
+	| { readonly status: "transient_failure"; readonly gitContext: RpcGitContext | null };
+
+export type GitContextObservationListener = (observation: GitContextObservation) => void;
+
 export interface GitContextSubscriptionOptions {
 	/** False for internal event bridges that must not keep a dormant provider polling. */
 	readonly monitor?: boolean;
@@ -439,10 +446,11 @@ export class GitContextProvider {
 	> &
 		Pick<GitContextProviderOptions, "workspaceName" | "baseRef">;
 	private readonly listeners = new Set<GitContextListener>();
+	private readonly observationListeners = new Set<GitContextObservationListener>();
 	private readonly children = new Set<ChildProcess>();
 	private cachedSnapshot: RpcGitContext | null = null;
 	private currentLocation: GitWorktreeLocation | null = null;
-	private refreshPromise: Promise<RpcGitContext | null> | null = null;
+	private refreshPromise: Promise<GitContextObservation> | null = null;
 	private scheduledRefresh: NodeJS.Timeout | null = null;
 	private pollTimer: NodeJS.Timeout | null = null;
 	private watchRetryTimer: NodeJS.Timeout | null = null;
@@ -486,6 +494,13 @@ export class GitContextProvider {
 		};
 	}
 
+	/** Subscribe to every completed authoritative scan, including definitive non-Git observations. */
+	subscribeObservations(listener: GitContextObservationListener): () => void {
+		if (this.disposed) return () => undefined;
+		this.observationListeners.add(listener);
+		return () => this.observationListeners.delete(listener);
+	}
+
 	/** Keep filesystem watches and low-frequency polling active for one live observer. */
 	retainObservation(): () => void {
 		if (this.disposed) return () => undefined;
@@ -504,8 +519,10 @@ export class GitContextProvider {
 	 * Scan now, or join the scan already in flight. A join also schedules one
 	 * follow-up scan, so a change landing mid-scan is never silently dropped.
 	 */
-	refresh(signal?: AbortSignal): Promise<RpcGitContext | null> {
-		if (this.disposed) return Promise.resolve(this.cachedSnapshot);
+	refresh(signal?: AbortSignal): Promise<GitContextObservation> {
+		if (this.disposed) {
+			return Promise.resolve({ status: "transient_failure", gitContext: this.cachedSnapshot });
+		}
 		if (this.refreshPromise) {
 			this.rerunRequested = true;
 			return this.refreshPromise;
@@ -539,6 +556,7 @@ export class GitContextProvider {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.listeners.clear();
+		this.observationListeners.clear();
 		this.observationCount = 0;
 		this.stopMonitoring();
 		if (this.scheduledRefresh) clearTimeout(this.scheduledRefresh);
@@ -547,14 +565,17 @@ export class GitContextProvider {
 		this.children.clear();
 	}
 
-	private async performRefresh(signal?: AbortSignal): Promise<RpcGitContext | null> {
+	private async performRefresh(signal?: AbortSignal): Promise<GitContextObservation> {
+		let result: GitContextObservation;
 		try {
 			const location = discoverGitWorktree(this.cwd);
 			this.updateLocation(location);
 			if (!location) {
 				this.pollDelayMs = this.options.pollIntervalMs;
 				this.replaceSnapshot(null);
-				return this.cachedSnapshot;
+				result = { status: "definitive", gitContext: null };
+				this.publishObservation(result);
+				return result;
 			}
 
 			const statusParser = new GitStatusParser();
@@ -582,8 +603,10 @@ export class GitContextProvider {
 			};
 			this.applySuccessfulContent(content);
 			this.pollDelayMs = this.options.pollIntervalMs;
+			result = { status: "definitive", gitContext: this.cachedSnapshot };
+			this.publishObservation(result);
 		} catch (error) {
-			if (this.disposed) return this.cachedSnapshot;
+			if (this.disposed) return { status: "transient_failure", gitContext: this.cachedSnapshot };
 			if (!(error instanceof GitCommandError && error.kind === "cancelled")) {
 				this.pollDelayMs = Math.min(
 					Math.max(this.pollDelayMs * 2, this.options.pollIntervalMs),
@@ -591,10 +614,11 @@ export class GitContextProvider {
 				);
 			}
 			this.markStale();
+			result = { status: "transient_failure", gitContext: this.cachedSnapshot };
 		} finally {
 			this.scheduleNextPoll();
 		}
-		return this.cachedSnapshot;
+		return result;
 	}
 
 	private async readBaseComparison(
@@ -675,6 +699,16 @@ export class GitContextProvider {
 		if (!current || current.stale) return;
 		this.revision++;
 		this.replaceSnapshot(freezeSnapshot({ ...current, revision: this.revision, stale: true }));
+	}
+
+	private publishObservation(observation: GitContextObservation): void {
+		for (const listener of this.observationListeners) {
+			try {
+				listener(observation);
+			} catch {
+				// Collection is authoritative; an observer cannot affect future scans.
+			}
+		}
 	}
 
 	private replaceSnapshot(snapshot: RpcGitContext | null): void {

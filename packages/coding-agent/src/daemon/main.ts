@@ -68,6 +68,8 @@ import {
 } from "./paths.ts";
 import { verifyPidfileProcess, verifyVoltdProcessIdentity } from "./process-identity.ts";
 import { VoltdStateStore } from "./state.ts";
+import { WorkAssociationService } from "./work-association.ts";
+import { WorkStateStore } from "./work-state.ts";
 import { handleWorktreeControlRequest, isWorktreeControlRequest, WorktreeManager } from "./worktree-manager.ts";
 
 export interface Clock {
@@ -154,6 +156,7 @@ export interface VoltdRuntimeServices {
 	logger: DaemonLogger;
 	state: VoltdStateStore;
 	stateManager: IrohRemoteHostStateManager;
+	work: WorkAssociationService;
 	auditLogger: IrohRemoteAuditLogger;
 	controlServer: ControlServer;
 	keepAwake: KeepAwakeController;
@@ -319,6 +322,10 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 		log("error", "invalid remote.allowTools setting: expected an array of tool names");
 		return finishBeforeServing(1);
 	}
+	if (remoteSettings.pullRequestDiscovery !== undefined && typeof remoteSettings.pullRequestDiscovery !== "boolean") {
+		log("error", "invalid remote.pullRequestDiscovery setting: expected a boolean");
+		return finishBeforeServing(1);
+	}
 	const allowTools =
 		configuredAllowTools === undefined
 			? null
@@ -347,6 +354,23 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 		},
 	});
 	const auditLogger = new IrohRemoteAuditLogger({ path: paths.auditPath });
+	const workState = new WorkStateStore({ path: paths.workStatePath, now: () => clock.now() });
+	try {
+		const workLoad = await workState.load();
+		if (workLoad.corruptBackupPath) {
+			log("warn", "replaced invalid Work association state with an empty private store", {
+				backupPath: workLoad.corruptBackupPath,
+			});
+		}
+	} catch (error) {
+		log("error", `failed to load Work association state: ${error instanceof Error ? error.message : String(error)}`);
+		return finishBeforeServing(1);
+	}
+	const work = new WorkAssociationService({
+		store: workState,
+		enabled: remoteSettings.pullRequestDiscovery !== false,
+		now: () => clock.now(),
+	});
 	const fallbackPushRelayClient = new IrohRemotePushRelayHttpClient({
 		authToken: process.env.VOLT_PUSH_RELAY_AUTH_TOKEN,
 		baseUrl: process.env.VOLT_PUSH_RELAY_URL,
@@ -435,6 +459,7 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 			}
 		}
 		await keepAwake.shutdown().catch(() => {});
+		await work.close().catch(() => {});
 		await state.close().catch(() => {});
 
 		shutdownPhase = "disposing";
@@ -984,6 +1009,7 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 		logger,
 		state,
 		stateManager,
+		work,
 		auditLogger,
 		controlServer,
 		keepAwake,

@@ -16,6 +16,8 @@ import {
 import { readdir, stat } from "fs/promises";
 import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
+import { Type } from "typebox";
+import { Check } from "typebox/value";
 import { TextDecoder } from "util";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { syncDurableFile, writeDurableAtomicFile, writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
@@ -37,6 +39,8 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 import { clonePlanningState, DEFAULT_PLANNING_STATE, type PlanningState, parsePlanningState } from "./planning.ts";
+import { RpcGitContextSchema } from "./rpc/schema/git-context.ts";
+import type { RpcGitContext } from "./rpc/types.ts";
 import {
 	RPC_CLIENT_MESSAGE_ID_MAX_CHARS,
 	RPC_CLIENT_MESSAGE_ID_PATTERN_SOURCE,
@@ -449,6 +453,31 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
+/**
+ * First path-free Git observation for a newly created session. Host metadata
+ * only: it never advances the conversation branch or enters model context.
+ */
+export interface SessionStartGitContextEntry extends SessionEntryBase {
+	type: "session_start_git_context";
+	gitContext: RpcGitContext | null;
+}
+
+const SessionStartGitContextEntrySchema = Type.Object(
+	{
+		type: Type.Literal("session_start_git_context"),
+		id: Type.String({ minLength: 1 }),
+		parentId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
+		timestamp: Type.String({ minLength: 1, maxLength: 64 }),
+		ordinal: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+		gitContext: Type.Union([RpcGitContextSchema, Type.Null()]),
+	},
+	{ additionalProperties: false },
+);
+
+function isValidSessionStartGitContextEntry(value: unknown): value is SessionStartGitContextEntry {
+	return Check(SessionStartGitContextEntrySchema, value);
+}
+
 /** Durable host-only active-branch pointer. Never projected into conversation history. */
 export interface LeafEntry extends SessionEntryBase {
 	type: "leaf";
@@ -516,6 +545,7 @@ export type SessionEntry =
 	| CustomMessageEntry
 	| LabelEntry
 	| SessionInfoEntry
+	| SessionStartGitContextEntry
 	| LeafEntry
 	| SubagentSpawnEntry;
 
@@ -536,7 +566,12 @@ export function isClientInputWalEntry(
  * and never copy into forks.
  */
 export function isHostOnlySessionEntry(entry: FileEntry): boolean {
-	return isClientInputWalEntry(entry) || entry.type === "subagent_spawn" || entry.type === "leaf";
+	return (
+		isClientInputWalEntry(entry) ||
+		entry.type === "session_start_git_context" ||
+		entry.type === "subagent_spawn" ||
+		entry.type === "leaf"
+	);
 }
 
 const CLIENT_INPUT_ID_MAX_CHARACTERS = RPC_CLIENT_MESSAGE_ID_MAX_CHARS;
@@ -827,6 +862,8 @@ export interface SessionInfo {
 	parentSessionPath?: string;
 	/** "subagent" when this session was created for a delegated subagent run. */
 	origin?: SessionOrigin;
+	/** First host-observed path-free Git state for this session. */
+	startingGitContext?: RpcGitContext | null;
 	created: Date;
 	modified: Date;
 	messageCount: number;
@@ -1584,6 +1621,7 @@ function isSessionDurabilityBoundary(entry: SessionEntry): boolean {
 		// cannot recover its child; it gets the same fsync treatment as the
 		// client-input WAL.
 		entry.type === "subagent_spawn" ||
+		entry.type === "session_start_git_context" ||
 		(entry.type === "message" && entry.message.role === "user" && typeof entry.message.clientMessageId === "string")
 	);
 }
@@ -1670,6 +1708,8 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 		let header: SessionHeader | null = null;
 		const entries: SessionEntry[] = [];
 		let name: string | undefined;
+		let startingGitContext: RpcGitContext | null | undefined;
+		let sawStartingGitContext = false;
 
 		const rl = createInterface({
 			input: createReadStream(filePath, { encoding: "utf8" }),
@@ -1689,6 +1729,16 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 			// Extract session name (use latest, including explicit clears)
 			if (entry.type === "session_info") {
 				name = entry.name?.trim() || undefined;
+			}
+			if (entry.type === "session_start_git_context") {
+				const currentFormat = (header.version ?? 1) >= CURRENT_SESSION_VERSION;
+				if (currentFormat && (!isValidSessionStartGitContextEntry(entry) || sawStartingGitContext)) {
+					throw new Error("Current session contains invalid starting Git context metadata");
+				}
+				if (!sawStartingGitContext && isValidSessionStartGitContextEntry(entry)) {
+					startingGitContext = entry.gitContext;
+					sawStartingGitContext = true;
+				}
 			}
 
 			if (entry.type !== "session") {
@@ -1729,6 +1779,7 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 			name,
 			parentSessionPath,
 			origin,
+			...(startingGitContext === undefined ? {} : { startingGitContext }),
 			created: new Date(header.timestamp),
 			modified,
 			messageCount: summary.messageCount,
@@ -1863,6 +1914,8 @@ export class SessionManager {
 	private conversationAuthorityStatus: SessionConversationAuthorityStatus = { status: "available" };
 	/** Prevents a disposed persisted session from accepting work after its final drain watermark. */
 	private persistenceClosed = false;
+	/** Only a session created by this manager may capture its first Git observation. */
+	private acceptsStartingGitContext = false;
 	/** Settled internal lane used to serialize immutable filesystem work. */
 	private persistenceQueue: Promise<void> = Promise.resolve();
 	/** Promise for all persistence work accepted through the latest synchronous mutation. */
@@ -1910,6 +1963,7 @@ export class SessionManager {
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
 		this.assertConversationAuthorityAvailable();
+		this.acceptsStartingGitContext = false;
 		if (this.atomicAppendInFlight) {
 			throw new Error("Cannot switch session files during an atomic append");
 		}
@@ -1969,6 +2023,7 @@ export class SessionManager {
 		this.canonicalRevision = 0;
 		this.sessionFileNeedsMigration = false;
 		this.flushed = false;
+		this.acceptsStartingGitContext = true;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -1990,9 +2045,16 @@ export class SessionManager {
 			CURRENT_SESSION_VERSION;
 		const seenEntryIds = new Set<string>();
 		let lastWalOrdinal = 0;
+		let sawStartingGitContext = false;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			if (currentVersion) {
+				if (entry.type === "session_start_git_context") {
+					if (!isValidSessionStartGitContextEntry(entry) || sawStartingGitContext) {
+						throw new Error("Current session contains invalid starting Git context metadata");
+					}
+					sawStartingGitContext = true;
+				}
 				if (typeof entry.id !== "string" || entry.id.length === 0 || seenEntryIds.has(entry.id)) {
 					throw new Error("Current session contains an invalid or duplicate entry identity");
 				}
@@ -3416,6 +3478,39 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * Record the first completed Git scan for this newly created session.
+	 * The expected id prevents a delayed scan from attaching to a replacement.
+	 */
+	recordStartingGitContext(expectedSessionId: string, gitContext: RpcGitContext | null): boolean {
+		if (!Check(Type.Union([RpcGitContextSchema, Type.Null()]), gitContext)) {
+			throw new Error("Cannot record invalid starting Git context metadata");
+		}
+		if (!this.acceptsStartingGitContext || this.sessionId !== expectedSessionId) {
+			return false;
+		}
+		if (this.fileEntries.some((entry) => entry.type === "session_start_git_context")) {
+			this.acceptsStartingGitContext = false;
+			return false;
+		}
+		this._appendEntry({
+			type: "session_start_git_context",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			gitContext,
+		});
+		this.acceptsStartingGitContext = false;
+		return true;
+	}
+
+	getStartingGitContext(): RpcGitContext | null | undefined {
+		const entry = this.fileEntries.find(
+			(candidate): candidate is SessionStartGitContextEntry => candidate.type === "session_start_git_context",
+		);
+		return entry?.gitContext;
 	}
 
 	/** Get the current session name from the latest session_info entry, if any. */

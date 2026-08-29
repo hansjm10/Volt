@@ -312,6 +312,25 @@ Session metadata (e.g., user-defined display name). Set via `/name`, `--name` / 
 
 The session name is displayed in the session selector (`/resume`) instead of the first message when set.
 
+### SessionStartGitContextEntry (host-only)
+
+A newly created current-format session records its first **definitive** path-free
+Git observation. `gitContext` is either the same bounded object used by RPC
+`gitContext`, or `null` when the cwd was definitively not a Git worktree.
+Transient Git command failures do not create this entry; a later successful
+observation may still do so. The expected session ID fences delayed scans from a
+replacement session.
+
+```json
+{"type":"session_start_git_context","id":"l2m3n4o5","parentId":null,"timestamp":"2026-08-29T16:00:00.000Z","ordinal":1,"gitContext":{"repository":"Volt","head":{"kind":"branch","name":"feature/work","oid":"0123456789abcdef0123456789abcdef01234567"},"upstream":null,"base":null,"status":{"staged":{"added":0,"modified":0,"deleted":0,"renamed":0},"unstaged":{"added":0,"modified":0,"deleted":0,"renamed":0},"untracked":0,"conflicted":0,"total":0,"clean":true},"operation":null,"revision":1,"observedAt":"2026-08-29T16:00:00.000Z","stale":false}}
+```
+
+Current-format readers validate this entry strictly and reject duplicates. It
+is host metadata only: it never advances the active leaf, enters model context,
+appears as a transcript item, copies into forks, or reaches extension message
+projection. Session listings and state responses may expose the validated
+path-free value as optional `startingGitContext`.
+
 ## Tree Structure
 
 Entries form a tree:
@@ -337,6 +356,7 @@ Entries form a tree:
    - Then messages from `firstKeptEntryId` to compaction
    - Then messages after compaction
 4. Converts `BranchSummaryEntry` and `CustomMessageEntry` to appropriate message formats
+5. Ignores host-only entries such as `session_start_git_context`, client-input WAL records, durable leaf pointers, and subagent spawn edges
 
 ## Parsing Example
 

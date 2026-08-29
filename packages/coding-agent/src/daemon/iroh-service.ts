@@ -1,9 +1,12 @@
 import { Buffer } from "node:buffer";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { relative, resolve, sep } from "node:path";
 import { createAgentSessionServices } from "../core/agent-session-services.ts";
+import type { GitContextObservation } from "../core/git-context-provider.ts";
+import { discoverGitWorktree } from "../core/git-repository.ts";
 import {
 	createIrohRemoteExplicitAccess,
 	createIrohRemotePresetAccess,
@@ -69,7 +72,12 @@ import {
 } from "../core/remote/iroh/workspace.ts";
 import type { IrohRemoteWorktreeRpcBackend } from "../core/remote/iroh/worktree-rpc.ts";
 import type { IrohBiStreamLike } from "../core/rpc/iroh-transport.ts";
-import { getDefaultSessionDir } from "../core/session-manager.ts";
+import {
+	getDefaultSessionDir,
+	getDefaultSessionDirPath,
+	readSessionHeader,
+	SessionManager,
+} from "../core/session-manager.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { getCurrentThemeName, getResolvedThemeColors } from "../core/theme/runtime.ts";
 import { ProjectTrustStore } from "../core/trust-manager.ts";
@@ -137,7 +145,7 @@ import {
 	isIrohStreamLifecycleClosedError,
 	runLifecycleFencedPhysicalOperation,
 } from "./iroh-stream-lifecycle.ts";
-import { type DaemonAttachClaim, LeaseBroker, type LeaseState } from "./lease-broker.ts";
+import { type DaemonAttachClaim, LeaseBroker, type LeaseRecord, type LeaseState } from "./lease-broker.ts";
 import type { VoltdRuntimeServices, VoltdServiceExtension } from "./main.ts";
 import {
 	activateIrohManagedRelayCredential,
@@ -197,6 +205,15 @@ const WORKSPACE_MANAGEMENT_STREAM_SESSION_ID = "$workspace-management";
 const IROH_ENDPOINT_READY_TIMEOUT_MS = 15_000;
 const IROH_UNAUTHENTICATED_CONNECTION_TIMEOUT_MS = 15_000;
 const SHUTDOWN_RUNTIME_IDLE_CAP_MS = 60_000;
+
+export function isExactTuiWorkObservationLeaseHolder(
+	connection: Pick<ControlConnection, "client" | "connectionId">,
+	lease: Pick<LeaseRecord, "state" | "tuiConnectionId"> | undefined,
+): boolean {
+	return (
+		connection.client === "tui" && lease?.state === "tui-owned" && lease.tuiConnectionId === connection.connectionId
+	);
+}
 
 function normalizeRelayCloseReason(reason: string): RelayCloseReason {
 	switch (reason) {
@@ -788,6 +805,8 @@ class IrohDaemonService {
 	private readonly trustStore: ProjectTrustStore;
 	private readonly conversationCoordinators = new ConversationCoordinatorRegistry();
 	private readonly runtimes: IntegratedRuntimeRegistry;
+	private readonly runtimeWorkObservers = new Map<IntegratedRuntimeEntry, () => void>();
+	private readonly tuiWorkAuthorities = new Map<string, { connectionId: string; workspaceGeneration: number }>();
 	private readonly worktrees: WorktreeManager;
 	private readonly worktreeRetention: WorktreeRetentionSweeper;
 	private readonly leaseBroker: LeaseBroker;
@@ -951,7 +970,12 @@ class IrohDaemonService {
 				this.worktrees.beginRuntimePreparation(workspaceName, worktreeId),
 			bindWorktreeSession: (workspaceName, worktreeId, sessionId) =>
 				this.worktrees.bindSession(workspaceName, worktreeId, sessionId),
+			onRuntimePublished: (entry) => this.startRuntimeWorkObservation(entry),
+			onRuntimeSessionRekeyed: (entry, previousSessionId) => {
+				this.rekeyRuntimeWorkObservation(entry, previousSessionId);
+			},
 			onRuntimeDisposed: (entry) => {
+				this.stopRuntimeWorkObservation(entry);
 				if (entry.worktreeId !== undefined) {
 					this.worktreeRetention.onRuntimeDisposed(entry.workspaceName, entry.worktreeId);
 				}
@@ -1076,6 +1100,184 @@ class IrohDaemonService {
 		this.ready = { promise: readyPromise, resolve: readyResolve, reject: readyReject };
 	}
 
+	private startRuntimeWorkObservation(entry: IntegratedRuntimeEntry): void {
+		if (entry.workspaceGeneration === undefined || this.runtimeWorkObservers.has(entry)) return;
+		const publish = (observation: GitContextObservation): void => {
+			if (
+				observation.status !== "definitive" ||
+				this.runtimeWorkObservers.get(entry) !== unsubscribe ||
+				entry.lifecycle !== "active"
+			) {
+				return;
+			}
+			const gitContext = observation.gitContext;
+			if (!gitContext || gitContext.stale || gitContext.head.kind !== "branch") {
+				this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration!, entry.sessionId);
+				return;
+			}
+			const location = discoverGitWorktree(entry.runtime.cwd);
+			if (!location) {
+				this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration!, entry.sessionId);
+				return;
+			}
+			void this.services.work
+				.observe({
+					workspaceName: entry.workspaceName,
+					workspaceGeneration: entry.workspaceGeneration!,
+					sessionId: entry.sessionId,
+					cwd: entry.runtime.cwd,
+					commonGitDir: location.commonGitDir,
+					repositoryDisplayName: gitContext.repository,
+					branch: gitContext.head.name,
+					headOid: gitContext.head.oid,
+					trusted: entry.projectTrusted,
+					...(gitContext.base === null ? {} : { baseBranches: [gitContext.base.ref] }),
+				})
+				.catch(() => {});
+		};
+		const unsubscribeObservation = entry.runtime.session.gitContextProvider.subscribeObservations(publish);
+		const releaseMonitor = entry.runtime.session.gitContextProvider.retainObservation();
+		const unsubscribe = () => {
+			unsubscribeObservation();
+			releaseMonitor();
+		};
+		this.runtimeWorkObservers.set(entry, unsubscribe);
+		void entry.runtime.session.gitContextProvider.refresh();
+	}
+
+	private rekeyRuntimeWorkObservation(entry: IntegratedRuntimeEntry, previousSessionId: string): void {
+		if (entry.workspaceGeneration === undefined) return;
+		this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
+		if (this.runtimeWorkObservers.has(entry)) {
+			void entry.runtime.session.gitContextProvider.refresh();
+		}
+	}
+
+	private stopRuntimeWorkObservation(entry: IntegratedRuntimeEntry): void {
+		const unsubscribe = this.runtimeWorkObservers.get(entry);
+		if (unsubscribe) {
+			this.runtimeWorkObservers.delete(entry);
+			unsubscribe();
+		}
+		if (entry.workspaceGeneration === undefined) return;
+		this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, entry.sessionId);
+		for (const previousSessionId of entry.previousSessionIds) {
+			this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
+		}
+	}
+
+	private tuiWorkKey(workspaceName: string, sessionId: string): string {
+		return `${workspaceName}\0${sessionId}`;
+	}
+
+	private retireTuiWorkAuthority(workspaceName: string, sessionId: string, connectionId?: string): void {
+		const key = this.tuiWorkKey(workspaceName, sessionId);
+		const authority = this.tuiWorkAuthorities.get(key);
+		if (!authority || (connectionId !== undefined && authority.connectionId !== connectionId)) return;
+		this.tuiWorkAuthorities.delete(key);
+		this.services.work.retireSession(workspaceName, authority.workspaceGeneration, sessionId);
+	}
+
+	private async handleTuiWorkObservation(
+		connection: ControlConnection,
+		request: Extract<ControlRequest, { type: "work_observe" }>,
+	): Promise<void> {
+		const assertLease = (): boolean =>
+			isExactTuiWorkObservationLeaseHolder(
+				connection,
+				this.leaseBroker.lookup(request.workspaceName, request.sessionId),
+			);
+		if (!assertLease()) {
+			connection.send({ type: "error", id: request.id, code: "not_held", message: "lease not held" });
+			return;
+		}
+		const state = await this.stateManager.getState();
+		const workspace = state.workspaces.find((candidate) => candidate.name === request.workspaceName);
+		const workspaceGeneration = (state.workspaceGenerations ?? []).find(
+			(candidate) => candidate.workspaceName === request.workspaceName,
+		)?.generation;
+		if (!workspace || workspaceGeneration === undefined) {
+			connection.send({ type: "error", id: request.id, code: "not_found", message: "workspace not found" });
+			return;
+		}
+		if (request.gitContext === null) {
+			if (!assertLease()) {
+				connection.send({ type: "error", id: request.id, code: "not_held", message: "lease not held" });
+				return;
+			}
+			this.services.work.retireSession(request.workspaceName, workspaceGeneration, request.sessionId);
+			this.tuiWorkAuthorities.delete(this.tuiWorkKey(request.workspaceName, request.sessionId));
+			connection.send({ type: "ok", id: request.id });
+			return;
+		}
+
+		const sessionDir = getDefaultSessionDirPath(workspace.path, this.services.agentDir);
+		const session = await SessionManager.findForResume(sessionDir, request.sessionId);
+		const header = session ? readSessionHeader(session.path) : null;
+		if (!header || header.id !== request.sessionId || typeof header.cwd !== "string") {
+			connection.send({ type: "error", id: request.id, code: "not_found", message: "session not found" });
+			return;
+		}
+		const worktree = (state.worktrees ?? []).find(
+			(candidate) =>
+				candidate.workspaceName === request.workspaceName && candidate.sessionIds.includes(request.sessionId),
+		);
+		let runtimeDirectory: WorkspaceDirectoryResolution;
+		try {
+			const rootPath = await realpath(worktree?.path ?? workspace.path);
+			const absolutePath = await realpath(header.cwd);
+			if (!isPathInside(rootPath, absolutePath) || !(await stat(absolutePath)).isDirectory()) {
+				throw new Error("session working directory escaped its workspace");
+			}
+			const relativePath = relative(rootPath, absolutePath).split(sep).join("/");
+			runtimeDirectory = {
+				absolutePath,
+				...(relativePath.length === 0 ? {} : { relativePath }),
+			};
+		} catch {
+			connection.send({
+				type: "error",
+				id: request.id,
+				code: "session_unavailable",
+				message: "session working directory is unavailable",
+			});
+			return;
+		}
+		const location = discoverGitWorktree(runtimeDirectory.absolutePath);
+		if (!location) {
+			connection.send({ type: "error", id: request.id, code: "not_git", message: "session is not in Git" });
+			return;
+		}
+		const currentState = await this.stateManager.getState();
+		const currentWorkspace = currentState.workspaces.find(
+			(candidate) => candidate.name === request.workspaceName && candidate.path === workspace.path,
+		);
+		const currentGeneration = (currentState.workspaceGenerations ?? []).find(
+			(candidate) => candidate.workspaceName === request.workspaceName,
+		)?.generation;
+		if (!assertLease() || !currentWorkspace || currentGeneration !== workspaceGeneration) {
+			connection.send({ type: "error", id: request.id, code: "authority_changed", message: "authority changed" });
+			return;
+		}
+		const key = this.tuiWorkKey(request.workspaceName, request.sessionId);
+		this.tuiWorkAuthorities.set(key, { connectionId: connection.connectionId, workspaceGeneration });
+		void this.services.work
+			.observe({
+				workspaceName: request.workspaceName,
+				workspaceGeneration,
+				sessionId: request.sessionId,
+				cwd: runtimeDirectory.absolutePath,
+				commonGitDir: location.commonGitDir,
+				repositoryDisplayName: request.gitContext.repository,
+				branch: request.gitContext.branch,
+				headOid: request.gitContext.headOid,
+				trusted: resolveIrohRemoteWorkspaceProjectTrusted(currentWorkspace, { trustStore: this.trustStore }),
+				...(request.gitContext.baseRef === undefined ? {} : { baseBranches: [request.gitContext.baseRef] }),
+			})
+			.catch(() => {});
+		connection.send({ type: "ok", id: request.id });
+	}
+
 	private requireEngine(): IrohRemoteHostEngine {
 		if (!this.engine) {
 			throw new Error("iroh host engine is not ready");
@@ -1177,6 +1379,8 @@ class IrohDaemonService {
 				}
 				return states;
 			},
+			getWorkContext: (workspaceName, workspaceGeneration, sessionId) =>
+				this.services.work.getWorkContext(workspaceName, workspaceGeneration, sessionId),
 			keepAwake: this.services.keepAwake,
 			onKeepAwakeSetting: (enabled) => this.services.state.updateSettings({ keepAwakeEnabled: enabled }),
 			webSearchKey: this.services.webSearchKey,
@@ -4290,6 +4494,20 @@ class IrohDaemonService {
 			workspacePath?: string;
 		} = {},
 	): Promise<{ closedStreamCount: number; stoppedRuntimeCount: number }> {
+		for (const entry of this.runtimeWorkObservers.keys()) {
+			if (entry.workspaceName === workspaceName) this.stopRuntimeWorkObservation(entry);
+		}
+		for (const [key, authority] of this.tuiWorkAuthorities) {
+			if (key.startsWith(`${workspaceName}\0`)) {
+				this.tuiWorkAuthorities.delete(key);
+				this.services.work.retireSession(
+					workspaceName,
+					authority.workspaceGeneration,
+					key.slice(workspaceName.length + 1),
+				);
+			}
+		}
+		this.services.work.retireWorkspace(workspaceName);
 		const closedStreamCount = await this.closeActiveStreamsForWorkspace(
 			workspaceName,
 			WORKSPACE_UNREGISTERED_CLOSE_REASON,
@@ -4620,6 +4838,10 @@ class IrohDaemonService {
 
 	async handleRequest(connection: ControlConnection, request: ControlRequest): Promise<boolean> {
 		switch (request.type) {
+			case "work_observe": {
+				await this.handleTuiWorkObservation(connection, request);
+				return true;
+			}
 			case "lease_acquire": {
 				const outcome = await this.leaseBroker.acquireForTui({
 					connectionId: connection.connectionId,
@@ -4674,6 +4896,7 @@ class IrohDaemonService {
 					connection.send({ type: "error", id: request.id, code: result.code, message: "lease not held" });
 					return true;
 				}
+				this.retireTuiWorkAuthority(request.workspaceName, request.sessionId, connection.connectionId);
 				connection.send({ type: "ok", id: request.id });
 				return true;
 			}
@@ -4776,6 +4999,7 @@ class IrohDaemonService {
 					});
 					return true;
 				}
+				this.retireTuiWorkAuthority(reservation.workspaceName, reservation.oldSessionId, connection.connectionId);
 				connection.send({ type: "ok", id: request.id });
 				return true;
 			}
@@ -5296,6 +5520,16 @@ class IrohDaemonService {
 
 	onControlConnectionClosed(connection: ControlConnection): void {
 		this.leaseBroker.releaseAllForConnection(connection.connectionId);
+		for (const [key, authority] of this.tuiWorkAuthorities) {
+			if (authority.connectionId !== connection.connectionId) continue;
+			this.tuiWorkAuthorities.delete(key);
+			const separator = key.indexOf("\0");
+			this.services.work.retireSession(
+				key.slice(0, separator),
+				authority.workspaceGeneration,
+				key.slice(separator + 1),
+			);
+		}
 		const admission = this.admission.tryAcquire();
 		if (!admission) {
 			// Quiesce owns every remaining ticket after the admission cut. A final
@@ -5347,6 +5581,15 @@ class IrohDaemonService {
 		// ownership commits, relay offers, and turn-starting commands now fail
 		// closed against the same state.
 		this.admission.close();
+		for (const [key, authority] of this.tuiWorkAuthorities) {
+			const separator = key.indexOf("\0");
+			this.services.work.retireSession(
+				key.slice(0, separator),
+				authority.workspaceGeneration,
+				key.slice(separator + 1),
+			);
+		}
+		this.tuiWorkAuthorities.clear();
 		await this.stopRelayRecoveryMonitor();
 		if (this.relayCredentialRefreshTimer !== undefined) {
 			clearTimeout(this.relayCredentialRefreshTimer);

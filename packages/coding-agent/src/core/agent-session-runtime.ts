@@ -23,6 +23,7 @@ import {
 } from "./planning.ts";
 import { ReviewWorkflowManager } from "./review-workflows.ts";
 import { ConversationProjectionFeed, type ConversationProjectionSource } from "./rpc/conversation-projection-feed.ts";
+import type { RpcGitContext } from "./rpc/types.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import {
@@ -73,6 +74,8 @@ export interface WorkspaceSessionSummary {
 	cwd: string;
 	/** "subagent" when this session was created for a delegated subagent run. */
 	origin?: SessionOrigin;
+	/** First host-observed path-free Git state for this session. */
+	startingGitContext?: RpcGitContext | null;
 }
 
 export interface AgentSessionSwitchOptions {
@@ -210,6 +213,7 @@ function sessionInfoToSummary(info: SessionInfo, currentSessionId: string): Work
 		current: info.id === currentSessionId,
 		cwd: info.cwd,
 		origin: info.origin,
+		...(info.startingGitContext === undefined ? {} : { startingGitContext: info.startingGitContext }),
 	};
 }
 
@@ -962,6 +966,7 @@ export class AgentSessionRuntime {
 	private getCurrentSessionSummary(): WorkspaceSessionSummary {
 		const header = this.session.sessionManager.getHeader();
 		const entries = this.session.sessionManager.getEntries();
+		const startingGitContext = this.session.sessionManager.getStartingGitContext();
 		const lastEntry = entries.at(-1);
 		const summary = summarizeSessionEntries(entries);
 		return {
@@ -974,6 +979,7 @@ export class AgentSessionRuntime {
 			current: true,
 			cwd: header?.cwd ?? this.cwd,
 			origin: header?.origin,
+			...(startingGitContext === undefined ? {} : { startingGitContext }),
 		};
 	}
 

@@ -617,6 +617,7 @@ export class InteractiveMode {
 	// a reconnecting client even when auto-start is off, so a daemon started by
 	// another process can discover every already-running agent.
 	private daemonAttach: DaemonAttach = createDisabledDaemonAttach();
+	private unsubscribeDaemonWorkObservation: (() => void) | undefined;
 	private daemonRelayServers = new Set<Promise<void>>();
 	/** list_sessions cursor state shared across relayed phone conversations. */
 	private readonly relaySessionListCursors = new Map<string, RemoteSessionListCursorEntry>();
@@ -1967,6 +1968,11 @@ export class InteractiveMode {
 		});
 		await this.daemonAttach.start();
 		const acquireOutcome = await this.acquireCurrentSessionLease();
+		this.unsubscribeDaemonWorkObservation = this.session.gitContextProvider.subscribeObservations((observation) => {
+			if (observation.status !== "definitive") return;
+			void this.daemonAttach.publishGitObservation(this.session.sessionId, observation.gitContext);
+		});
+		void this.session.gitContextProvider.refresh();
 		this.runtimeHost.setPrepareSessionReplacement(async ({ previousSessionId, sessionId, cwd }) => {
 			const rekey = await this.daemonAttach.prepareRekey(previousSessionId, sessionId, cwd);
 			if (!rekey) {
@@ -1976,6 +1982,7 @@ export class InteractiveMode {
 				commit: async () => {
 					await rekey.commit();
 					this.daemonLeaseSessionId = sessionId;
+					void this.session.gitContextProvider.refresh();
 				},
 				rollback: () => rekey.rollback(),
 				dispose: async () => {
@@ -2024,6 +2031,7 @@ export class InteractiveMode {
 		}
 		if (outcome.kind === "granted") {
 			await this.runtimeHost.startRecoveredClientInputs().catch(() => undefined);
+			void this.session.gitContextProvider.refresh();
 		}
 	}
 
@@ -2324,6 +2332,8 @@ export class InteractiveMode {
 	}
 
 	private async releaseDaemonLeaseOnQuit(): Promise<void> {
+		this.unsubscribeDaemonWorkObservation?.();
+		this.unsubscribeDaemonWorkObservation = undefined;
 		if (this.daemonAttach.connectionState() === "disabled") {
 			return;
 		}

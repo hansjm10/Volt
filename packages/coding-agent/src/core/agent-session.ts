@@ -798,12 +798,24 @@ export class AgentSession {
 		this._unsubscribeAgent = this._harness.subscribe(async (event) => {
 			if (isAgentEvent(event)) await this._handleAgentEvent(event);
 		});
-		this._unsubscribeGitContext = this.gitContextProvider.subscribe(
-			(gitContext) => {
-				this._emit({ type: "git_context_changed", gitContext });
-			},
+		const startingGitContextSessionId = this.sessionManager.getSessionId();
+		const unsubscribeStartingGitContext = this.gitContextProvider.subscribeObservations((observation) => {
+			if (observation.status !== "definitive") return;
+			try {
+				this.sessionManager.recordStartingGitContext(startingGitContextSessionId, observation.gitContext);
+			} catch {
+				// Git replacement delivery remains independent from metadata persistence.
+			}
+		});
+		const unsubscribeGitContextEvents = this.gitContextProvider.subscribe(
+			(gitContext) => this._emit({ type: "git_context_changed", gitContext }),
 			{ monitor: false },
 		);
+		this._unsubscribeGitContext = () => {
+			unsubscribeStartingGitContext();
+			unsubscribeGitContextEvents();
+		};
+		void this.gitContextProvider.refresh();
 		this._installAgentToolHooks();
 
 		this._buildRuntime({

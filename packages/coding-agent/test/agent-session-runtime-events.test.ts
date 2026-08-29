@@ -13,6 +13,7 @@ import {
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { appendReviewRun, getReviewRun, type ReviewRunRecord } from "../src/core/review-state.ts";
+import { buildRpcSessionState } from "../src/core/rpc/session-state.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type { BashOperations } from "../src/core/tools/bash.ts";
 import type {
@@ -93,9 +94,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		return { runtimeHost, faux };
 	}
 
-	it("bridges Git replacements and explicitly refreshes after recorded Bash", async () => {
+	it("bridges Git replacements while retaining the session's first Git observation", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => undefined);
 		const events: AgentSessionEvent[] = [];
+		await vi.waitFor(() => expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull());
+		expect(buildRpcSessionState(runtimeHost.session).startingGitContext).toBeNull();
 		const unsubscribe = runtimeHost.session.subscribe((event) => events.push(event));
 		execFileSync("git", ["init", "--initial-branch=main"], { cwd: runtimeHost.cwd, stdio: "ignore" });
 
@@ -106,6 +109,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				gitContext: expect.objectContaining({ head: { kind: "unborn", name: "main" }, stale: false }),
 			}),
 		);
+		expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull();
 
 		const scheduleRefresh = vi.spyOn(runtimeHost.session.gitContextProvider, "scheduleRefresh");
 		runtimeHost.session.recordBashResult("touch changed", {

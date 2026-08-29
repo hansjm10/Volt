@@ -123,6 +123,8 @@ import type {
 	RpcSessionListItemSchema,
 	RpcSessionStateProjectionSchema,
 	RpcSessionStateSchema,
+	RpcSessionWorkContextSchema,
+	RpcSessionWorkPullRequestSchema,
 	RpcSubagentDefinitionSchema,
 	RpcSubagentDefinitionSourceSchema,
 	RpcSubagentSourceInfoSchema,
@@ -312,6 +314,8 @@ export type RpcSlashCommand = Static<typeof RpcSlashCommandSchema>;
 // ============================================================================
 
 export type RpcSessionListItem = Static<typeof RpcSessionListItemSchema>;
+export type RpcSessionWorkContext = Static<typeof RpcSessionWorkContextSchema>;
+export type RpcSessionWorkPullRequest = Static<typeof RpcSessionWorkPullRequestSchema>;
 export type RpcSubscriptionUsageReport = Static<typeof RpcSubscriptionUsageReportSchema>;
 /** Path-free host-observed metadata for one active session worktree. */
 export type RpcGitContext = Static<typeof RpcGitContextSchema>;

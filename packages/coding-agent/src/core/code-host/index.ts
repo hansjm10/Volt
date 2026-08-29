@@ -1,9 +1,21 @@
 import { githubCliCodeHostProvider } from "./github-cli-provider.ts";
 import type { CodeHostProvider } from "./types.ts";
 
+export {
+	canonicalizeGitHubRemoteUrl,
+	discoverPullRequestWithGitHubCli,
+	githubCliPullRequestDiscoveryProvider,
+} from "./github-cli-discovery.ts";
 export { githubCliCodeHostProvider } from "./github-cli-provider.ts";
 export type {
+	CanonicalCodeHostRepository,
 	CodeHostProvider,
+	CodeHostPullRequestAssociation,
+	CodeHostPullRequestDiscoveryOutcome,
+	CodeHostPullRequestDiscoveryProvider,
+	CodeHostPullRequestDiscoveryRequest,
+	CodeHostPullRequestDiscoveryUnavailableReason,
+	CodeHostPullRequestStatus,
 	CodeHostPullRequestSummary,
 	PullRequestFetchPlan,
 	PullRequestFetchRef,

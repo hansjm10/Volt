@@ -59,6 +59,19 @@ describe("control protocol framing", () => {
 			{ type: "lease_rekey_commit", id: "5a", transactionId: "tx-1" },
 			{ type: "lease_rekey_rollback", id: "5b", transactionId: "tx-1" },
 			{ type: "lease_rekey_dispose", id: "5c", transactionId: "tx-1" },
+			{
+				type: "work_observe",
+				id: "5d",
+				workspaceName: "volt",
+				sessionId: "s-1",
+				gitContext: {
+					repository: "Volt",
+					branch: "feature/work",
+					headOid: "0123456789abcdef0123456789abcdef01234567",
+					baseRef: "main",
+				},
+			},
+			{ type: "work_observe", id: "5e", workspaceName: "volt", sessionId: "s-1", gitContext: null },
 			{ type: "pair_request", id: "6", access: "coding" },
 			{
 				type: "client_access_update",
@@ -226,6 +239,31 @@ describe("control protocol framing", () => {
 		const request = { type: "lease_release", id: "4", workspaceName: "volt", sessionId: "s-1" };
 		expect(isControlRequest(request)).toBe(false);
 		expect(isControlRequest({ ...request, reason: "workspace_removed" })).toBe(false);
+	});
+
+	it("strictly bounds path-free Work observations", () => {
+		expect(
+			isControlRequest({
+				type: "work_observe",
+				id: "1",
+				workspaceName: "w",
+				sessionId: "s",
+				gitContext: { repository: "repo", branch: "feature/work", headOid: "not-an-oid" },
+			}),
+		).toBe(false);
+		expect(
+			isControlRequest({
+				type: "work_observe",
+				id: "1",
+				workspaceName: "w",
+				sessionId: "s",
+				gitContext: {
+					repository: "repo",
+					branch: "feature/work\npoison",
+					headOid: "0123456789abcdef0123456789abcdef01234567",
+				},
+			}),
+		).toBe(false);
 	});
 
 	it("rejects pair_request with a malformed workspace", () => {
