@@ -308,6 +308,8 @@ describe("exact GitHub pull request discovery", () => {
 		expect(ghCalls).toHaveLength(2);
 		for (const call of ghCalls) {
 			expect(call.args).toEqual(expect.arrayContaining(["--repo"]));
+			const args = call.args as string[];
+			expect(args[args.indexOf("--head") + 1]).toBe("feature/work");
 			expect(call.env).toEqual({
 				GH_PROMPT_DISABLED: "1",
 				GH_PAGER: "cat",

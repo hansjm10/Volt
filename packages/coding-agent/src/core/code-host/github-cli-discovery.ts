@@ -392,7 +392,7 @@ export async function discoverPullRequestWithGitHubCli(
 					"--state",
 					"all",
 					"--head",
-					`${headRepository.owner}:${branch}`,
+					branch,
 					"--limit",
 					"100",
 					"--json",
