@@ -815,12 +815,15 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const commitSourceRebind = runtimeHost.conversationProjectionFeed.commitSourceRebind.bind(
 			runtimeHost.conversationProjectionFeed,
 		);
-		vi.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind").mockImplementation(() => {
-			phases.push("publish");
-			commitSourceRebind();
-		});
+		const publish = vi
+			.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind")
+			.mockImplementation((requestId) => {
+				phases.push("publish");
+				commitSourceRebind(requestId);
+			});
 
-		await runtimeHost.newSession();
+		await runtimeHost.newSession({ rebindRequestId: "new-session-request" });
+		expect(publish).toHaveBeenCalledWith("new-session-request");
 		expect(phases).toEqual(["prepare", "session_shutdown", "commit", "publish", "finalize", "rebind"]);
 	});
 
@@ -861,13 +864,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			return undefined;
 		});
 
-		const first = runtimeHost.newSession();
+		const publish = vi.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind");
+		const first = runtimeHost.newSession({ rebindRequestId: "winning-request" });
 		await preparationStarted;
-		const queuedFromOldSession = runtimeHost.newSession();
+		const queuedFromOldSession = runtimeHost.newSession({ rebindRequestId: "stale-request" });
 		releasePreparation();
 
 		await first;
 		await expect(queuedFromOldSession).rejects.toThrow("Stale agent session structural operation");
+		expect(publish).toHaveBeenCalledOnce();
+		expect(publish).toHaveBeenCalledWith("winning-request");
 		expect(preparationCount).toBe(1);
 		expect(shutdownReasons).toEqual(["new"]);
 	});

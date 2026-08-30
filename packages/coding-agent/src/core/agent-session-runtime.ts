@@ -719,6 +719,8 @@ export class AgentSessionRuntime {
 		create: () => Promise<CreateAgentSessionRuntimeResult>;
 		afterApply?: () => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		/** RPC request correlated with the replacement bootstrap, when any. */
+		rebindRequestId?: string;
 	}): Promise<{ seeded: boolean }> {
 		// The entire public operation runs in the lifecycle actor. Re-check at the
 		// ownership boundary so a queued command can never prepare against the
@@ -794,7 +796,7 @@ export class AgentSessionRuntime {
 					throw new Error("Agent session replacement changed before ownership commit");
 				}
 				await transaction?.commit();
-				return await this.finishSessionReplacement(options.withSession, transaction);
+				return await this.finishSessionReplacement(options.withSession, transaction, options.rebindRequestId);
 			} catch (error: unknown) {
 				const replacementError = error instanceof Error ? error : new Error(String(error));
 				if (applied) {
@@ -913,6 +915,7 @@ export class AgentSessionRuntime {
 	private async finishSessionReplacement(
 		withSession: ((ctx: ReplacedSessionContext) => Promise<void>) | undefined,
 		transaction: AgentSessionReplacementTransaction | undefined,
+		rebindRequestId: string | undefined,
 	): Promise<{ seeded: boolean }> {
 		try {
 			for (const listener of [...this.sessionWillProjectListeners]) {
@@ -923,7 +926,7 @@ export class AgentSessionRuntime {
 			this.conversationProjectionFeed.failSourceRebind(ownershipError);
 			throw ownershipError;
 		}
-		this.conversationProjectionFeed.commitSourceRebind();
+		this.conversationProjectionFeed.commitSourceRebind(rebindRequestId);
 		await transaction?.finalize?.();
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
@@ -1093,6 +1096,8 @@ export class AgentSessionRuntime {
 
 	async newSession(options?: {
 		parentSession?: string;
+		/** RPC request correlated with the replacement bootstrap, when any. */
+		rebindRequestId?: string;
 		/** Override the new session's cwd (e.g. a daemon-managed worktree checkout). */
 		cwd?: string;
 		/** Override the session dir (e.g. the parent workspace's default dir for worktree sessions). */
@@ -1266,6 +1271,7 @@ export class AgentSessionRuntime {
 		options:
 			| {
 					parentSession?: string;
+					rebindRequestId?: string;
 					cwd?: string;
 					sessionDir?: string;
 					workspaceName?: string;
@@ -1316,6 +1322,7 @@ export class AgentSessionRuntime {
 					subagentContext: this.subagentContext,
 				}),
 			withSession: options?.withSession,
+			rebindRequestId: options?.rebindRequestId,
 		});
 		return { cancelled: false, seeded: replacement.seeded };
 	}

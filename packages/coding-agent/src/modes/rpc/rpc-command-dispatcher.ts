@@ -349,23 +349,24 @@ export async function handleRpcCommand(
 			if (command.preserveReviewRunId && !preservedReviewRun) {
 				return createRpcErrorResponse(id, "new_session", `Unknown review run: ${command.preserveReviewRunId}`);
 			}
-			const newSessionOptions = preservedReviewRun
-				? {
-						...(command.parentSession ? { parentSession: command.parentSession } : {}),
-						setup: async (sessionManager: SessionManager) => {
-							appendReviewRun(sessionManager, preservedReviewRun);
-							if (preservedReviewRun.acknowledgedAt !== undefined) {
-								acknowledgeReviewRun(
-									sessionManager,
-									preservedReviewRun.runId,
-									preservedReviewRun.acknowledgedAt,
-								);
-							}
-						},
-					}
-				: command.parentSession
-					? { parentSession: command.parentSession }
-					: undefined;
+			const newSessionOptions = {
+				rebindRequestId: id,
+				...(command.parentSession ? { parentSession: command.parentSession } : {}),
+				...(preservedReviewRun
+					? {
+							setup: async (sessionManager: SessionManager) => {
+								appendReviewRun(sessionManager, preservedReviewRun);
+								if (preservedReviewRun.acknowledgedAt !== undefined) {
+									acknowledgeReviewRun(
+										sessionManager,
+										preservedReviewRun.runId,
+										preservedReviewRun.acknowledgedAt,
+									);
+								}
+							},
+						}
+					: {}),
+			};
 			const result = await runSessionNewHostAction(context.createHostActionContext(), newSessionOptions);
 			return createRpcSuccessResponse(id, "new_session", { cancelled: result.cancelled });
 		}
