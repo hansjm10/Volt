@@ -104,6 +104,10 @@ interface ActiveReviewWorkflow {
 	disposePending: () => Promise<void>;
 }
 
+function formatRunningReviewMessage(description: string, preparing: boolean): string {
+	return preparing ? `${description}.` : `Reviewing ${description}.`;
+}
+
 function formatCompletedReviewSummary(
 	completionStatus: ParsedReview["completionStatus"],
 	findingsCount: number | undefined,
@@ -207,6 +211,18 @@ export class ReviewWorkflowManager {
 			};
 			descriptor.startedAt = prepared.startedAt;
 			entry.disposePending = () => prepared.resolution.dispose?.() ?? Promise.resolve();
+			if (entry.launched && !entry.abortController.signal.aborted) {
+				this.emit({
+					type: "workflow_update",
+					workflowId: descriptor.workflowId,
+					kind: "review",
+					action: descriptor.action,
+					title: "Review",
+					message: formatRunningReviewMessage(descriptor.target.description, false),
+					status: "running",
+					startedAt: descriptor.startedAt,
+				});
+			}
 		};
 
 		const launch = (): void => {
@@ -214,12 +230,24 @@ export class ReviewWorkflowManager {
 				return;
 			}
 			entry.launched = true;
+			this.emit({
+				type: "workflow_start",
+				workflowId: descriptor.workflowId,
+				kind: "review",
+				action: descriptor.action,
+				title: "Review",
+				message: formatRunningReviewMessage(descriptor.target.description, entry.awaitingPreparation),
+				status: "running",
+				startedAt: descriptor.startedAt,
+			});
 			void (async () => {
 				let result: ExecuteReviewWorkflowResult;
 				try {
 					result = await options.execute({
 						signal: entry.abortController.signal,
-						onEvent: (event) => this.emit(event),
+						onEvent: (event) => {
+							if (event.type !== "workflow_start" || event.workflowId !== workflowId) this.emit(event);
+						},
 					});
 				} catch (error) {
 					result = {

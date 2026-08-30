@@ -269,6 +269,7 @@ describe("review command controls", () => {
 		const newSession = vi.fn();
 		const onPrepared = vi.fn();
 		let workflowId: string | undefined;
+		let startPublishedDuringPreparation = false;
 		let remainedActiveAfterCancellation = false;
 		try {
 			const result = await runReviewWorkflow({
@@ -287,6 +288,9 @@ describe("review command controls", () => {
 						const active = workflowManager.list().find((workflow) => workflow.status === "running");
 						workflowId = active?.workflowId;
 						if (active) {
+							startPublishedDuringPreparation = events.some(
+								(event) => event.type === "workflow_start" && event.workflowId === active.workflowId,
+							);
 							workflowManager.cancel(active.workflowId);
 							remainedActiveAfterCancellation = workflowManager.hasActiveWorkflows;
 						} else localController.abort();
@@ -296,7 +300,14 @@ describe("review command controls", () => {
 			});
 			expect(result.status).toBe("cancelled");
 			if (!workflowId) throw new Error("Expected the shared review to be listed during preparation");
+			expect(startPublishedDuringPreparation).toBe(true);
 			expect(remainedActiveAfterCancellation).toBe(true);
+			expect(events.map((event) => event.type)).toEqual(["workflow_start", "workflow_end"]);
+			expect(events[0]).toMatchObject({
+				type: "workflow_start",
+				workflowId,
+				message: "Preparing uncommitted review.",
+			});
 			expect(workflowManager.get(workflowId)).toMatchObject({
 				workflowId,
 				action: "review.uncommitted",
@@ -386,6 +397,12 @@ describe("review command controls", () => {
 			await confirmationStarted;
 			workflowId = workflowManager.list().find((candidate) => candidate.status === "running")?.workflowId;
 			if (!workflowId) throw new Error("Expected the shared review to be listed during confirmation");
+			expect(events.map((event) => event.type)).toEqual(["workflow_start", "workflow_update"]);
+			expect(events[1]).toMatchObject({
+				type: "workflow_update",
+				workflowId,
+				message: "Reviewing uncommitted changes.",
+			});
 			workflowManager.cancel(workflowId);
 
 			await expect(workflow).resolves.toMatchObject({ status: "cancelled" });
@@ -418,6 +435,7 @@ describe("review command controls", () => {
 			releasePrepared = resolve;
 		});
 		let workflowId: string | undefined;
+		let eventsBeforeCancellation: unknown[] = [];
 		try {
 			const workflow = runReviewWorkflow({
 				target: { kind: "uncommitted" },
@@ -431,6 +449,7 @@ describe("review command controls", () => {
 				createHooks: () => ({
 					onPrepared: async () => {
 						workflowId = workflowManager.list().find((candidate) => candidate.status === "running")?.workflowId;
+						eventsBeforeCancellation = events.map((event) => event.type);
 						markPreparedStarted();
 						await preparedGate;
 					},
@@ -438,10 +457,22 @@ describe("review command controls", () => {
 			});
 			await preparedStarted;
 			if (!workflowId) throw new Error("Expected the shared review to be listed during onPrepared");
+			expect(eventsBeforeCancellation).toEqual(["workflow_start", "workflow_update"]);
+			expect(events[0]).toMatchObject({
+				type: "workflow_start",
+				workflowId,
+				message: "Preparing uncommitted review.",
+			});
+			expect(events[1]).toMatchObject({
+				type: "workflow_update",
+				workflowId,
+				message: "Reviewing uncommitted changes.",
+			});
 			workflowManager.cancel(workflowId);
 
 			await expect(workflow).resolves.toMatchObject({ status: "cancelled" });
 			expect(workflowManager.get(workflowId)?.status).toBe("cancelled");
+			expect(events.filter((event) => event.type === "workflow_start")).toHaveLength(1);
 			expect(events).toContainEqual(
 				expect.objectContaining({ type: "workflow_end", workflowId, status: "cancelled" }),
 			);

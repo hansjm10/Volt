@@ -6,6 +6,7 @@ import {
 	type ReviewWorkflowExecuteHooks,
 	ReviewWorkflowManager,
 } from "../src/core/review-workflows.ts";
+import { ConversationProjectionFeed } from "../src/core/rpc/conversation-projection-feed.ts";
 
 function parsed(findingsCount = 1, completionStatus: ParsedReview["completionStatus"] = "complete"): ParsedReview {
 	return {
@@ -126,6 +127,12 @@ describe("ReviewWorkflowManager", () => {
 			findingsCount: 1,
 			parsed: { completionStatus: "complete" },
 		});
+		expect(events.map((event) => event.type)).toEqual(["workflow_start", "workflow_end"]);
+		expect(events[0]).toMatchObject({
+			type: "workflow_start",
+			workflowId: "review:one",
+			message: "Reviewing uncommitted changes with private metadata.",
+		});
 		expect(events.at(-1)).toMatchObject({ type: "workflow_end", status: "completed" });
 	});
 
@@ -160,13 +167,14 @@ describe("ReviewWorkflowManager", () => {
 		expect(JSON.stringify(descriptor)).not.toContain("private metadata");
 	});
 
-	test("updates a launched provisional workflow and retains it until cancellation settles", async () => {
+	test("publishes and updates a launched provisional workflow before execution admission", async () => {
 		const dispose = vi.fn(async () => {});
 		let releasePreparation!: () => void;
 		const preparationGate = new Promise<void>((resolve) => {
 			releasePreparation = resolve;
 		});
-		const manager = new ReviewWorkflowManager();
+		const projection = new ConversationProjectionFeed({ subscribe: () => () => {} });
+		const manager = new ReviewWorkflowManager({ publishEvent: (event) => projection.publishExternal(event) });
 		const started = manager.start({
 			provisional: true,
 			prepared: prepared("review:preparing", { workflowDescription: "Preparing pull request review" }),
@@ -182,9 +190,31 @@ describe("ReviewWorkflowManager", () => {
 		started.launch();
 		expect(started.signal.aborted).toBe(false);
 		expect(manager.get("review:preparing")?.target.description).toBe("Preparing pull request review");
+		expect(projection.activeWorkflows).toMatchObject([
+			{
+				workflowId: "review:preparing",
+				workflowEvent: {
+					type: "workflow_start",
+					workflowId: "review:preparing",
+					message: "Preparing pull request review.",
+				},
+				activeTools: [],
+			},
+		]);
 
 		started.updatePrepared(prepared("review:preparing", { workflowDescription: "PR #7", dispose }));
 		expect(manager.get("review:preparing")?.target.description).toBe("PR #7");
+		expect(projection.activeWorkflows).toMatchObject([
+			{
+				workflowId: "review:preparing",
+				workflowEvent: {
+					type: "workflow_update",
+					workflowId: "review:preparing",
+					message: "Reviewing PR #7.",
+				},
+				activeTools: [],
+			},
+		]);
 		manager.cancel("review:preparing");
 		const remainedActiveUntilPreparationSettled = manager.hasActiveWorkflows;
 		releasePreparation();
@@ -194,6 +224,8 @@ describe("ReviewWorkflowManager", () => {
 		expect(started.signal.aborted).toBe(true);
 		expect(dispose).toHaveBeenCalledOnce();
 		expect(manager.get("review:preparing")?.status).toBe("cancelled");
+		expect(projection.activeWorkflows).toEqual([]);
+		projection.dispose();
 	});
 
 	test("records thrown failures", async () => {
@@ -301,6 +333,6 @@ describe("ReviewWorkflowManager", () => {
 		const started = manager.start({ prepared: prepared("review:sinks"), execute: async () => completed() });
 		started.launch();
 		await manager.waitForIdle();
-		expect(received).toEqual(["workflow_end"]);
+		expect(received).toEqual(["workflow_start", "workflow_end"]);
 	});
 });
