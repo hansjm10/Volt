@@ -188,6 +188,22 @@ export class WorkAssociationService {
 		await this.resolve(active);
 	}
 
+	async inheritSession(
+		workspaceName: string,
+		workspaceGeneration: number,
+		sourceSessionId: string,
+		targetSessionId: string,
+	): Promise<boolean> {
+		if (this.closed) return false;
+		return this.store.inheritSessionBinding({
+			workspaceName,
+			workspaceGeneration,
+			sourceSessionId,
+			targetSessionId,
+			now: this.now(),
+		});
+	}
+
 	retireSession(workspaceName: string, workspaceGeneration: number, sessionId: string): void {
 		const key = observationKey(workspaceName, workspaceGeneration, sessionId);
 		this.active.delete(key);

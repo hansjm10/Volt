@@ -1154,6 +1154,9 @@ class IrohDaemonService {
 
 	private rekeyRuntimeWorkObservation(entry: IntegratedRuntimeEntry, previousSessionId: string): void {
 		if (entry.workspaceGeneration === undefined) return;
+		void this.services.work
+			.inheritSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId, entry.sessionId)
+			.catch(() => {});
 		this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
 	}
 
@@ -4964,6 +4967,19 @@ class IrohDaemonService {
 							boundWorktree.id,
 							reservation.newSessionId,
 						);
+					}
+					const workspaceGeneration = (await this.stateManager.getState()).workspaceGenerations?.find(
+						(candidate) => candidate.workspaceName === reservation.workspaceName,
+					)?.generation;
+					if (workspaceGeneration !== undefined) {
+						await this.services.work
+							.inheritSession(
+								reservation.workspaceName,
+								workspaceGeneration,
+								reservation.oldSessionId,
+								reservation.newSessionId,
+							)
+							.catch(() => false);
 					}
 					await this.stateManager.setClientsLastSessionId(
 						Array.from(relayedClientNodeIds),

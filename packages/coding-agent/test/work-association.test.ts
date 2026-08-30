@@ -275,6 +275,38 @@ describe("WorkAssociationService", () => {
 		await service.close();
 	});
 
+	it("inherits Work context for a replacement session without moving or overwriting bindings", async () => {
+		const path = statePath("work-session-inheritance");
+		const store = new WorkStateStore({ path });
+		await store.load();
+		const provider = new FakeDiscoveryProvider();
+		provider.outcome = resolved(42);
+		const service = new WorkAssociationService({ store, discoveryProvider: provider });
+		await service.observe(observation({ sessionId: "source" }));
+		const source = service.getWorkContext("volt", 1, "source")!;
+
+		expect(await service.inheritSession("volt", 1, "source", "review-session")).toBe(true);
+		service.retireSession("volt", 1, "source");
+		expect(service.getWorkContext("volt", 1, "review-session")).toMatchObject({
+			changeId: source.changeId,
+			pullRequest: { number: 42 },
+		});
+
+		provider.outcome = resolved(99);
+		await service.observe(observation({ sessionId: "existing", branch: "feature/other", headOid: OID_B }));
+		const existing = service.getWorkContext("volt", 1, "existing")!;
+		expect(existing.changeId).not.toBe(source.changeId);
+		expect(await service.inheritSession("volt", 1, "source", "existing")).toBe(false);
+		expect(service.getWorkContext("volt", 1, "existing")?.changeId).toBe(existing.changeId);
+		await service.close();
+
+		const reopened = new WorkStateStore({ path });
+		await reopened.load();
+		expect(reopened.getWorkContext("volt", 1, "source")?.changeId).toBe(source.changeId);
+		expect(reopened.getWorkContext("volt", 1, "review-session")?.changeId).toBe(source.changeId);
+		await reopened.close();
+	});
+
 	it("fences delayed discovery by session binding generation, repository, branch, and OID", async () => {
 		const store = new WorkStateStore({ path: statePath("work-cas") });
 		await store.load();

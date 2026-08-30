@@ -110,6 +110,14 @@ export interface WorkObservationInput {
 	now: number;
 }
 
+export interface WorkBindingInheritanceInput {
+	workspaceName: string;
+	workspaceGeneration: number;
+	sourceSessionId: string;
+	targetSessionId: string;
+	now: number;
+}
+
 export interface WorkDiscoveryFence {
 	workspaceName: string;
 	workspaceGeneration: number;
@@ -600,6 +608,43 @@ export class WorkStateStore {
 				},
 				shouldDiscover,
 			};
+		});
+	}
+
+	async inheritSessionBinding(input: WorkBindingInheritanceInput): Promise<boolean> {
+		if (
+			!boundedString(input.workspaceName, MAX_WORKSPACE_CHARS) ||
+			!safePositiveInteger(input.workspaceGeneration) ||
+			!boundedString(input.sourceSessionId, MAX_ID_CHARS) ||
+			!boundedString(input.targetSessionId, MAX_ID_CHARS) ||
+			input.sourceSessionId === input.targetSessionId ||
+			!safeNonNegativeInteger(input.now)
+		) {
+			throw new Error("invalid Work binding inheritance");
+		}
+		return this.mutate((state) => {
+			const targetKey = bindingKey(input.workspaceName, input.workspaceGeneration, input.targetSessionId);
+			if (
+				state.bindings.some(
+					(candidate) =>
+						bindingKey(candidate.workspaceName, candidate.workspaceGeneration, candidate.sessionId) === targetKey,
+				)
+			) {
+				return false;
+			}
+			const sourceKey = bindingKey(input.workspaceName, input.workspaceGeneration, input.sourceSessionId);
+			const source = state.bindings.find(
+				(candidate) =>
+					bindingKey(candidate.workspaceName, candidate.workspaceGeneration, candidate.sessionId) === sourceKey,
+			);
+			if (!source) return false;
+			state.bindings.push({
+				...source,
+				sessionId: input.targetSessionId,
+				bindingGeneration: 1,
+				updatedAt: input.now,
+			});
+			return true;
 		});
 	}
 
