@@ -62,10 +62,10 @@ function observationKey(workspaceName: string, workspaceGeneration: number, sess
 }
 
 function normalizedBaseBranch(value: string): string {
-	const trimmed = value.trim();
-	const withoutRefs = trimmed.replace(/^refs\/heads\//, "").replace(/^refs\/remotes\/[^/]+\//, "");
-	const slash = withoutRefs.indexOf("/");
-	return slash === -1 ? withoutRefs : withoutRefs.slice(slash + 1);
+	return value
+		.trim()
+		.replace(/^refs\/heads\//, "")
+		.replace(/^refs\/remotes\/[^/]+\//, "");
 }
 
 export function isConfiguredBaseBranch(branch: string, configured: readonly string[] = []): boolean {

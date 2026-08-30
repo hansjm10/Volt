@@ -231,6 +231,19 @@ describe("TUI Work observation authority", () => {
 });
 
 describe("WorkAssociationService", () => {
+	it("shares slash-delimited feature branches ending in a default base branch name", async () => {
+		const store = new WorkStateStore({ path: statePath("work-prefixed-feature") });
+		await store.load();
+		const provider = new FakeDiscoveryProvider();
+		const service = new WorkAssociationService({ store, discoveryProvider: provider });
+		await service.observe(observation({ sessionId: "feature-a", branch: "feature/main" }));
+		await service.observe(observation({ sessionId: "feature-b", branch: "feature/main" }));
+		expect(service.getWorkContext("volt", 1, "feature-b")?.changeId).toBe(
+			service.getWorkContext("volt", 1, "feature-a")?.changeId,
+		);
+		await service.close();
+	});
+
 	it("keeps an exact positive association sticky across checkout changes and branch reuse", async () => {
 		let now = 100;
 		const store = new WorkStateStore({ path: statePath("work-sticky"), now: () => now });
