@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
 	CanonicalCodeHostRepository,
 	CodeHostPullRequestDiscoveryOutcome,
@@ -114,6 +114,7 @@ async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void
 }
 
 afterEach(() => {
+	vi.useRealTimers();
 	while (tempDirectories.length > 0) {
 		rmSync(tempDirectories.pop()!, { recursive: true, force: true });
 	}
@@ -329,6 +330,80 @@ describe("WorkAssociationService", () => {
 		expect(provider.maxActive).toBe(1);
 		pending.shift()!({ state: "none" });
 		await Promise.all([branchA, branchB]);
+		await service.close();
+	});
+
+	it("contains thrown scheduled discovery failures and retries them with backoff", async () => {
+		vi.useFakeTimers({ now: 1000 });
+		const store = new WorkStateStore({ path: statePath("work-scheduled-provider-failure") });
+		await store.load();
+		const provider = new FakeDiscoveryProvider();
+		let attempts = 0;
+		provider.resolver = async () => {
+			attempts++;
+			if (attempts === 2) throw new Error("scheduled provider failure");
+			return { state: "none" };
+		};
+		const failures: Array<{ phase: string; message: string }> = [];
+		const service = new WorkAssociationService({
+			store,
+			discoveryProvider: provider,
+			onRefreshError: (phase, error) => {
+				failures.push({ phase, message: error instanceof Error ? error.message : String(error) });
+			},
+		});
+		await service.observe(observation());
+
+		await vi.advanceTimersByTimeAsync(60_000);
+		await store.flush();
+		expect(provider.requests).toHaveLength(2);
+		expect(failures).toEqual([{ phase: "discovery", message: "scheduled provider failure" }]);
+		expect(service.getWorkContext("volt", 1, "session-a")).toMatchObject({
+			resolutionState: "unavailable",
+		});
+
+		await vi.advanceTimersByTimeAsync(30_000);
+		await store.flush();
+		expect(provider.requests).toHaveLength(3);
+		expect(service.getWorkContext("volt", 1, "session-a")).toMatchObject({ resolutionState: "none" });
+		await service.close();
+	});
+
+	it("contains scheduled persistence failures and retries them with backoff", async () => {
+		vi.useFakeTimers({ now: 1000 });
+		let failWrites = false;
+		let writeAttempts = 0;
+		const store = new WorkStateStore({
+			path: statePath("work-scheduled-persistence-failure"),
+			writeStateFile: async () => {
+				writeAttempts++;
+				if (failWrites) throw new Error("scheduled persistence failure");
+			},
+		});
+		await store.load();
+		const provider = new FakeDiscoveryProvider();
+		const failures: Array<{ phase: string; message: string }> = [];
+		const service = new WorkAssociationService({
+			store,
+			discoveryProvider: provider,
+			onRefreshError: (phase, error) => {
+				failures.push({ phase, message: error instanceof Error ? error.message : String(error) });
+			},
+		});
+		await service.observe(observation());
+		const changeId = service.getWorkContext("volt", 1, "session-a")!.changeId;
+		const initialWriteAttempts = writeAttempts;
+
+		failWrites = true;
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(writeAttempts).toBe(initialWriteAttempts + 1);
+		expect(failures).toEqual([{ phase: "scheduled_refresh", message: "scheduled persistence failure" }]);
+		expect(store.getChange(changeId)!.nextRefreshAt).toBeLessThanOrEqual(Date.now());
+
+		failWrites = false;
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(writeAttempts).toBe(initialWriteAttempts + 2);
+		expect(store.getChange(changeId)!.nextRefreshAt).toBeGreaterThan(Date.now());
 		await service.close();
 	});
 

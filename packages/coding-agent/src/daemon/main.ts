@@ -370,6 +370,12 @@ export async function runVoltDaemon(config: VoltdConfig, extensions: VoltdServic
 		store: workState,
 		enabled: remoteSettings.pullRequestDiscovery !== false,
 		now: () => clock.now(),
+		onRefreshError: (phase, error) => {
+			const operation = phase === "discovery" ? "provider discovery" : "scheduled refresh";
+			log("warn", `Work association ${operation} failed; retrying with backoff`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		},
 	});
 	const fallbackPushRelayClient = new IrohRemotePushRelayHttpClient({
 		authToken: process.env.VOLT_PUSH_RELAY_AUTH_TOKEN,

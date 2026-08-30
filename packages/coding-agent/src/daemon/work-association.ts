@@ -47,6 +47,8 @@ interface CachedDiscovery {
 	readonly expiresAt: number;
 }
 
+export type WorkAssociationRefreshFailurePhase = "discovery" | "scheduled_refresh";
+
 export interface WorkAssociationServiceOptions {
 	store: WorkStateStore;
 	discoveryProvider?: CodeHostPullRequestDiscoveryProvider;
@@ -55,6 +57,7 @@ export interface WorkAssociationServiceOptions {
 	now?: () => number;
 	providerConcurrency?: number;
 	cacheMaxEntries?: number;
+	onRefreshError?: (phase: WorkAssociationRefreshFailurePhase, error: unknown) => void;
 }
 
 function observationKey(workspaceName: string, workspaceGeneration: number, sessionId: string): string {
@@ -131,6 +134,7 @@ export class WorkAssociationService {
 	private readonly now: () => number;
 	private readonly providerConcurrency: number;
 	private readonly cacheMaxEntries: number;
+	private readonly onRefreshError: NonNullable<WorkAssociationServiceOptions["onRefreshError"]>;
 	private readonly active = new Map<string, ActiveObservation>();
 	private readonly timers = new Map<string, NodeJS.Timeout>();
 	private readonly cache = new Map<string, CachedDiscovery>();
@@ -148,6 +152,7 @@ export class WorkAssociationService {
 		this.now = options.now ?? (() => Date.now());
 		this.providerConcurrency = Math.max(1, Math.floor(options.providerConcurrency ?? DEFAULT_PROVIDER_CONCURRENCY));
 		this.cacheMaxEntries = Math.max(1, Math.floor(options.cacheMaxEntries ?? DEFAULT_CACHE_MAX_ENTRIES));
+		this.onRefreshError = options.onRefreshError ?? (() => {});
 	}
 
 	async observe(observation: WorkAssociationObservation): Promise<void> {
@@ -233,7 +238,13 @@ export class WorkAssociationService {
 		} else if (!this.isOnline()) {
 			outcome = { state: "unavailable", reason: "network" };
 		} else {
-			outcome = await this.discover(active);
+			try {
+				outcome = await this.discover(active);
+			} catch (error) {
+				if (!this.isCurrent(active)) return;
+				this.reportRefreshError("discovery", error);
+				outcome = { state: "unavailable", reason: "provider_error" };
+			}
 		}
 		if (!this.isCurrent(active)) return;
 		const latestChange = this.store.getChange(active.fence.changeId);
@@ -307,13 +318,33 @@ export class WorkAssociationService {
 		}
 	}
 
+	private reportRefreshError(phase: WorkAssociationRefreshFailurePhase, error: unknown): void {
+		try {
+			this.onRefreshError(phase, error);
+		} catch {
+			// Error reporting must not break refresh supervision.
+		}
+	}
+
+	private async runScheduledRefresh(active: ActiveObservation): Promise<void> {
+		try {
+			await this.resolve(active);
+		} catch (error) {
+			if (!this.isCurrent(active)) return;
+			this.reportRefreshError("scheduled_refresh", error);
+			const change = this.store.getChange(active.fence.changeId);
+			if (!change) return;
+			this.schedule(active, this.now() + backoffMs(change.failureCount));
+		}
+	}
+
 	private schedule(active: ActiveObservation, refreshAt: number): void {
 		if (!this.isCurrent(active)) return;
 		this.clearTimer(active.key);
 		const timer = setTimeout(
 			() => {
 				this.timers.delete(active.key);
-				if (this.isCurrent(active)) void this.resolve(active);
+				if (this.isCurrent(active)) void this.runScheduledRefresh(active);
 			},
 			Math.max(1, Math.min(2_147_483_647, refreshAt - this.now())),
 		);
