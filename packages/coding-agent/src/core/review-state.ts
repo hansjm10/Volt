@@ -110,6 +110,12 @@ export interface ReviewRunPage {
 	nextCursor?: string;
 }
 
+export interface ReviewStateHandoffSnapshot {
+	runs: ReviewRunRecord[];
+	acknowledgments: ReviewAcknowledgmentRecord[];
+	transitions: ReviewFindingTransitionRecord[];
+}
+
 export interface ReviewIncrementalPlan {
 	mode: "incremental" | "full";
 	previousRun?: ReviewRunRecord;
@@ -365,6 +371,45 @@ function decodeCursor(cursor: string): { endedAt: number; runId: string } {
 
 function compareRuns(left: ReviewRunRecord, right: ReviewRunRecord): number {
 	return right.endedAt - left.endedAt || right.runId.localeCompare(left.runId);
+}
+
+export function captureReviewStateForHandoff(sessionManager: SessionManager): ReviewStateHandoffSnapshot {
+	const entries = branchCustomEntries(sessionManager);
+	const acknowledgments = acknowledgmentMap(entries);
+	const transitions = transitionMap(entries);
+	const byRunId = new Map<string, ReviewRunRecord>();
+	for (const entry of entries) {
+		if (entry.customType !== REVIEW_RUN_CUSTOM_ENTRY_TYPE) continue;
+		const run = parseRun(entry.data);
+		if (run) byRunId.set(run.runId, run);
+	}
+	const runs = [...byRunId.values()].sort(compareRuns).slice(0, MAX_HYDRATED_REVIEW_RUNS);
+	const retainedFindingKeys = new Set(
+		runs.flatMap((run) => (run.result?.findings ?? []).map((finding) => `${run.runId}\0${finding.id}`)),
+	);
+	return {
+		runs,
+		acknowledgments: runs.flatMap((run) => {
+			const acknowledgment = acknowledgments.get(run.runId);
+			return acknowledgment ? [acknowledgment] : [];
+		}),
+		transitions: [...transitions.entries()].flatMap(([key, transition]) =>
+			retainedFindingKeys.has(key) ? [transition] : [],
+		),
+	};
+}
+
+export function restoreReviewStateFromHandoff(
+	sessionManager: SessionManager,
+	snapshot: ReviewStateHandoffSnapshot,
+): void {
+	for (const run of snapshot.runs) appendReviewRun(sessionManager, run);
+	for (const acknowledgment of snapshot.acknowledgments) {
+		acknowledgeReviewRun(sessionManager, acknowledgment.runId, acknowledgment.acknowledgedAt);
+	}
+	for (const transition of snapshot.transitions) {
+		appendReviewFindingTransition(sessionManager, transition);
+	}
 }
 
 export function listReviewRuns(

@@ -21,6 +21,7 @@ import {
 	type PlanningState,
 	StalePlanRevisionError,
 } from "./planning.ts";
+import { captureReviewStateForHandoff, restoreReviewStateFromHandoff } from "./review-state.ts";
 import { ReviewWorkflowManager } from "./review-workflows.ts";
 import { ConversationProjectionFeed, type ConversationProjectionSource } from "./rpc/conversation-projection-feed.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
@@ -1179,10 +1180,12 @@ export class AgentSessionRuntime {
 		const sourceModel = sourceSession.model;
 		const sourceThinking = sourceSession.thinkingLevel;
 		const sourceFastMode = sourceSession.fastModeEnabled;
+		const sourceReviewState = captureReviewStateForHandoff(sourceManager);
 		let execution: PlanExecution | undefined;
 		const replacement = await this.newSession({
 			...(sourceSessionFile ? { parentSession: sourceSessionFile } : {}),
 			setup: async (sessionManager) => {
+				restoreReviewStateFromHandoff(sessionManager, sourceReviewState);
 				execution = {
 					id: randomUUID(),
 					approvedRevision: expectedRevision,
