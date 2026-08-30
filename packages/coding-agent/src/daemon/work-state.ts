@@ -682,7 +682,14 @@ export class WorkStateStore {
 				return false;
 			}
 			const change = state.changes.find((candidate) => candidate.id === fence.changeId);
-			if (!change) return false;
+			if (
+				!change ||
+				change.repositoryId !== fence.repositoryId ||
+				change.branch !== fence.branch ||
+				change.headOid !== fence.headOid
+			) {
+				return false;
+			}
 			change.checkedAt = options.now;
 			change.nextRefreshAt = options.nextRefreshAt;
 			change.updatedAt = options.now;

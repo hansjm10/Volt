@@ -339,6 +339,37 @@ describe("WorkAssociationService", () => {
 		await service.close();
 	});
 
+	it("rejects delayed discovery after another session advances the shared change head", async () => {
+		const store = new WorkStateStore({ path: statePath("work-shared-head-cas") });
+		await store.load();
+		const provider = new FakeDiscoveryProvider();
+		const resolvers = new Map<string, (outcome: CodeHostPullRequestDiscoveryOutcome) => void>();
+		provider.resolver = (request) => new Promise((resolve) => resolvers.set(request.headOid, resolve));
+		const service = new WorkAssociationService({ store, discoveryProvider: provider });
+
+		const older = service.observe(observation({ sessionId: "older", headOid: OID_A }));
+		await waitFor(() => resolvers.has(OID_A));
+		const newer = service.observe(observation({ sessionId: "newer", headOid: OID_B }));
+		await waitFor(() => resolvers.has(OID_B));
+		resolvers.get(OID_B)!({ state: "none" });
+		await newer;
+
+		const newerContext = service.getWorkContext("volt", 1, "newer");
+		const olderContext = service.getWorkContext("volt", 1, "older");
+		const changeId = newerContext!.changeId;
+		const changeSnapshot = store.getChange(changeId);
+		expect(changeSnapshot).toMatchObject({ headOid: OID_B, resolutionState: "none" });
+		expect(olderContext).toEqual(newerContext);
+
+		resolvers.get(OID_A)!(resolved(1));
+		await older;
+
+		expect(store.getChange(changeId)).toEqual(changeSnapshot);
+		expect(service.getWorkContext("volt", 1, "older")).toEqual(olderContext);
+		expect(service.getWorkContext("volt", 1, "newer")).toEqual(newerContext);
+		await service.close();
+	});
+
 	it("skips a guarded binding that becomes stale while queued behind persistence", async () => {
 		const writeGate = createDeferred();
 		let writeCount = 0;
