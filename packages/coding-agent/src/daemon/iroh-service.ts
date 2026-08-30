@@ -5,7 +5,7 @@ import { realpath, stat } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { relative, resolve, sep } from "node:path";
 import { createAgentSessionServices } from "../core/agent-session-services.ts";
-import type { GitContextObservation } from "../core/git-context-provider.ts";
+import { type GitContextObservation, GitContextObservationBinding } from "../core/git-context-provider.ts";
 import { discoverGitWorktree } from "../core/git-repository.ts";
 import {
 	createIrohRemoteExplicitAccess,
@@ -805,7 +805,10 @@ class IrohDaemonService {
 	private readonly trustStore: ProjectTrustStore;
 	private readonly conversationCoordinators = new ConversationCoordinatorRegistry();
 	private readonly runtimes: IntegratedRuntimeRegistry;
-	private readonly runtimeWorkObservers = new Map<IntegratedRuntimeEntry, () => void>();
+	private readonly runtimeWorkObservers = new Map<
+		IntegratedRuntimeEntry,
+		{ binding: GitContextObservationBinding; unsubscribeSessionReplaced: () => void }
+	>();
 	private readonly tuiWorkAuthorities = new Map<string, { connectionId: string; workspaceGeneration: number }>();
 	private readonly worktrees: WorktreeManager;
 	private readonly worktreeRetention: WorktreeRetentionSweeper;
@@ -1102,10 +1105,14 @@ class IrohDaemonService {
 
 	private startRuntimeWorkObservation(entry: IntegratedRuntimeEntry): void {
 		if (entry.workspaceGeneration === undefined || this.runtimeWorkObservers.has(entry)) return;
+		let observer!: {
+			binding: GitContextObservationBinding;
+			unsubscribeSessionReplaced: () => void;
+		};
 		const publish = (observation: GitContextObservation): void => {
 			if (
 				observation.status !== "definitive" ||
-				this.runtimeWorkObservers.get(entry) !== unsubscribe ||
+				this.runtimeWorkObservers.get(entry) !== observer ||
 				entry.lifecycle !== "active"
 			) {
 				return;
@@ -1135,29 +1142,27 @@ class IrohDaemonService {
 				})
 				.catch(() => {});
 		};
-		const unsubscribeObservation = entry.runtime.session.gitContextProvider.subscribeObservations(publish);
-		const releaseMonitor = entry.runtime.session.gitContextProvider.retainObservation();
-		const unsubscribe = () => {
-			unsubscribeObservation();
-			releaseMonitor();
-		};
-		this.runtimeWorkObservers.set(entry, unsubscribe);
-		void entry.runtime.session.gitContextProvider.refresh();
+		const binding = new GitContextObservationBinding(publish, { monitor: true });
+		const unsubscribeSessionReplaced = entry.runtime.subscribeSessionReplaced((session) => {
+			if (this.runtimeWorkObservers.get(entry) !== observer) return;
+			binding.bind(session.gitContextProvider);
+		});
+		observer = { binding, unsubscribeSessionReplaced };
+		this.runtimeWorkObservers.set(entry, observer);
+		binding.bind(entry.runtime.session.gitContextProvider);
 	}
 
 	private rekeyRuntimeWorkObservation(entry: IntegratedRuntimeEntry, previousSessionId: string): void {
 		if (entry.workspaceGeneration === undefined) return;
 		this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
-		if (this.runtimeWorkObservers.has(entry)) {
-			void entry.runtime.session.gitContextProvider.refresh();
-		}
 	}
 
 	private stopRuntimeWorkObservation(entry: IntegratedRuntimeEntry): void {
-		const unsubscribe = this.runtimeWorkObservers.get(entry);
-		if (unsubscribe) {
+		const observer = this.runtimeWorkObservers.get(entry);
+		if (observer) {
 			this.runtimeWorkObservers.delete(entry);
-			unsubscribe();
+			observer.unsubscribeSessionReplaced();
+			observer.binding.dispose();
 		}
 		if (entry.workspaceGeneration === undefined) return;
 		this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, entry.sessionId);

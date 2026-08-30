@@ -3,7 +3,12 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { detectGitOperation, GitContextProvider, parseGitStatusPorcelainV2 } from "../src/core/git-context-provider.ts";
+import {
+	detectGitOperation,
+	GitContextObservationBinding,
+	GitContextProvider,
+	parseGitStatusPorcelainV2,
+} from "../src/core/git-context-provider.ts";
 import { discoverGitWorktree, getGitRepositoryDisplayName } from "../src/core/git-repository.ts";
 
 const SHA1 = "0123456789abcdef0123456789abcdef01234567";
@@ -241,6 +246,41 @@ describe("GitContextProvider", () => {
 		expect(await provider.refresh()).toEqual({ status: "definitive", gitContext: null });
 		expect(observations).toEqual(["definitive"]);
 		provider.dispose();
+	});
+
+	it("rebinds host-owned observations to a replacement provider", async () => {
+		const initial = new GitContextProvider(tempDirectory("initial-non-git"));
+		const replacementRepository = initRepository("replacement-repository");
+		const replacement = new GitContextProvider(replacementRepository);
+		const observations: Array<string | null> = [];
+		const binding = new GitContextObservationBinding(
+			(observation) => {
+				if (observation.status === "definitive") {
+					observations.push(observation.gitContext?.repository ?? null);
+				}
+			},
+			{ monitor: true },
+		);
+
+		binding.bind(initial);
+		await waitFor(() => observations.length === 1);
+		expect(observations).toEqual([null]);
+		expect((initial as unknown as { observationCount: number }).observationCount).toBe(1);
+
+		binding.bind(replacement);
+		await waitFor(() => observations.includes(basename(replacementRepository)));
+		expect((initial as unknown as { observationCount: number }).observationCount).toBe(0);
+		expect((replacement as unknown as { observationCount: number }).observationCount).toBe(1);
+		const reboundObservationCount = observations.length;
+		await initial.refresh();
+		expect(observations).toHaveLength(reboundObservationCount);
+
+		binding.dispose();
+		expect((replacement as unknown as { observationCount: number }).observationCount).toBe(0);
+		await replacement.refresh();
+		expect(observations).toHaveLength(reboundObservationCount);
+		initial.dispose();
+		replacement.dispose();
 	});
 
 	it("parses an unborn repository", async () => {

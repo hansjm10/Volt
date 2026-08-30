@@ -809,3 +809,38 @@ export class GitContextProvider {
 		this.pollTimer.unref?.();
 	}
 }
+
+/** A host-owned observation subscription that can follow replacement session providers. */
+export class GitContextObservationBinding {
+	private readonly listener: GitContextObservationListener;
+	private readonly monitor: boolean;
+	private provider: GitContextProvider | undefined;
+	private unsubscribeObservation: (() => void) | undefined;
+	private releaseMonitor: (() => void) | undefined;
+
+	constructor(listener: GitContextObservationListener, options: { monitor?: boolean } = {}) {
+		this.listener = listener;
+		this.monitor = options.monitor === true;
+	}
+
+	bind(provider: GitContextProvider): void {
+		if (this.provider === provider) return;
+		this.clear();
+		this.provider = provider;
+		this.unsubscribeObservation = provider.subscribeObservations(this.listener);
+		this.releaseMonitor = this.monitor ? provider.retainObservation() : undefined;
+		void provider.refresh();
+	}
+
+	dispose(): void {
+		this.clear();
+	}
+
+	private clear(): void {
+		this.unsubscribeObservation?.();
+		this.releaseMonitor?.();
+		this.unsubscribeObservation = undefined;
+		this.releaseMonitor = undefined;
+		this.provider = undefined;
+	}
+}
