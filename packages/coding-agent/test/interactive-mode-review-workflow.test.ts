@@ -200,6 +200,32 @@ describe("InteractiveMode review workflow", () => {
 		expect(context.editorContainer.children).toEqual([context.editor]);
 	});
 
+	it("dismisses review confirmation when the workflow signal is aborted", async () => {
+		const context = createContext();
+		const controller = new AbortController();
+		reviewMocks.runReviewWorkflow.mockImplementationOnce(async (options) => {
+			const hooks = await options.createHooks?.();
+			const confirmed = await options.confirm?.({
+				title: "Review changes",
+				message: "Confirm rerun",
+				resolution,
+				signal: controller.signal,
+			});
+			expect(confirmed).toBe(false);
+			hooks?.cleanup?.();
+			return { status: "cancelled", resolution };
+		});
+
+		const pending = run(context, true);
+		await vi.waitFor(() => expect(context.extensionSelector).toBeDefined());
+		controller.abort();
+		await pending;
+
+		expect(context.extensionSelector).toBeUndefined();
+		expect(context.editorContainer.children).toEqual([context.editor]);
+		expect(context.ui.setFocus).toHaveBeenLastCalledWith(context.editor);
+	});
+
 	it("Escape aborts preparation, restores the editor, and prevents promotion or inference", async () => {
 		const context = createContext();
 		let hooks: ReviewWorkflowHooks | undefined;

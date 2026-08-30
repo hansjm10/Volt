@@ -891,7 +891,12 @@ export interface ReviewWorkflowOptions {
 	tools?: readonly string[];
 	requireProjectTrust?: boolean;
 	requireConfirmation?: boolean;
-	confirm?: (request: { title: string; message: string; resolution: ResolvedReview }) => Promise<boolean>;
+	confirm?: (request: {
+		title: string;
+		message: string;
+		resolution: ResolvedReview;
+		signal?: AbortSignal;
+	}) => Promise<boolean>;
 	createHooks?: () => Promise<ReviewWorkflowHooks> | ReviewWorkflowHooks;
 	onReviewModelWarning?: (message: string) => void;
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
@@ -1738,6 +1743,42 @@ async function promoteCompletedReview(
 	};
 }
 
+type ReviewAdmissionStepResult<T> = { status: "completed"; value: T } | { status: "cancelled" };
+
+async function awaitReviewAdmissionStep<T>(
+	signal: AbortSignal | undefined,
+	operation: () => Promise<T> | T,
+): Promise<ReviewAdmissionStepResult<T>> {
+	if (signal?.aborted) return { status: "cancelled" };
+	if (!signal) return { status: "completed", value: await operation() };
+	const activeSignal = signal;
+	return await new Promise<ReviewAdmissionStepResult<T>>((resolve, reject) => {
+		let settled = false;
+		function settle(callback: () => void): void {
+			if (settled) return;
+			settled = true;
+			activeSignal.removeEventListener("abort", onAbort);
+			callback();
+		}
+		function onAbort(): void {
+			settle(() => resolve({ status: "cancelled" }));
+		}
+		activeSignal.addEventListener("abort", onAbort, { once: true });
+		if (activeSignal.aborted) {
+			onAbort();
+			return;
+		}
+		try {
+			void Promise.resolve(operation()).then(
+				(value) => settle(() => resolve({ status: "completed", value })),
+				(error: unknown) => settle(() => reject(error)),
+			);
+		} catch (error) {
+			settle(() => reject(error));
+		}
+	});
+}
+
 export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise<ReviewWorkflowResult> {
 	assertReviewCanStart(options.session);
 	let hooks: ReviewWorkflowHooks | undefined;
@@ -1862,7 +1903,8 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 		}
 		registeredWorkflow?.updatePrepared(prepared);
 
-		const { resolution, workflowId, action, startedAt, controls, incrementalPlan } = prepared;
+		const { resolution, workflowId, action, startedAt, controls, incrementalPlan, model } = prepared;
+		const admissionSignal = registeredWorkflow?.signal ?? hooks?.signal;
 		const persistPreparedCancellation = async (): Promise<ReviewWorkflowResult> => {
 			const record = createReviewRunRecord({
 				workflowId,
@@ -1887,19 +1929,25 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 
 		if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();
 		if (options.requireConfirmation) {
-			const confirmed = await options.confirm?.({
-				title: "Review changes",
-				message: createReviewConfirmationMessage(resolution),
-				resolution,
-			});
-			if (!confirmed) return await persistPreparedCancellation();
+			const confirmation = await awaitReviewAdmissionStep(admissionSignal, () =>
+				options.confirm?.({
+					title: "Review changes",
+					message: createReviewConfirmationMessage(resolution),
+					resolution,
+					...(admissionSignal ? { signal: admissionSignal } : {}),
+				}),
+			);
+			if (confirmation.status === "cancelled" || !confirmation.value) return await persistPreparedCancellation();
 		}
 		if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();
 		if (prepared.modelWarning) options.onReviewModelWarning?.(prepared.modelWarning);
 		if (prepared.verifierModelWarning) options.onReviewModelWarning?.(prepared.verifierModelWarning);
 		try {
 			assertReviewCanStart(options.session);
-			await hooks?.onPrepared?.(resolution, prepared.model);
+			const preparation = await awaitReviewAdmissionStep(admissionSignal, () =>
+				hooks?.onPrepared?.(resolution, model),
+			);
+			if (preparation.status === "cancelled") return await persistPreparedCancellation();
 			if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();
 		} catch (error) {
 			if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();

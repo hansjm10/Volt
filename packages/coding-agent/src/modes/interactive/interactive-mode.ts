@@ -9255,7 +9255,8 @@ export class InteractiveMode {
 				tools: options.tools,
 				requireConfirmation: options.requireConfirmation,
 				requireProjectTrust: options.requireProjectTrust,
-				confirm: ({ title, message }) => this.showExtensionConfirm(title, message),
+				confirm: ({ title, message, signal }) =>
+					this.showExtensionConfirm(title, message, signal ? { signal } : undefined),
 				onReviewModelWarning: (message) => this.showWarning(message),
 				createHooks: () => this.createReviewWorkflowHooks(),
 				workflowManager: this.runtimeHost.reviewWorkflows,

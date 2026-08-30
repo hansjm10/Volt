@@ -353,16 +353,73 @@ describe("review command controls", () => {
 		}
 	});
 
-	it("exposes and cancels a shared TUI review while onPrepared is pending", async () => {
+	it("settles manager cancellation while review confirmation remains pending", async () => {
 		const harness = await createHarness();
 		initializeUncommittedReviewRepository(harness.tempDir);
-		const localController = new AbortController();
 		const events: Array<Record<string, unknown>> = [];
 		const workflowManager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
 		const newSession = vi.fn();
+		let markConfirmationStarted!: () => void;
+		const confirmationStarted = new Promise<void>((resolve) => {
+			markConfirmationStarted = resolve;
+		});
+		const pendingConfirmation = new Promise<boolean>(() => {});
+		let confirmationSignal: AbortSignal | undefined;
 		let workflowId: string | undefined;
 		try {
-			const result = await runReviewWorkflow({
+			const workflow = runReviewWorkflow({
+				target: { kind: "uncommitted" },
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				session: harness.session,
+				newSession,
+				authStorage: harness.authStorage,
+				settingsManager: harness.settingsManager,
+				workflowManager,
+				requireConfirmation: true,
+				confirm: (request) => {
+					confirmationSignal = request.signal;
+					markConfirmationStarted();
+					return pendingConfirmation;
+				},
+			});
+			await confirmationStarted;
+			workflowId = workflowManager.list().find((candidate) => candidate.status === "running")?.workflowId;
+			if (!workflowId) throw new Error("Expected the shared review to be listed during confirmation");
+			workflowManager.cancel(workflowId);
+
+			await expect(workflow).resolves.toMatchObject({ status: "cancelled" });
+			expect(confirmationSignal?.aborted).toBe(true);
+			expect(workflowManager.get(workflowId)?.status).toBe("cancelled");
+			expect(workflowManager.hasActiveWorkflows).toBe(false);
+			expect(events).toContainEqual(
+				expect.objectContaining({ type: "workflow_end", workflowId, status: "cancelled" }),
+			);
+			expect(newSession).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			await workflowManager.abortAll();
+			harness.cleanup();
+		}
+	});
+
+	it("exposes and cancels a shared TUI review while onPrepared is pending", async () => {
+		const harness = await createHarness();
+		initializeUncommittedReviewRepository(harness.tempDir);
+		const events: Array<Record<string, unknown>> = [];
+		const workflowManager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+		const newSession = vi.fn();
+		let markPreparedStarted!: () => void;
+		const preparedStarted = new Promise<void>((resolve) => {
+			markPreparedStarted = resolve;
+		});
+		let releasePrepared!: () => void;
+		const preparedGate = new Promise<void>((resolve) => {
+			releasePrepared = resolve;
+		});
+		let workflowId: string | undefined;
+		try {
+			const workflow = runReviewWorkflow({
 				target: { kind: "uncommitted" },
 				cwd: harness.tempDir,
 				agentDir: harness.tempDir,
@@ -372,17 +429,18 @@ describe("review command controls", () => {
 				settingsManager: harness.settingsManager,
 				workflowManager,
 				createHooks: () => ({
-					signal: localController.signal,
-					onPrepared: () => {
-						const active = workflowManager.list().find((workflow) => workflow.status === "running");
-						workflowId = active?.workflowId;
-						if (active) workflowManager.cancel(active.workflowId);
-						else localController.abort();
+					onPrepared: async () => {
+						workflowId = workflowManager.list().find((candidate) => candidate.status === "running")?.workflowId;
+						markPreparedStarted();
+						await preparedGate;
 					},
 				}),
 			});
-			expect(result.status).toBe("cancelled");
+			await preparedStarted;
 			if (!workflowId) throw new Error("Expected the shared review to be listed during onPrepared");
+			workflowManager.cancel(workflowId);
+
+			await expect(workflow).resolves.toMatchObject({ status: "cancelled" });
 			expect(workflowManager.get(workflowId)?.status).toBe("cancelled");
 			expect(events).toContainEqual(
 				expect.objectContaining({ type: "workflow_end", workflowId, status: "cancelled" }),
@@ -393,6 +451,7 @@ describe("review command controls", () => {
 			expect(newSession).not.toHaveBeenCalled();
 			expect(harness.faux.state.callCount).toBe(0);
 		} finally {
+			releasePrepared();
 			await workflowManager.abortAll();
 			harness.cleanup();
 		}
