@@ -113,6 +113,14 @@ async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void
 	}
 }
 
+function createDeferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve = () => {};
+	const promise = new Promise<void>((innerResolve) => {
+		resolve = innerResolve;
+	});
+	return { promise, resolve };
+}
+
 afterEach(() => {
 	vi.useRealTimers();
 	while (tempDirectories.length > 0) {
@@ -286,7 +294,7 @@ describe("WorkAssociationService", () => {
 		const source = service.getWorkContext("volt", 1, "source")!;
 
 		expect(await service.inheritSession("volt", 1, "source", "review-session")).toBe(true);
-		service.retireSession("volt", 1, "source");
+		await service.retireSession("volt", 1, "source");
 		expect(service.getWorkContext("volt", 1, "review-session")).toMatchObject({
 			changeId: source.changeId,
 			pullRequest: { number: 42 },
@@ -327,6 +335,117 @@ describe("WorkAssociationService", () => {
 		expect(service.getWorkContext("volt", 1, "session-a")).toMatchObject({
 			branch: "feature/new",
 			resolutionState: "none",
+		});
+		await service.close();
+	});
+
+	it("skips a guarded binding that becomes stale while queued behind persistence", async () => {
+		const writeGate = createDeferred();
+		let writeCount = 0;
+		let blockingWriteStarted = false;
+		const store = new WorkStateStore({
+			path: statePath("work-guarded-binding"),
+			writeStateFile: async () => {
+				writeCount++;
+				if (writeCount === 2) {
+					blockingWriteStarted = true;
+					await writeGate.promise;
+				}
+			},
+		});
+		await store.load();
+		const blocking = store.bindObservation({
+			...observation({ sessionId: "blocking" }),
+			baseBranch: false,
+			now: 1,
+		});
+		await waitFor(() => blockingWriteStarted);
+
+		const provider = new FakeDiscoveryProvider();
+		const service = new WorkAssociationService({ store, discoveryProvider: provider });
+		let currentRevision = true;
+		const stale = service.observe(
+			observation({ sessionId: "stale", branch: "feature/stale", headOid: OID_B }),
+			() => currentRevision,
+		);
+		currentRevision = false;
+		writeGate.resolve();
+		await Promise.all([blocking, stale]);
+
+		expect(writeCount).toBe(2);
+		expect(store.getBinding("volt", 1, "stale")).toBeUndefined();
+		expect(provider.requests).toEqual([]);
+		await service.close();
+	});
+
+	it("waits for an admitted guarded persistence mutation before retirement completes", async () => {
+		const writeGate = createDeferred();
+		let writeCount = 0;
+		let observationWriteStarted = false;
+		const store = new WorkStateStore({
+			path: statePath("work-retirement-drain"),
+			writeStateFile: async () => {
+				writeCount++;
+				if (writeCount === 2) {
+					observationWriteStarted = true;
+					await writeGate.promise;
+				}
+			},
+		});
+		await store.load();
+		const provider = new FakeDiscoveryProvider();
+		const service = new WorkAssociationService({ store, discoveryProvider: provider });
+		let currentRevision = true;
+		const observing = service.observe(observation(), () => currentRevision);
+		await waitFor(() => observationWriteStarted);
+		currentRevision = false;
+
+		let retirementSettled = false;
+		const retirement = service.retireSession("volt", 1, "session-a").then(() => {
+			retirementSettled = true;
+		});
+		await Promise.resolve();
+		expect(retirementSettled).toBe(false);
+		writeGate.resolve();
+		await Promise.all([observing, retirement]);
+
+		expect(retirementSettled).toBe(true);
+		expect(provider.requests).toEqual([]);
+		expect(service.getWorkContext("volt", 1, "session-a")).toMatchObject({
+			branch: "feature/work",
+			resolutionState: "unavailable",
+		});
+		await service.close();
+	});
+
+	it("retires active discovery without waiting for the provider or allowing timers to reactivate", async () => {
+		vi.useFakeTimers({ now: 1000 });
+		const store = new WorkStateStore({ path: statePath("work-retired-discovery") });
+		await store.load();
+		const discoveryStarted = createDeferred();
+		const discoveryGate = createDeferred();
+		const provider = new FakeDiscoveryProvider();
+		provider.resolver = async () => {
+			discoveryStarted.resolve();
+			await discoveryGate.promise;
+			return { state: "none" };
+		};
+		const service = new WorkAssociationService({ store, discoveryProvider: provider });
+		const observing = service.observe(observation());
+		await discoveryStarted.promise;
+
+		await service.retireSession("volt", 1, "session-a");
+		expect(provider.active).toBe(1);
+		expect(service.getWorkContext("volt", 1, "session-a")).toMatchObject({
+			resolutionState: "unavailable",
+		});
+		discoveryGate.resolve();
+		await observing;
+		await vi.advanceTimersByTimeAsync(15 * 60_000);
+
+		expect(provider.requests).toHaveLength(1);
+		expect(service.getWorkContext("volt", 1, "session-a")).toMatchObject({
+			resolutionState: "unavailable",
 		});
 		await service.close();
 	});

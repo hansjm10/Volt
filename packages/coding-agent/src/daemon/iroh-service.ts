@@ -340,6 +340,10 @@ export interface IrohDaemonServiceDependencies {
 		kind: "conversation" | "workspace_discovery" | "workspace_management" | "worktree_management" | "relay",
 		authorization: IrohRemoteClientAuthorizationSuccess,
 	): void | Promise<void>;
+	/** Pause a TUI Work receipt after its daemon revision is claimed and before validation (test-only race injection). */
+	beforeTuiWorkObservationValidation?(
+		request: Readonly<Extract<ControlRequest, { type: "work_observe" }>>,
+	): void | Promise<void>;
 	/** Override native relay-recovery capabilities and timing (test-only). */
 	relayWatchApiSafe?: boolean;
 	relayReconnectApiSafe?: boolean;
@@ -434,6 +438,12 @@ interface PendingPairRequest {
 interface ClientConnectionRecord {
 	connectionId: string;
 	supervisor: IrohConnectionSupervisor;
+}
+
+interface TuiWorkAuthorityClaim {
+	readonly connectionId: string;
+	readonly revision: bigint;
+	workspaceGeneration: number | undefined;
 }
 
 type RelayPushDeliveryResult =
@@ -809,7 +819,9 @@ class IrohDaemonService {
 		IntegratedRuntimeEntry,
 		{ binding: GitContextObservationBinding; unsubscribeSessionReplaced: () => void }
 	>();
-	private readonly tuiWorkAuthorities = new Map<string, { connectionId: string; workspaceGeneration: number }>();
+	private readonly tuiWorkAuthorities = new Map<string, TuiWorkAuthorityClaim>();
+	private readonly tuiWorkRetirementTasks = new Set<Promise<void>>();
+	private tuiWorkReceiptRevision = 0n;
 	private readonly worktrees: WorktreeManager;
 	private readonly worktreeRetention: WorktreeRetentionSweeper;
 	private readonly leaseBroker: LeaseBroker;
@@ -1157,7 +1169,7 @@ class IrohDaemonService {
 		void this.services.work
 			.inheritSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId, entry.sessionId)
 			.catch(() => {});
-		this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
+		void this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
 	}
 
 	private stopRuntimeWorkObservation(entry: IntegratedRuntimeEntry): void {
@@ -1168,9 +1180,9 @@ class IrohDaemonService {
 			observer.binding.dispose();
 		}
 		if (entry.workspaceGeneration === undefined) return;
-		this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, entry.sessionId);
+		void this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, entry.sessionId);
 		for (const previousSessionId of entry.previousSessionIds) {
-			this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
+			void this.services.work.retireSession(entry.workspaceName, entry.workspaceGeneration, previousSessionId);
 		}
 	}
 
@@ -1178,12 +1190,75 @@ class IrohDaemonService {
 		return `${workspaceName}\0${sessionId}`;
 	}
 
-	private retireTuiWorkAuthority(workspaceName: string, sessionId: string, connectionId?: string): void {
+	private claimTuiWorkAuthority(
+		workspaceName: string,
+		sessionId: string,
+		connectionId: string,
+	): TuiWorkAuthorityClaim {
 		const key = this.tuiWorkKey(workspaceName, sessionId);
-		const authority = this.tuiWorkAuthorities.get(key);
-		if (!authority || (connectionId !== undefined && authority.connectionId !== connectionId)) return;
+		const previous = this.tuiWorkAuthorities.get(key);
+		const claim: TuiWorkAuthorityClaim = {
+			connectionId,
+			revision: ++this.tuiWorkReceiptRevision,
+			workspaceGeneration: previous?.workspaceGeneration,
+		};
+		this.tuiWorkAuthorities.set(key, claim);
+		return claim;
+	}
+
+	private isCurrentTuiWorkAuthority(key: string, claim: TuiWorkAuthorityClaim): boolean {
+		return this.tuiWorkAuthorities.get(key)?.revision === claim.revision;
+	}
+
+	private retireTuiWorkAuthorityClaim(
+		key: string,
+		workspaceName: string,
+		sessionId: string,
+		claim: TuiWorkAuthorityClaim,
+	): Promise<void> {
+		if (!this.isCurrentTuiWorkAuthority(key, claim)) return Promise.resolve();
 		this.tuiWorkAuthorities.delete(key);
-		this.services.work.retireSession(workspaceName, authority.workspaceGeneration, sessionId);
+		return claim.workspaceGeneration === undefined
+			? Promise.resolve()
+			: this.services.work.retireSession(workspaceName, claim.workspaceGeneration, sessionId);
+	}
+
+	private retireTuiWorkAuthority(workspaceName: string, sessionId: string, connectionId?: string): Promise<void> {
+		const key = this.tuiWorkKey(workspaceName, sessionId);
+		const claim = this.tuiWorkAuthorities.get(key);
+		if (!claim || (connectionId !== undefined && claim.connectionId !== connectionId)) return Promise.resolve();
+		return this.retireTuiWorkAuthorityClaim(key, workspaceName, sessionId, claim);
+	}
+
+	private retireCurrentTuiWorkObservation(
+		key: string,
+		workspaceName: string,
+		sessionId: string,
+		claim: TuiWorkAuthorityClaim,
+	): Promise<void> {
+		if (!this.isCurrentTuiWorkAuthority(key, claim) || claim.workspaceGeneration === undefined) {
+			return Promise.resolve();
+		}
+		return this.services.work.retireSession(workspaceName, claim.workspaceGeneration, sessionId);
+	}
+
+	private retireTuiWorkWorkspace(workspaceName: string): Promise<void> {
+		for (const [key, claim] of this.tuiWorkAuthorities) {
+			if (key.startsWith(`${workspaceName}\0`) && this.isCurrentTuiWorkAuthority(key, claim)) {
+				this.tuiWorkAuthorities.delete(key);
+			}
+		}
+		return this.services.work.retireWorkspace(workspaceName);
+	}
+
+	private trackTuiWorkRetirement(task: Promise<void>): void {
+		const tracked = task.catch((error: unknown) => {
+			this.log("warn", "failed to retire TUI Work observation after control disconnect", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		this.tuiWorkRetirementTasks.add(tracked);
+		void tracked.finally(() => this.tuiWorkRetirementTasks.delete(tracked));
 	}
 
 	private async handleTuiWorkObservation(
@@ -1199,7 +1274,24 @@ class IrohDaemonService {
 			connection.send({ type: "error", id: request.id, code: "not_held", message: "lease not held" });
 			return;
 		}
+		const key = this.tuiWorkKey(request.workspaceName, request.sessionId);
+		const claim = this.claimTuiWorkAuthority(request.workspaceName, request.sessionId, connection.connectionId);
+		const isCurrentRevision = (): boolean => this.isCurrentTuiWorkAuthority(key, claim);
+		const initialRetirement =
+			request.gitContext === null
+				? this.retireCurrentTuiWorkObservation(key, request.workspaceName, request.sessionId, claim)
+				: Promise.resolve();
+		const finishIfSuperseded = async (): Promise<boolean> => {
+			if (isCurrentRevision()) return false;
+			await initialRetirement;
+			connection.send({ type: "ok", id: request.id });
+			return true;
+		};
+		await this.dependencies.beforeTuiWorkObservationValidation?.(request);
+		if (await finishIfSuperseded()) return;
+
 		const state = await this.stateManager.getState();
+		if (await finishIfSuperseded()) return;
 		const workspace = state.workspaces.find((candidate) => candidate.name === request.workspaceName);
 		const workspaceGeneration = (state.workspaceGenerations ?? []).find(
 			(candidate) => candidate.workspaceName === request.workspaceName,
@@ -1208,19 +1300,24 @@ class IrohDaemonService {
 			connection.send({ type: "error", id: request.id, code: "not_found", message: "workspace not found" });
 			return;
 		}
+		claim.workspaceGeneration = workspaceGeneration;
 		if (request.gitContext === null) {
 			if (!assertLease()) {
+				await this.retireTuiWorkAuthorityClaim(key, request.workspaceName, request.sessionId, claim);
 				connection.send({ type: "error", id: request.id, code: "not_held", message: "lease not held" });
 				return;
 			}
-			this.services.work.retireSession(request.workspaceName, workspaceGeneration, request.sessionId);
-			this.tuiWorkAuthorities.delete(this.tuiWorkKey(request.workspaceName, request.sessionId));
+			await Promise.all([
+				initialRetirement,
+				this.retireCurrentTuiWorkObservation(key, request.workspaceName, request.sessionId, claim),
+			]);
 			connection.send({ type: "ok", id: request.id });
 			return;
 		}
 
 		const sessionDir = getDefaultSessionDirPath(workspace.path, this.services.agentDir);
 		const session = await SessionManager.findForResume(sessionDir, request.sessionId);
+		if (await finishIfSuperseded()) return;
 		const header = session ? readSessionHeader(session.path) : null;
 		if (!header || header.id !== request.sessionId || typeof header.cwd !== "string") {
 			connection.send({ type: "error", id: request.id, code: "not_found", message: "session not found" });
@@ -1243,6 +1340,7 @@ class IrohDaemonService {
 				...(relativePath.length === 0 ? {} : { relativePath }),
 			};
 		} catch {
+			if (await finishIfSuperseded()) return;
 			connection.send({
 				type: "error",
 				id: request.id,
@@ -1251,12 +1349,14 @@ class IrohDaemonService {
 			});
 			return;
 		}
+		if (await finishIfSuperseded()) return;
 		const location = discoverGitWorktree(runtimeDirectory.absolutePath);
 		if (!location) {
 			connection.send({ type: "error", id: request.id, code: "not_git", message: "session is not in Git" });
 			return;
 		}
 		const currentState = await this.stateManager.getState();
+		if (await finishIfSuperseded()) return;
 		const currentWorkspace = currentState.workspaces.find(
 			(candidate) => candidate.name === request.workspaceName && candidate.path === workspace.path,
 		);
@@ -1264,24 +1364,26 @@ class IrohDaemonService {
 			(candidate) => candidate.workspaceName === request.workspaceName,
 		)?.generation;
 		if (!assertLease() || !currentWorkspace || currentGeneration !== workspaceGeneration) {
+			await this.retireTuiWorkAuthorityClaim(key, request.workspaceName, request.sessionId, claim);
 			connection.send({ type: "error", id: request.id, code: "authority_changed", message: "authority changed" });
 			return;
 		}
-		const key = this.tuiWorkKey(request.workspaceName, request.sessionId);
-		this.tuiWorkAuthorities.set(key, { connectionId: connection.connectionId, workspaceGeneration });
 		void this.services.work
-			.observe({
-				workspaceName: request.workspaceName,
-				workspaceGeneration,
-				sessionId: request.sessionId,
-				cwd: runtimeDirectory.absolutePath,
-				commonGitDir: location.commonGitDir,
-				repositoryDisplayName: request.gitContext.repository,
-				branch: request.gitContext.branch,
-				headOid: request.gitContext.headOid,
-				trusted: resolveIrohRemoteWorkspaceProjectTrusted(currentWorkspace, { trustStore: this.trustStore }),
-				...(request.gitContext.baseRef === undefined ? {} : { baseBranches: [request.gitContext.baseRef] }),
-			})
+			.observe(
+				{
+					workspaceName: request.workspaceName,
+					workspaceGeneration,
+					sessionId: request.sessionId,
+					cwd: runtimeDirectory.absolutePath,
+					commonGitDir: location.commonGitDir,
+					repositoryDisplayName: request.gitContext.repository,
+					branch: request.gitContext.branch,
+					headOid: request.gitContext.headOid,
+					trusted: resolveIrohRemoteWorkspaceProjectTrusted(currentWorkspace, { trustStore: this.trustStore }),
+					...(request.gitContext.baseRef === undefined ? {} : { baseBranches: [request.gitContext.baseRef] }),
+				},
+				isCurrentRevision,
+			)
 			.catch(() => {});
 		connection.send({ type: "ok", id: request.id });
 	}
@@ -4505,17 +4607,7 @@ class IrohDaemonService {
 		for (const entry of this.runtimeWorkObservers.keys()) {
 			if (entry.workspaceName === workspaceName) this.stopRuntimeWorkObservation(entry);
 		}
-		for (const [key, authority] of this.tuiWorkAuthorities) {
-			if (key.startsWith(`${workspaceName}\0`)) {
-				this.tuiWorkAuthorities.delete(key);
-				this.services.work.retireSession(
-					workspaceName,
-					authority.workspaceGeneration,
-					key.slice(workspaceName.length + 1),
-				);
-			}
-		}
-		this.services.work.retireWorkspace(workspaceName);
+		const workRetirement = this.retireTuiWorkWorkspace(workspaceName);
 		const closedStreamCount = await this.closeActiveStreamsForWorkspace(
 			workspaceName,
 			WORKSPACE_UNREGISTERED_CLOSE_REASON,
@@ -4532,6 +4624,7 @@ class IrohDaemonService {
 				.cleanupUnregisteredWorkspace({ name: workspaceName, path: exclusions.workspacePath })
 				.catch(() => {});
 		}
+		await workRetirement;
 		return { closedStreamCount, stoppedRuntimeCount };
 	}
 
@@ -4904,7 +4997,7 @@ class IrohDaemonService {
 					connection.send({ type: "error", id: request.id, code: result.code, message: "lease not held" });
 					return true;
 				}
-				this.retireTuiWorkAuthority(request.workspaceName, request.sessionId, connection.connectionId);
+				await this.retireTuiWorkAuthority(request.workspaceName, request.sessionId, connection.connectionId);
 				connection.send({ type: "ok", id: request.id });
 				return true;
 			}
@@ -5020,7 +5113,11 @@ class IrohDaemonService {
 					});
 					return true;
 				}
-				this.retireTuiWorkAuthority(reservation.workspaceName, reservation.oldSessionId, connection.connectionId);
+				await this.retireTuiWorkAuthority(
+					reservation.workspaceName,
+					reservation.oldSessionId,
+					connection.connectionId,
+				);
 				connection.send({ type: "ok", id: request.id });
 				return true;
 			}
@@ -5541,15 +5638,16 @@ class IrohDaemonService {
 
 	onControlConnectionClosed(connection: ControlConnection): void {
 		this.leaseBroker.releaseAllForConnection(connection.connectionId);
-		for (const [key, authority] of this.tuiWorkAuthorities) {
-			if (authority.connectionId !== connection.connectionId) continue;
-			this.tuiWorkAuthorities.delete(key);
+		const workRetirements: Promise<void>[] = [];
+		for (const [key, claim] of this.tuiWorkAuthorities) {
+			if (claim.connectionId !== connection.connectionId) continue;
 			const separator = key.indexOf("\0");
-			this.services.work.retireSession(
-				key.slice(0, separator),
-				authority.workspaceGeneration,
-				key.slice(separator + 1),
+			workRetirements.push(
+				this.retireTuiWorkAuthorityClaim(key, key.slice(0, separator), key.slice(separator + 1), claim),
 			);
+		}
+		if (workRetirements.length > 0) {
+			this.trackTuiWorkRetirement(Promise.all(workRetirements).then(() => undefined));
 		}
 		const admission = this.admission.tryAcquire();
 		if (!admission) {
@@ -5602,15 +5700,14 @@ class IrohDaemonService {
 		// ownership commits, relay offers, and turn-starting commands now fail
 		// closed against the same state.
 		this.admission.close();
-		for (const [key, authority] of this.tuiWorkAuthorities) {
+		const workRetirements: Promise<void>[] = [];
+		for (const [key, claim] of this.tuiWorkAuthorities) {
 			const separator = key.indexOf("\0");
-			this.services.work.retireSession(
-				key.slice(0, separator),
-				authority.workspaceGeneration,
-				key.slice(separator + 1),
+			workRetirements.push(
+				this.retireTuiWorkAuthorityClaim(key, key.slice(0, separator), key.slice(separator + 1), claim),
 			);
 		}
-		this.tuiWorkAuthorities.clear();
+		await Promise.allSettled([...workRetirements, ...this.tuiWorkRetirementTasks]);
 		await this.stopRelayRecoveryMonitor();
 		if (this.relayCredentialRefreshTimer !== undefined) {
 			clearTimeout(this.relayCredentialRefreshTimer);

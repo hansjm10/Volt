@@ -255,6 +255,8 @@ interface PhoneConnection {
 }
 
 const ALPN = Array.from(Buffer.from(IROH_REMOTE_ALPN, "utf8"));
+const WORK_OID_A = "0123456789abcdef0123456789abcdef01234567";
+const WORK_OID_B = "abcdef0123456789abcdef0123456789abcdef01";
 
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {
 	let resolve = () => {};
@@ -1062,6 +1064,161 @@ describe("iroh daemon lifecycle ownership", () => {
 			"replacement_attach_released",
 		]);
 	});
+});
+
+describe.skipIf(!nativeAvailable)("TUI Work observation receipt revisions", () => {
+	it("keeps delayed positive and null receipts from invalidating a newer claim", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-work-revision-"));
+		const unresolvedWorkspaceDir = join(agentDir, "ws");
+		mkdirSync(join(unresolvedWorkspaceDir, ".git"), { recursive: true });
+		writeFileSync(join(unresolvedWorkspaceDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+		const workspaceDir = realpathSync(unresolvedWorkspaceDir);
+		const sessionId = randomUUID();
+		const session = SessionManager.create(workspaceDir, getDefaultSessionDir(workspaceDir, agentDir), {
+			id: sessionId,
+		});
+		await session.materialize();
+
+		const oldPositiveGate = createDeferred();
+		const oldNullGate = createDeferred();
+		let oldPositiveStarted = false;
+		let oldNullStarted = false;
+		let retirementCount = 0;
+		let getCurrentBranch = (): string | undefined => undefined;
+		let daemonStopped = false;
+		let control: DaemonClient | undefined;
+		let tui: DaemonClient | undefined;
+		const daemon = runVoltDaemon({ agentDir, foreground: false }, [
+			(services) => {
+				getCurrentBranch = () => services.work.getWorkContext("ws", 1, sessionId)?.branch;
+				const retireSession = services.work.retireSession.bind(services.work);
+				services.work.retireSession = (workspaceName, workspaceGeneration, retiredSessionId) => {
+					if (workspaceName === "ws" && retiredSessionId === sessionId) retirementCount++;
+					return retireSession(workspaceName, workspaceGeneration, retiredSessionId);
+				};
+				return {};
+			},
+			createIrohDaemonService(
+				{ relayMode: "disabled" },
+				{
+					beforeTuiWorkObservationValidation: async (request) => {
+						if (request.gitContext?.branch === "feature/old") {
+							oldPositiveStarted = true;
+							await oldPositiveGate.promise;
+						} else if (request.gitContext === null) {
+							oldNullStarted = true;
+							await oldNullGate.promise;
+						}
+					},
+				},
+			),
+		]);
+
+		try {
+			const status = await waitForHealthyDaemon(agentDir);
+			control = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "cli",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			tui = createDaemonClient({
+				socketPath: status.socketPath,
+				client: "tui",
+				version: "test",
+				authToken: status.authToken,
+				reconnect: false,
+			});
+			expect(await control.request({ type: "workspace_register", name: "ws", path: workspaceDir })).toMatchObject({
+				type: "ok",
+			});
+			expect(await tui.request({ type: "lease_acquire", workspaceName: "ws", sessionId })).toMatchObject({
+				type: "lease_granted",
+			});
+
+			const oldPositive = tui.request({
+				type: "work_observe",
+				workspaceName: "ws",
+				sessionId,
+				gitContext: {
+					repository: "Volt",
+					branch: "feature/old",
+					headOid: WORK_OID_A,
+				},
+			});
+			void oldPositive.catch(() => {});
+			await expect.poll(() => oldPositiveStarted).toBe(true);
+			expect(
+				await tui.request({
+					type: "work_observe",
+					workspaceName: "ws",
+					sessionId,
+					gitContext: {
+						repository: "Volt",
+						branch: "feature/new",
+						headOid: WORK_OID_B,
+					},
+				}),
+			).toMatchObject({ type: "ok" });
+			await expect.poll(getCurrentBranch).toBe("feature/new");
+
+			oldPositiveGate.resolve();
+			await expect(oldPositive).resolves.toMatchObject({ type: "ok" });
+			await expect.poll(getCurrentBranch).toBe("feature/new");
+
+			const oldNull = tui.request({
+				type: "work_observe",
+				workspaceName: "ws",
+				sessionId,
+				gitContext: null,
+			});
+			void oldNull.catch(() => {});
+			await expect.poll(() => oldNullStarted).toBe(true);
+			expect(retirementCount).toBe(1);
+			expect(
+				await tui.request({
+					type: "work_observe",
+					workspaceName: "ws",
+					sessionId,
+					gitContext: {
+						repository: "Volt",
+						branch: "feature/replacement",
+						headOid: WORK_OID_A,
+					},
+				}),
+			).toMatchObject({ type: "ok" });
+			await expect.poll(getCurrentBranch).toBe("feature/replacement");
+
+			oldNullGate.resolve();
+			await expect(oldNull).resolves.toMatchObject({ type: "ok" });
+			expect(retirementCount).toBe(1);
+			expect(
+				await tui.request({
+					type: "lease_release",
+					workspaceName: "ws",
+					sessionId,
+					reason: "quit",
+				}),
+			).toMatchObject({ type: "ok" });
+			expect(retirementCount).toBe(2);
+			expect(getCurrentBranch()).toBe("feature/replacement");
+
+			expect((await control.request({ type: "shutdown" })).type).toBe("ok");
+			await daemon;
+			daemonStopped = true;
+		} finally {
+			oldPositiveGate.resolve();
+			oldNullGate.resolve();
+			if (!daemonStopped) {
+				await control?.request({ type: "shutdown" }).catch(() => {});
+				await daemon;
+			}
+			await tui?.close();
+			await control?.close();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () => {

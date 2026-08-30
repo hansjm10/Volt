@@ -110,6 +110,8 @@ export interface WorkObservationInput {
 	now: number;
 }
 
+export type WorkObservationRevisionGuard = () => boolean;
+
 export interface WorkBindingInheritanceInput {
 	workspaceName: string;
 	workspaceGeneration: number;
@@ -481,7 +483,16 @@ export class WorkStateStore {
 		return createHmac("sha256", Buffer.from(this.state.repositoryHashSalt, "hex")).update(commonGitDir).digest("hex");
 	}
 
-	async bindObservation(input: WorkObservationInput): Promise<WorkBindingMutationResult> {
+	async bindObservation(input: WorkObservationInput): Promise<WorkBindingMutationResult>;
+	async bindObservation(
+		input: WorkObservationInput,
+		isCurrentRevision: WorkObservationRevisionGuard,
+	): Promise<WorkBindingMutationResult | undefined>;
+	async bindObservation(
+		input: WorkObservationInput,
+		isCurrentRevision: WorkObservationRevisionGuard = () => true,
+	): Promise<WorkBindingMutationResult | undefined> {
+		if (!isCurrentRevision()) return undefined;
 		if (
 			!boundedString(input.workspaceName, MAX_WORKSPACE_CHARS) ||
 			!safePositiveInteger(input.workspaceGeneration) ||
@@ -494,7 +505,7 @@ export class WorkStateStore {
 			throw new Error("invalid Work observation");
 		}
 		const commonGitDirHash = this.hashCommonGitDirectory(input.commonGitDir);
-		return this.mutate((state) => {
+		return this.mutateGuarded(isCurrentRevision, (state) => {
 			let repository = state.repositories.find(
 				(candidate) =>
 					candidate.workspaceName === input.workspaceName &&
@@ -770,6 +781,27 @@ export class WorkStateStore {
 
 	private mutate<T>(mutation: (draft: WorkStateFileV1) => T): Promise<T> {
 		const operation = this.mutationQueue.then(async () => {
+			const draft = cloneRecord(this.state);
+			const result = mutation(draft);
+			trimState(draft);
+			await this.write(draft);
+			this.current = draft;
+			return result;
+		});
+		this.mutationQueue = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation;
+	}
+
+	private mutateGuarded<T>(
+		isCurrentRevision: WorkObservationRevisionGuard,
+		mutation: (draft: WorkStateFileV1) => T,
+	): Promise<T | undefined> {
+		if (!isCurrentRevision()) return Promise.resolve(undefined);
+		const operation = this.mutationQueue.then(async () => {
+			if (!isCurrentRevision()) return undefined;
 			const draft = cloneRecord(this.state);
 			const result = mutation(draft);
 			trimState(draft);

@@ -34,12 +34,15 @@ export interface WorkAssociationObservation {
 	baseBranches?: readonly string[];
 }
 
+export type WorkAssociationRevisionGuard = () => boolean;
+
 interface ActiveObservation {
 	readonly key: string;
 	readonly cwd: string;
 	readonly trusted: boolean;
 	readonly fence: WorkDiscoveryFence;
 	readonly change: WorkChangeRecord;
+	readonly isCurrentRevision: WorkAssociationRevisionGuard;
 }
 
 interface CachedDiscovery {
@@ -155,21 +158,27 @@ export class WorkAssociationService {
 		this.onRefreshError = options.onRefreshError ?? (() => {});
 	}
 
-	async observe(observation: WorkAssociationObservation): Promise<void> {
-		if (this.closed) return;
+	async observe(
+		observation: WorkAssociationObservation,
+		isCurrentRevision: WorkAssociationRevisionGuard = () => true,
+	): Promise<void> {
+		if (this.closed || !isCurrentRevision()) return;
 		const now = this.now();
-		const binding = await this.store.bindObservation({
-			workspaceName: observation.workspaceName,
-			workspaceGeneration: observation.workspaceGeneration,
-			sessionId: observation.sessionId,
-			commonGitDir: observation.commonGitDir,
-			repositoryDisplayName: observation.repositoryDisplayName,
-			branch: observation.branch,
-			headOid: observation.headOid.toLowerCase(),
-			baseBranch: isConfiguredBaseBranch(observation.branch, observation.baseBranches),
-			now,
-		});
-		if (this.closed) return;
+		const binding = await this.store.bindObservation(
+			{
+				workspaceName: observation.workspaceName,
+				workspaceGeneration: observation.workspaceGeneration,
+				sessionId: observation.sessionId,
+				commonGitDir: observation.commonGitDir,
+				repositoryDisplayName: observation.repositoryDisplayName,
+				branch: observation.branch,
+				headOid: observation.headOid.toLowerCase(),
+				baseBranch: isConfiguredBaseBranch(observation.branch, observation.baseBranches),
+				now,
+			},
+			isCurrentRevision,
+		);
+		if (!binding || this.closed || !isCurrentRevision()) return;
 		const key = observationKey(observation.workspaceName, observation.workspaceGeneration, observation.sessionId);
 		const active: ActiveObservation = {
 			key,
@@ -177,6 +186,7 @@ export class WorkAssociationService {
 			trusted: observation.trusted,
 			fence: binding.fence,
 			change: binding.change,
+			isCurrentRevision,
 		};
 		this.active.set(key, active);
 		this.clearTimer(key);
@@ -204,13 +214,14 @@ export class WorkAssociationService {
 		});
 	}
 
-	retireSession(workspaceName: string, workspaceGeneration: number, sessionId: string): void {
+	retireSession(workspaceName: string, workspaceGeneration: number, sessionId: string): Promise<void> {
 		const key = observationKey(workspaceName, workspaceGeneration, sessionId);
 		this.active.delete(key);
 		this.clearTimer(key);
+		return this.store.flush();
 	}
 
-	retireWorkspace(workspaceName: string, workspaceGeneration?: number): void {
+	retireWorkspace(workspaceName: string, workspaceGeneration?: number): Promise<void> {
 		for (const [key, active] of this.active) {
 			if (
 				active.fence.workspaceName === workspaceName &&
@@ -220,6 +231,7 @@ export class WorkAssociationService {
 				this.clearTimer(key);
 			}
 		}
+		return this.store.flush();
 	}
 
 	getWorkContext(
@@ -243,7 +255,7 @@ export class WorkAssociationService {
 	}
 
 	private isCurrent(active: ActiveObservation): boolean {
-		return !this.closed && this.active.get(active.key) === active;
+		return !this.closed && active.isCurrentRevision() && this.active.get(active.key) === active;
 	}
 
 	private async resolve(active: ActiveObservation): Promise<void> {
