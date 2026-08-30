@@ -3952,6 +3952,7 @@ export class SessionManager {
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
+			this.acceptsStartingGitContext = true;
 
 			// Fast mode is recoverable by exact session ID even without visible
 			// conversation content, so preserve that durable policy immediately.
@@ -3991,6 +3992,7 @@ export class SessionManager {
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 		this.sessionId = newSessionId;
 		this._buildIndex();
+		this.acceptsStartingGitContext = true;
 		return undefined;
 	}
 

@@ -122,6 +122,22 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		unsubscribe();
 	});
 
+	it("captures the starting Git context after forking from a selected leaf", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => undefined);
+		await vi.waitFor(() => expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull());
+		await runtimeHost.session.prompt("fork source");
+
+		const sourceSessionId = runtimeHost.session.sessionId;
+		const selectedLeafId = runtimeHost.session.sessionManager.getLeafId();
+		expect(selectedLeafId).not.toBeNull();
+
+		await expect(runtimeHost.fork(selectedLeafId!, { position: "at" })).resolves.toMatchObject({
+			cancelled: false,
+		});
+		expect(runtimeHost.session.sessionId).not.toBe(sourceSessionId);
+		await vi.waitFor(() => expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull());
+	});
+
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtimeHost } = await createRuntimeHost((volt) => {
