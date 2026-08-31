@@ -283,6 +283,42 @@ describe("WorkAssociationService", () => {
 		await service.close();
 	});
 
+	it("refreshes and rearms a sticky association after its branch head advances", async () => {
+		vi.useFakeTimers({ now: 1000 });
+		const store = new WorkStateStore({ path: statePath("work-sticky-head-refresh") });
+		await store.load();
+		const provider = new FakeDiscoveryProvider();
+		provider.resolver = async (request) => {
+			const outcome = resolved(42);
+			return {
+				...outcome,
+				pullRequest: { ...outcome.pullRequest, matchedHeadOid: request.headOid },
+			};
+		};
+		const service = new WorkAssociationService({ store, discoveryProvider: provider });
+		await service.observe(observation({ headOid: OID_A }));
+		const changeId = service.getWorkContext("volt", 1, "session-a")!.changeId;
+		const initialCheckedAt = store.getChange(changeId)!.checkedAt;
+
+		await vi.advanceTimersByTimeAsync(1000);
+		await service.observe(observation({ headOid: OID_B }));
+		expect(provider.requests.map((request) => request.headOid)).toEqual([OID_A]);
+		expect(store.getChange(changeId)).toMatchObject({ headOid: OID_B, checkedAt: initialCheckedAt });
+
+		await vi.advanceTimersByTimeAsync(5 * 60_000 - 1000);
+		await store.flush();
+		expect(provider.requests.map((request) => request.headOid)).toEqual([OID_A, OID_B]);
+		const refreshed = store.getChange(changeId)!;
+		expect(refreshed).toMatchObject({ headOid: OID_B, pullRequest: { matchedHeadOid: OID_B } });
+		expect(refreshed.checkedAt).toBeGreaterThan(initialCheckedAt);
+
+		await vi.advanceTimersByTimeAsync(5 * 60_000);
+		await store.flush();
+		expect(provider.requests.map((request) => request.headOid)).toEqual([OID_A, OID_B, OID_B]);
+		expect(store.getChange(changeId)!.checkedAt).toBeGreaterThan(refreshed.checkedAt);
+		await service.close();
+	});
+
 	it("inherits Work context for a replacement session without moving or overwriting bindings", async () => {
 		const path = statePath("work-session-inheritance");
 		const store = new WorkStateStore({ path });

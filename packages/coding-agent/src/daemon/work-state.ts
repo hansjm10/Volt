@@ -563,7 +563,9 @@ export class WorkStateStore {
 				sticky = change.resolutionState === "resolved";
 			}
 			if (!change) throw new Error("Work observation did not resolve a change record");
-			if (!sticky) change.headOid = input.headOid;
+			if (!sticky || (change.repositoryId === repository.id && change.branch === input.branch)) {
+				change.headOid = input.headOid;
+			}
 			change.updatedAt = input.now;
 			const observationChanged =
 				!binding ||
