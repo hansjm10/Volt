@@ -597,6 +597,7 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 	);
 	const sessionFile = projectOptionalStateString(session.sessionFile);
 	const sessionName = projectOptionalStateString(session.sessionName);
+	const startingGitContext = session.sessionManager.getStartingGitContext();
 	const modelBytes =
 		session.model === undefined
 			? null
@@ -630,6 +631,7 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 		planning:
 			typeof session.getPlanningState === "function" ? session.getPlanningState() : { ...DEFAULT_PLANNING_STATE },
 		gitContext: session.gitContextProvider.getSnapshot(),
+		...(startingGitContext === undefined ? {} : { startingGitContext }),
 		isStreaming: session.isStreaming,
 		isBusy: session.isBusy,
 		isCompacting: session.isCompacting,

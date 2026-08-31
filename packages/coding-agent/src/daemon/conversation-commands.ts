@@ -44,8 +44,10 @@ import { extractMessageImages, projectMessageImages } from "../core/rpc/transcri
 import type {
 	RpcConversationAssistantPart,
 	RpcConversationTranscriptItem,
+	RpcGitContext,
 	RpcKeepAwakeStatus,
 	RpcSessionTreePage,
+	RpcSessionWorkContext,
 } from "../core/rpc/types.ts";
 import { REMOTE_TRANSCRIPT_DEFAULT_MAX_SERIALIZED_BYTES } from "../core/rpc/wire-limits.ts";
 import { getDefaultSessionDir, type SessionEntry, SessionManager } from "../core/session-manager.ts";
@@ -129,6 +131,10 @@ export interface RemoteSessionListEntry {
 	messageCount: number;
 	/** "subagent" when this session was created for a delegated subagent run. */
 	origin?: "subagent";
+	/** First host-observed path-free Git state for this session. */
+	startingGitContext?: RpcGitContext | null;
+	/** Sanitized daemon-owned change and pull-request association. */
+	workContext?: RpcSessionWorkContext;
 	/** Live host ownership for this session. Omitted when no runtime is currently owned. */
 	runtimeState?: RemoteSessionRuntimeState;
 	/** Present when the session is bound to a daemon-managed worktree (worktrees.v1). */
@@ -162,6 +168,7 @@ export interface ConversationCommandRuntime {
 			firstMessage: string;
 			cwd?: string;
 			origin?: "subagent";
+			startingGitContext?: RpcGitContext | null;
 		}>
 	>;
 }
@@ -184,6 +191,12 @@ export interface ConversationCommandContext {
 	listRuntimeStates?: (
 		workspaceName: string,
 	) => Promise<ReadonlyMap<string, RemoteSessionRuntimeState>> | ReadonlyMap<string, RemoteSessionRuntimeState>;
+	/** Synchronous Work-store lookup. Must never start provider discovery. */
+	getWorkContext?: (
+		workspaceName: string,
+		workspaceGeneration: number,
+		sessionId: string,
+	) => RpcSessionWorkContext | undefined;
 	/** True while this conversation's lease is draining to a TUI (§4.5 rejection). */
 	isDraining?: () => boolean;
 	/** True once the daemon has closed its admission epoch for shutdown. */
@@ -1616,6 +1629,7 @@ interface RemoteSessionSummaryInput {
 	messageCount: number;
 	cwd?: string;
 	origin?: "subagent";
+	startingGitContext?: RpcGitContext | null;
 }
 
 function getRelativeWorkingDirectory(rootPath: string, cwd: string | undefined): string | null | undefined {
@@ -1656,6 +1670,7 @@ function createRemoteSessionSummary(
 			updatedAt,
 			messageCount: input.messageCount,
 			...(input.origin === undefined ? {} : { origin: input.origin }),
+			...(input.startingGitContext === undefined ? {} : { startingGitContext: input.startingGitContext }),
 			...(workingDirectory === undefined || workingDirectory === null ? {} : { workingDirectory }),
 		},
 		...(input.cwd === undefined ? {} : { cwd: input.cwd }),
@@ -1664,6 +1679,28 @@ function createRemoteSessionSummary(
 
 function sortRemoteSessionSummaries(left: RemoteSessionSummary, right: RemoteSessionSummary): number {
 	return right.sortUpdatedAtMs - left.sortUpdatedAtMs || left.session.sessionId.localeCompare(right.session.sessionId);
+}
+
+function projectRemoteWorkContext(workContext: RpcSessionWorkContext): RpcSessionWorkContext {
+	const base = {
+		changeId: workContext.changeId,
+		repository: workContext.repository,
+		branch: workContext.branch,
+	};
+	if (workContext.resolutionState === "resolved") {
+		return {
+			...base,
+			resolutionState: "resolved",
+			pullRequest: {
+				provider: workContext.pullRequest.provider,
+				number: workContext.pullRequest.number,
+				title: workContext.pullRequest.title,
+				status: workContext.pullRequest.status,
+				stale: workContext.pullRequest.stale,
+			},
+		};
+	}
+	return { ...base, resolutionState: workContext.resolutionState };
 }
 
 export async function listRemoteWorkspaceSessionSummaries(
@@ -1686,6 +1723,7 @@ export async function listRemoteWorkspaceSessionSummaries(
 					messageCount: info.messageCount,
 					cwd: info.cwd,
 					...(info.origin === undefined ? {} : { origin: info.origin }),
+					...(info.startingGitContext === undefined ? {} : { startingGitContext: info.startingGitContext }),
 				},
 				authorization,
 			);
@@ -1703,6 +1741,9 @@ export async function listRemoteWorkspaceSessionSummaries(
 					messageCount: liveSummary.messageCount,
 					cwd: liveSummary.cwd,
 					...(liveSummary.origin === undefined ? {} : { origin: liveSummary.origin }),
+					...(liveSummary.startingGitContext === undefined
+						? {}
+						: { startingGitContext: liveSummary.startingGitContext }),
 				},
 				authorization,
 			);
@@ -1747,6 +1788,16 @@ export async function listRemoteWorkspaceSessionSummaries(
 		}
 	} catch {
 		// Presence is best-effort; persisted session discovery remains authoritative.
+	}
+	if (authorization.workspaceGeneration !== undefined && context.getWorkContext) {
+		for (const summary of bySessionId.values()) {
+			const workContext = context.getWorkContext(
+				authorization.workspace.name,
+				authorization.workspaceGeneration,
+				summary.session.sessionId,
+			);
+			if (workContext) summary.session.workContext = projectRemoteWorkContext(workContext);
+		}
 	}
 	return Array.from(bySessionId.values()).sort(sortRemoteSessionSummaries);
 }

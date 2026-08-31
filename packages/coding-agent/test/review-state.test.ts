@@ -10,15 +10,18 @@ import {
 	appendReviewPublication,
 	appendReviewRun,
 	appendReviewRunDurably,
+	captureReviewStateForHandoff,
 	createReviewRunRecord,
 	exportReviewFeedback,
 	getReviewRun,
 	listReviewRuns,
+	MAX_HYDRATED_REVIEW_RUNS,
 	MAX_REVIEW_STATE_RECORD_BYTES,
 	planIncrementalReview,
 	REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE,
 	type ReviewRunRecord,
 	reconcileFindingIdentities,
+	restoreReviewStateFromHandoff,
 } from "../src/core/review-state.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
@@ -250,6 +253,74 @@ describe("durable review state", () => {
 		manager.branch(branchPoint);
 		appendReviewRun(manager, record("run-2", 2));
 		expect(listReviewRuns(manager).runs.map((run) => run.runId)).toEqual(["run-2"]);
+	});
+
+	it("captures bounded effective review state without copying model context", () => {
+		const source = SessionManager.inMemory("/tmp/review-handoff-source");
+		source.appendMessage({ role: "user", content: "SOURCE_ONLY_DISCUSSION", timestamp: 1 });
+		for (let index = 0; index < MAX_HYDRATED_REVIEW_RUNS + 2; index++) {
+			appendReviewRun(source, record(`run-${index}`, index));
+		}
+		const retainedRunId = `run-${MAX_HYDRATED_REVIEW_RUNS + 1}`;
+		acknowledgeReviewRun(source, retainedRunId, 123);
+		appendReviewFindingTransition(source, {
+			runId: retainedRunId,
+			findingId: "finding-1",
+			status: "accepted",
+			createdAt: 10,
+		});
+		appendReviewFindingTransition(source, {
+			runId: retainedRunId,
+			findingId: "finding-1",
+			status: "dismissed",
+			reason: "false_positive",
+			note: "Verified against the current branch.",
+			createdAt: 20,
+		});
+		appendReviewFindingTransition(source, {
+			runId: "run-0",
+			findingId: "finding-1",
+			status: "fixed",
+			createdAt: 30,
+		});
+		source.appendCustomEntry(REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE, {
+			schemaVersion: 1,
+			runId: retainedRunId,
+			acknowledgedAt: "invalid",
+		});
+		const sourceBranch = structuredClone(source.getBranch());
+
+		const snapshot = captureReviewStateForHandoff(source);
+
+		expect(source.getBranch()).toEqual(sourceBranch);
+		expect(snapshot.runs).toHaveLength(MAX_HYDRATED_REVIEW_RUNS);
+		expect(snapshot.runs[0]?.runId).toBe(retainedRunId);
+		expect(snapshot.runs.at(-1)?.runId).toBe("run-2");
+		expect(snapshot.acknowledgments).toEqual([{ schemaVersion: 1, runId: retainedRunId, acknowledgedAt: 123 }]);
+		expect(snapshot.transitions).toEqual([
+			{
+				schemaVersion: 1,
+				runId: retainedRunId,
+				findingId: "finding-1",
+				status: "dismissed",
+				reason: "false_positive",
+				note: "Verified against the current branch.",
+				createdAt: 20,
+			},
+		]);
+
+		const target = SessionManager.inMemory("/tmp/review-handoff-target");
+		restoreReviewStateFromHandoff(target, snapshot);
+
+		expect(listReviewRuns(target, { limit: 50 }).runs).toHaveLength(MAX_HYDRATED_REVIEW_RUNS);
+		expect(getReviewRun(target, "run-0")).toBeUndefined();
+		expect(getReviewRun(target, retainedRunId)).toMatchObject({
+			acknowledgedAt: 123,
+			result: { findings: [{ id: "finding-1", status: "dismissed" }] },
+		});
+		expect(exportReviewFeedback(target).outcomes).toEqual(snapshot.transitions);
+		expect(target.buildSessionContext().messages).toEqual([]);
+		expect(JSON.stringify(target.getBranch())).not.toContain("SOURCE_ONLY_DISCUSSION");
 	});
 
 	it("durably records a review before any prompt and recovers it after restart", async () => {

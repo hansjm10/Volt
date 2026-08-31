@@ -719,6 +719,9 @@
 					"$ref": "#/$defs/RpcCommand.get_agent_options"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.get_session_contexts"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
 				},
 				{
@@ -999,6 +1002,9 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.get_agent_options"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_session_contexts"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
@@ -1889,6 +1895,43 @@
 				},
 				"runId": {
 					"$ref": "#/$defs/RpcConversationIdentifier"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.get_session_contexts": {
+			"type": "object",
+			"required": [
+				"type",
+				"workspaceName",
+				"sessionIds"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_session_contexts"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"workspaceName": {
+					"type": "string",
+					"pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+					"x-volt-expected": "be a non-empty workspace name"
+				},
+				"sessionIds": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 128
+					},
+					"minItems": 1,
+					"maxItems": 64,
+					"uniqueItems": true
 				}
 			},
 			"additionalProperties": false
@@ -6672,6 +6715,9 @@
 					"$ref": "#/$defs/RpcResponse.list_sessions"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.get_session_contexts"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.export_html"
 				},
 				{
@@ -7823,6 +7869,82 @@
 				},
 				"data": {
 					"$ref": "#/$defs/RpcReviewWorkflowResultResponse"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.get_session_contexts": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_session_contexts"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"type": "object",
+					"required": [
+						"contexts"
+					],
+					"properties": {
+						"contexts": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"required": [
+									"sessionId",
+									"startingGitContext",
+									"workContext"
+								],
+								"properties": {
+									"sessionId": {
+										"type": "string",
+										"minLength": 1,
+										"maxLength": 128
+									},
+									"startingGitContext": {
+										"anyOf": [
+											{
+												"$ref": "#/$defs/RpcGitContext"
+											},
+											{
+												"type": "null"
+											}
+										]
+									},
+									"workContext": {
+										"anyOf": [
+											{
+												"$ref": "#/$defs/RpcSessionWorkContext"
+											},
+											{
+												"type": "null"
+											}
+										]
+									}
+								},
+								"additionalProperties": false
+							},
+							"maxItems": 64
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
@@ -10590,6 +10712,19 @@
 				"origin": {
 					"type": "string",
 					"const": "subagent"
+				},
+				"startingGitContext": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcGitContext"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"workContext": {
+					"$ref": "#/$defs/RpcSessionWorkContext"
 				}
 			},
 			"additionalProperties": false
@@ -10633,6 +10768,16 @@
 					"$ref": "#/$defs/RpcPlanningState"
 				},
 				"gitContext": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcGitContext"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"startingGitContext": {
 					"anyOf": [
 						{
 							"$ref": "#/$defs/RpcGitContext"
@@ -10944,6 +11089,115 @@
 							"type": "null"
 						}
 					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcSessionWorkContext": {
+			"anyOf": [
+				{
+					"type": "object",
+					"required": [
+						"changeId",
+						"repository",
+						"branch",
+						"resolutionState",
+						"pullRequest"
+					],
+					"properties": {
+						"changeId": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 128
+						},
+						"repository": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 256
+						},
+						"branch": {
+							"$ref": "#/$defs/RpcGitRef"
+						},
+						"resolutionState": {
+							"type": "string",
+							"const": "resolved"
+						},
+						"pullRequest": {
+							"$ref": "#/$defs/RpcSessionWorkPullRequest"
+						}
+					},
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"required": [
+						"changeId",
+						"repository",
+						"branch",
+						"resolutionState"
+					],
+					"properties": {
+						"changeId": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 128
+						},
+						"repository": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 256
+						},
+						"branch": {
+							"$ref": "#/$defs/RpcGitRef"
+						},
+						"resolutionState": {
+							"type": "string",
+							"enum": [
+								"none",
+								"ambiguous",
+								"unavailable"
+							]
+						}
+					},
+					"additionalProperties": false
+				}
+			]
+		},
+		"RpcSessionWorkPullRequest": {
+			"type": "object",
+			"required": [
+				"provider",
+				"number",
+				"title",
+				"status",
+				"stale"
+			],
+			"properties": {
+				"provider": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 64
+				},
+				"number": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 9007199254740991
+				},
+				"title": {
+					"type": "string",
+					"maxLength": 512
+				},
+				"status": {
+					"type": "string",
+					"enum": [
+						"open",
+						"draft",
+						"merged",
+						"closed"
+					]
+				},
+				"stale": {
+					"type": "boolean"
 				}
 			},
 			"additionalProperties": false

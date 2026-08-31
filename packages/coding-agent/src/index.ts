@@ -173,6 +173,8 @@ export {
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export {
 	detectGitOperation,
+	type GitContextObservation,
+	type GitContextObservationListener,
 	GitContextProvider,
 	type GitContextProviderOptions,
 	type GitContextSubscriptionOptions,

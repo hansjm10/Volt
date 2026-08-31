@@ -89,6 +89,7 @@ import type {
 	ToolInfo,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import { GitContextObservationBinding } from "../../core/git-context-provider.ts";
 import {
 	BUILTIN_HOST_ACTION_REGISTRY,
 	CONTEXT_COMPACT_SLASH_ALIAS,
@@ -617,6 +618,10 @@ export class InteractiveMode {
 	// a reconnecting client even when auto-start is off, so a daemon started by
 	// another process can discover every already-running agent.
 	private daemonAttach: DaemonAttach = createDisabledDaemonAttach();
+	private readonly daemonWorkObservation = new GitContextObservationBinding((observation) => {
+		if (observation.status !== "definitive") return;
+		void this.daemonAttach.publishGitObservation(this.session.sessionId, observation.gitContext);
+	});
 	private daemonRelayServers = new Set<Promise<void>>();
 	/** list_sessions cursor state shared across relayed phone conversations. */
 	private readonly relaySessionListCursors = new Map<string, RemoteSessionListCursorEntry>();
@@ -1967,6 +1972,7 @@ export class InteractiveMode {
 		});
 		await this.daemonAttach.start();
 		const acquireOutcome = await this.acquireCurrentSessionLease();
+		this.bindDaemonWorkObservation(this.session);
 		this.runtimeHost.setPrepareSessionReplacement(async ({ previousSessionId, sessionId, cwd }) => {
 			const rekey = await this.daemonAttach.prepareRekey(previousSessionId, sessionId, cwd);
 			if (!rekey) {
@@ -1976,6 +1982,7 @@ export class InteractiveMode {
 				commit: async () => {
 					await rekey.commit();
 					this.daemonLeaseSessionId = sessionId;
+					this.bindDaemonWorkObservation(this.session);
 				},
 				rollback: () => rekey.rollback(),
 				dispose: async () => {
@@ -2024,6 +2031,7 @@ export class InteractiveMode {
 		}
 		if (outcome.kind === "granted") {
 			await this.runtimeHost.startRecoveredClientInputs().catch(() => undefined);
+			void this.session.gitContextProvider.refresh();
 		}
 	}
 
@@ -2324,6 +2332,7 @@ export class InteractiveMode {
 	}
 
 	private async releaseDaemonLeaseOnQuit(): Promise<void> {
+		this.daemonWorkObservation.dispose();
 		if (this.daemonAttach.connectionState() === "disabled") {
 			return;
 		}
@@ -2368,11 +2377,17 @@ export class InteractiveMode {
 	}
 
 	private async rebindReplacementSession(session: AgentSession): Promise<void> {
+		this.bindDaemonWorkObservation(session);
 		await this.rebindCurrentSession(session);
 		this.ui.requestRender(true);
 		const suspension = this.sessionRenderSuspension;
 		this.sessionRenderSuspension = undefined;
 		suspension?.release();
+	}
+
+	private bindDaemonWorkObservation(session: AgentSession): void {
+		if (this.daemonAttach.connectionState() === "disabled") return;
+		this.daemonWorkObservation.bind(session.gitContextProvider);
 	}
 
 	private async rebindCurrentSession(session: AgentSession): Promise<void> {
@@ -9240,9 +9255,11 @@ export class InteractiveMode {
 				tools: options.tools,
 				requireConfirmation: options.requireConfirmation,
 				requireProjectTrust: options.requireProjectTrust,
-				confirm: ({ title, message }) => this.showExtensionConfirm(title, message),
+				confirm: ({ title, message, signal }) =>
+					this.showExtensionConfirm(title, message, signal ? { signal } : undefined),
 				onReviewModelWarning: (message) => this.showWarning(message),
 				createHooks: () => this.createReviewWorkflowHooks(),
+				workflowManager: this.runtimeHost.reviewWorkflows,
 			});
 
 			if (result.status !== "completed") {

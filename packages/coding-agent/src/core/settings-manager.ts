@@ -177,6 +177,8 @@ export interface RemoteSettings {
 	detachedRuntimeTtlMs?: number;
 	/** Tool allowlist for daemon-owned headless runtimes only. */
 	allowTools?: string[];
+	/** Discover exact pull-request associations for trusted Work sessions. Default: true. */
+	pullRequestDiscovery?: boolean;
 }
 
 /** Deep merge records: overrides take precedence, nested objects merge recursively, arrays replace. */

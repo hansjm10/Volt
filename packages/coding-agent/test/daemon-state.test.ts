@@ -107,8 +107,8 @@ describe("voltd state migration", () => {
 		expect(migrated?.state.revokedClients).toEqual([]);
 		expect(migrated?.state.pendingPairingTickets).toEqual([]);
 		expect(migrated?.state.workspaces[0]?.name).toBe("volt");
-		expect(migrated?.state.workspaceGenerationCounter).toBe(0);
-		expect(migrated?.state.workspaceGenerations).toEqual([]);
+		expect(migrated?.state.workspaceGenerationCounter).toBe(1);
+		expect(migrated?.state.workspaceGenerations).toEqual([{ workspaceName: "volt", generation: 1 }]);
 		expect(migrated?.state.settings.detachedRuntimeTtlMs).toBe(30 * 60 * 1000);
 		expect(migrated?.droppedAccess).toEqual({ clients: 1, revokedClients: 1, pendingPairingTickets: 1 });
 	});

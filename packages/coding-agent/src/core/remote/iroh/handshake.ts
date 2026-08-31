@@ -47,7 +47,7 @@ export interface IrohRemoteConversationHandshakeMetadata {
 }
 
 export interface IrohRemoteWorkspaceDiscoveryTarget {
-	purpose: "list_sessions" | "agent_options";
+	purpose: "list_sessions" | "agent_options" | "session_contexts";
 }
 
 export interface IrohRemoteWorkspaceManagementTarget {
@@ -512,7 +512,7 @@ function parseWorkspaceDiscoveryTarget(value: unknown): IrohRemoteWorkspaceDisco
 		"handshake workspaceDiscovery purpose",
 		"invalid_conversation_target",
 	);
-	if (purpose !== "list_sessions" && purpose !== "agent_options") {
+	if (purpose !== "list_sessions" && purpose !== "agent_options" && purpose !== "session_contexts") {
 		throw new IrohRemoteHandshakeError("invalid_conversation_target", "unsupported workspaceDiscovery purpose");
 	}
 	return { purpose };
@@ -886,7 +886,11 @@ function expectOptionalWorktreeIdForResponse(value: unknown, label: string): str
 function parseWorkspaceDiscoveryResponseMetadata(value: unknown): IrohRemoteWorkspaceDiscoveryTarget {
 	const metadata = expectRecord(value, "handshake response workspaceDiscovery");
 	expectKnownResponseFields(metadata, "handshake response workspaceDiscovery", ["purpose"]);
-	if (metadata.purpose !== "list_sessions" && metadata.purpose !== "agent_options") {
+	if (
+		metadata.purpose !== "list_sessions" &&
+		metadata.purpose !== "agent_options" &&
+		metadata.purpose !== "session_contexts"
+	) {
 		throw new Error("handshake response workspaceDiscovery purpose must be supported");
 	}
 	return { purpose: metadata.purpose };

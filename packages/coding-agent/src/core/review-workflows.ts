@@ -67,6 +67,8 @@ export interface ReviewWorkflowExecuteHooks {
 }
 
 export interface ReviewWorkflowStartOptions {
+	/** Allows one metadata replacement while the launched workflow is still preparing. */
+	provisional?: boolean;
 	prepared: Pick<PreparedReviewWorkflow, "workflowId" | "action" | "startedAt"> & {
 		resolution: Pick<PreparedReviewWorkflow["resolution"], "description" | "workflowDescription" | "diffCommand"> &
 			Partial<Pick<PreparedReviewWorkflow["resolution"], "dispose">>;
@@ -77,12 +79,18 @@ export interface ReviewWorkflowStartOptions {
 
 export interface StartedReviewWorkflow {
 	descriptor: ReviewWorkflowDescriptor;
+	/** Manager-owned lifecycle signal, including cancellation before launch. */
+	signal: AbortSignal;
+	/** Replace provisional target metadata and disposal with the resolved snapshot. */
+	updatePrepared: (prepared: ReviewWorkflowStartOptions["prepared"]) => void;
 	/**
 	 * Begins detached execution. Idempotent. Callers emit their acceptance
 	 * response before launching so the response deterministically precedes
 	 * workflow_start on shared ordered lanes.
 	 */
 	launch: () => void;
+	/** Resolves with the retained terminal record after workflow_end is emitted. */
+	finished: Promise<ReviewWorkflowResultRecord>;
 }
 
 interface ActiveReviewWorkflow {
@@ -90,9 +98,14 @@ interface ActiveReviewWorkflow {
 	abortController: AbortController;
 	fastModeEnabled: boolean;
 	launched: boolean;
-	done: Promise<void>;
-	settle: () => void;
+	awaitingPreparation: boolean;
+	done: Promise<ReviewWorkflowResultRecord>;
+	settle: (record: ReviewWorkflowResultRecord) => void;
 	disposePending: () => Promise<void>;
+}
+
+function formatRunningReviewMessage(description: string, preparing: boolean): string {
+	return preparing ? `${description}.` : `Reviewing ${description}.`;
 }
 
 function formatCompletedReviewSummary(
@@ -141,8 +154,10 @@ export class ReviewWorkflowManager {
 	}
 
 	/**
-	 * Register a prepared review workflow. Throws when the concurrency cap is
-	 * reached. Execution does not begin until `launch()` is invoked.
+	 * Register a review workflow. The initial metadata may be provisional and
+	 * replaced once with `updatePrepared()` while the launched workflow prepares.
+	 * Throws when the concurrency cap is reached. Execution does not begin until
+	 * `launch()` is invoked.
 	 */
 	start(options: ReviewWorkflowStartOptions): StartedReviewWorkflow {
 		const { workflowId, action, resolution } = options.prepared;
@@ -165,8 +180,8 @@ export class ReviewWorkflowManager {
 			},
 			startedAt: options.prepared.startedAt,
 		};
-		let settle: () => void = () => {};
-		const done = new Promise<void>((resolve) => {
+		let settle: (record: ReviewWorkflowResultRecord) => void = () => {};
+		const done = new Promise<ReviewWorkflowResultRecord>((resolve) => {
 			settle = resolve;
 		});
 		const entry: ActiveReviewWorkflow = {
@@ -174,23 +189,65 @@ export class ReviewWorkflowManager {
 			abortController: new AbortController(),
 			fastModeEnabled: options.fastModeEnabled === true,
 			launched: false,
+			awaitingPreparation: options.provisional === true,
 			done,
 			settle,
 			disposePending: () => options.prepared.resolution.dispose?.() ?? Promise.resolve(),
 		};
 		this.active.set(workflowId, entry);
 
+		const updatePrepared = (prepared: ReviewWorkflowStartOptions["prepared"]): void => {
+			if (prepared.workflowId !== workflowId) {
+				throw new Error(`Cannot replace review workflow ${workflowId} with ${prepared.workflowId}`);
+			}
+			if (this.active.get(workflowId) !== entry || !entry.awaitingPreparation) {
+				throw new Error(`Review workflow is no longer awaiting preparation: ${workflowId}`);
+			}
+			entry.awaitingPreparation = false;
+			descriptor.action = prepared.action;
+			descriptor.target = {
+				description: prepared.resolution.workflowDescription ?? prepared.resolution.description,
+				diffCommand: prepared.resolution.diffCommand,
+			};
+			descriptor.startedAt = prepared.startedAt;
+			entry.disposePending = () => prepared.resolution.dispose?.() ?? Promise.resolve();
+			if (entry.launched && !entry.abortController.signal.aborted) {
+				this.emit({
+					type: "workflow_update",
+					workflowId: descriptor.workflowId,
+					kind: "review",
+					action: descriptor.action,
+					title: "Review",
+					message: formatRunningReviewMessage(descriptor.target.description, false),
+					status: "running",
+					startedAt: descriptor.startedAt,
+				});
+			}
+		};
+
 		const launch = (): void => {
 			if (entry.launched) {
 				return;
 			}
 			entry.launched = true;
+			this.emit({
+				type: "workflow_start",
+				workflowId: descriptor.workflowId,
+				kind: "review",
+				action: descriptor.action,
+				title: "Review",
+				message: formatRunningReviewMessage(descriptor.target.description, entry.awaitingPreparation),
+				status: "running",
+				startedAt: descriptor.startedAt,
+			});
 			void (async () => {
 				let result: ExecuteReviewWorkflowResult;
 				try {
 					result = await options.execute({
 						signal: entry.abortController.signal,
-						onEvent: (event) => this.emit(event),
+						onEvent: (event) => {
+							if (event.type !== "workflow_start" || event.workflowId !== workflowId) this.emit(event);
+						},
 					});
 				} catch (error) {
 					result = {
@@ -210,7 +267,13 @@ export class ReviewWorkflowManager {
 				this.finish(entry, result);
 			})();
 		};
-		return { descriptor, launch };
+		return {
+			descriptor,
+			signal: entry.abortController.signal,
+			updatePrepared,
+			launch,
+			finished: done,
+		};
 	}
 
 	/** Abort a running review workflow. Throws for unknown or finished workflows. */
@@ -336,6 +399,6 @@ export class ReviewWorkflowManager {
 			startedAt: descriptor.startedAt,
 			endedAt: descriptor.endedAt,
 		});
-		entry.settle();
+		entry.settle(record);
 	}
 }

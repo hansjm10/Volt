@@ -1486,6 +1486,40 @@ describe("ConversationProjectionFeed", () => {
 		feed.dispose();
 	});
 
+	it("scopes a replacement request ID to its exact session rebind bootstrap", async () => {
+		const firstSource = new TestSource();
+		const secondSource = new TestSource();
+		const thirdSource = new TestSource();
+		const feed = new ConversationProjectionFeed(firstSource, { createId: makeIds("request-rebind") });
+		const writes: object[] = [];
+		const subscription = feed.attach({
+			write: (value) => {
+				writes.push(value);
+			},
+			buildSnapshot: (context) => snapshotBuilder(context.source as TestSource)(context),
+		});
+		await subscription.ready;
+
+		feed.beginSourceRebind(secondSource);
+		feed.commitSourceRebind("new-session-request");
+		await subscription.flush();
+		expect(writes.at(-1)).toMatchObject({
+			type: "conversation_bootstrap",
+			reason: "session_rebind",
+			requestId: "new-session-request",
+		});
+
+		feed.beginSourceRebind(thirdSource);
+		feed.commitSourceRebind();
+		await subscription.flush();
+		expect(writes.at(-1)).toMatchObject({
+			type: "conversation_bootstrap",
+			reason: "session_rebind",
+		});
+		expect(writes.at(-1)).not.toHaveProperty("requestId");
+		feed.dispose();
+	});
+
 	it("keeps a replacement generation unpublished until host ownership rekey commits", async () => {
 		const firstSource = new TestSource();
 		const secondSource = new TestSource();

@@ -234,7 +234,7 @@ The `model` field is a full [Model](#model) object or `null`. `availableThinking
 - `operation` is `null` or a host-detected merge, rebase, cherry-pick, revert, bisect, or sequencer operation. Rebase metadata may include `step` and `total`.
 - `revision` is monotonic only for one provider lifetime. `observedAt` advances only after a complete successful scan. On a later scan failure, Volt retains the last good value, increments its revision once, and sets `stale:true`; recovery emits another replacement with `stale:false`.
 
-Collection is local-only and performs no fetch. It uses bounded, fixed-argument Git reads and never includes changed path names, absolute checkout paths, remote URLs, credentials, or diff content. Git context is not persisted in session JSONL and is not added to model context, extension prompts, handshake `remoteHost`, or host-global metadata.
+Collection is local-only and performs no fetch. It uses bounded, fixed-argument Git reads and never includes changed path names, absolute checkout paths, remote URLs, credentials, or diff content. Live `gitContext` is not persisted. A newly created session may additionally expose optional `startingGitContext`, which is the first definitive path-free observation (`null` for a definitive non-Git cwd) stored in one strictly validated host-only `session_start_git_context` JSONL entry. That entry never enters model context, transcript projection, extension prompts, handshake `remoteHost`, or host-global metadata.
 
 #### get_transcript
 
@@ -1217,12 +1217,35 @@ Response:
         "modifiedAt": "2026-06-22T15:10:00.000Z",
         "messageCount": 12,
         "firstMessage": "Implement the feature",
-        "current": true
+        "current": true,
+        "workContext": {
+          "changeId": "c56d55ca-3937-4fc8-b13a-a7525577864b",
+          "repository": "Volt",
+          "branch": "feature/work-association",
+          "resolutionState": "resolved",
+          "pullRequest": {
+            "provider": "github",
+            "number": 42,
+            "title": "Add Work association",
+            "status": "open",
+            "stale": false
+          }
+        }
       }
     ]
   }
 }
 ```
+
+Daemon-backed remote lists may add optional `workContext`. It is either a
+resolved context with bounded `pullRequest`, or an unresolved context whose
+`resolutionState` is `none`, `ambiguous`, or `unavailable` and has no
+`pullRequest`. The daemon joins this from its synchronous private store; a
+`list_sessions` request never starts Git or provider work. Only opaque
+`changeId`, repository display name, effective branch, resolution state, and
+the bounded PR provider/number/title/status/staleness cross the wire. Checkout
+paths, remotes, canonical repository IDs, matched object IDs, credentials, raw
+provider output, and diagnostics are excluded.
 
 #### export_html
 

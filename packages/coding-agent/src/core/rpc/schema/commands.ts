@@ -208,6 +208,14 @@ export const RPC_COMMAND_SCHEMAS = {
 	get_agent_options: commandSchema("get_agent_options", {
 		workspaceName: workspaceNameSchema,
 	}),
+	get_session_contexts: commandSchema("get_session_contexts", {
+		workspaceName: workspaceNameSchema,
+		sessionIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
+			minItems: 1,
+			maxItems: 64,
+			uniqueItems: true,
+		}),
+	}),
 
 	// Device diagnostics
 	upload_device_logs: commandSchema("upload_device_logs", {

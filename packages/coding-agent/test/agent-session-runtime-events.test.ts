@@ -12,7 +12,16 @@ import {
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { appendReviewRun, getReviewRun, type ReviewRunRecord } from "../src/core/review-state.ts";
+import {
+	acknowledgeReviewRun,
+	appendReviewFindingTransition,
+	appendReviewRun,
+	exportReviewFeedback,
+	getReviewRun,
+	listReviewRuns,
+	type ReviewRunRecord,
+} from "../src/core/review-state.ts";
+import { buildRpcSessionState } from "../src/core/rpc/session-state.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type { BashOperations } from "../src/core/tools/bash.ts";
 import type {
@@ -93,9 +102,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		return { runtimeHost, faux };
 	}
 
-	it("bridges Git replacements and explicitly refreshes after recorded Bash", async () => {
+	it("bridges Git replacements while retaining the session's first Git observation", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => undefined);
 		const events: AgentSessionEvent[] = [];
+		await vi.waitFor(() => expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull());
+		expect(buildRpcSessionState(runtimeHost.session).startingGitContext).toBeNull();
 		const unsubscribe = runtimeHost.session.subscribe((event) => events.push(event));
 		execFileSync("git", ["init", "--initial-branch=main"], { cwd: runtimeHost.cwd, stdio: "ignore" });
 
@@ -106,6 +117,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				gitContext: expect.objectContaining({ head: { kind: "unborn", name: "main" }, stale: false }),
 			}),
 		);
+		expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull();
 
 		const scheduleRefresh = vi.spyOn(runtimeHost.session.gitContextProvider, "scheduleRefresh");
 		runtimeHost.session.recordBashResult("touch changed", {
@@ -116,6 +128,22 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		});
 		expect(scheduleRefresh).toHaveBeenCalledOnce();
 		unsubscribe();
+	});
+
+	it("captures the starting Git context after forking from a selected leaf", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => undefined);
+		await vi.waitFor(() => expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull());
+		await runtimeHost.session.prompt("fork source");
+
+		const sourceSessionId = runtimeHost.session.sessionId;
+		const selectedLeafId = runtimeHost.session.sessionManager.getLeafId();
+		expect(selectedLeafId).not.toBeNull();
+
+		await expect(runtimeHost.fork(selectedLeafId!, { position: "at" })).resolves.toMatchObject({
+			cancelled: false,
+		});
+		expect(runtimeHost.session.sessionId).not.toBe(sourceSessionId);
+		await vi.waitFor(() => expect(runtimeHost.session.sessionManager.getStartingGitContext()).toBeNull());
 	});
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
@@ -439,6 +467,82 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const sourceSessionId = runtimeHost.session.sessionId;
 		const sourceSessionFile = runtimeHost.session.sessionFile;
 		expect(sourceSessionFile).toBeDefined();
+		const reviewOnlyMarker = "REVIEW_ONLY_FINDING_BODY";
+		const reviewRecord = (runId: string, endedAt: number, title: string): ReviewRunRecord => ({
+			schemaVersion: 1,
+			runId,
+			workflowAction: "review.uncommitted",
+			status: "completed",
+			startedAt: endedAt - 1,
+			endedAt,
+			target: {
+				description: "uncommitted changes",
+				diffCommand: "git diff HEAD",
+				identity: { kind: "uncommitted", baseTree: `base-${runId}`, headTree: `head-${runId}` },
+				files: [],
+			},
+			options: { scope: [], effort: "standard", includeOptional: false, scopeMode: "full" },
+			result: {
+				completionStatus: "complete",
+				summary: `${title} remains.`,
+				findings: [
+					{
+						id: `finding-${runId}`,
+						fingerprint: "f".repeat(64),
+						status: "open",
+						title,
+						body: reviewOnlyMarker,
+						trigger: "Trigger the reviewed path.",
+						impact: "The reviewed behavior is incorrect.",
+						category: "correctness",
+						rootCauseKey: `root-${runId}`,
+						priority: 2,
+						confidence: 0.9,
+						changeLocation: { path: "src/value.ts", side: "head", startLine: 1, endLine: 1 },
+						evidenceLocations: [],
+						verification: {
+							outcome: "accepted",
+							method: "Inspected the exact changed blob.",
+							rationale: "The trigger remains reachable.",
+							confidence: 0.95,
+						},
+					},
+				],
+				coverage: {
+					changedFileInventoryComplete: true,
+					filesInspected: ["src/value.ts"],
+					hunksInspected: ["hunk-1"],
+					commandsRun: [],
+					failedVerificationAttempts: [],
+					exclusions: [],
+					uncheckedAreas: [],
+					residualRisk: [],
+					modelReportedLimitations: [],
+				},
+				overallCorrectness: "incorrect",
+				overallExplanation: `${title} is verified.`,
+			},
+		});
+		const olderReview = reviewRecord("review:older", 10, "Older finding");
+		const currentReview = reviewRecord("review:current", 20, "Current finding");
+		appendReviewRun(sourceManager, olderReview);
+		appendReviewRun(sourceManager, currentReview);
+		acknowledgeReviewRun(sourceManager, currentReview.runId, 123);
+		appendReviewFindingTransition(sourceManager, {
+			runId: currentReview.runId,
+			findingId: "finding-review:current",
+			status: "accepted",
+			createdAt: 30,
+		});
+		appendReviewFindingTransition(sourceManager, {
+			runId: currentReview.runId,
+			findingId: "finding-review:current",
+			status: "dismissed",
+			reason: "false_positive",
+			createdAt: 40,
+		});
+		const sourceReviewsBefore = listReviewRuns(sourceManager, { limit: 50 }).runs;
+		const sourceFeedbackBefore = exportReviewFeedback(sourceManager).outcomes;
 
 		await runtimeHost.session.setAgentMode("plan");
 		const draft = runtimeHost.session.updatePlan({
@@ -481,8 +585,30 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				execution: { targetSessionId: started.selectedSessionId },
 			},
 		});
+		expect(listReviewRuns(sourceManager, { limit: 50 }).runs).toEqual(sourceReviewsBefore);
+		expect(exportReviewFeedback(sourceManager).outcomes).toEqual(sourceFeedbackBefore);
 
-		const childBranch = runtimeHost.session.sessionManager.getBranch();
+		const targetManager = runtimeHost.session.sessionManager;
+		expect(listReviewRuns(targetManager, { limit: 50 }).runs.map((run) => run.runId)).toEqual([
+			currentReview.runId,
+			olderReview.runId,
+		]);
+		expect(getReviewRun(targetManager, currentReview.runId)).toMatchObject({
+			acknowledgedAt: 123,
+			result: { findings: [{ id: "finding-review:current", status: "dismissed" }] },
+		});
+		expect(exportReviewFeedback(targetManager).outcomes).toEqual([sourceFeedbackBefore.at(-1)]);
+		appendReviewFindingTransition(targetManager, {
+			runId: currentReview.runId,
+			findingId: "finding-review:current",
+			status: "fixed",
+			createdAt: 50,
+		});
+		expect(getReviewRun(targetManager, currentReview.runId)?.result?.findings[0]?.status).toBe("fixed");
+		expect(getReviewRun(sourceManager, currentReview.runId)?.result?.findings[0]?.status).toBe("dismissed");
+		expect(JSON.stringify(targetManager.buildSessionContext().messages)).not.toContain(reviewOnlyMarker);
+
+		const childBranch = targetManager.getBranch();
 		expect(
 			childBranch.some(
 				(entry) =>
@@ -502,8 +628,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			content: expect.stringContaining(`(id: ${started.planning.plan!.steps[0]!.id})`),
 		});
 
+		const transferredReviewEntryCount = childBranch.filter(
+			(entry) => entry.type === "custom" && entry.customType.startsWith("volt.review."),
+		).length;
 		const retry = await runtimeHost.executePlan(ready.id, ready.revision, "new_session");
 		expect(retry).toMatchObject({ selectedSessionId: started.selectedSessionId, started: false });
+		expect(
+			runtimeHost.session.sessionManager
+				.getBranch()
+				.filter((entry) => entry.type === "custom" && entry.customType.startsWith("volt.review.")),
+		).toHaveLength(transferredReviewEntryCount);
 	});
 
 	it("rejects session replacement and fork commands while manual compaction owns the persistence leaf", async () => {
@@ -681,12 +815,15 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const commitSourceRebind = runtimeHost.conversationProjectionFeed.commitSourceRebind.bind(
 			runtimeHost.conversationProjectionFeed,
 		);
-		vi.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind").mockImplementation(() => {
-			phases.push("publish");
-			commitSourceRebind();
-		});
+		const publish = vi
+			.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind")
+			.mockImplementation((requestId) => {
+				phases.push("publish");
+				commitSourceRebind(requestId);
+			});
 
-		await runtimeHost.newSession();
+		await runtimeHost.newSession({ rebindRequestId: "new-session-request" });
+		expect(publish).toHaveBeenCalledWith("new-session-request");
 		expect(phases).toEqual(["prepare", "session_shutdown", "commit", "publish", "finalize", "rebind"]);
 	});
 
@@ -727,13 +864,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			return undefined;
 		});
 
-		const first = runtimeHost.newSession();
+		const publish = vi.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind");
+		const first = runtimeHost.newSession({ rebindRequestId: "winning-request" });
 		await preparationStarted;
-		const queuedFromOldSession = runtimeHost.newSession();
+		const queuedFromOldSession = runtimeHost.newSession({ rebindRequestId: "stale-request" });
 		releasePreparation();
 
 		await first;
 		await expect(queuedFromOldSession).rejects.toThrow("Stale agent session structural operation");
+		expect(publish).toHaveBeenCalledOnce();
+		expect(publish).toHaveBeenCalledWith("winning-request");
 		expect(preparationCount).toBe(1);
 		expect(shutdownReasons).toEqual(["new"]);
 	});

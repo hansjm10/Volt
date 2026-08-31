@@ -720,6 +720,9 @@ describe("RPC durable review actions", () => {
 				data: { cancelled: false },
 			}),
 		);
+		expect(runtimeHost.newSession).toHaveBeenCalledWith(
+			expect.objectContaining({ rebindRequestId: "new-discussion" }),
+		);
 		expect(getReviewRun(replacementManagers[0]!, "review:test")).toMatchObject({
 			runId: "review:test",
 			acknowledgedAt,

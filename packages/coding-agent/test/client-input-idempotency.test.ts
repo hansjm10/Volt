@@ -747,7 +747,13 @@ describe("durable client input idempotency", () => {
 					.trim()
 					.split("\n")
 					.map((line) => (JSON.parse(line) as { type: string }).type),
-			).toEqual(["session", "client_input_receipt", "client_input_queued", "client_input_state"]);
+			).toEqual([
+				"session",
+				"client_input_receipt",
+				"session_start_git_context",
+				"client_input_queued",
+				"client_input_state",
+			]);
 		},
 	);
 

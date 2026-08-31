@@ -8,6 +8,7 @@ import type {
 	IrohRemotePushNotificationIntent,
 } from "../../core/remote/iroh/push.ts";
 import type { IrohRemoteWorkspaceMetadataSnapshot } from "../../core/remote/iroh/workspace.ts";
+import type { RpcGitContext } from "../../core/rpc/types.ts";
 import { createDaemonClient, type DaemonClient } from "../../daemon/control-client.ts";
 import {
 	CONTROL_RPC_GRANTS_CAPABILITY,
@@ -126,6 +127,8 @@ export interface DaemonAttach {
 	/** Connect, resolve (or auto-register) the cwd workspace. Never throws. */
 	start(): Promise<void>;
 	acquire(sessionId: string): Promise<AcquireOutcome>;
+	/** Publish path-free Git state only for the session leased by this exact connection. */
+	publishGitObservation(sessionId: string, gitContext: RpcGitContext | null): Promise<void>;
 	release(sessionId: string, reason?: LeaseReleaseReason): Promise<void>;
 	prepareRekey(
 		oldSessionId: string,
@@ -358,6 +361,7 @@ export function createDisabledDaemonAttach(): DaemonAttach {
 		async acquire() {
 			return NOOP_OUTCOME;
 		},
+		async publishGitObservation() {},
 		async release() {},
 		async prepareRekey() {
 			return undefined;
@@ -692,6 +696,38 @@ export function createDaemonAttach(options: CreateDaemonAttachOptions): DaemonAt
 				return outcome;
 			} catch {
 				return NOOP_OUTCOME;
+			}
+		},
+		async publishGitObservation(sessionId: string, gitContext: RpcGitContext | null) {
+			const workspaceName = resolvedWorkspaceName;
+			const activeClient = client;
+			if (
+				!activeClient ||
+				!workspaceName ||
+				state !== "connected" ||
+				heldSessionId !== sessionId ||
+				currentSessionId !== sessionId
+			) {
+				return;
+			}
+			const branchContext =
+				gitContext && !gitContext.stale && gitContext.head.kind === "branch"
+					? {
+							repository: gitContext.repository,
+							branch: gitContext.head.name,
+							headOid: gitContext.head.oid,
+							...(gitContext.base === null ? {} : { baseRef: gitContext.base.ref }),
+						}
+					: null;
+			try {
+				await activeClient.request({
+					type: "work_observe",
+					workspaceName,
+					sessionId,
+					gitContext: branchContext,
+				});
+			} catch {
+				// Observation publication is best-effort; lease recovery republishes.
 			}
 		},
 		async release(sessionId: string, reason = "quit") {

@@ -72,6 +72,7 @@ function createStateSession(sessionId: string, gitContext: RpcGitContext | null 
 		pendingMessageCount: 0,
 		sessionFile: `/sessions/${sessionId}.jsonl`,
 		sessionId,
+		sessionManager: { getStartingGitContext: () => undefined },
 		steeringMode: "one-at-a-time" as const,
 		subscribe: vi.fn(() => () => {}),
 		thinkingLevel: "off" as const,

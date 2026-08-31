@@ -1161,13 +1161,13 @@ export class ConversationProjectionFeed {
 	}
 
 	/** Publish a source previously installed by beginSourceRebind as cursor zero. */
-	commitSourceRebind(): void {
+	commitSourceRebind(requestId?: string): void {
 		this.assertActive();
 		if (!this.sourceRebindPending) {
 			throw new Error("Conversation source rebind is not pending");
 		}
 		this.sourceRebindPending = false;
-		this.rotateAllSubscriptions("session_rebind", false);
+		this.rotateAllSubscriptions("session_rebind", false, requestId);
 		this.flushPendingRebindControls();
 	}
 
@@ -1815,6 +1815,7 @@ export class ConversationProjectionFeed {
 	private rotateAllSubscriptions(
 		reason: Extract<RpcConversationBootstrapReason, "branch_rebase" | "session_rebind">,
 		notifyAuthorityChanging = true,
+		requestId?: string,
 	): void {
 		for (const subscriber of [...this.subscribers]) {
 			if (!subscriber.active || subscriber.fenced) continue;
@@ -1835,7 +1836,7 @@ export class ConversationProjectionFeed {
 				subscriber.attaching = true;
 				const subscriptionId = subscriber.subscriptionId;
 				const branchEpoch = this._branchEpoch;
-				const bootstrap = this.createBootstrap(subscriber, reason, 0, undefined, true);
+				const bootstrap = this.createBootstrap(subscriber, reason, 0, requestId, true);
 				const item = this.createQueueItem(subscriber, bootstrap, "checkpoint");
 				this.assertSubscriberGeneration(subscriber, subscriptionId, branchEpoch);
 				this.assertAuthorityCapacity(subscriber, item, "Generation bootstrap exceeds its authority slot");

@@ -2,6 +2,7 @@ import { type Component, Container, setKeybindings, Text, type TUI } from "@hans
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { ReviewWorkflowHooks, ReviewWorkflowOptions, ReviewWorkflowResult } from "../src/core/review.ts";
+import { ReviewWorkflowManager } from "../src/core/review-workflows.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
 
 const reviewMocks = vi.hoisted(() => ({
@@ -21,6 +22,7 @@ interface ReviewContext {
 		session: Record<string, unknown>;
 		services: { agentDir: string };
 		newSession: ReturnType<typeof vi.fn>;
+		reviewWorkflows: ReviewWorkflowManager;
 	};
 	ui: TUI;
 	editorContainer: Container;
@@ -68,6 +70,7 @@ function createContext(): ReviewContext {
 			session,
 			services: { agentDir: "/workspace/.volt" },
 			newSession: vi.fn(),
+			reviewWorkflows: new ReviewWorkflowManager(),
 		},
 		ui,
 		editorContainer,
@@ -197,6 +200,32 @@ describe("InteractiveMode review workflow", () => {
 		expect(context.editorContainer.children).toEqual([context.editor]);
 	});
 
+	it("dismisses review confirmation when the workflow signal is aborted", async () => {
+		const context = createContext();
+		const controller = new AbortController();
+		reviewMocks.runReviewWorkflow.mockImplementationOnce(async (options) => {
+			const hooks = await options.createHooks?.();
+			const confirmed = await options.confirm?.({
+				title: "Review changes",
+				message: "Confirm rerun",
+				resolution,
+				signal: controller.signal,
+			});
+			expect(confirmed).toBe(false);
+			hooks?.cleanup?.();
+			return { status: "cancelled", resolution };
+		});
+
+		const pending = run(context, true);
+		await vi.waitFor(() => expect(context.extensionSelector).toBeDefined());
+		controller.abort();
+		await pending;
+
+		expect(context.extensionSelector).toBeUndefined();
+		expect(context.editorContainer.children).toEqual([context.editor]);
+		expect(context.ui.setFocus).toHaveBeenLastCalledWith(context.editor);
+	});
+
 	it("Escape aborts preparation, restores the editor, and prevents promotion or inference", async () => {
 		const context = createContext();
 		let hooks: ReviewWorkflowHooks | undefined;
@@ -227,6 +256,16 @@ describe("InteractiveMode review workflow", () => {
 		expect(context.footer.setTransientUsage).toHaveBeenLastCalledWith(undefined);
 		expect(context.editorContainer.children).toEqual([context.editor]);
 		expect(context.ui.setFocus).toHaveBeenLastCalledWith(context.editor);
+	});
+
+	it("registers a TUI-started review with the runtime workflow manager", async () => {
+		const context = createContext();
+		reviewMocks.runReviewWorkflow.mockImplementationOnce(async (options) => {
+			expect(options.workflowManager).toBe(context.runtimeHost.reviewWorkflows);
+			return { status: "cancelled" };
+		});
+
+		await run(context);
 	});
 
 	it("rejects a duplicate local start while the first review is active", async () => {

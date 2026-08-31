@@ -232,6 +232,8 @@ import {
 	RpcSessionListItemSchema,
 	RpcSessionStateProjectionSchema,
 	RpcSessionStateSchema,
+	RpcSessionWorkContextSchema,
+	RpcSessionWorkPullRequestSchema,
 	RpcSubagentDefinitionSchema,
 	RpcSubagentDefinitionSourceSchema,
 	RpcSubagentSourceInfoSchema,
@@ -449,6 +451,8 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcSlashCommand: RpcSlashCommandSchema,
 
 	// Session state + transcript + subagents + host status
+	RpcSessionWorkPullRequest: RpcSessionWorkPullRequestSchema,
+	RpcSessionWorkContext: RpcSessionWorkContextSchema,
 	RpcSessionListItem: RpcSessionListItemSchema,
 	RpcActiveToolExecution: RpcActiveToolExecutionSchema,
 	RpcActiveAgentRun: RpcActiveAgentRunSchema,

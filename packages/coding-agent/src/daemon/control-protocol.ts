@@ -113,6 +113,19 @@ export type ControlRequest =
 	| { type: "lease_rekey_commit"; id: string; transactionId: string }
 	| { type: "lease_rekey_rollback"; id: string; transactionId: string }
 	| { type: "lease_rekey_dispose"; id: string; transactionId: string }
+	| {
+			type: "work_observe";
+			id: string;
+			workspaceName: string;
+			sessionId: string;
+			/** Path-free authoritative Git state from the exact TUI lease holder. */
+			gitContext: {
+				repository: string;
+				branch: string;
+				headOid: string;
+				baseRef?: string;
+			} | null;
+	  }
 	| ({ type: "pair_request"; id: string; workspaceName?: string } & ControlAccessSelection) // progress arrives as pairing_progress events
 	| { type: "pair_cancel"; id: string; requestId: string }
 	| { type: "clients_list"; id: string }
@@ -736,6 +749,36 @@ export function isControlRequest(value: unknown): value is ControlRequest {
 		case "lease_rekey_rollback":
 		case "lease_rekey_dispose":
 			return typeof value.transactionId === "string";
+		case "work_observe": {
+			if (
+				typeof value.workspaceName !== "string" ||
+				typeof value.sessionId !== "string" ||
+				value.workspaceName.length === 0 ||
+				value.workspaceName.length > 256 ||
+				value.sessionId.length === 0 ||
+				value.sessionId.length > 128
+			) {
+				return false;
+			}
+			if (value.gitContext === null) return true;
+			if (!isRecord(value.gitContext)) return false;
+			return (
+				typeof value.gitContext.repository === "string" &&
+				value.gitContext.repository.length > 0 &&
+				value.gitContext.repository.length <= 256 &&
+				!/[\0\r\n]/.test(value.gitContext.repository) &&
+				typeof value.gitContext.branch === "string" &&
+				value.gitContext.branch.length > 0 &&
+				value.gitContext.branch.length <= 1024 &&
+				!/[\0\r\n]/.test(value.gitContext.branch) &&
+				typeof value.gitContext.headOid === "string" &&
+				/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.gitContext.headOid) &&
+				(value.gitContext.baseRef === undefined ||
+					(typeof value.gitContext.baseRef === "string" &&
+						value.gitContext.baseRef.length <= 1024 &&
+						!/[\0\r\n]/.test(value.gitContext.baseRef)))
+			);
+		}
 		case "pair_cancel":
 			return typeof value.requestId === "string";
 		case "client_access_update":

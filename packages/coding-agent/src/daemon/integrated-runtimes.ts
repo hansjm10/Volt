@@ -56,6 +56,8 @@ export interface IntegratedRuntimeEntry {
 	readonly key: string;
 	clientNodeId: string;
 	workspaceName: string;
+	readonly workspaceGeneration?: number;
+	readonly projectTrusted: boolean;
 	readonly sessionId: string;
 	runtime: AgentSessionRuntime;
 	readonly lifecycle: "prepared" | "active" | "retiring" | "retired";
@@ -147,6 +149,10 @@ export interface IntegratedRuntimeRegistryOptions {
 	) => { commit(): void; rollback(): void };
 	/** Retire and await every stream/subscriber owner before low-level runtime disposal. */
 	beforeRuntimeStop?: (entry: IntegratedRuntimeEntry, reason: string) => Promise<void>;
+	/** Called exactly once after a newly-created runtime is published in the registry. */
+	onRuntimePublished?: (entry: IntegratedRuntimeEntry) => void;
+	/** Called after a published runtime's coordinator and registry key move atomically. */
+	onRuntimeSessionRekeyed?: (entry: IntegratedRuntimeEntry, previousSessionId: string, sessionId: string) => void;
 	onRuntimeDisposed?: (entry: IntegratedRuntimeEntry, reason: string) => void;
 }
 
@@ -581,6 +587,7 @@ export class IntegratedRuntimeRegistry {
 				options.signal,
 			);
 			const toolPolicy = this.resolveToolPolicy(authorization);
+			const projectTrusted = this.options.getProjectTrustedForWorkspace(authorization.workspace);
 			assertAttachAdmissionOpen(options.signal);
 			const runtimeOperation = (this.options.createRuntime ?? createIrohRemoteAgentRuntimeWithSessionSelection)({
 				agentDir: this.options.agentDir,
@@ -596,7 +603,7 @@ export class IntegratedRuntimeRegistry {
 				},
 				onSubagentRuntimeCreated: (event) => this.registerSubagentRuntime(event, authorization),
 				profile: this.options.profile,
-				projectTrusted: this.options.getProjectTrustedForWorkspace(authorization.workspace),
+				projectTrusted,
 			});
 			const runtimeResult = await waitForAttachAdmission(runtimeOperation, options.signal, async (lateResult) => {
 				await cleanupUncommittedRuntime(lateResult.runtime, lateResult.sessionSelection);
@@ -678,6 +685,10 @@ export class IntegratedRuntimeRegistry {
 			const entry = this.createEntryRecord({
 				clientNodeId: authorization.client.nodeId,
 				workspaceName: authorization.workspace.name,
+				...(authorization.workspaceGeneration === undefined
+					? {}
+					: { workspaceGeneration: authorization.workspaceGeneration }),
+				projectTrusted,
 				sessionId,
 				runtime: runtime!,
 				...(worktreePreparation === undefined ? {} : { worktreePreparation }),
@@ -712,6 +723,8 @@ export class IntegratedRuntimeRegistry {
 	private createEntryRecord(options: {
 		clientNodeId: string;
 		workspaceName: string;
+		workspaceGeneration?: number;
+		projectTrusted: boolean;
 		sessionId: string;
 		runtime: AgentSessionRuntime;
 		parentSessionId?: string;
@@ -731,6 +744,8 @@ export class IntegratedRuntimeRegistry {
 			},
 			clientNodeId: options.clientNodeId,
 			workspaceName: options.workspaceName,
+			...(options.workspaceGeneration === undefined ? {} : { workspaceGeneration: options.workspaceGeneration }),
+			projectTrusted: options.projectTrusted,
 			get sessionId() {
 				return coordinator.sessionId;
 			},
@@ -809,6 +824,10 @@ export class IntegratedRuntimeRegistry {
 		const entry = this.createEntryRecord({
 			clientNodeId: authorization.client.nodeId,
 			workspaceName,
+			...(parentEntry.workspaceGeneration === undefined
+				? {}
+				: { workspaceGeneration: parentEntry.workspaceGeneration }),
+			projectTrusted: parentEntry.projectTrusted,
 			sessionId: event.sessionId,
 			runtime: event.runtime,
 			parentSessionId: event.parentSessionId,
@@ -838,6 +857,7 @@ export class IntegratedRuntimeRegistry {
 				entry.coordinator.activateRuntime();
 				entry.coordinator.markDetached();
 				this.entries.set(entry.key, entry);
+				this.options.onRuntimePublished?.(entry);
 				this.scheduleRetention(entry, "subagent_created");
 				void this.logEntryAudit(entry, "remote_runtime_started", {
 					parentSessionId: event.parentSessionId,
@@ -948,6 +968,7 @@ export class IntegratedRuntimeRegistry {
 				throw this.createAttachRetryError(entry, "conversation runtime ownership changed during commit");
 			}
 			entry.coordinator.activateRuntime();
+			if (inserted) this.options.onRuntimePublished?.(entry);
 			const namedCreation = this.namedSessionCreations.get(entry.key);
 			if (namedCreation?.entry === entry) {
 				this.namedSessionCreations.delete(entry.key);
@@ -1431,6 +1452,7 @@ export class IntegratedRuntimeRegistry {
 				}
 				phase = "finalized";
 				clearReservation();
+				this.options.onRuntimeSessionRekeyed?.(entry, target.previousSessionId, target.sessionId);
 				await this.logEntryAudit(entry, "remote_runtime_session_changed", {
 					previousSessionId: target.previousSessionId,
 					sessionId: target.sessionId,
@@ -1590,6 +1612,7 @@ export class IntegratedRuntimeRegistry {
 		if (entry.worktreeId !== undefined && this.options.bindWorktreeSession) {
 			await this.options.bindWorktreeSession(entry.workspaceName, entry.worktreeId, nextSessionId);
 		}
+		this.options.onRuntimeSessionRekeyed?.(entry, previousSessionId, nextSessionId);
 		await this.logEntryAudit(entry, "remote_runtime_session_changed", {
 			previousSessionId,
 			sessionId: nextSessionId,

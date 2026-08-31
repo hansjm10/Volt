@@ -58,6 +58,7 @@ import {
 	ReviewCoverageTracker,
 	reviewSnapshotToolGuidelines,
 } from "./review-tools.ts";
+import type { ReviewWorkflowManager } from "./review-workflows.ts";
 import { createAgentSession } from "./sdk.ts";
 import { SessionManager } from "./session-manager.ts";
 import type { SessionUsageProjection, SessionUsageTotals } from "./session-usage.ts";
@@ -890,10 +891,17 @@ export interface ReviewWorkflowOptions {
 	tools?: readonly string[];
 	requireProjectTrust?: boolean;
 	requireConfirmation?: boolean;
-	confirm?: (request: { title: string; message: string; resolution: ResolvedReview }) => Promise<boolean>;
+	confirm?: (request: {
+		title: string;
+		message: string;
+		resolution: ResolvedReview;
+		signal?: AbortSignal;
+	}) => Promise<boolean>;
 	createHooks?: () => Promise<ReviewWorkflowHooks> | ReviewWorkflowHooks;
 	onReviewModelWarning?: (message: string) => void;
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
+	/** Runtime-scoped registry used to expose a local TUI review to attached RPC clients. */
+	workflowManager?: ReviewWorkflowManager;
 }
 
 export type ReviewWorkflowResult =
@@ -911,6 +919,8 @@ export interface PrepareReviewWorkflowOptions {
 	target: ReviewTarget;
 	controls?: Partial<ReviewRunControls>;
 	parentRunId?: string;
+	workflowId?: string;
+	startedAt?: number;
 	cwd: string;
 	settingsManager: SettingsManager;
 	modelRegistry: ModelRegistry;
@@ -1041,6 +1051,18 @@ function createReviewWorkflowId(): string {
 	return `review:${randomUUID()}`;
 }
 
+function provisionalReviewWorkflowTarget(target: ReviewTarget): { description: string; diffCommand: string } {
+	const description =
+		target.kind === "uncommitted"
+			? "Preparing uncommitted review"
+			: target.kind === "branch"
+				? "Preparing branch review"
+				: target.kind === "pr"
+					? "Preparing pull request review"
+					: "Preparing commit review";
+	return { description, diffCommand: "Snapshot resolution pending." };
+}
+
 class ReviewPreparationCancelledError extends Error {
 	constructor() {
 		super("Review preparation was cancelled.");
@@ -1079,14 +1101,14 @@ export async function prepareReviewWorkflow(options: PrepareReviewWorkflowOption
 			discoveryModel: reviewModel.model,
 		});
 		return {
-			workflowId: createReviewWorkflowId(),
+			workflowId: options.workflowId ?? createReviewWorkflowId(),
 			action: reviewActionIdForTarget(options.target),
 			target: options.target,
 			controls,
 			resolution,
 			model: reviewModel.model,
 			verifierModel: verifier.model,
-			startedAt: Date.now(),
+			startedAt: options.startedAt ?? Date.now(),
 			incrementalPlan: planIncrementalReview(
 				options.sessionManager,
 				resolution,
@@ -1691,35 +1713,198 @@ export function createReviewSeedMessage(
 	};
 }
 
+async function promoteCompletedReview(
+	options: ReviewWorkflowOptions,
+	resolution: ResolvedReview,
+	result: Extract<ExecuteReviewWorkflowResult, { status: "completed" }>,
+): Promise<Extract<ReviewWorkflowResult, { status: "completed" }>> {
+	const runRecord = result.record;
+	if (!runRecord) throw new Error("Review completed without a durable run record.");
+	const reviewMessage = createReviewSeedMessage(resolution, result);
+	const fastModeEnabled = options.session.fastModeEnabled === true;
+	const newSessionResult = await options.newSession({
+		setup: async (sessionManager) => {
+			if (fastModeEnabled) sessionManager.appendFastModeChange(true);
+			appendReviewRun(sessionManager, runRecord);
+		},
+		withSession: async (context: ReplacedSessionContext) => {
+			await context.sendMessage(reviewMessage);
+		},
+	});
+	if (newSessionResult.cancelled) await options.session.sendCustomMessage(reviewMessage);
+	else if (!newSessionResult.seeded)
+		throw new Error("Review completed, but seeding verified findings was skipped in the replacement session.");
+	return {
+		status: "completed",
+		resolution,
+		findingsCount: result.findingsCount,
+		completionStatus: result.completionStatus,
+		sessionSwitchCancelled: newSessionResult.cancelled,
+	};
+}
+
+type ReviewAdmissionStepResult<T> = { status: "completed"; value: T } | { status: "cancelled" };
+
+async function awaitReviewAdmissionStep<T>(
+	signal: AbortSignal | undefined,
+	operation: () => Promise<T> | T,
+): Promise<ReviewAdmissionStepResult<T>> {
+	if (signal?.aborted) return { status: "cancelled" };
+	if (!signal) return { status: "completed", value: await operation() };
+	const activeSignal = signal;
+	return await new Promise<ReviewAdmissionStepResult<T>>((resolve, reject) => {
+		let settled = false;
+		function settle(callback: () => void): void {
+			if (settled) return;
+			settled = true;
+			activeSignal.removeEventListener("abort", onAbort);
+			callback();
+		}
+		function onAbort(): void {
+			settle(() => resolve({ status: "cancelled" }));
+		}
+		activeSignal.addEventListener("abort", onAbort, { once: true });
+		if (activeSignal.aborted) {
+			onAbort();
+			return;
+		}
+		try {
+			void Promise.resolve(operation()).then(
+				(value) => settle(() => resolve({ status: "completed", value })),
+				(error: unknown) => settle(() => reject(error)),
+			);
+		} catch (error) {
+			settle(() => reject(error));
+		}
+	});
+}
+
 export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise<ReviewWorkflowResult> {
 	assertReviewCanStart(options.session);
 	let hooks: ReviewWorkflowHooks | undefined;
 	let prepared: PreparedReviewWorkflow | undefined;
+	let registeredWorkflow: ReturnType<ReviewWorkflowManager["start"]> | undefined;
+	let detachRegisteredForwarder: (() => void) | undefined;
+	let cancelRegisteredFromLocalUi: (() => void) | undefined;
+	let managedExecutionResult: ExecuteReviewWorkflowResult | undefined;
+	type ManagedReviewAdmission = "execute" | "cancelled" | "failed";
+	let resolveManagedAdmission: ((admission: ManagedReviewAdmission) => void) | undefined;
+	let managedAdmissionSettled = false;
+	const settleManagedAdmission = (admission: ManagedReviewAdmission): void => {
+		if (!resolveManagedAdmission || managedAdmissionSettled) return;
+		managedAdmissionSettled = true;
+		resolveManagedAdmission(admission);
+	};
+	const settleRegisteredFailure = async (): Promise<void> => {
+		if (!registeredWorkflow || !options.workflowManager) return;
+		if (options.workflowManager.get(registeredWorkflow.descriptor.workflowId)?.status !== "running") return;
+		settleManagedAdmission("failed");
+		await registeredWorkflow.finished;
+	};
 	try {
 		hooks = await options.createHooks?.();
 		if (hooks?.signal?.aborted) return { status: "cancelled" };
+		if (options.workflowManager) {
+			const workflowId = createReviewWorkflowId();
+			const action = reviewActionIdForTarget(options.target);
+			const startedAt = Date.now();
+			const managedAdmission = new Promise<ManagedReviewAdmission>((resolve) => {
+				resolveManagedAdmission = resolve;
+			});
+			registeredWorkflow = options.workflowManager.start({
+				provisional: true,
+				prepared: {
+					workflowId,
+					action,
+					startedAt,
+					resolution: provisionalReviewWorkflowTarget(options.target),
+				},
+				fastModeEnabled: options.session.fastModeEnabled,
+				execute: async (managedHooks) => {
+					const admission = await managedAdmission;
+					if (admission === "cancelled") return { status: "cancelled" };
+					const executable = prepared;
+					if (admission === "failed" || !executable) {
+						return { status: "failed", errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE };
+					}
+					managedExecutionResult = await executeReviewWorkflow({
+						prepared: executable,
+						cwd: options.cwd,
+						agentDir: options.agentDir,
+						authStorage: options.authStorage,
+						modelRegistry: options.session.modelRegistry,
+						settingsManager: options.settingsManager,
+						sessionManager: options.session.sessionManager,
+						thinkingLevel: options.session.thinkingLevel,
+						fastModeEnabled: options.session.fastModeEnabled,
+						parentResourceLoader: options.session.resourceLoader,
+						tools: options.tools,
+						signal: managedHooks.signal,
+						onProgress: hooks?.onProgress,
+						onSessionEvent: hooks?.onSessionEvent,
+						onUsage: hooks?.onUsage,
+						onEvent: managedHooks.onEvent,
+					});
+					return managedExecutionResult.status === "failed"
+						? { status: "failed", errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE }
+						: managedExecutionResult;
+				},
+			});
+			detachRegisteredForwarder = options.workflowManager.attachSink((event) => {
+				if (event.workflowId !== workflowId) return;
+				options.onEvent?.(event);
+				hooks?.onEvent?.(event);
+			});
+			cancelRegisteredFromLocalUi = (): void => {
+				if (options.workflowManager?.get(workflowId)?.status !== "running") return;
+				options.workflowManager.cancel(workflowId);
+			};
+			hooks?.signal?.addEventListener("abort", cancelRegisteredFromLocalUi, { once: true });
+			if (hooks?.signal?.aborted) cancelRegisteredFromLocalUi();
+			registeredWorkflow.launch();
+		}
 		try {
 			prepared = await prepareReviewWorkflow({
 				target: options.target,
 				controls: options.controls,
 				...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
+				...(registeredWorkflow
+					? {
+							workflowId: registeredWorkflow.descriptor.workflowId,
+							startedAt: registeredWorkflow.descriptor.startedAt,
+						}
+					: {}),
 				cwd: options.cwd,
 				settingsManager: options.settingsManager,
 				modelRegistry: options.session.modelRegistry,
 				currentModel: options.session.model,
 				sessionManager: options.session.sessionManager,
 				requireProjectTrust: options.requireProjectTrust,
-				signal: hooks?.signal,
+				signal: registeredWorkflow?.signal ?? hooks?.signal,
 				onProgress: hooks?.onProgress,
 			});
 		} catch (error) {
-			if (error instanceof ReviewPreparationCancelledError || hooks?.signal?.aborted) {
+			if (
+				error instanceof ReviewPreparationCancelledError ||
+				registeredWorkflow?.signal.aborted ||
+				hooks?.signal?.aborted
+			) {
+				if (
+					registeredWorkflow &&
+					options.workflowManager?.get(registeredWorkflow.descriptor.workflowId)?.status === "running"
+				) {
+					options.workflowManager.cancel(registeredWorkflow.descriptor.workflowId);
+				}
+				settleManagedAdmission("cancelled");
+				if (registeredWorkflow) await registeredWorkflow.finished;
 				return { status: "cancelled" };
 			}
 			throw error;
 		}
+		registeredWorkflow?.updatePrepared(prepared);
 
-		const { resolution, workflowId, action, startedAt, controls, incrementalPlan } = prepared;
+		const { resolution, workflowId, action, startedAt, controls, incrementalPlan, model } = prepared;
+		const admissionSignal = registeredWorkflow?.signal ?? hooks?.signal;
 		const persistPreparedCancellation = async (): Promise<ReviewWorkflowResult> => {
 			const record = createReviewRunRecord({
 				workflowId,
@@ -1731,26 +1916,41 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 				incrementalPlan,
 			});
 			if (options.session.sessionManager) await appendReviewRunDurably(options.session.sessionManager, record);
+			if (
+				registeredWorkflow &&
+				options.workflowManager?.get(registeredWorkflow.descriptor.workflowId)?.status === "running"
+			) {
+				options.workflowManager.cancel(registeredWorkflow.descriptor.workflowId);
+			}
+			settleManagedAdmission("cancelled");
+			if (registeredWorkflow) await registeredWorkflow.finished;
 			return { status: "cancelled", resolution };
 		};
 
-		if (hooks?.signal?.aborted) return await persistPreparedCancellation();
+		if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();
 		if (options.requireConfirmation) {
-			const confirmed = await options.confirm?.({
-				title: "Review changes",
-				message: createReviewConfirmationMessage(resolution),
-				resolution,
-			});
-			if (!confirmed) return await persistPreparedCancellation();
+			const confirmation = await awaitReviewAdmissionStep(admissionSignal, () =>
+				options.confirm?.({
+					title: "Review changes",
+					message: createReviewConfirmationMessage(resolution),
+					resolution,
+					...(admissionSignal ? { signal: admissionSignal } : {}),
+				}),
+			);
+			if (confirmation.status === "cancelled" || !confirmation.value) return await persistPreparedCancellation();
 		}
+		if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();
 		if (prepared.modelWarning) options.onReviewModelWarning?.(prepared.modelWarning);
 		if (prepared.verifierModelWarning) options.onReviewModelWarning?.(prepared.verifierModelWarning);
 		try {
 			assertReviewCanStart(options.session);
-			await hooks?.onPrepared?.(resolution, prepared.model);
-			if (hooks?.signal?.aborted) return await persistPreparedCancellation();
+			const preparation = await awaitReviewAdmissionStep(admissionSignal, () =>
+				hooks?.onPrepared?.(resolution, model),
+			);
+			if (preparation.status === "cancelled") return await persistPreparedCancellation();
+			if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();
 		} catch (error) {
-			if (hooks?.signal?.aborted) return await persistPreparedCancellation();
+			if (registeredWorkflow?.signal.aborted || hooks?.signal?.aborted) return await persistPreparedCancellation();
 			const record = createReviewRunRecord({
 				workflowId,
 				workflowAction: action,
@@ -1767,6 +1967,23 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 			});
 			if (options.session.sessionManager) await appendReviewRunDurably(options.session.sessionManager, record);
 			throw error;
+		}
+
+		if (registeredWorkflow) {
+			settleManagedAdmission("execute");
+			const terminalRecord = await registeredWorkflow.finished;
+			if (terminalRecord.status === "cancelled") return { status: "cancelled", resolution };
+			if (terminalRecord.status === "failed") {
+				const message =
+					managedExecutionResult?.status === "failed"
+						? managedExecutionResult.errorMessage
+						: terminalRecord.errorMessage;
+				throw new Error(`Review failed: ${message ?? REMOTE_REVIEW_FAILURE_MESSAGE}`);
+			}
+			if (managedExecutionResult?.status !== "completed") {
+				throw new Error("Review completed without a structured execution result.");
+			}
+			return await promoteCompletedReview(options, resolution, managedExecutionResult);
 		}
 
 		const emit = (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent): void => {
@@ -1825,41 +2042,19 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 				});
 				throw new Error(`Review failed: ${result.errorMessage}`);
 			}
-			const runRecord = result.record;
-			if (!runRecord) throw new Error("Review completed without a durable run record.");
-			const reviewMessage = createReviewSeedMessage(resolution, result);
-			const fastModeEnabled = options.session.fastModeEnabled === true;
-			const newSessionResult = await options.newSession({
-				setup: async (sessionManager) => {
-					if (fastModeEnabled) sessionManager.appendFastModeChange(true);
-					appendReviewRun(sessionManager, runRecord);
-				},
-				withSession: async (context: ReplacedSessionContext) => {
-					await context.sendMessage(reviewMessage);
-				},
-			});
-			if (newSessionResult.cancelled) await options.session.sendCustomMessage(reviewMessage);
-			else if (!newSessionResult.seeded)
-				throw new Error("Review completed, but seeding verified findings was skipped in the replacement session.");
-			const completed = {
-				status: "completed" as const,
-				resolution,
-				findingsCount: result.findingsCount,
-				completionStatus: result.completionStatus,
-				sessionSwitchCancelled: newSessionResult.cancelled,
-			};
+			const completed = await promoteCompletedReview(options, resolution, result);
 			terminal({
 				type: "workflow_end",
 				workflowId,
 				kind: "review",
 				action,
 				title: "Review",
-				message: newSessionResult.cancelled
+				message: completed.sessionSwitchCancelled
 					? `${formatReviewWorkflowSummary(completed)} Findings were added to the current session.`
 					: `${formatReviewWorkflowSummary(completed)} Opening review session.`,
 				status: "completed",
 				startedAt: prepared.startedAt,
-				endedAt: runRecord.endedAt,
+				endedAt: result.record?.endedAt ?? Date.now(),
 			});
 			return completed;
 		} catch (error) {
@@ -1877,7 +2072,14 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 				});
 			throw error;
 		}
+	} catch (error) {
+		await settleRegisteredFailure();
+		throw error;
 	} finally {
+		if (cancelRegisteredFromLocalUi) {
+			hooks?.signal?.removeEventListener("abort", cancelRegisteredFromLocalUi);
+		}
+		detachRegisteredForwarder?.();
 		try {
 			hooks?.cleanup?.();
 		} finally {

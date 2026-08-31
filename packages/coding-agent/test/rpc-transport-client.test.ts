@@ -2505,6 +2505,7 @@ function createRuntimeHost(
 			sessionManager: {
 				flush: vi.fn(async () => {}),
 				getCwd: vi.fn(() => resources.cwd ?? tmpdir()),
+				getStartingGitContext: vi.fn(() => undefined),
 			},
 			promptTemplates: resources.prompts ?? [],
 			modelRegistry,

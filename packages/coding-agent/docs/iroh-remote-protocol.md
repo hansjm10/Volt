@@ -180,7 +180,7 @@ Subsequent semantic changes arrive as ordered full replacements:
 {"type":"git_context_changed","gitContext":{"repository":"volt","head":{"kind":"branch","name":"main","oid":"0123456789abcdef0123456789abcdef01234567"},"upstream":null,"base":null,"status":{"staged":{"added":0,"modified":0,"deleted":0,"renamed":0},"unstaged":{"added":0,"modified":1,"deleted":0,"renamed":0},"untracked":0,"conflicted":0,"total":1,"clean":false},"operation":null,"revision":2,"observedAt":"2026-07-29T17:00:00.000Z","stale":false},"delivery":{"subscriptionId":"sub-1","cursor":42}}
 ```
 
-`gitContext` can be `null` for a non-Git cwd. A bootstrap/checkpoint replaces the entire value and resets the client-side provider-revision baseline; after that, clients apply `git_context_changed` in `delivery.cursor` order. Provider revisions are local to one runtime and must not be compared across session rebinds. Git context is conversation-scoped session state, not handshake or host identity data: it is deliberately absent from `remoteHost`, tickets, workspace discovery metadata, persisted session JSONL, model context, and extension prompts.
+`gitContext` can be `null` for a non-Git cwd. A bootstrap/checkpoint replaces the entire value and resets the client-side provider-revision baseline; after that, clients apply `git_context_changed` in `delivery.cursor` order. Provider revisions are local to one runtime and must not be compared across session rebinds. Live Git context is conversation-scoped session state, not handshake or host identity data, and is absent from `remoteHost`, tickets, and workspace discovery metadata. A current-format session may separately expose optional `startingGitContext`: the first definitive path-free observation persisted in a strictly validated host-only JSONL entry. It never enters model context, transcript projection, or extension prompts.
 
 `get_state` responses for Iroh sessions include remote host metadata with the current workspace, the available workspace names, and the availability of every registered workspace visible to the saved host:
 
@@ -270,6 +270,21 @@ Conversation streams reject `new_session`, `switch_session_by_id`, and raw `get_
 Conversation streams on `worktrees.v1` hosts also accept `create_worktree` and `list_worktrees` (same shapes and validation as the `manage_worktrees` stream, scoped to the stream-bound workspace), so a client can create a worktree and open a new isolated conversation without a separate management stream. `remove_worktree` remains management-stream-only. Hosts without a daemon backend answer both with `unsupported_remote_command`.
 
 `list_sessions` entries include an optional `worktreeId` when the session is bound to a daemon-managed worktree, so clients can badge worktree sessions without a `list_worktrees` join. Entries also include optional `workingDirectory` when the session cwd is below the workspace/worktree root. Worktree attribution may be absent while a desktop TUI owns the conversation lease.
+
+An entry may also include daemon-owned `workContext`:
+
+```json
+{"changeId":"c56d55ca-3937-4fc8-b13a-a7525577864b","repository":"Volt","branch":"feature/work-association","resolutionState":"resolved","pullRequest":{"provider":"github","number":42,"title":"Add Work association","status":"open","stale":false}}
+```
+
+`resolutionState` is `resolved`, `none`, `ambiguous`, or `unavailable`.
+`pullRequest` is required only for `resolved`; its status is `open`, `draft`,
+`merged`, or `closed`. The daemon joins this value synchronously from private
+bounded state. Listing never invokes Git or a provider. The wire omits checkout
+paths, remotes, canonical repository identities, matched object IDs,
+credentials, raw provider output, and diagnostics. Default/configured base
+branches are not grouped across sessions, and an exact positive PR association
+is sticky rather than silently moving to a newer match.
 
 On hosts advertising `session_runtime_state.v1`, an entry may also include `runtimeState` with one of `tui-owned`, `daemon-active`, `daemon-detached`, or `daemon-draining`. The field is omitted when the session has no live lease/runtime. `tui-owned` means a desktop TUI process currently owns the conversation. `daemon-active` means a daemon runtime has at least one attached phone stream. `daemon-detached` means the daemon still retains the runtime with no attached streams and may represent idle warm retention rather than active work. `daemon-draining` means the daemon runtime is handing ownership to a TUI. Clients should therefore use the exact state, not mere field presence, when deciding which hidden sessions to auto-connect.
 

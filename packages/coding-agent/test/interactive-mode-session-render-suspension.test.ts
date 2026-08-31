@@ -11,6 +11,7 @@ type SessionReplacementContext = {
 	sessionRenderSuspension: RenderSuspensionLease | undefined;
 	dismissSubagentInspector?: () => void;
 	resetExtensionUI(): void;
+	bindDaemonWorkObservation(session: AgentSession): void;
 	rebindCurrentSession(session: AgentSession): Promise<void>;
 };
 
@@ -42,6 +43,7 @@ describe("InteractiveMode session replacement rendering", () => {
 			sessionRenderSuspension: undefined,
 			dismissSubagentInspector: vi.fn(() => order.push("dismiss")),
 			resetExtensionUI: vi.fn(() => order.push("reset")),
+			bindDaemonWorkObservation: vi.fn(() => order.push("bind-work")),
 			rebindCurrentSession: vi.fn(async () => {
 				order.push("rebind");
 				await rebindPending;
@@ -54,13 +56,14 @@ describe("InteractiveMode session replacement rendering", () => {
 
 		const replacement = interactiveModePrototype.rebindReplacementSession.call(context, replacementSession);
 		await Promise.resolve();
-		expect(order).toEqual(["suspend", "dismiss", "reset", "rebind"]);
+		expect(order).toEqual(["suspend", "dismiss", "reset", "bind-work", "rebind"]);
 
 		finishRebind();
 		await replacement;
 
+		expect(context.bindDaemonWorkObservation).toHaveBeenCalledWith(replacementSession);
 		expect(context.rebindCurrentSession).toHaveBeenCalledWith(replacementSession);
-		expect(order).toEqual(["suspend", "dismiss", "reset", "rebind", "render:true", "release"]);
+		expect(order).toEqual(["suspend", "dismiss", "reset", "bind-work", "rebind", "render:true", "release"]);
 		expect(context.sessionRenderSuspension).toBeUndefined();
 	});
 
@@ -74,6 +77,7 @@ describe("InteractiveMode session replacement rendering", () => {
 			},
 			sessionRenderSuspension: suspension,
 			resetExtensionUI: vi.fn(),
+			bindDaemonWorkObservation: vi.fn(),
 			rebindCurrentSession: vi.fn(async () => {
 				throw rebindError;
 			}),
@@ -83,6 +87,7 @@ describe("InteractiveMode session replacement rendering", () => {
 			rebindError,
 		);
 
+		expect(context.bindDaemonWorkObservation).toHaveBeenCalledOnce();
 		expect(context.ui.requestRender).not.toHaveBeenCalled();
 		expect(suspension.release).not.toHaveBeenCalled();
 		expect(context.sessionRenderSuspension).toBe(suspension);

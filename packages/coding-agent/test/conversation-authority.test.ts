@@ -222,7 +222,7 @@ describe("conversation mutation authority", () => {
 				replacedListeners.add(listener);
 				return () => replacedListeners.delete(listener);
 			},
-			newSession: vi.fn(async () => {
+			newSession: vi.fn(async (options?: { rebindRequestId?: string }) => {
 				await replacementGate;
 				const feed = (runtime as { conversationProjectionFeed?: ConversationProjectionFeed })
 					.conversationProjectionFeed;
@@ -230,7 +230,7 @@ describe("conversation mutation authority", () => {
 				feed.beginSourceRebind(sourceFor(newSession));
 				currentSession = newSession;
 				for (const listener of willProjectListeners) await listener(newSession as unknown as AgentSession);
-				feed.commitSourceRebind();
+				feed.commitSourceRebind(options?.rebindRequestId);
 				for (const listener of replacedListeners) await listener(newSession as unknown as AgentSession);
 				return { cancelled: false };
 			}),
@@ -268,6 +268,17 @@ describe("conversation mutation authority", () => {
 		releaseReplacement();
 
 		await vi.waitFor(() => {
+			const initiatingFrames = parseWrittenObjects(modeB.send);
+			const initiatingBootstrapIndex = initiatingFrames.findIndex(
+				(frame) =>
+					frame.type === "conversation_bootstrap" &&
+					frame.reason === "session_rebind" &&
+					frame.requestId === "rebind",
+			);
+			const initiatingResponseIndex = initiatingFrames.findIndex((frame) => frame.id === "rebind");
+			expect(initiatingBootstrapIndex).toBeGreaterThanOrEqual(0);
+			expect(initiatingResponseIndex).toBeGreaterThan(initiatingBootstrapIndex);
+
 			const frames = parseWrittenObjects(modeA.send);
 			const replacementBootstrapIndex = frames.findIndex(
 				(frame) => frame.type === "conversation_bootstrap" && frame.reason === "session_rebind",

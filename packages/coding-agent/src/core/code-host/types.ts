@@ -109,6 +109,59 @@ export interface CodeHostPullRequestSummary {
 	title: string;
 }
 
+/** Host-only normalized repository identity. Never project canonicalId to clients. */
+export interface CanonicalCodeHostRepository {
+	providerId: string;
+	host: string;
+	owner: string;
+	name: string;
+	canonicalId: string;
+}
+
+export type CodeHostPullRequestStatus = "open" | "draft" | "merged" | "closed";
+
+/** Bounded exact match retained by daemon Work association state. */
+export interface CodeHostPullRequestAssociation {
+	providerId: string;
+	repository: CanonicalCodeHostRepository;
+	headRepository: CanonicalCodeHostRepository;
+	number: number;
+	title: string;
+	status: CodeHostPullRequestStatus;
+	headBranch: string;
+	matchedHeadOid: string;
+}
+
+export type CodeHostPullRequestDiscoveryUnavailableReason =
+	| "unsupported_repository"
+	| "repository_ambiguous"
+	| "not_authenticated"
+	| "rate_limited"
+	| "network"
+	| "timeout"
+	| "output_limited"
+	| "invalid_response"
+	| "provider_error"
+	| "cancelled";
+
+export type CodeHostPullRequestDiscoveryOutcome =
+	| { state: "resolved"; pullRequest: CodeHostPullRequestAssociation }
+	| { state: "none" }
+	| { state: "ambiguous" }
+	| { state: "unavailable"; reason: CodeHostPullRequestDiscoveryUnavailableReason };
+
+export interface CodeHostPullRequestDiscoveryRequest {
+	cwd: string;
+	branch: string;
+	headOid: string;
+	signal?: AbortSignal;
+}
+
+export interface CodeHostPullRequestDiscoveryProvider {
+	readonly id: string;
+	discoverPullRequest(request: CodeHostPullRequestDiscoveryRequest): Promise<CodeHostPullRequestDiscoveryOutcome>;
+}
+
 export interface PullRequestFetchRef {
 	remoteRef: string;
 	localRef: string;
