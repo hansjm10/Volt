@@ -10,7 +10,13 @@ import type {
 } from "../src/core/code-host/types.ts";
 import { isExactTuiWorkObservationLeaseHolder } from "../src/daemon/iroh-service.ts";
 import { WorkAssociationService } from "../src/daemon/work-association.ts";
-import { parseWorkState, WORK_STATE_MAX_REPOSITORIES, WorkStateStore } from "../src/daemon/work-state.ts";
+import {
+	parseWorkState,
+	WORK_STATE_MAX_BYTES,
+	WORK_STATE_MAX_REPOSITORIES,
+	type WorkBindingMutationResult,
+	WorkStateStore,
+} from "../src/daemon/work-state.ts";
 
 const OID_A = "0123456789abcdef0123456789abcdef01234567";
 const OID_B = "abcdef0123456789abcdef0123456789abcdef01";
@@ -192,6 +198,125 @@ describe("WorkStateStore", () => {
 		).toThrow(/invalid|unsupported/i);
 		now++;
 		await store.close();
+	});
+
+	it("trims by serialized bytes while retaining the successful mutation", async () => {
+		const path = statePath("work-state-byte-trim");
+		let persisted = "";
+		const store = new WorkStateStore({
+			path,
+			writeStateFile: async (_path, content) => {
+				persisted = content;
+			},
+		});
+		await store.load();
+		const workspaceName = "\u0001界".repeat(128);
+		const repositoryDisplayName = "界\u0001".repeat(128);
+		const boundedUniqueValue = (maximum: number, index: number): string => {
+			const suffix = `-${index}`;
+			return `${"\u0001界".repeat(maximum).slice(0, maximum - suffix.length)}${suffix}`;
+		};
+		let oldestSessionId = "";
+		let latestSessionId = "";
+		let latestChangeId = "";
+		let latestRepositoryId = "";
+		let latestResult: WorkBindingMutationResult | undefined;
+		let evictionObserved = false;
+
+		for (let index = 0; index < 1000; index++) {
+			latestSessionId = boundedUniqueValue(128, index);
+			const result = await store.bindObservation({
+				workspaceName,
+				workspaceGeneration: 1,
+				sessionId: latestSessionId,
+				commonGitDir: "/workspace/volt/.git",
+				repositoryDisplayName,
+				branch: boundedUniqueValue(1024, index),
+				headOid: OID_A,
+				baseBranch: false,
+				now: 1,
+			});
+			if (index === 0) oldestSessionId = latestSessionId;
+			latestChangeId = result.change.id;
+			latestRepositoryId = result.repository.id;
+			latestResult = result;
+			const parsed = parseWorkState(JSON.parse(persisted) as unknown);
+			if (!parsed.bindings.some((binding) => binding.sessionId === oldestSessionId)) {
+				evictionObserved = true;
+				break;
+			}
+		}
+
+		expect(evictionObserved).toBe(true);
+		expect(Buffer.byteLength(persisted, "utf8")).toBeLessThanOrEqual(WORK_STATE_MAX_BYTES);
+		const persistedState = parseWorkState(JSON.parse(persisted) as unknown);
+		const latestBinding = persistedState.bindings.find((binding) => binding.sessionId === latestSessionId);
+		expect(latestBinding).toMatchObject({
+			changeId: latestChangeId,
+			repositoryId: latestRepositoryId,
+			observedRepositoryId: latestRepositoryId,
+		});
+		expect(persistedState.changes.some((change) => change.id === latestChangeId)).toBe(true);
+		expect(persistedState.repositories.some((repository) => repository.id === latestRepositoryId)).toBe(true);
+		if (!latestResult) throw new Error("expected a retained Work mutation result");
+
+		expect(
+			await store.applyDiscovery(
+				latestResult.fence,
+				{
+					state: "resolved",
+					pullRequest: {
+						provider: "github",
+						number: 42,
+						title: "\u0001界".repeat(256),
+						status: "open",
+						matchedHeadOid: OID_A,
+					},
+				},
+				{ now: 1, nextRefreshAt: 2, refreshSucceeded: true },
+			),
+		).toBe(true);
+		const crossRepository = await store.bindObservation({
+			workspaceName,
+			workspaceGeneration: 1,
+			sessionId: latestSessionId,
+			commonGitDir: "/workspace/other/.git",
+			repositoryDisplayName,
+			branch: boundedUniqueValue(1024, 1001),
+			headOid: OID_B,
+			baseBranch: false,
+			now: 1,
+		});
+		expect(crossRepository.binding.repositoryId).toBe(latestRepositoryId);
+		expect(crossRepository.binding.observedRepositoryId).toBe(crossRepository.repository.id);
+		expect(crossRepository.repository.id).not.toBe(latestRepositoryId);
+
+		const inheritedSessionId = boundedUniqueValue(128, 1002);
+		expect(
+			await store.inheritSessionBinding({
+				workspaceName,
+				workspaceGeneration: 1,
+				sourceSessionId: latestSessionId,
+				targetSessionId: inheritedSessionId,
+				now: 1,
+			}),
+		).toBe(true);
+		const finalState = parseWorkState(JSON.parse(persisted) as unknown);
+		expect(finalState.bindings.find((binding) => binding.sessionId === inheritedSessionId)).toMatchObject({
+			changeId: latestChangeId,
+			repositoryId: latestRepositoryId,
+			observedRepositoryId: crossRepository.repository.id,
+		});
+		expect(finalState.repositories.some((repository) => repository.id === latestRepositoryId)).toBe(true);
+		expect(finalState.repositories.some((repository) => repository.id === crossRepository.repository.id)).toBe(true);
+		expect(Buffer.byteLength(persisted, "utf8")).toBeLessThanOrEqual(WORK_STATE_MAX_BYTES);
+
+		writeFileSync(path, persisted, { mode: 0o600 });
+		await store.close();
+		const reopened = new WorkStateStore({ path });
+		await reopened.load();
+		expect(reopened.getBinding(workspaceName, 1, inheritedSessionId)).toMatchObject({ changeId: latestChangeId });
+		await reopened.close();
 	});
 
 	it("shares feature changes, isolates base branches, and rebinds unresolved branch moves", async () => {

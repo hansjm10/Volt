@@ -386,17 +386,57 @@ function cloneRecord<T>(value: T): T {
 	return structuredClone(value);
 }
 
-function trimState(state: WorkStateFileV1): void {
-	state.bindings.sort((left, right) => right.updatedAt - left.updatedAt);
+function serializeWorkState(state: WorkStateFileV1): string {
+	return `${JSON.stringify(state, null, 2)}\n`;
+}
+
+function serializedWorkStateBytes(state: WorkStateFileV1): number {
+	return Buffer.byteLength(serializeWorkState(state), "utf8");
+}
+
+function oldestRecordIndex<T extends { updatedAt: number }>(
+	records: readonly T[],
+	isEligible: (record: T) => boolean,
+): number {
+	let oldestIndex = -1;
+	for (let index = 0; index < records.length; index++) {
+		if (
+			isEligible(records[index]!) &&
+			(oldestIndex === -1 || records[index]!.updatedAt <= records[oldestIndex]!.updatedAt)
+		) {
+			oldestIndex = index;
+		}
+	}
+	return oldestIndex;
+}
+
+function trimState(state: WorkStateFileV1, protectedBindingKey: string): void {
+	const isProtectedBinding = (binding: WorkSessionBindingRecord): boolean =>
+		bindingKey(binding.workspaceName, binding.workspaceGeneration, binding.sessionId) === protectedBindingKey;
+	state.bindings.sort(
+		(left, right) =>
+			Number(isProtectedBinding(right)) - Number(isProtectedBinding(left)) || right.updatedAt - left.updatedAt,
+	);
 	state.bindings.splice(WORK_STATE_MAX_BINDINGS);
+	const protectedBinding = state.bindings.find(isProtectedBinding);
+	const protectedChangeId = protectedBinding?.changeId;
 	const boundChangeIds = new Set(state.bindings.map((binding) => binding.changeId));
 	state.changes.sort(
 		(left, right) =>
-			Number(boundChangeIds.has(right.id)) - Number(boundChangeIds.has(left.id)) || right.updatedAt - left.updatedAt,
+			Number(right.id === protectedChangeId) - Number(left.id === protectedChangeId) ||
+			Number(boundChangeIds.has(right.id)) - Number(boundChangeIds.has(left.id)) ||
+			right.updatedAt - left.updatedAt,
 	);
 	state.changes.splice(WORK_STATE_MAX_CHANGES);
 	const retainedChanges = new Set(state.changes.map((change) => change.id));
 	state.bindings = state.bindings.filter((binding) => retainedChanges.has(binding.changeId));
+	const protectedRepositoryIds = new Set<string>();
+	if (protectedBinding) {
+		protectedRepositoryIds.add(protectedBinding.repositoryId);
+		protectedRepositoryIds.add(protectedBinding.observedRepositoryId);
+		const protectedChange = state.changes.find((change) => change.id === protectedBinding.changeId);
+		if (protectedChange) protectedRepositoryIds.add(protectedChange.repositoryId);
+	}
 	const usedRepositoryIds = new Set<string>();
 	for (const change of state.changes) usedRepositoryIds.add(change.repositoryId);
 	for (const binding of state.bindings) {
@@ -405,6 +445,7 @@ function trimState(state: WorkStateFileV1): void {
 	}
 	state.repositories.sort(
 		(left, right) =>
+			Number(protectedRepositoryIds.has(right.id)) - Number(protectedRepositoryIds.has(left.id)) ||
 			Number(usedRepositoryIds.has(right.id)) - Number(usedRepositoryIds.has(left.id)) ||
 			right.updatedAt - left.updatedAt,
 	);
@@ -418,6 +459,37 @@ function trimState(state: WorkStateFileV1): void {
 			retainedRepositories.has(binding.observedRepositoryId) &&
 			finalChanges.has(binding.changeId),
 	);
+
+	while (serializedWorkStateBytes(state) > WORK_STATE_MAX_BYTES) {
+		const referencedRepositoryIds = new Set<string>();
+		for (const change of state.changes) referencedRepositoryIds.add(change.repositoryId);
+		for (const binding of state.bindings) {
+			referencedRepositoryIds.add(binding.repositoryId);
+			referencedRepositoryIds.add(binding.observedRepositoryId);
+		}
+		const repositoryIndex = oldestRecordIndex(
+			state.repositories,
+			(repository) => !referencedRepositoryIds.has(repository.id),
+		);
+		if (repositoryIndex !== -1) {
+			state.repositories.splice(repositoryIndex, 1);
+			continue;
+		}
+
+		const currentlyBoundChangeIds = new Set(state.bindings.map((binding) => binding.changeId));
+		const changeIndex = oldestRecordIndex(state.changes, (change) => !currentlyBoundChangeIds.has(change.id));
+		if (changeIndex !== -1) {
+			state.changes.splice(changeIndex, 1);
+			continue;
+		}
+
+		const bindingIndex = oldestRecordIndex(state.bindings, (binding) => !isProtectedBinding(binding));
+		if (bindingIndex !== -1) {
+			state.bindings.splice(bindingIndex, 1);
+			continue;
+		}
+		throw new Error("Work state cannot retain its protected binding within the size bound");
+	}
 }
 
 export class WorkStateStore {
@@ -505,7 +577,8 @@ export class WorkStateStore {
 			throw new Error("invalid Work observation");
 		}
 		const commonGitDirHash = this.hashCommonGitDirectory(input.commonGitDir);
-		return this.mutateGuarded(isCurrentRevision, (state) => {
+		const protectedBindingKey = bindingKey(input.workspaceName, input.workspaceGeneration, input.sessionId);
+		return this.mutateGuarded(isCurrentRevision, protectedBindingKey, (state) => {
 			let repository = state.repositories.find(
 				(candidate) =>
 					candidate.workspaceName === input.workspaceName &&
@@ -527,10 +600,10 @@ export class WorkStateStore {
 				repository.updatedAt = input.now;
 			}
 
-			const key = bindingKey(input.workspaceName, input.workspaceGeneration, input.sessionId);
 			let binding = state.bindings.find(
 				(candidate) =>
-					bindingKey(candidate.workspaceName, candidate.workspaceGeneration, candidate.sessionId) === key,
+					bindingKey(candidate.workspaceName, candidate.workspaceGeneration, candidate.sessionId) ===
+					protectedBindingKey,
 			);
 			let change = binding ? state.changes.find((candidate) => candidate.id === binding!.changeId) : undefined;
 			let sticky = change?.resolutionState === "resolved";
@@ -635,8 +708,8 @@ export class WorkStateStore {
 		) {
 			throw new Error("invalid Work binding inheritance");
 		}
-		return this.mutate((state) => {
-			const targetKey = bindingKey(input.workspaceName, input.workspaceGeneration, input.targetSessionId);
+		const targetKey = bindingKey(input.workspaceName, input.workspaceGeneration, input.targetSessionId);
+		return this.mutate(targetKey, (state) => {
 			if (
 				state.bindings.some(
 					(candidate) =>
@@ -666,7 +739,8 @@ export class WorkStateStore {
 		outcome: WorkDiscoveryApplyOutcome,
 		options: { now: number; nextRefreshAt: number; refreshSucceeded: boolean },
 	): Promise<boolean> {
-		return this.mutate((state) => {
+		const protectedBindingKey = bindingKey(fence.workspaceName, fence.workspaceGeneration, fence.sessionId);
+		return this.mutate(protectedBindingKey, (state) => {
 			const binding = state.bindings.find(
 				(candidate) =>
 					candidate.workspaceName === fence.workspaceName &&
@@ -788,11 +862,11 @@ export class WorkStateStore {
 		await this.flush();
 	}
 
-	private mutate<T>(mutation: (draft: WorkStateFileV1) => T): Promise<T> {
+	private mutate<T>(protectedBindingKey: string, mutation: (draft: WorkStateFileV1) => T): Promise<T> {
 		const operation = this.mutationQueue.then(async () => {
 			const draft = cloneRecord(this.state);
 			const result = mutation(draft);
-			trimState(draft);
+			trimState(draft, protectedBindingKey);
 			await this.write(draft);
 			this.current = draft;
 			return result;
@@ -806,6 +880,7 @@ export class WorkStateStore {
 
 	private mutateGuarded<T>(
 		isCurrentRevision: WorkObservationRevisionGuard,
+		protectedBindingKey: string,
 		mutation: (draft: WorkStateFileV1) => T,
 	): Promise<T | undefined> {
 		if (!isCurrentRevision()) return Promise.resolve(undefined);
@@ -813,7 +888,7 @@ export class WorkStateStore {
 			if (!isCurrentRevision()) return undefined;
 			const draft = cloneRecord(this.state);
 			const result = mutation(draft);
-			trimState(draft);
+			trimState(draft, protectedBindingKey);
 			await this.write(draft);
 			this.current = draft;
 			return result;
@@ -826,7 +901,7 @@ export class WorkStateStore {
 	}
 
 	private async write(state: WorkStateFileV1): Promise<void> {
-		const content = `${JSON.stringify(state, null, 2)}\n`;
+		const content = serializeWorkState(state);
 		if (Buffer.byteLength(content, "utf8") > WORK_STATE_MAX_BYTES) {
 			throw new Error("Work state exceeds its size bound");
 		}
