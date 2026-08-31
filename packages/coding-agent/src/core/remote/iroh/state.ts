@@ -139,6 +139,19 @@ export function createEmptyIrohRemoteHostState(): IrohRemoteHostState {
 	};
 }
 
+export function allocateIrohRemoteWorkspaceGeneration(state: IrohRemoteHostState, workspaceName: string): void {
+	const currentGeneration = state.workspaceGenerationCounter ?? 0;
+	if (currentGeneration === Number.MAX_SAFE_INTEGER) {
+		throw new Error("Workspace generation counter is exhausted");
+	}
+	const generation = currentGeneration + 1;
+	state.workspaceGenerationCounter = generation;
+	state.workspaceGenerations = [
+		...(state.workspaceGenerations ?? []).filter((record) => record.workspaceName !== workspaceName),
+		{ workspaceName, generation },
+	];
+}
+
 export interface IrohRemoteStateParseOptions {
 	/** Default grant to canonicalize against; tests inject alternate defaults. */
 	defaultAllowTools?: string;
@@ -166,7 +179,7 @@ export async function writeIrohRemoteHostState(path: string, state: IrohRemoteHo
 
 export function parseIrohRemoteHostState(value: unknown, options?: IrohRemoteStateParseOptions): IrohRemoteHostState {
 	const state = expectRecord(value, "Iroh remote host state");
-	return {
+	const parsed: IrohRemoteHostState = {
 		hostSecretKey: parseOptionalByteArray(state.hostSecretKey, "hostSecretKey"),
 		pairingSecretTombstones: parseOptionalArray(
 			state.pairingSecretTombstones,
@@ -184,6 +197,12 @@ export function parseIrohRemoteHostState(value: unknown, options?: IrohRemoteSta
 			parseIrohRemotePendingPairingTicket(entry, options),
 		),
 	};
+	for (const workspace of parsed.workspaces) {
+		if (!(parsed.workspaceGenerations ?? []).some((record) => record.workspaceName === workspace.name)) {
+			allocateIrohRemoteWorkspaceGeneration(parsed, workspace.name);
+		}
+	}
+	return parsed;
 }
 
 function serializeIrohRemoteHostState(state: IrohRemoteHostState): IrohRemoteHostState {

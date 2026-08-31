@@ -2931,7 +2931,7 @@ describe("Iroh remote core helpers", () => {
 		expect(state.pendingPairingTickets).toEqual([expect.objectContaining({ workspace: "alphabet" })]);
 	});
 
-	test("captures workspace generations and fences identical re-registration and change-revert ABA", async () => {
+	test("repairs missing workspace generations and fences re-registration ABA", async () => {
 		const workspace = { name: "alpha", path: "/alpha", allowedTools: "read" };
 		const stateManager = new IrohRemoteHostStateManager({
 			initialState: {
@@ -2960,23 +2960,28 @@ describe("Iroh remote core helpers", () => {
 		if (!legacyAuthorization.ok) throw new Error(legacyAuthorization.error);
 		expect(legacyAuthorization).not.toHaveProperty("workspaceGeneration");
 		await stateManager.upsertWorkspace(workspace);
-		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(0);
+		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(1);
+		await expect(stateManager.isAuthorizationCurrent(legacyAuthorization)).resolves.toBe(false);
+		const repairedAuthorization = await authorize();
+		if (!repairedAuthorization.ok) throw new Error(repairedAuthorization.error);
+		expect(repairedAuthorization.workspaceGeneration).toBe(1);
+		await expect(stateManager.isAuthorizationCurrent(repairedAuthorization)).resolves.toBe(true);
 
 		await stateManager.unregisterWorkspace("alpha");
 		await stateManager.upsertWorkspace(workspace);
-		await expect(stateManager.isAuthorizationCurrent(legacyAuthorization)).resolves.toBe(false);
+		await expect(stateManager.isAuthorizationCurrent(repairedAuthorization)).resolves.toBe(false);
 		const replacementAuthorization = await authorize();
 		if (!replacementAuthorization.ok) throw new Error(replacementAuthorization.error);
-		expect(replacementAuthorization.workspaceGeneration).toBe(1);
+		expect(replacementAuthorization.workspaceGeneration).toBe(2);
 		await expect(stateManager.isAuthorizationCurrent(replacementAuthorization)).resolves.toBe(true);
 
 		await stateManager.upsertWorkspace({ ...workspace, path: "/replacement" });
 		await stateManager.upsertWorkspace(workspace);
-		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(3);
+		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(4);
 		await expect(stateManager.isAuthorizationCurrent(replacementAuthorization)).resolves.toBe(false);
 		const revertedAuthorization = await authorize();
 		if (!revertedAuthorization.ok) throw new Error(revertedAuthorization.error);
-		expect(revertedAuthorization.workspaceGeneration).toBe(3);
+		expect(revertedAuthorization.workspaceGeneration).toBe(4);
 		await expect(stateManager.isAuthorizationCurrent(revertedAuthorization)).resolves.toBe(true);
 	});
 
