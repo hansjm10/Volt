@@ -3,6 +3,7 @@
  */
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
@@ -201,9 +202,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			try {
 				await session.waitForClosed();
 			} finally {
-				if (existsSync(tempDir)) {
-					rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-				}
+				await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 			}
 		},
 	};
