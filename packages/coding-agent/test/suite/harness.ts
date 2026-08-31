@@ -89,6 +89,7 @@ export interface Harness {
 	eventsOfType<T extends AgentSessionEvent["type"]>(type: T): Extract<AgentSessionEvent, { type: T }>[];
 	tempDir: string;
 	cleanup: () => void;
+	cleanupAsync: () => Promise<void>;
 }
 
 function createTempDir(): string {
@@ -192,6 +193,17 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			fauxProvider.unregister();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+			}
+		},
+		async cleanupAsync() {
+			session.dispose();
+			fauxProvider.unregister();
+			try {
+				await session.waitForClosed();
+			} finally {
+				if (existsSync(tempDir)) {
+					rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+				}
 			}
 		},
 	};

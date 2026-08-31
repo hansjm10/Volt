@@ -256,7 +256,7 @@ describe("review command controls", () => {
 			expect(harness.faux.state.callCount).toBe(0);
 			expect(listReviewRuns(harness.session.sessionManager!).runs).toEqual([]);
 		} finally {
-			harness.cleanup();
+			await harness.cleanupAsync();
 		}
 	});
 
@@ -321,7 +321,7 @@ describe("review command controls", () => {
 			expect(harness.faux.state.callCount).toBe(0);
 		} finally {
 			await workflowManager.abortAll();
-			harness.cleanup();
+			await harness.cleanupAsync();
 		}
 	});
 
@@ -360,7 +360,7 @@ describe("review command controls", () => {
 			expect(harness.faux.state.callCount).toBe(0);
 		} finally {
 			await workflowManager.abortAll();
-			harness.cleanup();
+			await harness.cleanupAsync();
 		}
 	});
 
@@ -519,7 +519,7 @@ describe("review command controls", () => {
 			expect(harness.faux.state.callCount).toBe(0);
 		} finally {
 			await workflowManager.abortAll();
-			harness.cleanup();
+			await harness.cleanupAsync();
 		}
 	});
 
@@ -558,7 +558,7 @@ describe("review command controls", () => {
 			expect(harness.faux.state.callCount).toBe(0);
 		} finally {
 			await workflowManager.abortAll();
-			harness.cleanup();
+			await harness.cleanupAsync();
 		}
 	});
 
@@ -666,7 +666,7 @@ describe("review pipeline", () => {
 	afterEach(async () => {
 		vi.unstubAllEnvs();
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
-		for (const harness of harnesses.splice(0)) harness.cleanup();
+		for (const harness of harnesses.splice(0)) await harness.cleanupAsync();
 	});
 
 	it("keeps context-exposed prose private and presents findings from code in a fresh context", async () => {
