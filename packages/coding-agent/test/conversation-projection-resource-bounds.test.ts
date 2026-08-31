@@ -132,10 +132,11 @@ function createRuntime(largePayload: string): AgentSessionRuntime {
 
 function createLinearSessionManager(
 	branch: SessionEntry[],
-): Pick<SessionManager, "getBranch" | "getBranchWindow" | "getLeafEntry"> {
+): Pick<SessionManager, "getBranch" | "getBranchWindow" | "getLeafEntry" | "getStartingGitContext"> {
 	return {
 		getBranch: () => branch,
 		getLeafEntry: () => branch.at(-1),
+		getStartingGitContext: () => undefined,
 		getBranchWindow: ({ beforeEntryId, maxEntries, lookbackEntries = 0 }) => {
 			const endIndex =
 				beforeEntryId === undefined ? branch.length : branch.findIndex((entry) => entry.id === beforeEntryId);

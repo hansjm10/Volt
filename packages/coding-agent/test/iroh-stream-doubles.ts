@@ -181,6 +181,7 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 			getLeafEntry: (): SessionEntry | undefined => (session.sessionManager.getBranch() as SessionEntry[]).at(-1),
 			getLeafId: (): string | null => session.leafId,
 			getSessionId: (): string => sessionId,
+			getStartingGitContext: () => undefined,
 		},
 		settingsManager: { flush: vi.fn(async () => {}) },
 		steeringMode: "all" as const,

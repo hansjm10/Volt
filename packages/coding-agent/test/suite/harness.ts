@@ -191,7 +191,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			session.dispose();
 			fauxProvider.unregister();
 			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
+				rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 			}
 		},
 	};
