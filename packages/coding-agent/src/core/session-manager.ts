@@ -1791,6 +1791,23 @@ async function buildSessionInfo(filePath: string, includeMessageFreeDurable = fa
 	}
 }
 
+async function readStartingGitContextFromSessionFile(filePath: string): Promise<RpcGitContext | null> {
+	try {
+		hardenPrivateRegularFileSync(filePath);
+		const rl = createInterface({
+			input: createReadStream(filePath, { encoding: "utf8" }),
+			crlfDelay: Infinity,
+		});
+		for await (const line of rl) {
+			const entry = parseSessionEntryLine(line);
+			if (entry?.type === "session_start_git_context" && isValidSessionStartGitContextEntry(entry)) {
+				return entry.gitContext;
+			}
+		}
+	} catch {}
+	return null;
+}
+
 export type SessionListProgress = (loaded: number, total: number) => void;
 
 export interface SessionListOptions {
@@ -4053,6 +4070,45 @@ export class SessionManager {
 	 * selectors, this includes WAL-only sessions and fails closed when the target
 	 * file is corrupt or when more than one file claims the same session id.
 	 */
+	static async readStartingGitContexts(
+		sessionDir: string,
+		sessionIds: readonly string[],
+	): Promise<ReadonlyMap<string, RpcGitContext | null>> {
+		for (const sessionId of sessionIds) assertValidSessionId(sessionId);
+		if (new Set(sessionIds).size !== sessionIds.length) {
+			throw new Error("Session context lookup requires unique session ids");
+		}
+		const contexts = new Map<string, RpcGitContext | null>(sessionIds.map((sessionId) => [sessionId, null]));
+		const dir = normalizePath(sessionDir);
+		if (!existsSync(dir) || sessionIds.length === 0) return contexts;
+		ensurePrivateDirectorySync(dir, { hardenExisting: false });
+		const requested = new Set(sessionIds);
+		const matches = new Map<string, string[]>();
+		for (const name of await readdir(dir)) {
+			if (!name.endsWith(".jsonl")) continue;
+			for (const sessionId of requested) {
+				if (!name.endsWith(`_${sessionId}.jsonl`)) continue;
+				const paths = matches.get(sessionId) ?? [];
+				paths.push(join(dir, name));
+				matches.set(sessionId, paths);
+			}
+		}
+		for (const sessionId of sessionIds) {
+			const paths = matches.get(sessionId) ?? [];
+			if (paths.length > 1) {
+				throw new Error(`Multiple session files claim ${sessionId}`);
+			}
+			const filePath = paths[0];
+			if (!filePath) continue;
+			const header = readSessionHeader(filePath);
+			if (header?.id !== sessionId) {
+				throw new Error(`Session file claiming ${sessionId} has an invalid header`);
+			}
+			contexts.set(sessionId, await readStartingGitContextFromSessionFile(filePath));
+		}
+		return contexts;
+	}
+
 	static async findForResume(
 		sessionDir: string,
 		sessionId: string,

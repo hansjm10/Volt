@@ -38,6 +38,7 @@ import {
 	RpcListSubagentsResponseSchema,
 	RpcPromptResponseSchema,
 	RpcRegisterPushTargetResponseSchema,
+	RpcSessionContextSchema,
 	RpcSessionListItemSchema,
 	RpcSessionStateSchema,
 	RpcSubagentStartResponseSchema,
@@ -494,6 +495,10 @@ export const RPC_RESPONSE_SCHEMAS = {
 	list_sessions: dataResponse(
 		"list_sessions",
 		Type.Object({ sessions: Type.Array(RpcSessionListItemSchema) }, { additionalProperties: false }),
+	),
+	get_session_contexts: dataResponse(
+		"get_session_contexts",
+		Type.Object({ contexts: Type.Array(RpcSessionContextSchema, { maxItems: 64 }) }, { additionalProperties: false }),
 	),
 	export_html: dataResponse("export_html", Type.Object({ path: Type.String() }, { additionalProperties: false })),
 	switch_session: dataResponse("switch_session", cancelledDataSchema),

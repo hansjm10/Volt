@@ -719,6 +719,9 @@
 					"$ref": "#/$defs/RpcCommand.get_agent_options"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.get_session_contexts"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
 				},
 				{
@@ -999,6 +1002,9 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.get_agent_options"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_session_contexts"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.upload_device_logs"
@@ -1889,6 +1895,43 @@
 				},
 				"runId": {
 					"$ref": "#/$defs/RpcConversationIdentifier"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.get_session_contexts": {
+			"type": "object",
+			"required": [
+				"type",
+				"workspaceName",
+				"sessionIds"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_session_contexts"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"workspaceName": {
+					"type": "string",
+					"pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+					"x-volt-expected": "be a non-empty workspace name"
+				},
+				"sessionIds": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 128
+					},
+					"minItems": 1,
+					"maxItems": 64,
+					"uniqueItems": true
 				}
 			},
 			"additionalProperties": false
@@ -6672,6 +6715,9 @@
 					"$ref": "#/$defs/RpcResponse.list_sessions"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.get_session_contexts"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.export_html"
 				},
 				{
@@ -7823,6 +7869,82 @@
 				},
 				"data": {
 					"$ref": "#/$defs/RpcReviewWorkflowResultResponse"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.get_session_contexts": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_session_contexts"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"type": "object",
+					"required": [
+						"contexts"
+					],
+					"properties": {
+						"contexts": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"required": [
+									"sessionId",
+									"startingGitContext",
+									"workContext"
+								],
+								"properties": {
+									"sessionId": {
+										"type": "string",
+										"minLength": 1,
+										"maxLength": 128
+									},
+									"startingGitContext": {
+										"anyOf": [
+											{
+												"$ref": "#/$defs/RpcGitContext"
+											},
+											{
+												"type": "null"
+											}
+										]
+									},
+									"workContext": {
+										"anyOf": [
+											{
+												"$ref": "#/$defs/RpcSessionWorkContext"
+											},
+											{
+												"type": "null"
+											}
+										]
+									}
+								},
+								"additionalProperties": false
+							},
+							"maxItems": 64
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false

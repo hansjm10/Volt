@@ -974,6 +974,7 @@ describe("Iroh remote core helpers", () => {
 			"rerun_review",
 			"publish_review",
 			"list_sessions",
+			"get_session_contexts",
 			"switch_session_by_id",
 			"register_push_target",
 			"unregister_workspace",

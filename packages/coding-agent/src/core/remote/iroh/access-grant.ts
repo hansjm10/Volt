@@ -158,6 +158,7 @@ const OBSERVE_COMMANDS = new Set([
 	"get_ui_actions",
 	"get_ui_action_completions",
 	"list_sessions",
+	"get_session_contexts",
 	"list_worktrees",
 	"list_workspace_directories",
 	"get_keep_awake",

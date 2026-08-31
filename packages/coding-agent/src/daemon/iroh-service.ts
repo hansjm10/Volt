@@ -60,6 +60,10 @@ import {
 	createIrohRemoteRpcCapabilityDeniedResponse,
 	createIrohRemoteRpcErrorResponse,
 } from "../core/remote/iroh/rpc-command-filter.ts";
+import {
+	createIrohRemoteSessionContextsRpcBackend,
+	type IrohRemoteSessionContextsRpcBackend,
+} from "../core/remote/iroh/session-contexts.ts";
 import type { IrohRemoteClient, IrohRemoteWorkspace, IrohRemoteWorkspaceWorktree } from "../core/remote/iroh/state.ts";
 import {
 	IROH_REMOTE_WORKSPACE_HAS_WORKTREES_ERROR,
@@ -3051,14 +3055,22 @@ class IrohDaemonService {
 			{ terminalSessionId: undefined },
 		);
 		try {
+			const purpose =
+				handshake.hello.mode === "workspaceDiscovery"
+					? handshake.hello.workspaceDiscovery.purpose
+					: "list_sessions";
 			const discoveryHooks =
-				handshake.hello.mode === "workspaceDiscovery" &&
-				handshake.hello.workspaceDiscovery.purpose === "agent_options"
+				purpose === "agent_options"
 					? {
 							purpose: "agent_options" as const,
 							agentOptions: this.createAgentOptionsRpcBackend(handshake.authorization.workspace),
 						}
-					: { purpose: "list_sessions" as const, commandContext: this.getCommandContext() };
+					: purpose === "session_contexts"
+						? {
+								purpose: "session_contexts" as const,
+								sessionContexts: this.createSessionContextsRpcBackend(handshake.authorization),
+							}
+						: { purpose: "list_sessions" as const, commandContext: this.getCommandContext() };
 			await runWorkspaceDiscoveryStream(
 				{
 					stream,
@@ -3074,6 +3086,40 @@ class IrohDaemonService {
 		} finally {
 			activeStream.remove();
 		}
+	}
+
+	private createSessionContextsRpcBackend(
+		authorization: IrohRemoteClientAuthorizationSuccess,
+	): IrohRemoteSessionContextsRpcBackend {
+		const backend = createIrohRemoteSessionContextsRpcBackend({
+			workspaceName: authorization.workspace.name,
+			sessionDirectory: getDefaultSessionDirPath(authorization.workspace.path, this.services.agentDir),
+			getLiveStartingGitContext: (sessionId) => {
+				const owner = this.runtimes.findOwner(authorization.workspace.name, sessionId);
+				return owner?.sessionId === sessionId
+					? owner.runtime.session.sessionManager.getStartingGitContext()
+					: undefined;
+			},
+			getWorkContext: (sessionId) =>
+				authorization.workspaceGeneration === undefined
+					? undefined
+					: this.services.work.getWorkContext(
+							authorization.workspace.name,
+							authorization.workspaceGeneration,
+							sessionId,
+						),
+		});
+		return {
+			getSessionContexts: async (workspaceName, sessionIds) => {
+				const admission = this.admission.tryAcquire();
+				if (!admission) throw new Error("host is shutting down");
+				try {
+					return await backend.getSessionContexts(workspaceName, sessionIds);
+				} finally {
+					admission.release();
+				}
+			},
+		};
 	}
 
 	private createAgentOptionsRpcBackend(workspace: IrohRemoteWorkspace): IrohRemoteAgentOptionsRpcBackend {

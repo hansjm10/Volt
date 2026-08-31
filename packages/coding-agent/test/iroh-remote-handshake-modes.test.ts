@@ -109,6 +109,10 @@ describe("Iroh remote handshake stream modes", () => {
 			mode: "workspaceDiscovery",
 			workspaceDiscovery: { purpose: "agent_options" },
 		});
+		expect(parseHello({ workspaceDiscovery: { purpose: "session_contexts" } })).toMatchObject({
+			mode: "workspaceDiscovery",
+			workspaceDiscovery: { purpose: "session_contexts" },
+		});
 		expect(parseHello({ workspaceManagement: { purpose: "unregister_workspace" } })).toMatchObject({
 			mode: "workspaceManagement",
 			workspaceManagement: { purpose: "unregister_workspace" },
@@ -195,6 +199,9 @@ describe("Iroh remote handshake stream modes", () => {
 		expect(
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceDiscovery: { purpose: "agent_options" } })),
 		).toMatchObject({ success: true, workspaceDiscovery: { purpose: "agent_options" } });
+		expect(
+			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceDiscovery: { purpose: "session_contexts" } })),
+		).toMatchObject({ success: true, workspaceDiscovery: { purpose: "session_contexts" } });
 		expect(
 			parseIrohRemoteHandshakeResponseLine(
 				responseLine({ workspaceManagement: { purpose: "unregister_workspace" } }),

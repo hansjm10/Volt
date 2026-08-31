@@ -60,6 +60,7 @@ export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"rerun_review",
 	"publish_review",
 	"list_sessions",
+	"get_session_contexts",
 	"switch_session_by_id",
 	"register_push_target",
 	"unregister_workspace",

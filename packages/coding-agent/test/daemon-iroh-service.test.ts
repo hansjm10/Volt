@@ -1651,14 +1651,24 @@ describe.skipIf(!nativeAvailable)("voltd iroh service (loopback)", () => {
 			type: "volt_iroh_hello",
 			protocol: IROH_REMOTE_ALPN,
 			workspace: "ws",
-			workspaceDiscovery: { purpose: "list_sessions" },
+			workspaceDiscovery: { purpose: "session_contexts" },
 		});
 		const reusedHandshake = await readJsonLine(reusedStream);
 		expect(reusedHandshake.value.success).toBe(true);
-		await writeJsonLine(reusedStream, { id: "ls-reconnect-2", type: "list_sessions" });
-		const reusedListResponse = await readJsonLine(reusedStream, reusedHandshake.rest);
-		expect(reusedListResponse.value.command).toBe("list_sessions");
-		expect(reusedListResponse.value.success).toBe(true);
+		await writeJsonLine(reusedStream, {
+			id: "contexts-reconnect-2",
+			type: "get_session_contexts",
+			workspaceName: "ws",
+			sessionIds: ["session-missing"],
+		});
+		const reusedContextResponse = await readJsonLine(reusedStream, reusedHandshake.rest);
+		expect(reusedContextResponse.value).toMatchObject({
+			command: "get_session_contexts",
+			success: true,
+			data: {
+				contexts: [{ sessionId: "session-missing", startingGitContext: null, workContext: null }],
+			},
+		});
 		reconnection.close(0n, Array.from(Buffer.from("done", "utf8")));
 		await reconnection.closed();
 

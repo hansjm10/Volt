@@ -54,6 +54,15 @@ export const RpcSessionWorkContextSchema = Type.Union([
 	),
 ]);
 
+export const RpcSessionContextSchema = Type.Object(
+	{
+		sessionId: Type.String({ minLength: 1, maxLength: 128 }),
+		startingGitContext: Type.Union([RpcGitContextSchema, Type.Null()]),
+		workContext: Type.Union([RpcSessionWorkContextSchema, Type.Null()]),
+	},
+	{ additionalProperties: false },
+);
+
 export const RpcSessionListItemSchema = Type.Object(
 	{
 		sessionId: Type.String(),
