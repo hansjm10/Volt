@@ -166,6 +166,7 @@ function createActiveWorkflows(largePayload: string): Array<{
 			kind: "review",
 			status: "running",
 			message: largePayload,
+			pullRequest: { provider: "github", number: 243 },
 			details: { payload: largePayload },
 		},
 		activeTools: Array.from({ length: 4 }, (_, toolIndex) => ({
@@ -348,12 +349,18 @@ describe("conversation projection resource bounds", () => {
 		expect(snapshot.activeWorkflows.map((workflow) => workflow.workflowId)).toEqual(
 			Array.from({ length: 4 }, (_, index) => `workflow-${index}`),
 		);
+		expect(snapshot.activeWorkflows[0]?.workflowEvent).toMatchObject({
+			pullRequest: { provider: "github", number: 243 },
+		});
 		expect(snapshot.state).not.toHaveProperty("remoteHost");
 
 		const liveProjector = createRemoteConversationExternalProjector({
 			authorization: createAuthorization(),
 			runtime,
 		});
+		const liveWorkflow = liveProjector(activeWorkflows[0]!.workflowEvent)!;
+		expect(liveWorkflow).toMatchObject({ pullRequest: { provider: "github", number: 243 } });
+		expect(liveWorkflow).toEqual(snapshot.activeWorkflows[0]?.workflowEvent);
 		const live = liveProjector(activeWorkflows[0]!.activeTools[0]!)!;
 		expect(live).toEqual(snapshot.activeWorkflows[0]?.activeTools[0]);
 		expect(Buffer.byteLength(JSON.stringify(live), "utf8")).toBeLessThanOrEqual(
@@ -372,6 +379,19 @@ describe("conversation projection resource bounds", () => {
 		expect(Buffer.byteLength(JSON.stringify(mediumArgs.args), "utf8")).toBeLessThanOrEqual(
 			REMOTE_CONVERSATION_WORKFLOW_ARGUMENTS_MAX_SERIALIZED_BYTES,
 		);
+	});
+
+	it("rejects pull request references with fields outside the bounded canonical shape", () => {
+		const feed = new ConversationProjectionFeed({ subscribe: () => () => {} });
+		expect(() =>
+			feed.publishExternal({
+				type: "workflow_start",
+				workflowId: "review:invalid-reference",
+				kind: "review",
+				pullRequest: { provider: "github", number: 243, title: "must not cross" },
+			}),
+		).toThrow("Conversation workflow event contains malformed optional fields");
+		feed.dispose();
 	});
 
 	it("bounds projection traversal before omitted queue, tool, and workflow tails", () => {

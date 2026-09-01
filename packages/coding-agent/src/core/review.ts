@@ -58,7 +58,7 @@ import {
 	ReviewCoverageTracker,
 	reviewSnapshotToolGuidelines,
 } from "./review-tools.ts";
-import type { ReviewWorkflowManager } from "./review-workflows.ts";
+import type { ReviewPullRequestReference, ReviewWorkflowManager } from "./review-workflows.ts";
 import { createAgentSession } from "./sdk.ts";
 import { SessionManager } from "./session-manager.ts";
 import type { SessionUsageProjection, SessionUsageTotals } from "./session-usage.ts";
@@ -825,6 +825,7 @@ export type ReviewWorkflowEvent =
 			message: string;
 			status: "running";
 			startedAt: number;
+			pullRequest?: ReviewPullRequestReference;
 	  }
 	| {
 			type: "workflow_update";
@@ -835,6 +836,7 @@ export type ReviewWorkflowEvent =
 			message: string;
 			status: "running" | "finalizing";
 			startedAt: number;
+			pullRequest?: ReviewPullRequestReference;
 	  }
 	| {
 			type: "workflow_end";
@@ -846,6 +848,7 @@ export type ReviewWorkflowEvent =
 			status: "completed" | "cancelled" | "failed";
 			startedAt: number;
 			endedAt: number;
+			pullRequest?: ReviewPullRequestReference;
 	  };
 
 export type ReviewWorkflowToolEvent =
