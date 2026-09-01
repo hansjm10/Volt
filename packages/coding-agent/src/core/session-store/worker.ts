@@ -3,12 +3,12 @@ import { existsSync, lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
-import { fuzzyMatch } from "@hansjm10/volt-tui";
 import {
 	ensurePrivateDirectorySync,
 	hardenPrivateRegularFileSync,
 	writePrivateNewFileSync,
 } from "../../utils/private-files.ts";
+import { fuzzyMatchSessionText } from "../session-search.ts";
 import {
 	digestSessionStoreTransactionPayload,
 	parseCanonicalSessionStoreJson,
@@ -566,7 +566,7 @@ function matchesSearchText(text: string, parsed: ParsedSearchQuery): boolean {
 	let normalizedText: string | undefined;
 	for (const token of parsed.tokens) {
 		if (token.kind === "fuzzy") {
-			if (!fuzzyMatch(token.value, text).matches) return false;
+			if (!fuzzyMatchSessionText(token.value, text).matches) return false;
 			continue;
 		}
 		normalizedText ??= text.toLowerCase().replace(/\s+/gu, " ").trim();

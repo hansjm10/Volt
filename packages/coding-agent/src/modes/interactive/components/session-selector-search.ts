@@ -1,5 +1,5 @@
-import { fuzzyMatch } from "@hansjm10/volt-tui";
 import type { SessionInfo } from "../../../core/session-manager.ts";
+import { fuzzyMatchSessionText } from "../../../core/session-search.ts";
 
 export type SortMode = "threaded" | "recent" | "relevance";
 
@@ -145,7 +145,7 @@ export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): M
 			continue;
 		}
 
-		const m = fuzzyMatch(token.value, text);
+		const m = fuzzyMatchSessionText(token.value, text);
 		if (!m.matches) return { matches: false, score: 0 };
 		totalScore += m.score;
 	}
