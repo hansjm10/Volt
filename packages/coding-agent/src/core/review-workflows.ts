@@ -141,6 +141,10 @@ export function createReviewPullRequestReference(
 	return reviewPullRequestReference(identity?.pullRequest);
 }
 
+function containsControls(value: string): boolean {
+	return /[\u0000-\u001f\u007f]/u.test(value);
+}
+
 function boundedWebUrl(value: string, maximumBytes: number): string | undefined {
 	if (Buffer.byteLength(value, "utf8") > maximumBytes) return undefined;
 	try {
@@ -191,14 +195,24 @@ export function createReviewPullRequestMetadata(
 	if (
 		!url ||
 		!pullRequest.title.trim() ||
+		containsControls(pullRequest.title) ||
 		!pullRequest.baseRefName.trim() ||
+		containsControls(pullRequest.baseRefName) ||
 		!pullRequest.headRefName.trim() ||
+		containsControls(pullRequest.headRefName) ||
 		!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(pullRequest.headRefOid)
 	) {
 		return undefined;
 	}
 	const observedAt = pullRequest.observedAt;
 	const avatarUrl = boundedAvatarUrl(pullRequest.author?.avatarUrl, url);
+	const authorLogin = pullRequest.author?.login.trim();
+	const reviewState = ["draft", "ready", "merged", "closed"].includes(pullRequest.reviewState ?? "")
+		? pullRequest.reviewState
+		: undefined;
+	const mergeability = ["mergeable", "conflicting", "unknown"].includes(pullRequest.mergeability ?? "")
+		? pullRequest.mergeability
+		: undefined;
 	return {
 		...reference,
 		title: boundedUtf8(pullRequest.title.trim(), REVIEW_PULL_REQUEST_TITLE_MAX_UTF8_BYTES),
@@ -206,16 +220,16 @@ export function createReviewPullRequestMetadata(
 		baseRefName: boundedUtf8(pullRequest.baseRefName, REVIEW_PULL_REQUEST_REF_MAX_UTF8_BYTES),
 		headRefName: boundedUtf8(pullRequest.headRefName, REVIEW_PULL_REQUEST_REF_MAX_UTF8_BYTES),
 		headRefOid: pullRequest.headRefOid,
-		...(pullRequest.author?.login.trim()
+		...(authorLogin && !containsControls(authorLogin) && !/\s/u.test(authorLogin)
 			? {
 					author: {
-						login: boundedUtf8(pullRequest.author.login.trim(), REVIEW_PULL_REQUEST_AUTHOR_MAX_UTF8_BYTES),
+						login: boundedUtf8(authorLogin, REVIEW_PULL_REQUEST_AUTHOR_MAX_UTF8_BYTES),
 						...(avatarUrl ? { avatarUrl } : {}),
 					},
 				}
 			: {}),
-		...(pullRequest.reviewState ? { reviewState: pullRequest.reviewState } : {}),
-		...(pullRequest.mergeability ? { mergeability: pullRequest.mergeability } : {}),
+		...(reviewState ? { reviewState } : {}),
+		...(mergeability ? { mergeability } : {}),
 		...(validCheckSummary(pullRequest.checks) ? { checks: { ...pullRequest.checks! } } : {}),
 		...(observedAt !== undefined && Number.isSafeInteger(observedAt) && observedAt >= 0 ? { observedAt } : {}),
 	};
@@ -258,11 +272,11 @@ export function createReviewFileMetadata(
 			if (items.length >= REVIEW_FILE_METADATA_MAX_ITEMS) break;
 			if (
 				!file.path ||
-				file.path.includes("\0") ||
+				containsControls(file.path) ||
 				Buffer.byteLength(file.path, "utf8") > REVIEW_FILE_PATH_MAX_UTF8_BYTES ||
 				(file.previousPath !== undefined &&
 					(!file.previousPath ||
-						file.previousPath.includes("\0") ||
+						containsControls(file.previousPath) ||
 						Buffer.byteLength(file.previousPath, "utf8") > REVIEW_FILE_PATH_MAX_UTF8_BYTES)) ||
 				!file.status ||
 				!REVIEW_FILE_STATUSES.has(file.status) ||
