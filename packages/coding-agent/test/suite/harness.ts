@@ -203,7 +203,11 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			try {
 				await session.waitForClosed();
 			} finally {
-				await rm(tempDir, { recursive: true, force: true });
+				await rm(tempDir, {
+					recursive: true,
+					force: true,
+					...(process.platform === "win32" ? { maxRetries: 10, retryDelay: 50 } : {}),
+				});
 			}
 		},
 	};
