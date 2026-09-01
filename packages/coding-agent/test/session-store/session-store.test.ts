@@ -145,6 +145,18 @@ describe("SQLite session store", () => {
 		expect(await reopened.listSessionSummaries({ includeHidden: true })).toEqual([]);
 	});
 
+	it("starts a store worker when the daemon process has V8 optimization arguments", async () => {
+		const daemonFlag = "--optimize-for-size";
+		process.execArgv.push(daemonFlag);
+		try {
+			const client = await openStore();
+			expect(await client.listSessionSummaries({ includeHidden: true })).toEqual([]);
+		} finally {
+			const addedFlagIndex = process.execArgv.lastIndexOf(daemonFlag);
+			if (addedFlagIndex >= 0) process.execArgv.splice(addedFlagIndex, 1);
+		}
+	});
+
 	it("shares concurrent leases until the idempotent final release and supports fresh reacquisition", async () => {
 		const sessionDirectory = makeSessionDirectory();
 		const [first, same] = await Promise.all([

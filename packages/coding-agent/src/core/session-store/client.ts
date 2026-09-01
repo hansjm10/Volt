@@ -44,6 +44,7 @@ interface SharedStoreEntry {
 
 const sharedStores = new Map<string, SharedStoreEntry>();
 const SQLITE_WARNING_FLAG = "--disable-warning=ExperimentalWarning";
+const DAEMON_ONLY_V8_FLAG = "--optimize-for-size";
 
 function workerModuleUrl(): URL {
 	const moduleUrl: string | undefined = import.meta.url;
@@ -53,7 +54,10 @@ function workerModuleUrl(): URL {
 }
 
 function workerExecArgv(): string[] {
-	return [...process.execArgv.filter((argument) => argument !== SQLITE_WARNING_FLAG), SQLITE_WARNING_FLAG];
+	return [
+		...process.execArgv.filter((argument) => argument !== SQLITE_WARNING_FLAG && argument !== DAEMON_ONLY_V8_FLAG),
+		SQLITE_WARNING_FLAG,
+	];
 }
 
 export class SQLiteSessionStoreClient {
