@@ -585,7 +585,6 @@ describe("AgentSession conversation generation commits", () => {
 			sessionManager: activeManager,
 		});
 		const targetManager = await SessionManager.create(tempDir, tempDir);
-		cleanups.push(() => targetManager.drainPersistence().then(() => undefined));
 		targetManager.appendMessage({ role: "user", content: "switch target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("switch target assistant"));
 		const targetSessionId = targetManager.getSessionId();
@@ -595,6 +594,7 @@ describe("AgentSession conversation generation commits", () => {
 			endMode?.();
 			await modePromise;
 			await runtime.dispose();
+			await targetManager.closePersistence();
 			faux.unregister();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });

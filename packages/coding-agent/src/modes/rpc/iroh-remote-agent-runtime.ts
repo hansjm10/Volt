@@ -173,13 +173,26 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 	};
 
 	const sessionTarget = await createIrohRemoteSessionManager(options, agentDir);
-	await options.validateCwd?.(sessionTarget.sessionManager.getCwd());
-	const runtime = await createAgentSessionRuntime(createRuntime, {
-		cwd: sessionTarget.sessionManager.getCwd(),
-		agentDir,
-		sessionManager: sessionTarget.sessionManager,
-		profile: options.profile,
-	});
+	let runtime: AgentSessionRuntime;
+	try {
+		await options.validateCwd?.(sessionTarget.sessionManager.getCwd());
+		runtime = await createAgentSessionRuntime(createRuntime, {
+			cwd: sessionTarget.sessionManager.getCwd(),
+			agentDir,
+			sessionManager: sessionTarget.sessionManager,
+			profile: options.profile,
+		});
+	} catch (error) {
+		try {
+			await sessionTarget.sessionManager.closePersistence();
+		} catch (closeError) {
+			throw new AggregateError(
+				[error, closeError],
+				"Remote runtime creation failed and its session manager could not be closed",
+			);
+		}
+		throw error;
+	}
 	const errors = runtime.diagnostics.filter((diagnostic) => diagnostic.type === "error");
 	if (errors.length > 0) {
 		await runtime.dispose();

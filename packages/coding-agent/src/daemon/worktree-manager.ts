@@ -1125,7 +1125,12 @@ export class WorktreeManager {
 		try {
 			const sessionRef = await SessionManager.findForResume(sessionDir, sessionId);
 			if (sessionRef === undefined) return undefined;
-			storedCwd = (await SessionManager.open(sessionRef)).getCwd();
+			const manager = await SessionManager.open(sessionRef);
+			try {
+				storedCwd = manager.getCwd();
+			} finally {
+				await manager.closePersistence();
+			}
 		} catch {
 			return undefined;
 		}

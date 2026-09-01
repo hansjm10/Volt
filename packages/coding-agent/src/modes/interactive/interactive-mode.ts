@@ -7267,8 +7267,21 @@ export class InteractiveMode {
 							return;
 						}
 						const manager = await SessionManager.open(sessionRef);
-						manager.appendSessionInfo(next);
-						await manager.flush();
+						try {
+							manager.appendSessionInfo(next);
+							await manager.flush();
+						} catch (error) {
+							try {
+								await manager.closePersistence();
+							} catch (closeError) {
+								throw new AggregateError(
+									[error, closeError],
+									"Session rename failed and its manager could not be closed",
+								);
+							}
+							throw error;
+						}
+						await manager.closePersistence();
 					},
 					showRenameHint: true,
 					keybindings: this.keybindings,
@@ -9137,8 +9150,23 @@ export class InteractiveMode {
 				const acknowledgmentManager = sourceSessionRef
 					? await SessionManager.open(sourceSessionRef)
 					: sourceSessionManager;
-				acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
-				await acknowledgmentManager.flush();
+				try {
+					acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
+					await acknowledgmentManager.flush();
+				} catch (error) {
+					if (sourceSessionRef) {
+						try {
+							await acknowledgmentManager.closePersistence();
+						} catch (closeError) {
+							throw new AggregateError(
+								[error, closeError],
+								"Review acknowledgment failed and its source manager could not be closed",
+							);
+						}
+					}
+					throw error;
+				}
+				if (sourceSessionRef) await acknowledgmentManager.closePersistence();
 			}
 			if (!opened.cancelled) this.renderCurrentSessionState();
 			return {

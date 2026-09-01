@@ -1316,15 +1316,22 @@ class IrohDaemonService {
 		}
 
 		const sessionDir = getDefaultSessionDirPath(workspace.path, this.services.agentDir);
-		let sessionManager: SessionManager | undefined;
+		let sessionCwd: string | undefined;
 		try {
 			const sessionRef = await SessionManager.findForResume(sessionDir, request.sessionId);
-			sessionManager = sessionRef === undefined ? undefined : await SessionManager.open(sessionRef);
+			if (sessionRef !== undefined) {
+				const manager = await SessionManager.open(sessionRef);
+				try {
+					sessionCwd = manager.getCwd();
+				} finally {
+					await manager.closePersistence();
+				}
+			}
 		} catch {
-			sessionManager = undefined;
+			sessionCwd = undefined;
 		}
 		if (await finishIfSuperseded()) return;
-		if (!sessionManager) {
+		if (sessionCwd === undefined) {
 			connection.send({ type: "error", id: request.id, code: "not_found", message: "session not found" });
 			return;
 		}
@@ -1335,7 +1342,7 @@ class IrohDaemonService {
 		let runtimeDirectory: WorkspaceDirectoryResolution;
 		try {
 			const rootPath = await realpath(worktree?.path ?? workspace.path);
-			const absolutePath = await realpath(sessionManager.getCwd());
+			const absolutePath = await realpath(sessionCwd);
 			if (!isPathInside(rootPath, absolutePath) || !(await stat(absolutePath)).isDirectory()) {
 				throw new Error("session working directory escaped its workspace");
 			}
@@ -3660,6 +3667,7 @@ class IrohDaemonService {
 			return;
 		}
 		let resolvedTarget: ResolvedSessionTargetWithManager<SessionManager>;
+		let resolvedSessionCwd: string;
 		try {
 			resolvedTarget = await resolveIrohRemoteSessionTarget(
 				sessionTarget,
@@ -3670,11 +3678,15 @@ class IrohDaemonService {
 					{ listAll: true, preserveSessionCwd: true },
 				),
 			);
+			try {
+				resolvedSessionCwd = resolvedTarget.sessionManager.getCwd();
+			} finally {
+				await resolvedTarget.sessionManager.closePersistence();
+			}
 		} catch (error) {
 			await this.sendHandshakeError(stream, error);
 			return;
 		}
-		const resolvedSessionCwd = resolvedTarget.sessionManager.getCwd();
 		const relayWorkingDirectoryRelativeToRoot = getRelativeWorkingDirectoryForRoot(
 			boundWorktree?.path ?? authorization.workspace.path,
 			resolvedSessionCwd,

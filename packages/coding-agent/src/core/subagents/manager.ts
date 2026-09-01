@@ -988,20 +988,31 @@ export class SubagentManager {
 			);
 		}
 		let handle: SubagentHandle;
+		let preparedManager: SessionManager | undefined;
 		try {
-			let sessionManager: SessionManager;
 			try {
-				sessionManager = await SessionManager.open(claim.childSessionRef);
+				preparedManager = await SessionManager.open(claim.childSessionRef);
 			} catch {
 				throw new Error("The interrupted run's transcript no longer exists; it cannot be resumed.");
 			}
 			handle = await this.startByName(claim.agentName, {
-				sessionManager,
+				sessionManager: preparedManager,
 				resumeSubagentId: subagentId,
 				...(claim.task !== undefined ? { resumeTaskLabel: claim.task } : {}),
 				...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
 			});
 		} catch (error) {
+			if (preparedManager) {
+				try {
+					await preparedManager.closePersistence();
+				} catch (closeError) {
+					claim.rollback();
+					throw new AggregateError(
+						[error, closeError],
+						"Subagent resume failed and its prepared manager could not be closed",
+					);
+				}
+			}
 			claim.rollback();
 			throw error;
 		}
@@ -1934,19 +1945,23 @@ export class SubagentManager {
 				}
 				continue;
 			}
-			if (!settled) {
-				const state = deriveHydratedChildState(child, startedAt);
-				registry.hydrate({
-					...base,
-					status: state.status,
-					...(state.task !== undefined ? { task: state.task } : {}),
-					...(state.output !== undefined ? { output: state.output } : {}),
-					...(state.error !== undefined ? { error: state.error } : {}),
-					childSessionRef,
-					finishedAt: state.finishedAt,
-				});
+			try {
+				if (!settled) {
+					const state = deriveHydratedChildState(child, startedAt);
+					registry.hydrate({
+						...base,
+						status: state.status,
+						...(state.task !== undefined ? { task: state.task } : {}),
+						...(state.output !== undefined ? { output: state.output } : {}),
+						...(state.error !== undefined ? { error: state.error } : {}),
+						childSessionRef,
+						finishedAt: state.finishedAt,
+					});
+				}
+				await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedSessions);
+			} finally {
+				await child.closePersistence();
 			}
-			await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedSessions);
 		}
 	}
 

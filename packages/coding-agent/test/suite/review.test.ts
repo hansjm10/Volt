@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	buildReviewPrompt,
 	createReviewSeedMessage,
@@ -34,6 +34,7 @@ import { type ReviewSnapshot, resolveReviewSnapshot } from "../../src/core/revie
 import { getReviewRun, listReviewRuns } from "../../src/core/review-state.ts";
 import { MAX_ACTIVE_REVIEW_WORKFLOWS, ReviewWorkflowManager } from "../../src/core/review-workflows.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 function git(cwd: string, ...args: string[]): string {
@@ -662,10 +663,14 @@ describe("review command controls", () => {
 describe("review pipeline", () => {
 	const harnesses: Harness[] = [];
 	const snapshots: ReviewSnapshot[] = [];
+	const managerOwner = createSessionManagerTestOwner();
+
+	beforeEach(() => managerOwner.start());
 
 	afterEach(async () => {
 		vi.unstubAllEnvs();
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
+		await managerOwner.drain();
 		for (const harness of harnesses.splice(0)) await harness.cleanupAsync();
 	});
 
