@@ -3728,15 +3728,14 @@ export class SessionManager {
 		});
 	}
 
+	/** Find a generation-pinned reference by exact id; open() performs full snapshot validation. */
 	static async findForResume(sessionDir: string, sessionId: string): Promise<SessionReference | undefined> {
 		assertValidSessionId(sessionId);
 		const dir = normalizePath(sessionDir);
 		return SessionManager._scopedStore(dir, async (store) => {
 			const summary = await store.findSessionSummaryById(sessionId);
 			if (!summary) return undefined;
-			const snapshot = await store.loadSession(sessionId, summary.sessionGeneration);
-			if (!snapshot) throw new Error(`Session not found: ${sessionId}`);
-			return sessionReference(dir, store.info.storeId, sessionId, summary.sessionGeneration);
+			return sessionReference(dir, store.info.storeId, summary.id, summary.sessionGeneration);
 		});
 	}
 

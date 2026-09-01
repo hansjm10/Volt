@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { IrohRemoteOutcomeError } from "../src/core/remote/iroh/protocol.ts";
 import { SessionManager, type SessionReference } from "../src/core/session-manager.ts";
+import { SQLiteSessionStoreClient } from "../src/core/session-store/index.ts";
 import {
 	createSessionManagerTargetStore,
 	type IrohRemoteSessionTarget,
@@ -177,7 +178,7 @@ describe("resolveIrohRemoteSessionTarget", () => {
 		expect(store.createdIds).toEqual([]);
 	});
 
-	it("strictly resumes selector-hidden WAL-only SQLite sessions", async () => {
+	it("strictly resumes selector-hidden WAL-only SQLite sessions with one snapshot load", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-session-target-wal-"));
 		const managerOwner = createSessionManagerTestOwner();
 		managerOwner.start();
@@ -191,18 +192,25 @@ describe("resolveIrohRemoteSessionTarget", () => {
 			if (!managerRef) throw new Error("Expected a persisted session reference");
 			expect(await SessionManager.listAll(tempDir)).toEqual([]);
 
-			const store = createSessionManagerTargetStore(tempDir, tempDir, {
-				listAll: true,
-				preserveSessionCwd: true,
-			});
-			const resumed = await resolveIrohRemoteSessionTarget(
-				{ kind: "session", sessionId: "wal-only-resume" },
-				{ name: "volt", path: tempDir },
-				store,
-			);
-			expect(resumed.selection).toBe("resumed");
-			expect(resumed.sessionRef).toEqual(managerRef);
-			expect(resumed.sessionManager.getClientInput("handled-terminal")?.state).toBe("completed");
+			const loadSession = vi.spyOn(SQLiteSessionStoreClient.prototype, "loadSession");
+			try {
+				const store = createSessionManagerTargetStore(tempDir, tempDir, {
+					listAll: true,
+					preserveSessionCwd: true,
+				});
+				const resumed = await resolveIrohRemoteSessionTarget(
+					{ kind: "session", sessionId: "wal-only-resume" },
+					{ name: "volt", path: tempDir },
+					store,
+				);
+				expect(resumed.selection).toBe("resumed");
+				expect(resumed.sessionRef).toEqual(managerRef);
+				expect(resumed.sessionManager.getClientInput("handled-terminal")?.state).toBe("completed");
+				expect(loadSession).toHaveBeenCalledTimes(1);
+				expect(loadSession).toHaveBeenCalledWith(managerRef.sessionId, managerRef.sessionGeneration);
+			} finally {
+				loadSession.mockRestore();
+			}
 		} finally {
 			await managerOwner.drain();
 			rmSync(tempDir, { recursive: true, force: true });
