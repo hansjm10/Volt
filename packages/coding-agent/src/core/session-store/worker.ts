@@ -44,6 +44,7 @@ import {
 	type SessionStoreInfo,
 	type SessionStoreLabel,
 	type SessionStoreSearchChunk,
+	type SessionStoreSearchResult,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
 	type SessionStoreSubagentSpawn,
@@ -556,25 +557,35 @@ function parseSearchQuery(query: string): ParsedSearchQuery {
 	return { mode: "tokens", tokens, regex: null, invalid: false };
 }
 
-function matchesSearchText(text: string, parsed: ParsedSearchQuery): boolean {
-	if (parsed.invalid) return false;
-	if (parsed.mode === "regex") return parsed.regex !== null && text.search(parsed.regex) >= 0;
-	if (parsed.tokens.length === 0) return true;
+function matchSearchText(text: string, parsed: ParsedSearchQuery): { matches: boolean; score: number } {
+	if (parsed.invalid) return { matches: false, score: 0 };
+	if (parsed.mode === "regex") {
+		if (!parsed.regex) return { matches: false, score: 0 };
+		const index = text.search(parsed.regex);
+		return index < 0 ? { matches: false, score: 0 } : { matches: true, score: index * 0.1 };
+	}
+	if (parsed.tokens.length === 0) return { matches: true, score: 0 };
 
+	let score = 0;
 	let normalizedText: string | undefined;
 	for (const token of parsed.tokens) {
 		if (token.kind === "fuzzy") {
-			if (!fuzzyMatchSessionText(token.value, text).matches) return false;
+			const match = fuzzyMatchSessionText(token.value, text);
+			if (!match.matches) return { matches: false, score: 0 };
+			score += match.score;
 			continue;
 		}
 		normalizedText ??= text.toLowerCase().replace(/\s+/gu, " ").trim();
 		const phrase = token.value.toLowerCase().replace(/\s+/gu, " ").trim();
-		if (phrase && !normalizedText.includes(phrase)) return false;
+		if (!phrase) continue;
+		const index = normalizedText.indexOf(phrase);
+		if (index < 0) return { matches: false, score: 0 };
+		score += index * 0.1;
 	}
-	return true;
+	return { matches: true, score };
 }
 
-function searchSessions(query: string, includeHidden: boolean, cwd: string | null): SessionStoreSessionSummary[] {
+function searchSessions(query: string, includeHidden: boolean, cwd: string | null): SessionStoreSearchResult[] {
 	const db = requireDatabase();
 	return withDeferredReadTransaction(db, () => {
 		const sessions = listSessions(includeHidden, cwd);
@@ -610,10 +621,17 @@ function searchSessions(query: string, includeHidden: boolean, cwd: string | nul
 			chunks.push(sqlString(row, "text"));
 			chunksBySession.set(sessionId, chunks);
 		}
-		return sessions.filter((session) => {
+		const results: SessionStoreSearchResult[] = [];
+		for (const session of sessions) {
 			const extractedText = (chunksBySession.get(session.id) ?? []).join(" ");
-			return matchesSearchText(`${session.id} ${session.name ?? ""} ${extractedText} ${session.cwd}`, parsed);
+			const match = matchSearchText(`${session.id} ${session.name ?? ""} ${extractedText} ${session.cwd}`, parsed);
+			if (match.matches) results.push({ summary: session, score: match.score });
+		}
+		results.sort((left, right) => {
+			if (left.score !== right.score) return left.score - right.score;
+			return Date.parse(right.summary.updatedAt) - Date.parse(left.summary.updatedAt);
 		});
+		return results;
 	});
 }
 

@@ -28,6 +28,7 @@ function fixture(): { root: string; cwd: string; sessionDir: string } {
 afterEach(async () => {
 	for (const manager of managers.splice(0)) await manager.drainPersistence();
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
 	for (const lease of storeLeases.splice(0)) await lease.release();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -64,6 +65,30 @@ describe("SQLite-backed SessionManager", () => {
 
 		const matches = await SessionManager.search(cwd, "deep-only-needle", sessionDir);
 		expect(matches).toMatchObject([{ id: manager.getSessionId(), firstMessage: "first message" }]);
+	});
+
+	it("globally ranks deep-text matches across session stores", async () => {
+		const root = mkdtempSync(join(tmpdir(), "volt-session-search-all-"));
+		roots.push(root);
+		const olderCwd = join(root, "work-a");
+		const newerCwd = join(root, "work-b");
+		mkdirSync(olderCwd, { recursive: true });
+		mkdirSync(newerCwd, { recursive: true });
+		vi.stubEnv("VOLT_CODING_AGENT_DIR", join(root, "agent"));
+
+		const older = await own(SessionManager.create(olderCwd, undefined, { id: "rank-old" }));
+		older.appendMessage({ role: "user", content: "summary a", timestamp: 1_700_000_000_000 });
+		older.appendMessage({ role: "user", content: "rankneedle tail", timestamp: 1_700_000_000_001 });
+		await older.flush();
+
+		const newer = await own(SessionManager.create(newerCwd, undefined, { id: "rank-new" }));
+		newer.appendMessage({ role: "user", content: "summary b", timestamp: 1_700_000_001_000 });
+		newer.appendMessage({ role: "user", content: "xxxx rankneedle", timestamp: 1_700_000_001_001 });
+		await newer.flush();
+
+		const matches = await SessionManager.searchAll('"rankneedle"');
+		expect(matches.map((session) => session.id)).toEqual(["rank-old", "rank-new"]);
+		expect(matches.map((session) => session.firstMessage)).toEqual(["summary a", "summary b"]);
 	});
 
 	it("fails stale managers closed after delete and same-id recreation", async () => {

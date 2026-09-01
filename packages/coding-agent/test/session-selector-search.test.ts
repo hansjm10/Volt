@@ -1,6 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { setKeybindings } from "@hansjm10/volt-tui";
+import { beforeAll, describe, expect, it } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SessionInfo } from "../src/core/session-manager.ts";
+import { initTheme } from "../src/core/theme/runtime.ts";
+import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
 import { filterAndSortSessions } from "../src/modes/interactive/components/session-selector-search.ts";
+
+async function flushPromises(): Promise<void> {
+	await new Promise<void>((resolve) => {
+		setImmediate(resolve);
+	});
+}
 
 function makeSession(overrides: Partial<SessionInfo> & { id: string; modified: Date }): SessionInfo {
 	return {
@@ -21,6 +31,10 @@ function makeSession(overrides: Partial<SessionInfo> & { id: string; modified: D
 }
 
 describe("session selector search", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
 	it("filters by quoted phrase with whitespace normalization", () => {
 		const sessions = [
 			makeSession({
@@ -98,6 +112,51 @@ describe("session selector search", () => {
 			makeSession({ id: "a", modified: new Date("2026-01-01T00:00:00.000Z"), firstMessage: "brave" }),
 		];
 		expect(filterAndSortSessions(sessions, "re:(", "recent")).toEqual([]);
+	});
+
+	it("preserves worker relevance while toggling Recent without dropping deep matches", async () => {
+		const relevanceRanked = [
+			makeSession({
+				id: "older",
+				name: "Older",
+				modified: new Date("2026-01-01T00:00:00.000Z"),
+				firstMessage: "summary only",
+			}),
+			makeSession({
+				id: "newer",
+				name: "Newer",
+				modified: new Date("2026-01-02T00:00:00.000Z"),
+				firstMessage: "summary only",
+			}),
+		];
+		const keybindings = new KeybindingsManager();
+		setKeybindings(keybindings);
+		const selector = new SessionSelectorComponent(
+			async () => [],
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.onSearchQueryChange = undefined;
+		for (const character of "deepterm") list.handleInput(character);
+		list.setSessions(relevanceRanked, false, true);
+		list.setSortMode("relevance");
+
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("older");
+		const rendered = selector.render(100).lines.join("\n");
+		expect(rendered).toContain("Older");
+		expect(rendered).toContain("Newer");
+
+		list.setSortMode("recent");
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("newer");
+		list.setSortMode("relevance");
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("older");
 	});
 
 	describe("name filter", () => {

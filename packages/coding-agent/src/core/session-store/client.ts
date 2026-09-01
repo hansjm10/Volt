@@ -20,6 +20,7 @@ import {
 	type SessionStoreInfo,
 	type SessionStoreListOptions,
 	type SessionStoreReconcileCommitInput,
+	type SessionStoreSearchResult,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
 	type SessionStoreTransactionResult,
@@ -253,13 +254,13 @@ export class SQLiteSessionStoreClient {
 	async searchSessionSummaries(
 		query: string,
 		options: SessionStoreListOptions = {},
-	): Promise<SessionStoreSessionSummary[]> {
+	): Promise<SessionStoreSearchResult[]> {
 		return (await this.call({
 			kind: "search_sessions",
 			query,
 			includeHidden: options.includeHidden ?? false,
 			cwd: options.cwd ?? null,
-		})) as SessionStoreSessionSummary[];
+		})) as SessionStoreSearchResult[];
 	}
 
 	async applyTransaction(input: SessionStoreApplyTransactionInput): Promise<SessionStoreTransactionResult> {

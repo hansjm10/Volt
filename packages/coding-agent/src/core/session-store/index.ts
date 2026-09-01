@@ -25,6 +25,7 @@ export type {
 	SessionStoreReconcileCommitInput,
 	SessionStoreSearchChunk,
 	SessionStoreSearchChunkWrite,
+	SessionStoreSearchResult,
 	SessionStoreSessionProjection,
 	SessionStoreSessionSummary,
 	SessionStoreSnapshot,

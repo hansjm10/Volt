@@ -22,6 +22,7 @@ import {
 	type SessionStoreReconcileCommitInput,
 	type SessionStoreSearchChunk,
 	type SessionStoreSearchChunkWrite,
+	type SessionStoreSearchResult,
 	type SessionStoreSessionProjection,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
@@ -150,6 +151,11 @@ function safeInteger(value: unknown, path: string, minimum = 0): number {
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) {
 		fail(path, `expected a safe integer greater than or equal to ${minimum}`);
 	}
+	return value;
+}
+
+function finiteNumber(value: unknown, path: string): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) fail(path, "expected a finite number");
 	return value;
 }
 
@@ -580,6 +586,15 @@ function parseSummary(value: unknown, path: string): SessionStoreSessionSummary 
 	};
 }
 
+function parseSearchResult(value: unknown, path: string): SessionStoreSearchResult {
+	const input = record(value, path);
+	exactKeys(input, path, ["summary", "score"]);
+	return {
+		summary: parseSummary(input.summary, `${path}.summary`),
+		score: finiteNumber(input.score, `${path}.score`),
+	};
+}
+
 function parseEvidence(value: unknown, path: string): SessionStoreCommitEvidence {
 	const input = record(value, path);
 	exactKeys(input, path, [
@@ -704,6 +719,7 @@ export function parseSessionStoreOperationResult(
 	| SessionStoreInfo
 	| SessionStoreSessionSummary
 	| SessionStoreSessionSummary[]
+	| SessionStoreSearchResult[]
 	| SessionStoreSnapshot
 	| SessionStoreTransactionResult
 	| SessionStoreCommitReconciliation
@@ -717,8 +733,9 @@ export function parseSessionStoreOperationResult(
 		case "load_session":
 			return value === null ? null : parseSnapshot(value, "$result");
 		case "list_sessions":
-		case "search_sessions":
 			return arrayValue(value, "$result", parseSummary);
+		case "search_sessions":
+			return arrayValue(value, "$result", parseSearchResult);
 		case "find_session":
 		case "find_session_by_id":
 			return value === null ? null : parseSummary(value, "$result");

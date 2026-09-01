@@ -3983,11 +3983,11 @@ export class SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		return SessionManager._scopedStore(dir, async (store) => {
 			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
-			const summaries = await store.searchSessionSummaries(query, {
+			const results = await store.searchSessionSummaries(query, {
 				includeHidden: options?.includeMessageFreeDurable,
 				...(filterCwd ? { cwd: resolvePath(cwd) } : {}),
 			});
-			return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
+			return results.map(({ summary }) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
 		});
 	}
 
@@ -3995,8 +3995,8 @@ export class SessionManager {
 		if (sessionDir) {
 			const dir = normalizePath(sessionDir);
 			return SessionManager._scopedStore(dir, async (store) => {
-				const summaries = await store.searchSessionSummaries(query);
-				return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
+				const results = await store.searchSessionSummaries(query);
+				return results.map(({ summary }) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
 			});
 		}
 		const sessionsRoot = getSessionsDir();
@@ -4004,17 +4004,24 @@ export class SessionManager {
 		const directories = (await readdir(sessionsRoot, { withFileTypes: true }))
 			.filter((entry) => entry.isDirectory())
 			.map((entry) => join(sessionsRoot, entry.name));
-		const result: SessionInfo[] = [];
+		const result: { session: SessionInfo; score: number }[] = [];
 		for (const directory of directories) {
 			if (!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) continue;
 			result.push(
 				...(await SessionManager._scopedStore(directory, async (store) => {
-					const summaries = await store.searchSessionSummaries(query);
-					return summaries.map((summary) => sessionInfoFromStoreSummary(directory, store.info.storeId, summary));
+					const results = await store.searchSessionSummaries(query);
+					return results.map(({ summary, score }) => ({
+						session: sessionInfoFromStoreSummary(directory, store.info.storeId, summary),
+						score,
+					}));
 				})),
 			);
 		}
-		return result.sort((left, right) => right.modified.getTime() - left.modified.getTime());
+		result.sort((left, right) => {
+			if (left.score !== right.score) return left.score - right.score;
+			return right.session.modified.getTime() - left.session.modified.getTime();
+		});
+		return result.map(({ session }) => session);
 	}
 
 	static async exportJsonlSnapshot(ref: SessionReference, outputPath: string): Promise<{ revision: number }> {

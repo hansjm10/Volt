@@ -374,9 +374,11 @@ class SessionList implements Component, Focusable {
 			const roots = buildSessionTree(nameFiltered);
 			this.filteredSessions = flattenSessionTree(roots);
 		} else {
-			// Deep search results were already matched in the SQLite worker.
+			// Deep search results were already matched and relevance-ranked in the SQLite worker.
 			const filtered = this.sessionsAlreadyMatchQuery
-				? nameFiltered
+				? this.sortMode === "recent"
+					? [...nameFiltered].sort((left, right) => right.modified.getTime() - left.modified.getTime())
+					: nameFiltered
 				: filterAndSortSessions(nameFiltered, query, this.sortMode, "all");
 			this.filteredSessions = filtered.map((session) => ({
 				session,

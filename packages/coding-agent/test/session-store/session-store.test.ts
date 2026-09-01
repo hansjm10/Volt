@@ -367,12 +367,38 @@ describe("SQLite session store", () => {
 		await client.applyTransaction(transaction("other", 0, "commit-other", otherPayload));
 
 		const ids = async (query: string): Promise<string[]> =>
-			(await client.searchSessionSummaries(query)).map((session) => session.id);
+			(await client.searchSessionSummaries(query)).map(({ summary }) => summary.id);
 		expect(await ids('"hello sqlite"')).toEqual(["matching"]);
 		expect(await ids("hellosqlite")).toEqual(["matching"]);
 		expect(await ids("re:hello\\s+sqlite")).toEqual(["matching"]);
 		expect(await ids("hello absent")).toEqual([]);
 		expect(await ids("re:[")).toEqual([]);
+	});
+
+	it("ranks deep-text matches by score and modified-date ties", async () => {
+		const client = await openStore();
+		const addMatch = async (id: string, updatedAt: string, text: string): Promise<void> => {
+			await client.createHiddenSession(createInput(id));
+			const payload = {
+				...emptyPayload({ updatedAt, visible: true, firstMessage: "summary only" }),
+				searchChunks: [{ chunkIndex: 0, entryId: null, text }],
+			};
+			await client.applyTransaction(transaction(id, 0, `commit-${id}`, payload));
+		};
+
+		await addMatch("rank-old", "2026-08-31T12:02:00.000Z", "rankneedle tail");
+		await addMatch("rank-new", "2026-08-31T12:04:00.000Z", "xxxx rankneedle");
+		await addMatch("tie-old", "2026-08-31T12:03:00.000Z", "tieneedle");
+		await addMatch("tie-new", "2026-08-31T12:05:00.000Z", "tieneedle");
+
+		const ranked = await client.searchSessionSummaries('"rankneedle"');
+		expect(ranked.map(({ summary }) => summary.id)).toEqual(["rank-old", "rank-new"]);
+		expect(ranked[0]!.score).toBeLessThan(ranked[1]!.score);
+		expect(ranked.every(({ score }) => Number.isFinite(score))).toBe(true);
+
+		const tied = await client.searchSessionSummaries('"tieneedle"');
+		expect(tied.map(({ summary }) => summary.id)).toEqual(["tie-new", "tie-old"]);
+		expect(tied[0]!.score).toBe(tied[1]!.score);
 	});
 
 	it("rejects stale revisions without changing session state", async () => {

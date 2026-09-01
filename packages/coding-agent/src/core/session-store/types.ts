@@ -57,6 +57,11 @@ export interface SessionStoreSessionSummary {
 	readonly firstMessage: string;
 }
 
+export interface SessionStoreSearchResult {
+	readonly summary: SessionStoreSessionSummary;
+	readonly score: number;
+}
+
 export interface SessionStoreEntryWrite {
 	readonly id: string;
 	readonly parentId: string | null;
