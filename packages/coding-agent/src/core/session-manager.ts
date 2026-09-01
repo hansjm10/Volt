@@ -2691,6 +2691,32 @@ export class SessionManager {
 		}
 	}
 
+	/** @internal Seal this manager and discard only its exact persisted generation. */
+	async discardPersistence(): Promise<void> {
+		let closeError: unknown;
+		try {
+			await this.closePersistence();
+		} catch (error) {
+			closeError = error;
+		}
+
+		const ref = this.getSessionRef();
+		let deleteError: unknown;
+		if (ref) {
+			try {
+				await SessionManager.delete(ref, this.storeRevision);
+			} catch (error) {
+				deleteError = error;
+			}
+		}
+
+		if (closeError !== undefined && deleteError !== undefined) {
+			throw new AggregateError([closeError, deleteError], "Session persistence could not be closed or discarded");
+		}
+		if (closeError !== undefined) throw closeError;
+		if (deleteError !== undefined) throw deleteError;
+	}
+
 	private _indexClientInputEntry(entry: SessionEntry): void {
 		if (entry.type === "client_input_receipt") {
 			assertClientMessageId(entry.clientMessageId);

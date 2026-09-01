@@ -147,6 +147,24 @@ describe("SQLite-backed SessionManager", () => {
 		await expect(manager.closePersistence()).resolves.toBeUndefined();
 	});
 
+	it("preserves a session generation advanced beyond the discarding manager's final revision", async () => {
+		const { cwd, sessionDir } = fixture();
+		const discarding = await own(SessionManager.create(cwd, sessionDir));
+		discarding.appendPlanningState({ mode: "plan", plan: null });
+		await discarding.flush();
+		const ref = discarding.getSessionRef();
+		expect(ref).toBeDefined();
+
+		const advancing = await own(SessionManager.open(ref!));
+		advancing.appendSessionInfo("advanced owner");
+		await advancing.flush();
+
+		await expect(discarding.discardPersistence()).rejects.toThrow("Session changed before deletion (revision 2)");
+		const reopened = await own(SessionManager.open(ref!));
+		expect(reopened.getSessionRef()).toEqual(ref);
+		expect(reopened.getSessionName()).toBe("advanced owner");
+	});
+
 	it("keeps another manager usable and permits immediate deletion after the final close", async () => {
 		const { root, cwd, sessionDir } = fixture();
 		const first = await own(SessionManager.create(cwd, sessionDir));

@@ -22,7 +22,7 @@ import {
 	type ReviewRunRecord,
 } from "../src/core/review-state.ts";
 import { buildRpcSessionState } from "../src/core/rpc/session-state.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { SessionManager, type SessionReference } from "../src/core/session-manager.ts";
 import type { BashOperations } from "../src/core/tools/bash.ts";
 import type {
 	ExtensionFactory,
@@ -849,14 +849,31 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const { runtimeHost } = await createRuntimeHost(() => {});
 		const originalSession = runtimeHost.session;
 		const originalSessionId = originalSession.sessionId;
+		let preparedRef: SessionReference | undefined;
 		runtimeHost.setPrepareSessionReplacement(async () => {
 			throw new Error("target lease occupied");
 		});
 
-		await expect(runtimeHost.newSession()).rejects.toThrow("target lease occupied");
+		await expect(
+			runtimeHost.newSession({
+				setup: async (sessionManager) => {
+					sessionManager.appendPlanningState({ mode: "plan", plan: null });
+					preparedRef = sessionManager.getSessionRef();
+				},
+			}),
+		).rejects.toThrow("target lease occupied");
+		expect(preparedRef).toBeDefined();
 		expect(runtimeHost.session).toBe(originalSession);
 		expect(runtimeHost.session.sessionId).toBe(originalSessionId);
 		await expect(runtimeHost.session.prompt("still alive")).resolves.toBeUndefined();
+
+		const failedRef = preparedRef!;
+		await expect(SessionManager.open(failedRef)).rejects.toThrow(`Session not found: ${failedRef.sessionId}`);
+		expect(
+			await SessionManager.list(runtimeHost.cwd, failedRef.sessionDirectory, undefined, {
+				includeMessageFreeDurable: true,
+			}),
+		).not.toEqual(expect.arrayContaining([expect.objectContaining({ ref: failedRef })]));
 	});
 
 	it("serializes complete structural operations and rejects a queued stale derivation", async () => {
@@ -1656,6 +1673,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 	it("disposes committed replacement ownership when post-publication rebind fails", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => {});
 		const ownershipPhases: string[] = [];
+		let replacementRef: SessionReference | undefined;
 		runtimeHost.setPrepareSessionReplacement(async () => ({
 			async commit() {
 				ownershipPhases.push("commit");
@@ -1674,8 +1692,18 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			throw new Error("rebind failed");
 		});
 
-		await expect(runtimeHost.newSession()).rejects.toThrow("rebind failed");
+		await expect(
+			runtimeHost.newSession({
+				setup: async (sessionManager) => {
+					sessionManager.appendPlanningState({ mode: "plan", plan: null });
+					replacementRef = sessionManager.getSessionRef();
+				},
+			}),
+		).rejects.toThrow("rebind failed");
+		expect(replacementRef).toBeDefined();
 		expect(ownershipPhases).toEqual(["commit", "finalize", "dispose"]);
+		const reopened = await SessionManager.open(replacementRef!);
+		expect(reopened.buildSessionContext().planning).toEqual({ mode: "plan", plan: null });
 		expect(() =>
 			runtimeHost.conversationProjectionFeed.attach({
 				write: () => {},

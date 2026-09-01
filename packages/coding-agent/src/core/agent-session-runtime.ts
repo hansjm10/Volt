@@ -223,6 +223,15 @@ async function closePreparedSessionManager(manager: SessionManager, error: unkno
 	throw error;
 }
 
+async function discardPreparedSessionManager(manager: SessionManager, error: unknown, message: string): Promise<never> {
+	try {
+		await manager.discardPersistence();
+	} catch (cleanupError) {
+		throw new AggregateError([error, cleanupError], message);
+	}
+	throw error;
+}
+
 function sessionInfoToSummary(info: SessionInfo, currentSessionId: string): WorkspaceSessionSummary {
 	return {
 		sessionId: info.id,
@@ -1391,10 +1400,17 @@ export class AgentSessionRuntime {
 			});
 			return { cancelled: false, seeded: replacement.seeded };
 		} catch (error) {
-			return await closePreparedSessionManager(
+			if (sessionManager === this.session.sessionManager) {
+				return await closePreparedSessionManager(
+					sessionManager,
+					error,
+					"New session preparation failed and its installed manager could not be closed",
+				);
+			}
+			return await discardPreparedSessionManager(
 				sessionManager,
 				error,
-				"New session preparation failed and its manager could not be closed",
+				"New session preparation failed and its manager persistence could not be discarded",
 			);
 		}
 	}
