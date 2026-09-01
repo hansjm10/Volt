@@ -483,7 +483,6 @@ export interface RelayPreamble {
 	streamId: string;
 	resolvedTarget: {
 		sessionId: string;
-		sessionFilePath?: string;
 		selection: "created" | "created_after_missing" | "resumed" | "session_rekeyed";
 		requestedSessionId?: string;
 		workspaceName: string;

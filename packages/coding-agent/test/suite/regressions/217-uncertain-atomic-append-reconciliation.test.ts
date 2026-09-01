@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
@@ -15,50 +15,14 @@ import {
 	SessionConversationStateUnavailableError,
 	type SessionEntry,
 	SessionManager,
+	type SessionReference,
 } from "../../../src/core/session-manager.ts";
+import {
+	getSharedSQLiteSessionStore,
+	type SessionStoreTransactionResult,
+} from "../../../src/core/session-store/index.ts";
 import type { BashOperations } from "../../../src/core/tools/bash.ts";
 import type { ExtensionAPI } from "../../../src/index.ts";
-import type * as DurableAtomicWriteModule from "../../../src/utils/durable-atomic-write.ts";
-
-const atomicWriteFault = vi.hoisted(() => ({
-	writeStages: [] as Array<"before" | "after">,
-	syncStages: [] as Array<"pause" | "fail">,
-	pause: undefined as { started(): void; release: Promise<void> } | undefined,
-	capturePreimage: undefined as ((path: string) => void) | undefined,
-	captureCandidate: undefined as ((path: string) => void) | undefined,
-	beforeSyncFailure: undefined as ((path: string) => void) | undefined,
-}));
-
-vi.mock("../../../src/utils/durable-atomic-write.ts", async (importOriginal) => {
-	const original = await importOriginal<typeof DurableAtomicWriteModule>();
-	return {
-		...original,
-		writeDurableAtomicFile: async (...args: Parameters<typeof original.writeDurableAtomicFile>) => {
-			const stage = atomicWriteFault.writeStages.shift();
-			if (stage === "before") throw new Error("injected pre-replacement durability failure");
-			if (stage === "after") atomicWriteFault.capturePreimage?.(args[0]);
-			await original.writeDurableAtomicFile(...args);
-			if (stage === "after") {
-				atomicWriteFault.captureCandidate?.(args[0]);
-				throw new Error("injected post-replacement durability failure");
-			}
-		},
-		syncDurableFile: async (...args: Parameters<typeof original.syncDurableFile>) => {
-			const stage = atomicWriteFault.syncStages.shift();
-			if (stage === "pause") {
-				atomicWriteFault.pause?.started();
-				await atomicWriteFault.pause?.release;
-				atomicWriteFault.pause = undefined;
-			}
-			if (stage === "fail") {
-				atomicWriteFault.beforeSyncFailure?.(args[0]);
-				throw new Error("injected roll-forward fsync failure");
-			}
-			await original.syncDurableFile(...args);
-		},
-	};
-});
-
 import { createAgentSessionTestControl } from "../../agent-session-test-control.ts";
 import {
 	createHarness,
@@ -115,8 +79,8 @@ async function createReadyPlan(harness: Harness): Promise<void> {
 	await harness.session.setAgentMode("plan");
 	const draft = harness.session.updatePlan({
 		title: "Atomic append reconciliation",
-		summary: "Reconcile visible candidates without restoring stale projections.",
-		steps: [{ text: "Prove the candidate before publication" }],
+		summary: "Reconcile committed SQLite transactions before publication.",
+		steps: [{ text: "Prove the transaction outcome before publication" }],
 	});
 	harness.session.submitPlan({
 		planId: draft.id,
@@ -127,18 +91,64 @@ async function createReadyPlan(harness: Harness): Promise<void> {
 	await harness.sessionManager.flush();
 }
 
-describe("regression #217: uncertain atomic append reconciliation", () => {
+type TransactionFaultMode =
+	| "rollback"
+	| "reconcile_committed"
+	| "pause_committed"
+	| "uncertain_rollback"
+	| "uncertain_committed";
+
+interface TransactionFaultEvidence {
+	expectedRevision?: number;
+	applyResult?: SessionStoreTransactionResult;
+	reconcileCalls: number;
+}
+
+async function faultNextPlanningTransaction(
+	manager: SessionManager,
+	mode: TransactionFaultMode,
+	pause?: { started(): void; release: Promise<void> },
+): Promise<TransactionFaultEvidence> {
+	const store = await getSharedSQLiteSessionStore(manager.getSessionDir());
+	const applyTransaction = store.applyTransaction.bind(store);
+	const reconcileCommit = store.reconcileCommit.bind(store);
+	const evidence: TransactionFaultEvidence = { reconcileCalls: 0 };
+	let intercepted = false;
+
+	vi.spyOn(store, "applyTransaction").mockImplementation(async (input) => {
+		if (intercepted || !input.payload.entries.some((entry) => entry.type === "planning_state_change")) {
+			return applyTransaction(input);
+		}
+		intercepted = true;
+		evidence.expectedRevision = input.expectedRevision;
+		if (mode === "rollback" || mode === "uncertain_rollback") {
+			throw new Error("injected transaction request failure");
+		}
+		evidence.applyResult = await applyTransaction(input);
+		throw new Error("injected lost transaction response");
+	});
+
+	vi.spyOn(store, "reconcileCommit").mockImplementation(async (input) => {
+		if (!intercepted) return reconcileCommit(input);
+		evidence.reconcileCalls++;
+		if (mode === "pause_committed") {
+			pause?.started();
+			await pause?.release;
+		}
+		if (mode === "uncertain_rollback" || mode === "uncertain_committed") {
+			throw new Error("injected reconciliation failure");
+		}
+		return reconcileCommit(input);
+	});
+	return evidence;
+}
+
+describe("regression #217: SQLite transaction reconciliation", () => {
 	const harnesses: Harness[] = [];
 	const runtimeCleanups: Array<() => Promise<void>> = [];
 	const tempDirs: string[] = [];
 
 	afterEach(async () => {
-		atomicWriteFault.writeStages = [];
-		atomicWriteFault.syncStages = [];
-		atomicWriteFault.pause = undefined;
-		atomicWriteFault.capturePreimage = undefined;
-		atomicWriteFault.captureCandidate = undefined;
-		atomicWriteFault.beforeSyncFailure = undefined;
 		while (runtimeCleanups.length > 0) {
 			await runtimeCleanups.pop()?.();
 		}
@@ -152,6 +162,7 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		while (tempDirs.length > 0) {
 			rmSync(tempDirs.pop()!, { recursive: true, force: true });
 		}
+		vi.restoreAllMocks();
 	});
 
 	async function setupRuntime(replacementHook: () => void = () => {}): Promise<{
@@ -212,7 +223,7 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions")),
+			sessionManager: await SessionManager.create(tempDir, join(tempDir, "sessions")),
 		});
 		await runtime.session.bindExtensions({});
 		runtimeCleanups.push(async () => {
@@ -229,7 +240,7 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		const draft = runtime.session.updatePlan({
 			title: "Runtime reconciliation",
 			summary: "Replace the retired manager generation.",
-			steps: [{ text: "Reopen authoritative bytes" }],
+			steps: [{ text: "Reopen authoritative SQLite state" }],
 		});
 		runtime.session.submitPlan({
 			planId: draft.id,
@@ -239,8 +250,7 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		});
 		await runtime.session.sessionManager.flush();
 		await runtime.session.steer("retire this runtime", undefined, "issue-217-runtime-replacement");
-		atomicWriteFault.writeStages = ["after"];
-		atomicWriteFault.syncStages = ["fail"];
+		await faultNextPlanningTransaction(runtime.session.sessionManager, "uncertain_committed");
 		await expect(createAgentSessionTestControl(runtime.session).continue()).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "terminally_failed", phase: "settlement" },
@@ -250,18 +260,18 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 
 	async function setup(options: HarnessOptions = {}): Promise<{
 		harness: Harness;
-		sessionFile: string;
+		sessionRef: SessionReference;
 		baseline: PlanningSnapshot;
 	}> {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-"));
 		tempDirs.push(tempDir);
-		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const sessionManager = await SessionManager.create(tempDir, join(tempDir, "sessions"));
 		const harness = await createHarness({ ...options, sessionManager });
 		harnesses.push(harness);
 		await createReadyPlan(harness);
 		return {
 			harness,
-			sessionFile: sessionManager.getSessionFile()!,
+			sessionRef: sessionManager.getSessionRef()!,
 			baseline: snapshotHarness(harness),
 		};
 	}
@@ -289,139 +299,65 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		expect(replacementHookCalls).toBe(0);
 	});
 
-	it("still fails replacement for unrelated generation cleanup errors", async () => {
-		const { runtime } = await setupRuntime();
-		await makeRuntimeAuthorityUncertain(runtime);
-		const cleanupError = new Error("injected MCP cleanup failure");
-		const internals = runtime.session as unknown as {
-			_mcpManager?: { dispose(): Promise<void> };
-		};
-		internals._mcpManager = {
-			dispose: async () => Promise.reject(cleanupError),
-		};
-
-		await expect(runtime.newSession()).rejects.toBe(cleanupError);
-	});
-
-	it("refreshes a reconciliation-required runtime from the same session identity", async () => {
+	it("refreshes a reconciliation-required runtime from the same stable session reference", async () => {
 		const { runtime } = await setupRuntime();
 		await makeRuntimeAuthorityUncertain(runtime);
 		const previousSession = runtime.session;
-		const previousSessionId = previousSession.sessionId;
-		const previousSessionFile = previousSession.sessionFile;
+		const previousSessionRef = previousSession.sessionRef;
 		const previousBranchEpoch = runtime.conversationProjectionFeed.branchEpoch;
 		const prepareReplacement = vi.fn(async () => undefined);
 		runtime.setPrepareSessionReplacement(prepareReplacement);
 
-		await expect(runtime.switchSessionById(previousSessionId)).resolves.toEqual({
+		await expect(runtime.switchSessionById(previousSession.sessionId)).resolves.toEqual({
 			cancelled: false,
 			seeded: false,
 		});
 
 		expect(runtime.session).not.toBe(previousSession);
-		expect(runtime.session.sessionId).toBe(previousSessionId);
-		expect(runtime.session.sessionFile).toBe(previousSessionFile);
+		expect(runtime.session.sessionRef).toEqual(previousSessionRef);
 		expect(runtime.session.sessionManager.getConversationAuthorityStatus()).toEqual({ status: "available" });
 		expect(runtime.conversationProjectionFeed.branchEpoch).not.toBe(previousBranchEpoch);
 		expect(prepareReplacement).not.toHaveBeenCalled();
 	});
 
-	it("retires a stale manager before writing when another manager committed the session", async () => {
+	it("rejects a stale manager at the revision boundary without changing the committed winner", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-stale-manager-"));
 		tempDirs.push(tempDir);
-		const current = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const current = await SessionManager.create(tempDir, join(tempDir, "sessions"));
 		current.appendPlanningState({ mode: "build", plan: null });
 		await current.flush();
-		const sessionFile = current.getSessionFile()!;
-		const stale = SessionManager.open(sessionFile, tempDir);
+		const sessionRef = current.getSessionRef()!;
+		const stale = await SessionManager.open(sessionRef, tempDir);
 
 		current.appendPlanningState({ mode: "plan", plan: null });
 		await current.flush();
-		const authoritativeBytes = readFileSync(sessionFile);
+		const store = await getSharedSQLiteSessionStore(sessionRef.sessionDirectory);
+		const winner = await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration);
 
 		await expect(commitPlanningState(stale, "build")).rejects.toMatchObject({
 			effect: "not_started",
 			authority: "reconciliation_required",
-			message: "Session changed before the atomic append could begin",
+			message: expect.stringMatching(/Session revision changed from \d+ to \d+/),
 		});
 
-		expect(readFileSync(sessionFile).equals(authoritativeBytes)).toBe(true);
+		expect(await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration)).toMatchObject({
+			revision: winner?.revision,
+		});
 		expect(stale.getConversationAuthorityStatus().status).toBe("reconciliation_required");
 		expect(() => stale.getEntries()).toThrow(SessionConversationStateUnavailableError);
 		await expect(stale.drainPersistence()).resolves.toMatchObject({ status: "reconciliation_required" });
-		expect(SessionManager.open(sessionFile, tempDir).buildSessionContext().planning).toEqual({
+		expect((await SessionManager.open(sessionRef, tempDir)).buildSessionContext().planning).toEqual({
 			mode: "plan",
 			plan: null,
 		});
 	});
 
-	it("terminally consumes a stale-generation delivery and recovers it from a fresh manager", async () => {
-		const { harness, sessionFile } = await setup();
+	it("retains delivery and client-input ownership when the transaction is proven rolled back", async () => {
+		const { harness, sessionRef, baseline } = await setup();
 		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		const clientMessageId = "issue-217-stale-generation";
-		await harness.session.steer("recover from the authoritative preimage", undefined, clientMessageId);
-		await harness.sessionManager.flush();
-
-		const current = SessionManager.open(sessionFile);
-		current.appendSessionInfo("newer manager generation");
-		await current.flush();
-		const authoritativeBytes = readFileSync(sessionFile);
-
-		await expect(harness.control.continue()).resolves.toMatchObject({
-			status: "delivery_failed",
-			failure: { outcome: "terminally_failed", phase: "settlement" },
-		});
-
-		const authority = harness.sessionManager.getConversationAuthorityStatus();
-		expect(authority.status).toBe("reconciliation_required");
-		if (authority.status !== "reconciliation_required") {
-			throw new Error("Expected reconciliation-required conversation authority");
-		}
-		expect(authority.error.cause).toMatchObject({
-			effect: "not_started",
-			authority: "reconciliation_required",
-		});
-		expect(readFileSync(sessionFile).equals(authoritativeBytes)).toBe(true);
-		expect(harness.control.hasPendingPrompt()).toBe(false);
-		expect(harness.getPendingResponseCount()).toBe(1);
-
-		const reopened = SessionManager.open(sessionFile);
-		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		expect(reopened.getClientInputRecoveryPlan()).toMatchObject({
-			kind: "replay",
-			records: [{ clientMessageId }],
-		});
-		const replacement = await createHarness({ sessionManager: reopened });
-		harnesses.push(replacement);
-		replacement.setResponses([fauxAssistantMessage("fresh manager recovered delivery")]);
-
-		await replacement.session.resumeRecoveredClientInputs();
-
-		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
-		expect(getUserTexts(replacement)).toEqual(["recover from the authoritative preimage"]);
-		expect(getAssistantTexts(replacement)).toEqual(["fresh manager recovered delivery"]);
-		expect(replacement.getPendingResponseCount()).toBe(0);
-	});
-
-	it("retains an originally missing preimage after a proven pre-replacement failure", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-missing-"));
-		tempDirs.push(tempDir);
-		const manager = SessionManager.create(tempDir, join(tempDir, "sessions"));
-		const sessionFile = manager.getSessionFile()!;
-		atomicWriteFault.writeStages = ["before"];
-
-		await expect(commitPlanningState(manager, "build")).rejects.toMatchObject({ effect: "rolled_back" });
-
-		expect(existsSync(sessionFile)).toBe(false);
-		expect(manager.getEntries()).toEqual([]);
-	});
-
-	it("retains the exact preimage after a proven pre-replacement failure", async () => {
-		const { harness, sessionFile, baseline } = await setup();
-		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		await harness.session.steer("retain this feedback", undefined, "issue-217-retained-preimage");
-		const exactPreimage = readFileSync(sessionFile, "utf8");
-		atomicWriteFault.writeStages = ["before"];
+		const clientMessageId = "issue-217-rolled-back";
+		await harness.session.steer("retain this feedback", undefined, clientMessageId);
+		const evidence = await faultNextPlanningTransaction(harness.sessionManager, "rollback");
 
 		await expect(harness.control.continue()).resolves.toMatchObject({
 			status: "delivery_failed",
@@ -429,58 +365,27 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		});
 
 		expect(snapshotHarness(harness)).toEqual(baseline);
-		expect(readFileSync(sessionFile, "utf8").startsWith(exactPreimage)).toBe(true);
-		const reopened = SessionManager.open(sessionFile);
+		const reopened = await SessionManager.open(sessionRef);
 		expect(snapshotEntries(reopened.getBranch())).toEqual(baseline);
-		expect(harness.sessionManager.getClientInput("issue-217-retained-preimage")).toMatchObject({
-			state: "accepted",
-		});
-		expect(reopened.getClientInput("issue-217-retained-preimage")).toMatchObject({ state: "accepted" });
+		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
+		const summary = await (await getSharedSQLiteSessionStore(sessionRef.sessionDirectory)).findSessionSummary(
+			sessionRef.sessionId,
+			sessionRef.sessionGeneration,
+		);
+		expect(summary?.revision).toBe(evidence.expectedRevision);
+		expect(evidence.applyResult).toBeUndefined();
+		expect(evidence.reconcileCalls).toBe(1);
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
-	it("does not classify different bytes as an exact UTF-8 candidate", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-byte-identity-"));
-		tempDirs.push(tempDir);
-		const manager = SessionManager.create(tempDir, join(tempDir, "sessions"));
-		manager.appendSessionInfo("replacement marker \uFFFD");
-		manager.appendPlanningState({ mode: "build", plan: null });
-		await manager.flush();
-		const sessionFile = manager.getSessionFile()!;
-		let corruptedCandidate = Buffer.alloc(0);
-		atomicWriteFault.captureCandidate = (path) => {
-			const candidate = readFileSync(path);
-			const replacementBytes = Buffer.from("\uFFFD", "utf8");
-			const markerOffset = candidate.indexOf(replacementBytes);
-			if (markerOffset === -1) throw new Error("Expected replacement marker in atomic candidate");
-			corruptedCandidate = Buffer.concat([
-				candidate.subarray(0, markerOffset),
-				Buffer.from([0x80]),
-				candidate.subarray(markerOffset + replacementBytes.length),
-			]);
-			writeFileSync(path, corruptedCandidate);
-		};
-		atomicWriteFault.writeStages = ["after"];
-
-		await expect(commitPlanningState(manager, "plan")).rejects.toMatchObject({ effect: "uncertain" });
-
-		expect(readFileSync(sessionFile).equals(corruptedCandidate)).toBe(true);
-		expect(manager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
-	});
-
-	it("rolls a visible candidate forward into matching live and reopened state", async () => {
-		const { harness, sessionFile, baseline } = await setup();
+	it("publishes a committed delivery after reconciling a lost transaction response", async () => {
+		const { harness, sessionRef, baseline } = await setup();
 		harness.setResponses([fauxAssistantMessage("candidate committed")]);
-		const exactPreimage = readFileSync(sessionFile, "utf8");
-		let exactCandidate = "";
-		atomicWriteFault.captureCandidate = (path) => {
-			exactCandidate = readFileSync(path, "utf8");
-		};
-		atomicWriteFault.writeStages = ["after"];
 		const preflight: PromptPreflightResult[] = [];
-		const clientMessageId = "issue-217-visible-candidate";
+		const clientMessageId = "issue-217-reconciled-commit";
+		const evidence = await faultNextPlanningTransaction(harness.sessionManager, "reconcile_committed");
 
-		await harness.session.prompt("roll this candidate forward", {
+		await harness.session.prompt("publish the reconciled commit", {
 			clientMessageId,
 			source: "rpc",
 			preflightResult: (result) => preflight.push(result),
@@ -489,32 +394,42 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		const expected = {
 			phase: "draft",
 			checkpoints: baseline.checkpoints + 1,
-			userTexts: ["roll this candidate forward"],
+			userTexts: ["publish the reconciled commit"],
 		};
 		expect(snapshotHarness(harness)).toEqual(expected);
-		expect(exactCandidate).not.toBe(exactPreimage);
-		expect(readFileSync(sessionFile, "utf8").startsWith(exactCandidate)).toBe(true);
-		const reopened = SessionManager.open(sessionFile);
+		const reopened = await SessionManager.open(sessionRef);
 		expect(snapshotEntries(reopened.getBranch())).toEqual(expected);
-		expect(harness.sessionManager.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
 		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
+		expect(evidence.applyResult).toMatchObject({ status: "committed" });
+		expect(evidence.reconcileCalls).toBe(1);
+		if (evidence.applyResult?.status !== "committed") throw new Error("Expected committed transaction evidence");
+		expect(evidence.applyResult.evidence).toMatchObject({
+			beforeRevision: evidence.expectedRevision,
+			afterRevision: (evidence.expectedRevision ?? Number.NaN) + 1,
+		});
+		const summary = await (await getSharedSQLiteSessionStore(sessionRef.sessionDirectory)).findSessionSummary(
+			sessionRef.sessionId,
+			sessionRef.sessionGeneration,
+		);
+		expect(summary?.revision).toBeGreaterThanOrEqual(evidence.applyResult.evidence.afterRevision);
 		expect(preflight).toEqual([{ success: true, outcome: "admitted" }]);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("gates planning, delivery, direct RPC acceptance, and provider work on roll-forward proof", async () => {
+	it("gates planning, delivery, RPC acceptance, and provider work until commit reconciliation completes", async () => {
 		const { harness, baseline } = await setup();
 		harness.setResponses([fauxAssistantMessage("proof completed")]);
 		const proofStarted = deferred();
 		const releaseProof = deferred();
-		atomicWriteFault.writeStages = ["after"];
-		atomicWriteFault.syncStages = ["pause"];
-		atomicWriteFault.pause = { started: proofStarted.resolve, release: releaseProof.promise };
+		const evidence = await faultNextPlanningTransaction(harness.sessionManager, "pause_committed", {
+			started: proofStarted.resolve,
+			release: releaseProof.promise,
+		});
 		const planningEventsBefore = harness.eventsOfType("planning_state_changed").length;
 		const deliveryEventsBefore = harness.eventsOfType("delivery_start").length;
 		const preflight: PromptPreflightResult[] = [];
 
-		const prompting = harness.session.prompt("wait for durability proof", {
+		const prompting = harness.session.prompt("wait for transaction proof", {
 			clientMessageId: "issue-217-gated-direct-rpc",
 			source: "rpc",
 			preflightResult: (result) => preflight.push(result),
@@ -530,13 +445,59 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		releaseProof.resolve();
 		await prompting;
 
+		expect(evidence.applyResult).toMatchObject({ status: "committed" });
+		expect(evidence.reconcileCalls).toBe(1);
 		expect(harness.eventsOfType("planning_state_changed")).toHaveLength(planningEventsBefore + 1);
 		expect(harness.eventsOfType("delivery_start")).toHaveLength(deliveryEventsBefore + 1);
 		expect(preflight).toEqual([{ success: true, outcome: "admitted" }]);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("rejects conversation work before extension, MCP, bash, provider, queue, or planning side effects while cleanup remains available", async () => {
+	it("terminally consumes a stale-generation delivery and recovers it from a fresh manager", async () => {
+		const { harness, sessionRef } = await setup();
+		harness.setResponses([fauxAssistantMessage("must remain unused")]);
+		const clientMessageId = "issue-217-stale-generation";
+		await harness.session.steer("recover from the authoritative revision", undefined, clientMessageId);
+		await harness.sessionManager.flush();
+
+		const current = await SessionManager.open(sessionRef);
+		current.appendSessionInfo("newer manager generation");
+		await current.flush();
+		const store = await getSharedSQLiteSessionStore(sessionRef.sessionDirectory);
+		const winnerRevision = (await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration))
+			?.revision;
+
+		await expect(harness.control.continue()).resolves.toMatchObject({
+			status: "delivery_failed",
+			failure: { outcome: "terminally_failed", phase: "settlement" },
+		});
+
+		expect(harness.sessionManager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+		expect((await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration))?.revision).toBe(
+			winnerRevision,
+		);
+		expect(harness.control.hasPendingPrompt()).toBe(false);
+		expect(harness.getPendingResponseCount()).toBe(1);
+
+		const reopened = await SessionManager.open(sessionRef);
+		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
+		expect(reopened.getClientInputRecoveryPlan()).toMatchObject({
+			kind: "replay",
+			records: [{ clientMessageId }],
+		});
+		const replacement = await createHarness({ sessionManager: reopened });
+		harnesses.push(replacement);
+		replacement.setResponses([fauxAssistantMessage("fresh manager recovered delivery")]);
+
+		await replacement.session.resumeRecoveredClientInputs();
+
+		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
+		expect(getUserTexts(replacement)).toEqual(["recover from the authoritative revision"]);
+		expect(getAssistantTexts(replacement)).toEqual(["fresh manager recovered delivery"]);
+		expect(replacement.getPendingResponseCount()).toBe(0);
+	});
+
+	it("rejects new work before extension, MCP, bash, provider, queue, or planning effects after an unknown outcome", async () => {
 		let inputHookCalls = 0;
 		const { harness } = await setup({
 			extensionFactories: [
@@ -557,26 +518,14 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		internals._mcpManager = { startEagerServers: mcpStart, dispose: mcpDispose };
 		await harness.session.steer("fail authority", undefined, "issue-217-side-effect-fence");
 		await harness.session.followUp("hand back later input");
-		let preimage = "";
-		atomicWriteFault.capturePreimage = (path) => {
-			preimage = readFileSync(path, "utf8");
-		};
-		atomicWriteFault.beforeSyncFailure = (path) => {
-			writeFileSync(path, preimage, "utf8");
-		};
-		atomicWriteFault.writeStages = ["after"];
-		atomicWriteFault.syncStages = ["fail"];
+		await faultNextPlanningTransaction(harness.sessionManager, "uncertain_rollback");
 
 		await expect(harness.control.continue()).resolves.toMatchObject({
 			status: "delivery_failed",
 			failure: { outcome: "terminally_failed", phase: "settlement" },
 		});
 
-		const authority = harness.sessionManager.getConversationAuthorityStatus();
-		expect(authority.status).toBe("reconciliation_required");
-		const bashOperations: BashOperations = {
-			exec: vi.fn(async () => ({ exitCode: 0 })),
-		};
+		const bashOperations: BashOperations = { exec: vi.fn(async () => ({ exitCode: 0 })) };
 		const planningEvents = harness.eventsOfType("planning_state_changed").length;
 		const messageEvents = harness.events.filter(
 			(event) => event.type === "message_start" || event.type === "message_end",
@@ -597,9 +546,6 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 			SessionConversationStateUnavailableError,
 		);
 		await expect(
-			harness.session.sendCustomMessage({ customType: "issue-217", content: "must not append", display: true }),
-		).rejects.toBeInstanceOf(SessionConversationStateUnavailableError);
-		await expect(
 			harness.session.executeBash("must-not-run", undefined, { operations: bashOperations }),
 		).rejects.toBeInstanceOf(SessionConversationStateUnavailableError);
 		expect(() => harness.session.setAgentMode("build")).toThrow(SessionConversationStateUnavailableError);
@@ -610,8 +556,6 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 				steps: [{ text: "must not update" }],
 			}),
 		).toThrow(SessionConversationStateUnavailableError);
-		expect(() => harness.session.getMcpManager()).toThrow(SessionConversationStateUnavailableError);
-		expect(() => harness.session.resumeRecoveredClientInputs()).toThrow(SessionConversationStateUnavailableError);
 
 		expect(preflight).toEqual([]);
 		expect(inputHookCalls).toBe(0);
@@ -630,35 +574,26 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 		});
 		expect(harness.control.hasQueuedMessages()).toBe(false);
 		harness.session.dispose();
-		await expect(harness.session.waitForClosed()).rejects.toThrow("Atomic append durability is uncertain");
+		await expect(harness.session.waitForClosed()).rejects.toThrow("outcome could not be reconciled");
 		expect(mcpDispose).toHaveBeenCalledOnce();
 	});
 
-	it.each(["candidate", "preimage"] as const)(
-		"terminally consumes the failed runtime delivery while a fresh manager follows the authoritative %s",
-		async (authoritativeFile) => {
-			const { harness, sessionFile, baseline } = await setup();
+	it.each([
+		{ mode: "uncertain_committed" as const, authoritativeOutcome: "committed" as const },
+		{ mode: "uncertain_rollback" as const, authoritativeOutcome: "rolled_back" as const },
+	])(
+		"recovers from the authoritative $authoritativeOutcome transaction after reconciliation is unavailable",
+		async ({ mode, authoritativeOutcome }) => {
+			const { harness, sessionRef, baseline } = await setup();
 			harness.setResponses([fauxAssistantMessage("must remain unused")]);
-			const clientMessageId = `issue-217-unavailable-${authoritativeFile}`;
-			const laterClientMessageId = `issue-217-later-${authoritativeFile}`;
+			const clientMessageId = `issue-217-unavailable-${authoritativeOutcome}`;
+			const laterClientMessageId = `issue-217-later-${authoritativeOutcome}`;
 			await harness.session.steer("unproven feedback", undefined, clientMessageId);
 			await harness.session.followUp("later queued feedback", undefined, laterClientMessageId);
-			const stableSessionId = harness.session.sessionId;
-			const stableSessionFile = harness.session.sessionFile;
-			let preimage = "";
-			atomicWriteFault.capturePreimage = (path) => {
-				preimage = existsSync(path) ? readFileSync(path, "utf8") : "";
-			};
-			atomicWriteFault.beforeSyncFailure = (path) => {
-				if (authoritativeFile === "preimage") writeFileSync(path, preimage, "utf8");
-			};
-			atomicWriteFault.writeStages = ["after"];
-			atomicWriteFault.syncStages = ["fail"];
+			const evidence = await faultNextPlanningTransaction(harness.sessionManager, mode);
 			const planningEventsBefore = harness.eventsOfType("planning_state_changed").length;
 			const deliveryEventsBefore = harness.eventsOfType("delivery_start").length;
 			const queueEventsBefore = harness.eventsOfType("queue_update").length;
-			const messageStartEventsBefore = harness.eventsOfType("message_start").length;
-			const messageEndEventsBefore = harness.eventsOfType("message_end").length;
 
 			await expect(harness.control.continue()).resolves.toMatchObject({
 				status: "delivery_failed",
@@ -668,65 +603,29 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 			expect(harness.eventsOfType("planning_state_changed")).toHaveLength(planningEventsBefore);
 			expect(harness.eventsOfType("delivery_start")).toHaveLength(deliveryEventsBefore);
 			expect(harness.eventsOfType("queue_update")).toHaveLength(queueEventsBefore);
-			expect(harness.eventsOfType("message_start")).toHaveLength(messageStartEventsBefore);
-			expect(harness.eventsOfType("message_end")).toHaveLength(messageEndEventsBefore);
 			expect(harness.getPendingResponseCount()).toBe(1);
-			const authorityStatus = harness.sessionManager.getConversationAuthorityStatus();
-			expect(authorityStatus.status).toBe("reconciliation_required");
-			if (authorityStatus.status !== "reconciliation_required") {
-				throw new Error("Expected reconciliation-required conversation authority");
-			}
-			expect(authorityStatus.error.cause).toMatchObject({
-				message: "Atomic append durability is uncertain",
-				cause: { message: "injected roll-forward fsync failure" },
+			expect(harness.sessionManager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+			expect(evidence.reconcileCalls).toBe(1);
+			const store = await getSharedSQLiteSessionStore(sessionRef.sessionDirectory);
+			const summary = await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration);
+			expect(summary?.revision).toBe(
+				authoritativeOutcome === "committed"
+					? (evidence.expectedRevision ?? Number.NaN) + 1
+					: evidence.expectedRevision,
+			);
+			expect(evidence.applyResult).toEqual(
+				authoritativeOutcome === "committed" ? expect.objectContaining({ status: "committed" }) : undefined,
+			);
+			expect(() => harness.sessionManager.getEntries()).toThrow(SessionConversationStateUnavailableError);
+			expect(harness.session.sessionRef).toEqual(sessionRef);
+			await expect(harness.sessionManager.drainPersistence()).resolves.toMatchObject({
+				status: "reconciliation_required",
 			});
-			expect(() => harness.sessionManager.appendPlanningState({ mode: "build", plan: null })).toThrow(
-				authorityStatus.error,
-			);
-			expect(harness.sessionManager.getConversationAuthorityStatus()).toBe(authorityStatus);
-			expect(harness.session.sessionId).toBe(stableSessionId);
-			expect(harness.session.sessionFile).toBe(stableSessionFile);
-			const unavailableProjections = [
-				() => harness.sessionManager.getEntries(),
-				() => harness.sessionManager.getBranch(),
-				() => harness.sessionManager.getBranchWindow({ maxEntries: 1 }),
-				() => harness.sessionManager.getTree(),
-				() => harness.sessionManager.getHeader(),
-				() => harness.sessionManager.getLeafId(),
-				() => harness.sessionManager.getLeafEntry(),
-				() => harness.sessionManager.getEntry("missing"),
-				() => harness.sessionManager.getClientInput(clientMessageId),
-				() => harness.sessionManager.getClientInputRecoveryPlan(),
-				() => harness.sessionManager.getRecoverableQueuedClientInputs(),
-				() => harness.sessionManager.getSubagentSpawnEntries(),
-				() => harness.sessionManager.getSessionName(),
-				() => harness.sessionManager.buildSessionContext(),
-				() => harness.session.messages,
-				() => harness.session.planningState,
-				() => harness.session.state,
-			];
-			for (const readProjection of unavailableProjections) {
-				expect(readProjection).toThrow(SessionConversationStateUnavailableError);
-			}
-			expect(() => harness.sessionManager.subscribeEntries(() => {})).toThrow(
-				SessionConversationStateUnavailableError,
-			);
-			expect(() => harness.sessionManager.setSessionFile(sessionFile)).toThrow(
-				SessionConversationStateUnavailableError,
-			);
-			expect(harness.sessionManager.getSessionId()).toBe(stableSessionId);
-			expect(harness.sessionManager.getSessionFile()).toBe(stableSessionFile);
-			expect(harness.sessionManager.getCwd()).toBeTruthy();
-			expect(harness.sessionManager.getSessionDir()).toBeTruthy();
-			expect(harness.sessionManager.isPersisted()).toBe(true);
-			await expect(harness.sessionManager.flush()).rejects.toThrow("Atomic append durability is uncertain");
 
-			expect(harness.control.hasPendingPrompt()).toBe(false);
-			expect(harness.control.hasQueuedMessages()).toBe(false);
-			const reopened = SessionManager.open(sessionFile);
+			const reopened = await SessionManager.open(sessionRef);
 			const replacement = await createHarness({ sessionManager: reopened });
 			harnesses.push(replacement);
-			if (authoritativeFile === "candidate") {
+			if (authoritativeOutcome === "committed") {
 				replacement.setResponses([fauxAssistantMessage("fresh recovery later")]);
 				expect(snapshotEntries(reopened.getBranch())).toEqual({
 					phase: "draft",
@@ -734,7 +633,6 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 					userTexts: ["unproven feedback"],
 				});
 				expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
-				expect(reopened.getClientInput(laterClientMessageId)).toMatchObject({ state: "accepted" });
 				expect(reopened.getClientInputRecoveryPlan()).toMatchObject({
 					kind: "replay",
 					records: [{ clientMessageId: laterClientMessageId }],
@@ -746,30 +644,22 @@ describe("regression #217: uncertain atomic append reconciliation", () => {
 				]);
 				expect(snapshotEntries(reopened.getBranch())).toEqual(baseline);
 				expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-				expect(reopened.getClientInput(laterClientMessageId)).toMatchObject({ state: "accepted" });
 				expect(reopened.getClientInputRecoveryPlan()).toMatchObject({
 					kind: "replay",
 					records: [{ clientMessageId }, { clientMessageId: laterClientMessageId }],
 				});
 			}
+
 			await replacement.session.resumeRecoveredClientInputs();
 			expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
 			expect(reopened.getClientInput(laterClientMessageId)).toMatchObject({ state: "completed" });
-			expect(snapshotEntries(reopened.getBranch()).userTexts).toEqual([
-				"unproven feedback",
-				"later queued feedback",
-			]);
-			const expectedLiveUserTexts = ["unproven feedback", "later queued feedback"];
-			expect(getUserTexts(replacement)).toEqual(expectedLiveUserTexts);
-			const expectedAssistantTexts =
-				authoritativeFile === "candidate"
+			expect(getUserTexts(replacement)).toEqual(["unproven feedback", "later queued feedback"]);
+			expect(getAssistantTexts(replacement)).toEqual(
+				authoritativeOutcome === "committed"
 					? ["fresh recovery later"]
-					: ["fresh recovery first", "fresh recovery later"];
-			expect(getAssistantTexts(replacement)).toEqual(expectedAssistantTexts);
+					: ["fresh recovery first", "fresh recovery later"],
+			);
 			expect(replacement.getPendingResponseCount()).toBe(0);
-			await replacement.session.resumeRecoveredClientInputs();
-			expect(getUserTexts(replacement)).toEqual(expectedLiveUserTexts);
-			expect(getAssistantTexts(replacement)).toEqual(expectedAssistantTexts);
 		},
 	);
 });

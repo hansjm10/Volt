@@ -95,7 +95,7 @@ describe("SessionManager labels", () => {
 		expect(msg2Node?.labelTimestamp).toBe(msg2LabelEntry.timestamp);
 	});
 
-	it("labels are preserved in createBranchedSession", () => {
+	it("labels are preserved in createBranchedSession", async () => {
 		const session = SessionManager.inMemory();
 
 		const msg1Id = session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
@@ -123,8 +123,8 @@ describe("SessionManager labels", () => {
 		const msg1LabelEntry = originalEntries.find((e) => e.id === msg1LabelId) as LabelEntry;
 		const msg2LabelEntry = originalEntries.find((e) => e.id === msg2LabelId) as LabelEntry;
 
-		// Branch from msg2 (in-memory mode returns null, but updates internal state)
-		session.createBranchedSession(msg2Id);
+		// Branch from msg2 and replace the in-memory session with the selected path.
+		await session.createBranchedSession(msg2Id);
 
 		// Labels should be preserved
 		expect(session.getLabel(msg1Id)).toBe("important");
@@ -142,7 +142,7 @@ describe("SessionManager labels", () => {
 		expect(msg2Node?.labelTimestamp).toBe(msg2LabelEntry.timestamp);
 	});
 
-	it("rewires children of removed labels when forking", () => {
+	it("rewires children of removed labels when forking", async () => {
 		const session = SessionManager.inMemory();
 
 		const msg1Id = session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
@@ -150,12 +150,12 @@ describe("SessionManager labels", () => {
 		const modelChangeId = session.appendModelChange("anthropic", "claude-test");
 		const msg2Id = session.appendMessage({ role: "user", content: "followup", timestamp: 2 });
 
-		session.createBranchedSession(msg2Id);
+		await session.createBranchedSession(msg2Id);
 
 		expect(session.getEntry(modelChangeId)?.parentId).toBe(msg1Id);
 	});
 
-	it("labels not on path are not preserved in createBranchedSession", () => {
+	it("labels not on path are not preserved in createBranchedSession", async () => {
 		const session = SessionManager.inMemory();
 
 		const msg1Id = session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
@@ -184,7 +184,7 @@ describe("SessionManager labels", () => {
 		session.appendLabelChange(msg3Id, "third");
 
 		// Branch from msg2 (excludes msg3)
-		session.createBranchedSession(msg2Id);
+		await session.createBranchedSession(msg2Id);
 
 		// Only labels for msg1 and msg2 should be preserved
 		expect(session.getLabel(msg1Id)).toBe("first");

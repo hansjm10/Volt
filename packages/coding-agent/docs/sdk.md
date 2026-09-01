@@ -89,8 +89,8 @@ interface AgentSession {
   // Subscribe to events (returns unsubscribe function)
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
 
-  // Session info
-  sessionFile: string | undefined;
+  // Session identity
+  sessionRef: SessionReference | undefined; // undefined for in-memory sessions
   sessionId: string;
 
   // Model control
@@ -113,7 +113,7 @@ interface AgentSession {
   isStreaming: boolean; // provider run or session continuation
   isBusy: boolean;      // also includes prompt preflight and standalone session operations
 
-  // In-place tree navigation within the current session file
+  // In-place tree navigation within the current session
   navigateTree(targetId: string, options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string }): Promise<{ editorText?: string; cancelled: boolean }>;
 
   // Compaction
@@ -174,7 +174,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 ```
 
@@ -501,7 +501,7 @@ const { session } = await createAgentSession({
   - `.agents/skills/` in `cwd` and ancestor directories (up to git repo root, or filesystem root when not in a repo)
 - Project prompts (`.volt/prompts/`)
 - Context files (`AGENTS.md` walking up from cwd)
-- Session directory naming
+- Workspace session-store directory selection
 
 `agentDir` is used by `DefaultResourceLoader` for:
 - Global extensions (`extensions/`)
@@ -513,9 +513,9 @@ const { session } = await createAgentSession({
 - Settings (`settings.json`)
 - Custom models (`models.json`)
 - Credentials (`auth.json`)
-- Sessions (`sessions/`)
+- Per-workspace SQLite session stores (`sessions/`)
 
-When you pass a custom `ResourceLoader`, `cwd` and `agentDir` no longer control resource discovery. They still influence session naming and tool path resolution.
+When you pass a custom `ResourceLoader`, `cwd` and `agentDir` no longer control resource discovery. They still influence workspace session-store selection and tool path resolution.
 
 ### Model
 
@@ -829,7 +829,18 @@ const { session } = await createAgentSession({ resourceLoader: loader });
 
 ### Session Management
 
-Sessions use a tree structure with `id`/`parentId` linking, enabling in-place branching.
+Each workspace or custom session directory has one authoritative `sessions.sqlite` store. Persisted sessions use stable references:
+
+```typescript
+interface SessionReference {
+  readonly sessionDirectory: string;
+  readonly storeId: string;
+  readonly sessionId: string;
+  readonly sessionGeneration: string;
+}
+```
+
+Persisted factories and store queries are asynchronous. JSONL paths are explicit snapshot imports only.
 
 ```typescript
 import {
@@ -849,25 +860,36 @@ const { session } = await createAgentSession({
 
 // New persistent session
 const { session: persisted } = await createAgentSession({
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 // Continue most recent
 const { session: continued, modelFallbackMessage } = await createAgentSession({
-  sessionManager: SessionManager.continueRecent(process.cwd()),
+  sessionManager: await SessionManager.continueRecent(process.cwd()),
 });
 if (modelFallbackMessage) {
   console.log("Note:", modelFallbackMessage);
 }
 
-// Open specific file
-const { session: opened } = await createAgentSession({
-  sessionManager: SessionManager.open("/path/to/session.jsonl"),
-});
-
-// List sessions
+// Indexed listing and search return SessionInfo objects with stable refs
 const currentProjectSessions = await SessionManager.list(process.cwd());
-const allSessions = await SessionManager.listAll(process.cwd());
+const matchingSessions = await SessionManager.search(process.cwd(), "authentication");
+const allSessions = await SessionManager.listAll();
+const selectedRef = currentProjectSessions[0]?.ref;
+
+if (selectedRef) {
+  const { session: opened } = await createAgentSession({
+    sessionManager: await SessionManager.open(selectedRef),
+  });
+  console.log(opened.sessionId);
+}
+
+// Explicitly import or export a JSONL interchange snapshot
+const imported = await SessionManager.importFromJsonl("/path/to/session-snapshot.jsonl");
+const importedRef = imported.getSessionRef();
+if (importedRef) {
+  await SessionManager.exportJsonlSnapshot(importedRef, "/path/to/export.jsonl");
+}
 
 // Session replacement API for /clear, /resume, /fork, /clone, and import flows.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
@@ -886,47 +908,38 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
-// Replace the active session with a fresh one
 await runtime.newSession();
-
-// Replace the active session with another saved session
-await runtime.switchSession("/path/to/session.jsonl");
-
-// Replace the active session with a fork from a specific user entry
+if (selectedRef) await runtime.switchSession(selectedRef);
 await runtime.fork("entry-id");
-
-// Clone the active path through a specific entry
-await runtime.fork("entry-id", { position: "at" });
+await runtime.fork("entry-id", { position: "at" }); // clone through this entry
+await runtime.importFromJsonl("/path/to/session-snapshot.jsonl");
 ```
+
+`AgentSession.sessionRef` is the current persisted reference, or `undefined` for an in-memory session. `AgentSession.sessionId` is always available.
 
 **SessionManager tree API:**
 
 ```typescript
-const sm = SessionManager.open("/path/to/session.jsonl");
+if (!selectedRef) throw new Error("No saved session");
+const sm = await SessionManager.open(selectedRef);
 
-// Session listing
-const currentProjectSessions = await SessionManager.list(process.cwd());
-const allSessions = await SessionManager.listAll(process.cwd());
+const entries = sm.getEntries();
+const tree = sm.getTree();
+const path = sm.getBranch();
+const leaf = sm.getLeafEntry();
+const entry = sm.getEntry(id);
+const children = sm.getChildren(id);
 
-// Tree traversal
-const entries = sm.getEntries();        // All entries (excludes header)
-const tree = sm.getTree();              // Full tree structure
-const path = sm.getPath();              // Path from root to current leaf
-const leaf = sm.getLeafEntry();         // Current leaf entry
-const entry = sm.getEntry(id);          // Get entry by ID
-const children = sm.getChildren(id);    // Direct children of entry
+const label = sm.getLabel(id);
+sm.appendLabelChange(id, "checkpoint");
 
-// Labels
-const label = sm.getLabel(id);          // Get label for entry
-sm.appendLabelChange(id, "checkpoint"); // Set label
-
-// Branching
-sm.branch(entryId);                     // Move leaf to earlier entry
-sm.branchWithSummary(id, "Summary...");  // Branch with context summary
-sm.createBranchedSession(leafId);       // Extract path to new file
+sm.branch(entryId);
+sm.branchWithSummary(id, "Summary...");
+await sm.createBranchedSession(leafId);
+await sm.flush();
 ```
 
 > See [examples/sdk/11-sessions.ts](../examples/sdk/11-sessions.ts) and [Session Format](session-format.md)
@@ -1140,7 +1153,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 const mode = new InteractiveMode(runtime, {
@@ -1180,7 +1193,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 await runPrintMode(runtime, {
@@ -1217,7 +1230,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 await runRpcMode(runtime);
@@ -1247,7 +1260,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 const client = await createInProcessRpcClient(runtime);
@@ -1317,6 +1330,7 @@ getExamplesPath
 
 // Session management
 SessionManager
+type SessionReference
 SettingsManager
 
 // Tool factories

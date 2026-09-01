@@ -38,7 +38,7 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import { assertValidSessionId, SessionManager, type SessionReference } from "./core/session-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { SubagentManager } from "./core/subagents/index.ts";
 import { initTheme, stopThemeWatcher } from "./core/theme/runtime.ts";
@@ -170,27 +170,23 @@ async function prepareInitialMessage(
 	});
 }
 
-/** Result from resolving a session argument */
+/** Result from resolving a session argument. Paths are explicit JSONL import sources only. */
 type ResolvedSession =
-	| { type: "path"; path: string } // Direct file path
-	| { type: "local"; path: string } // Found in current project
-	| { type: "global"; path: string; cwd: string } // Found in different project
-	| { type: "not_found"; arg: string }; // Not found anywhere
+	| { type: "path"; path: string }
+	| { type: "local"; ref: SessionReference }
+	| { type: "global"; ref: SessionReference; cwd: string }
+	| { type: "not_found"; arg: string };
 
-/**
- * Resolve a session argument to a file path.
- * If it looks like a path, use as-is. Otherwise try to match as session ID prefix.
- */
 async function findLocalSessionByExactId(
 	sessionId: string,
 	cwd: string,
 	sessionDir?: string,
-): Promise<{ type: "local"; path: string } | undefined> {
+): Promise<{ type: "local"; ref: SessionReference } | undefined> {
 	const localSessions = await SessionManager.list(cwd, sessionDir, undefined, {
 		includeMessageFreeDurable: true,
 	});
-	const localMatch = localSessions.find((s) => s.id === sessionId);
-	return localMatch ? { type: "local", path: localMatch.path } : undefined;
+	const localMatch = localSessions.find((session) => session.id === sessionId);
+	return localMatch ? { type: "local", ref: localMatch.ref } : undefined;
 }
 
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
@@ -204,31 +200,23 @@ async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: 
 		includeMessageFreeDurable: true,
 	});
 	const localExactMatch = localAddressableSessions.find((session) => session.id === sessionArg);
-	if (localExactMatch) {
-		return { type: "local", path: localExactMatch.path };
-	}
+	if (localExactMatch) return { type: "local", ref: localExactMatch.ref };
 
 	// Try to match a visible session ID prefix in the current project.
 	const localSessions = await SessionManager.list(cwd, sessionDir);
 	const localPrefixMatch = localSessions.find((session) => session.id.startsWith(sessionArg));
-	if (localPrefixMatch) {
-		return { type: "local", path: localPrefixMatch.path };
-	}
+	if (localPrefixMatch) return { type: "local", ref: localPrefixMatch.ref };
 
 	// Try global search across all projects.
 	const allAddressableSessions = await SessionManager.listAll(sessionDir, undefined, {
 		includeMessageFreeDurable: true,
 	});
 	const globalExactMatch = allAddressableSessions.find((session) => session.id === sessionArg);
-	if (globalExactMatch) {
-		return { type: "global", path: globalExactMatch.path, cwd: globalExactMatch.cwd };
-	}
+	if (globalExactMatch) return { type: "global", ref: globalExactMatch.ref, cwd: globalExactMatch.cwd };
 	const allSessions = await SessionManager.listAll(sessionDir);
 	const globalMatch = allSessions.find((session) => session.id.startsWith(sessionArg));
 
-	if (globalMatch) {
-		return { type: "global", path: globalMatch.path, cwd: globalMatch.cwd };
-	}
+	if (globalMatch) return { type: "global", ref: globalMatch.ref, cwd: globalMatch.cwd };
 
 	// Not found anywhere
 	return { type: "not_found", arg: sessionArg };
@@ -288,9 +276,16 @@ function validateSessionIdFlags(parsed: Args): void {
 	}
 }
 
-function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string, sessionId?: string): SessionManager {
+async function forkSessionOrExit(
+	source: Extract<ResolvedSession, { type: "path" | "local" | "global" }>,
+	cwd: string,
+	sessionDir?: string,
+	sessionId?: string,
+): Promise<SessionManager> {
 	try {
-		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id: sessionId });
+		return source.type === "path"
+			? await SessionManager.importFromJsonl(source.path, cwd, sessionDir, { id: sessionId })
+			: await SessionManager.forkFrom(source.ref, cwd, sessionDir, { id: sessionId });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -323,7 +318,7 @@ async function createSessionManager(
 			case "path":
 			case "local":
 			case "global":
-				return forkSessionOrExit(resolved.path, cwd, sessionDir, parsed.sessionId);
+				return forkSessionOrExit(resolved, cwd, sessionDir, parsed.sessionId);
 
 			case "not_found":
 				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
@@ -336,8 +331,10 @@ async function createSessionManager(
 
 		switch (resolved.type) {
 			case "path":
+				return SessionManager.importFromJsonl(resolved.path, undefined, sessionDir);
+
 			case "local":
-				return SessionManager.open(resolved.path, sessionDir);
+				return SessionManager.open(resolved.ref);
 
 			case "global": {
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
@@ -346,7 +343,7 @@ async function createSessionManager(
 					console.log(chalk.dim("Aborted."));
 					process.exit(0);
 				}
-				return forkSessionOrExit(resolved.path, cwd, sessionDir);
+				return forkSessionOrExit(resolved, cwd, sessionDir);
 			}
 
 			case "not_found":
@@ -358,15 +355,17 @@ async function createSessionManager(
 	if (parsed.resume) {
 		initTheme(settingsManager.getTheme(), true);
 		try {
-			const selectedPath = await selectSession(
-				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
-				(onProgress) => SessionManager.listAll(sessionDir, onProgress),
+			const selectedRef = await selectSession(
+				(onProgress, query) =>
+					query ? SessionManager.search(cwd, query, sessionDir) : SessionManager.list(cwd, sessionDir, onProgress),
+				(onProgress, query) =>
+					query ? SessionManager.searchAll(query, sessionDir) : SessionManager.listAll(sessionDir, onProgress),
 			);
-			if (!selectedPath) {
+			if (!selectedRef) {
 				console.log(chalk.dim("No session selected"));
 				process.exit(0);
 			}
-			return SessionManager.open(selectedPath, sessionDir);
+			return SessionManager.open(selectedRef);
 		} finally {
 			stopThemeWatcher();
 		}
@@ -379,7 +378,7 @@ async function createSessionManager(
 	if (parsed.sessionId) {
 		const existingSession = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
 		if (existingSession) {
-			return SessionManager.open(existingSession.path, sessionDir);
+			return SessionManager.open(existingSession.ref);
 		}
 	}
 
@@ -651,7 +650,7 @@ export async function main(args: string[], options?: MainOptions) {
 			if (!selectedCwd) {
 				process.exit(0);
 			}
-			sessionManager = SessionManager.open(missingSessionCwdIssue.sessionFile!, sessionDir, selectedCwd);
+			sessionManager = await SessionManager.open(missingSessionCwdIssue.sessionRef!, selectedCwd);
 		} else {
 			console.error(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message));
 			process.exit(1);
@@ -664,6 +663,7 @@ export async function main(args: string[], options?: MainOptions) {
 			process.exit(1);
 		}
 		sessionManager.appendSessionInfo(name);
+		await sessionManager.flush();
 	}
 	time("createSessionManager");
 

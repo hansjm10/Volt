@@ -38,6 +38,19 @@ This is intentional. Volt is designed to operate on local source trees, invoke p
 
 Project trust is only an input-loading guard. It prevents a repository from silently changing volt's settings, MCP servers, or extensions before you approve it. It does not make untrusted code, untrusted prompts, or untrusted model output safe. Prompt injection from repository files, comments, documentation, context files, or build output is expected local-agent risk and cannot be reliably prevented by volt.
 
+## Session Storage
+
+Each workspace or custom session directory contains the authoritative
+`sessions.sqlite` database. Volt creates the directory with owner-only `0700`
+permissions and hardens `sessions.sqlite`, `sessions.sqlite-wal`, and
+`sessions.sqlite-shm` to `0600`. Explicit JSONL snapshot exports use `0600`,
+and one-time legacy migration archives remain inside owner-only directories.
+
+Treat the database and its WAL/SHM sidecars as one sensitive live store. Do not
+copy only `sessions.sqlite` while Volt is running. Session content can include
+prompts, model responses, tool arguments/results, workspace paths, and
+extension state.
+
 ## Standalone Release Integrity
 
 Prebuilt Volt executables are Node.js 22.23.1 Single Executable Applications.
@@ -100,7 +113,7 @@ Supported preview safety model:
 - Paired clients are persisted until revoked with `volt remote revoke <node-id>`.
 - After pairing, saved-host reconnect uses the persisted client node ID and a secret-free client saved-host record. Ordinary app reconnect, temporary network loss, or daemon restart should not require scanning another QR (the daemon owns a persistent Iroh identity).
 - Pairing is workstation-scoped for the daemon's state file. A paired phone can reconnect to any registered workspace name, including workspaces registered after pairing, without another QR scan. The app receives and selects names and host feature strings only, never host-local paths.
-- Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`. Mobile conversation streams bind at handshake time to one authorized workspace/session target, and the host-observed Iroh client node ID is authoritative for authorization, runtime ownership, revocation, and audit.
+- Integrated hosts advertise `multi_streams.v1` and `conversation_streams.v1`. Mobile conversation streams bind at handshake time to one authorized workspace/session target, and the host-observed Iroh client node ID is authoritative for authorization, runtime ownership, revocation, and audit. Session lists, state, and switch requests use stable IDs; session directories, SQLite paths, WAL/SHM paths, and host-side `SessionReference` values never cross the remote wire.
 - Same-client duplicates for one workspace/session on one live Iroh connection are rejected with `duplicate_conversation_connection`. The first conversation stream on a new same-client connection can replace a stale active stream for the same workspace/session and reattach to the retained runtime. Different sessions in the same registered workspace may run concurrently.
 - Distinct paired devices normally co-attach to one shared conversation runtime (or to a TUI-owned conversation over the daemon's byte relay). `conversation_in_use` is reserved for the narrow case where that existing daemon runtime permits tools outside the attaching client's persisted grant; the client cannot safely drive the broader runtime. Audit records (`~/.volt/agent/daemon/audit.jsonl`) cover pairing, lease transfers, and relay lifecycle so "what did the phone do while I was away" is reviewable after the fact.
 - Mobile conversation streams cannot be retargeted after handshake. Command-level workspace/session fields are assertions only and mismatches fail with `session_mismatch`. Direct `new_session`, `switch_session_by_id`, and raw `get_messages` are rejected on mobile conversation streams.

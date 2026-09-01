@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -28,6 +28,7 @@ import {
 	type RemoteSessionRuntimeState,
 	TURN_INITIATING_RPC_TYPES,
 } from "../src/daemon/conversation-commands.ts";
+import { loadPersistedSessionSnapshot } from "./utilities.ts";
 
 const STARTING_GIT_CONTEXT: RpcGitContext = {
 	repository: "volt-app",
@@ -553,7 +554,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		mkdirSync(workspacePath, { recursive: true });
 		mkdirSync(sessionDir, { recursive: true });
 		try {
-			const manager = SessionManager.create(workspacePath, sessionDir);
+			const manager = await SessionManager.create(workspacePath, sessionDir);
 			manager.reserveClientInput("client-message-42", "prompt", {
 				message: `Read ${workspacePath}/fixture.txt`,
 			});
@@ -585,7 +586,8 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			});
 			expect(bootstrap?.items).toEqual([live]);
 			await manager.flush();
-			expect(readFileSync(manager.getSessionFile()!, "utf8")).toContain('"clientMessageId":"client-message-42"');
+			const persisted = await loadPersistedSessionSnapshot(manager);
+			expect(JSON.stringify(persisted.entries)).toContain('"clientMessageId":"client-message-42"');
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -1432,16 +1434,10 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			const agentDir = join(tempDir, "agent");
 			mkdirSync(subfolderPath, { recursive: true });
 			const sessionDir = getDefaultSessionDir(workspacePath, agentDir);
-			writeFileSync(
-				join(sessionDir, "root-session.jsonl"),
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "s-root",
-					timestamp: new Date(1).toISOString(),
-					cwd: workspacePath,
-				})}\n`,
-			);
+			const rootManager = await SessionManager.create(workspacePath, sessionDir, { id: "s-root" });
+			rootManager.appendMessage({ role: "user", content: "root session", timestamp: 1 });
+			rootManager.appendCustomMessageEntry("test.persist", "persist root session", false);
+			await rootManager.flush();
 			const runtime = createRuntime("s-subfolder");
 			runtime.listSessions = async () => [
 				{

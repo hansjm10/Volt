@@ -6,7 +6,7 @@ import type { HostInteraction } from "../src/core/host-interaction.ts";
 import { isStdoutTakenOver, restoreStdout } from "../src/core/output-guard.ts";
 import type { RpcCloseHandler, RpcTransport } from "../src/core/rpc/transport.ts";
 import type { RpcGitContext } from "../src/core/rpc/types.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { SessionManager, type SessionReference } from "../src/core/session-manager.ts";
 import { runRpcMode as runRpcModeImpl } from "../src/modes/rpc/rpc-mode.ts";
 
 function runRpcMode(runtimeHost: AgentSessionRuntime, options?: Parameters<typeof runRpcModeImpl>[1]): Promise<void> {
@@ -27,12 +27,27 @@ function runRpcMode(runtimeHost: AgentSessionRuntime, options?: Parameters<typeo
 	return runRpcModeImpl(runtimeHost, options);
 }
 
+function createSessionRef(sessionId: string): SessionReference {
+	return Object.freeze({
+		sessionDirectory: "/sessions",
+		storeId: "test-store",
+		sessionId,
+		sessionGeneration: "generation-test",
+	});
+}
+
 function createRuntimeHost(): { runtimeHost: AgentSessionRuntime; dispose: ReturnType<typeof vi.fn> } {
 	const dispose = vi.fn(async () => {});
+	const sessionId = "runtime-session";
 	const runtimeHost = {
 		session: {
 			bindExtensions: vi.fn(async () => {}),
-			sessionManager: { getClientInput: vi.fn(() => undefined) },
+			sessionId,
+			sessionManager: {
+				getClientInput: vi.fn(() => undefined),
+				getSessionDir: vi.fn(() => "/sessions"),
+				getSessionRef: vi.fn(() => createSessionRef(sessionId)),
+			},
 			subscribe: vi.fn(() => () => {}),
 			subscribeRuntimeEvents: vi.fn(() => () => {}),
 		},
@@ -70,9 +85,12 @@ function createStateSession(sessionId: string, gitContext: RpcGitContext | null 
 		messages: [],
 		model: undefined,
 		pendingMessageCount: 0,
-		sessionFile: `/sessions/${sessionId}.jsonl`,
 		sessionId,
-		sessionManager: { getStartingGitContext: () => undefined },
+		sessionManager: {
+			getSessionDir: () => "/sessions",
+			getSessionRef: () => createSessionRef(sessionId),
+			getStartingGitContext: () => undefined,
+		},
 		steeringMode: "one-at-a-time" as const,
 		subscribe: vi.fn(() => () => {}),
 		thinkingLevel: "off" as const,
@@ -1364,24 +1382,30 @@ describe("RPC mode caller-provided transports", () => {
 			bindExtensions: vi.fn(async () => {}),
 			subscribe: vi.fn(() => detachSession),
 			subscribeRuntimeEvents: vi.fn(() => detachBackpressure),
-			sessionFile: `/sessions/${sessionId}.jsonl`,
 			sessionId,
+			sessionManager: {
+				getSessionRef: vi.fn(() => createSessionRef(sessionId)),
+			},
 		});
 		let currentSession = makeSession("initial-session");
+		let rebindSession: (() => Promise<void>) | undefined;
 		const runtimeHost = {
 			get session() {
 				return currentSession;
 			},
 			newSession: vi.fn(async () => {
 				currentSession = makeSession("next-session");
+				await rebindSession?.();
 				return { cancelled: false };
 			}),
 			switchSession: vi.fn(async () => ({ cancelled: true })),
 			fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 			dispose: vi.fn(async () => {}),
-			setRebindSession: vi.fn(),
+			setRebindSession: vi.fn((rebind: (() => Promise<void>) | undefined) => {
+				rebindSession = rebind;
+			}),
 		} as unknown as AgentSessionRuntime;
-		const sessionChanges: Array<{ sessionFile?: string; sessionId: string }> = [];
+		const sessionChanges: Array<{ sessionRef?: SessionReference; sessionId: string }> = [];
 		let resolveReady: () => void = () => {};
 		const ready = new Promise<void>((resolve) => {
 			resolveReady = resolve;
@@ -1411,8 +1435,8 @@ describe("RPC mode caller-provided transports", () => {
 		);
 
 		expect(sessionChanges).toEqual([
-			{ sessionFile: "/sessions/initial-session.jsonl", sessionId: "initial-session" },
-			{ sessionFile: "/sessions/next-session.jsonl", sessionId: "next-session" },
+			{ sessionRef: createSessionRef("initial-session"), sessionId: "initial-session" },
+			{ sessionRef: createSessionRef("next-session"), sessionId: "next-session" },
 		]);
 
 		closeHandler?.();

@@ -16,9 +16,9 @@ import type { RpcSessionState } from "../core/rpc/types.ts";
  * serving a different session id than the one requested).
  */
 export type IntegratedConversationSessionSelection =
-	| { kind: "created"; sessionId: string; sessionFile?: string }
-	| { kind: "created_after_missing"; requestedSessionId: string; sessionId: string; sessionFile?: string }
-	| { kind: "resumed"; requestedSessionId: string; sessionId: string; sessionFile?: string }
+	| { kind: "created"; sessionId: string }
+	| { kind: "created_after_missing"; requestedSessionId: string; sessionId: string }
+	| { kind: "resumed"; requestedSessionId: string; sessionId: string }
 	| { kind: "session_rekeyed"; requestedSessionId: string; sessionId: string };
 
 /** Host identity/context needed to build handshake responses and host-state decoration. */

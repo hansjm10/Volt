@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
@@ -87,7 +87,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: await SessionManager.create(tempDir),
 		});
 		await runtimeHost.session.bindExtensions({});
 
@@ -164,29 +164,29 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		events.length = 0;
 
 		await runtimeHost.session.prompt("hello");
-		const originalSessionFile = runtimeHost.session.sessionFile;
-		expect(originalSessionFile).toBeTruthy();
+		const originalSessionRef = runtimeHost.session.sessionRef;
+		expect(originalSessionRef).toBeTruthy();
 
 		const newSessionResult = await runtimeHost.newSession();
 		expect(newSessionResult.cancelled).toBe(false);
 		await runtimeHost.session.bindExtensions({});
-		const secondSessionFile = runtimeHost.session.sessionFile;
+		const secondSessionRef = runtimeHost.session.sessionRef;
 		expect(events).toEqual([
-			{ type: "session_before_switch", reason: "new", targetSessionFile: undefined },
-			{ type: "session_shutdown", reason: "new", targetSessionFile: secondSessionFile },
-			{ type: "session_start", reason: "new", previousSessionFile: originalSessionFile },
+			{ type: "session_before_switch", reason: "new", targetSessionRef: undefined },
+			{ type: "session_shutdown", reason: "new", targetSessionRef: secondSessionRef },
+			{ type: "session_start", reason: "new", previousSessionRef: originalSessionRef },
 		]);
 
 		events.length = 0;
-		expect(secondSessionFile).toBeTruthy();
+		expect(secondSessionRef).toBeTruthy();
 
-		const switchResult = await runtimeHost.switchSession(originalSessionFile!);
+		const switchResult = await runtimeHost.switchSession(originalSessionRef!);
 		expect(switchResult.cancelled).toBe(false);
 		await runtimeHost.session.bindExtensions({});
 		expect(events).toEqual([
-			{ type: "session_before_switch", reason: "resume", targetSessionFile: originalSessionFile },
-			{ type: "session_shutdown", reason: "resume", targetSessionFile: originalSessionFile },
-			{ type: "session_start", reason: "resume", previousSessionFile: secondSessionFile },
+			{ type: "session_before_switch", reason: "resume", targetSessionRef: originalSessionRef },
+			{ type: "session_shutdown", reason: "resume", targetSessionRef: originalSessionRef },
+			{ type: "session_start", reason: "resume", previousSessionRef: secondSessionRef },
 		]);
 	});
 
@@ -206,15 +206,15 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		events.length = 0;
 
 		await runtimeHost.session.prompt("hello");
-		const originalSessionFile = runtimeHost.session.sessionFile;
+		const originalSessionRef = runtimeHost.session.sessionRef;
 
 		const result = await runtimeHost.newSession();
 		expect(result.cancelled).toBe(true);
-		expect(runtimeHost.session.sessionFile).toBe(originalSessionFile);
-		expect(events).toEqual([{ type: "session_before_switch", reason: "new", targetSessionFile: undefined }]);
+		expect(runtimeHost.session.sessionRef).toEqual(originalSessionRef);
+		expect(events).toEqual([{ type: "session_before_switch", reason: "new", targetSessionRef: undefined }]);
 	});
 
-	it("treats switching to the current session path as a clean no-op", async () => {
+	it("treats switching to the current session reference as a clean no-op", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtimeHost } = await createRuntimeHost((volt) => {
 			volt.on("session_before_switch", (event) => {
@@ -225,8 +225,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			});
 		});
 		const originalSession = runtimeHost.session;
-		const currentSessionFile = originalSession.sessionFile;
-		expect(currentSessionFile).toBeDefined();
+		const currentSessionRef = originalSession.sessionRef;
+		expect(currentSessionRef).toBeDefined();
 		const prepare = vi.fn(async () => undefined);
 		const rebind = vi.fn(async () => {});
 		const replaced = vi.fn();
@@ -236,7 +236,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const publish = vi.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind");
 		events.length = 0;
 
-		await expect(runtimeHost.switchSession(currentSessionFile!)).resolves.toEqual({
+		await expect(runtimeHost.switchSession(currentSessionRef!)).resolves.toEqual({
 			cancelled: false,
 			seeded: false,
 		});
@@ -255,8 +255,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await runtimeHost.session.prompt("materialize review origin");
 		const originatingSession = runtimeHost.session;
 		const originatingManager = originatingSession.sessionManager;
-		const originatingFile = originatingSession.sessionFile;
-		expect(originatingFile).toBeDefined();
+		const originatingRef = originatingSession.sessionRef;
+		expect(originatingRef).toBeDefined();
 		await originatingManager.flush();
 		const originatingEntries = originatingManager.getEntries();
 		const originatingLeaf = originatingManager.getLeafId();
@@ -329,7 +329,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		});
 		workflow.launch();
 
-		await expect(runtimeHost.switchSession(originatingFile!)).resolves.toEqual({
+		await expect(runtimeHost.switchSession(originatingRef!)).resolves.toEqual({
 			cancelled: false,
 			seeded: false,
 		});
@@ -347,7 +347,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await runtimeHost.reviewWorkflows.waitForIdle();
 		await expect(runtimeHost.newSession()).resolves.toEqual({ cancelled: false, seeded: false });
 		expect(disposeForReplacement).toHaveBeenCalledOnce();
-		expect(getReviewRun(SessionManager.open(originatingFile!), record.runId)).toEqual(record);
+		expect(getReviewRun(await SessionManager.open(originatingRef!), record.runId)).toEqual(record);
 	});
 
 	it("rejects session replacement and fork commands while an agent run owns the persistence leaf", async () => {
@@ -357,17 +357,20 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const userEntryId = originalSession.getUserMessagesForForking()[0]?.entryId;
 		expect(userEntryId).toBeDefined();
 
-		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
+		const targetManager = await SessionManager.create(
+			runtimeHost.cwd,
+			originalSession.sessionManager.getSessionDir(),
+		);
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
 		await targetManager.flush();
-		const targetFile = targetManager.getSessionFile();
-		expect(targetFile).toBeDefined();
+		const targetRef = targetManager.getSessionRef();
+		expect(targetRef).toBeDefined();
 
 		vi.spyOn(originalSession, "isStreaming", "get").mockReturnValue(true);
 		const expectedError = "Cannot change sessions while an agent run is active; abort or wait for it to finish";
 		await expect(runtimeHost.newSession()).rejects.toThrow(expectedError);
-		await expect(runtimeHost.switchSession(targetFile!)).rejects.toThrow(expectedError);
+		await expect(runtimeHost.switchSession(targetRef!)).rejects.toThrow(expectedError);
 		await expect(runtimeHost.switchSessionById(targetManager.getSessionId())).rejects.toThrow(expectedError);
 		await expect(runtimeHost.fork(userEntryId!)).rejects.toThrow(expectedError);
 		expect(runtimeHost.session).toBe(originalSession);
@@ -380,12 +383,15 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const userEntryId = originalSession.getUserMessagesForForking()[0]?.entryId;
 		expect(userEntryId).toBeDefined();
 
-		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
+		const targetManager = await SessionManager.create(
+			runtimeHost.cwd,
+			originalSession.sessionManager.getSessionDir(),
+		);
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
 		await targetManager.flush();
-		const targetFile = targetManager.getSessionFile();
-		expect(targetFile).toBeDefined();
+		const targetRef = targetManager.getSessionRef();
+		expect(targetRef).toBeDefined();
 
 		let releaseBash!: () => void;
 		const bashGate = new Promise<void>((resolve) => {
@@ -403,7 +409,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		const expectedError = "Cannot change sessions while a bash run is active; abort or wait for it to finish";
 		await expect(runtimeHost.newSession()).rejects.toThrow(expectedError);
-		await expect(runtimeHost.switchSession(targetFile!)).rejects.toThrow(expectedError);
+		await expect(runtimeHost.switchSession(targetRef!)).rejects.toThrow(expectedError);
 		await expect(runtimeHost.switchSessionById(targetManager.getSessionId())).rejects.toThrow(expectedError);
 		await expect(runtimeHost.fork(userEntryId!)).rejects.toThrow(expectedError);
 		expect(runtimeHost.session).toBe(originalSession);
@@ -465,8 +471,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await runtimeHost.session.prompt("Source-only conversation");
 		const sourceManager = runtimeHost.session.sessionManager;
 		const sourceSessionId = runtimeHost.session.sessionId;
-		const sourceSessionFile = runtimeHost.session.sessionFile;
-		expect(sourceSessionFile).toBeDefined();
+		const sourceSessionRef = runtimeHost.session.sessionRef;
+		expect(sourceSessionRef).toBeDefined();
 		const reviewOnlyMarker = "REVIEW_ONLY_FINDING_BODY";
 		const reviewRecord = (runId: string, endedAt: number, title: string): ReviewRunRecord => ({
 			schemaVersion: 1,
@@ -563,7 +569,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		expect(runtimeHost.session.sessionId).toBe(started.selectedSessionId);
 		await runtimeHost.session.waitForIdle();
 
-		expect(runtimeHost.session.sessionManager.getHeader()?.parentSession).toBe(sourceSessionFile);
+		expect(runtimeHost.session.sessionManager.getHeader()?.parentSession).toEqual(sourceSessionRef);
 		expect(runtimeHost.session.planningState).toMatchObject({
 			mode: "build",
 			plan: {
@@ -577,7 +583,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				},
 			},
 		});
-		expect(sourceManager.buildSessionContext().planning).toMatchObject({
+		const sourceAfterHandoff = await SessionManager.open(sourceSessionRef!);
+		expect(sourceAfterHandoff.buildSessionContext().planning).toMatchObject({
 			mode: "build",
 			plan: {
 				id: ready.id,
@@ -585,8 +592,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				execution: { targetSessionId: started.selectedSessionId },
 			},
 		});
-		expect(listReviewRuns(sourceManager, { limit: 50 }).runs).toEqual(sourceReviewsBefore);
-		expect(exportReviewFeedback(sourceManager).outcomes).toEqual(sourceFeedbackBefore);
+		expect(listReviewRuns(sourceAfterHandoff, { limit: 50 }).runs).toEqual(sourceReviewsBefore);
+		expect(exportReviewFeedback(sourceAfterHandoff).outcomes).toEqual(sourceFeedbackBefore);
 
 		const targetManager = runtimeHost.session.sessionManager;
 		expect(listReviewRuns(targetManager, { limit: 50 }).runs.map((run) => run.runId)).toEqual([
@@ -605,7 +612,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			createdAt: 50,
 		});
 		expect(getReviewRun(targetManager, currentReview.runId)?.result?.findings[0]?.status).toBe("fixed");
-		expect(getReviewRun(sourceManager, currentReview.runId)?.result?.findings[0]?.status).toBe("dismissed");
+		expect(getReviewRun(sourceAfterHandoff, currentReview.runId)?.result?.findings[0]?.status).toBe("dismissed");
 		expect(JSON.stringify(targetManager.buildSessionContext().messages)).not.toContain(reviewOnlyMarker);
 
 		const childBranch = targetManager.getBranch();
@@ -648,12 +655,15 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const userEntryId = originalSession.getUserMessagesForForking()[0]?.entryId;
 		expect(userEntryId).toBeDefined();
 
-		const targetManager = SessionManager.create(runtimeHost.cwd, originalSession.sessionManager.getSessionDir());
+		const targetManager = await SessionManager.create(
+			runtimeHost.cwd,
+			originalSession.sessionManager.getSessionDir(),
+		);
 		targetManager.appendMessage({ role: "user", content: "target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant"));
 		await targetManager.flush();
-		const targetFile = targetManager.getSessionFile();
-		expect(targetFile).toBeDefined();
+		const targetRef = targetManager.getSessionRef();
+		expect(targetRef).toBeDefined();
 
 		let notifyCompactionStarted!: () => void;
 		const compactionStarted = new Promise<void>((resolve) => {
@@ -690,7 +700,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const expectedError = "Cannot change sessions while a session mutation is active; wait for it to finish";
 		try {
 			await expect(runtimeHost.newSession()).rejects.toThrow(expectedError);
-			await expect(runtimeHost.switchSession(targetFile!)).rejects.toThrow(expectedError);
+			await expect(runtimeHost.switchSession(targetRef!)).rejects.toThrow(expectedError);
 			await expect(runtimeHost.switchSessionById(targetManager.getSessionId())).rejects.toThrow(expectedError);
 			await expect(runtimeHost.fork(userEntryId!)).rejects.toThrow(expectedError);
 			expect(runtimeHost.session).toBe(originalSession);
@@ -749,7 +759,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		expect(originalSession.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	});
 
-	it("rejects a different session file that collides on the current session ID", async () => {
+	it("rejects a different session reference that collides on the current session ID", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtimeHost } = await createRuntimeHost((volt) => {
 			volt.on("session_shutdown", (event) => {
@@ -758,11 +768,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		});
 		await runtimeHost.session.prompt("persist current session");
 		const originalSession = runtimeHost.session;
-		const currentSessionFile = originalSession.sessionFile;
-		expect(currentSessionFile).toBeDefined();
+		const currentSessionRef = originalSession.sessionRef;
+		expect(currentSessionRef).toBeDefined();
 		await originalSession.sessionManager.flush();
-		const collisionFile = join(runtimeHost.cwd, "same-id-collision.jsonl");
-		copyFileSync(currentSessionFile!, collisionFile);
+		const collisionManager = await SessionManager.create(
+			runtimeHost.cwd,
+			join(runtimeHost.cwd, "collision-sessions"),
+			{ id: originalSession.sessionId },
+		);
+		const collisionRef = collisionManager.getSessionRef();
+		expect(collisionRef).toBeDefined();
 		const prepare = vi.fn(async () => undefined);
 		const rebind = vi.fn(async () => {});
 		const replaced = vi.fn();
@@ -772,8 +787,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const publish = vi.spyOn(runtimeHost.conversationProjectionFeed, "commitSourceRebind");
 		events.length = 0;
 
-		await expect(runtimeHost.switchSession(collisionFile)).rejects.toThrow(
-			"Cannot replace the current session with a different file using the same session ID",
+		await expect(runtimeHost.switchSession(collisionRef!)).rejects.toThrow(
+			"Cannot replace the current session with a different persisted reference using the same session ID",
 		);
 
 		expect(runtimeHost.session).toBe(originalSession);
@@ -1161,20 +1176,23 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 	it("drains WAL-bearing replacement input before withSession can submit fresh work", async () => {
 		const { runtimeHost, faux } = await createRuntimeHost(() => {});
-		const targetManager = SessionManager.create(runtimeHost.cwd, runtimeHost.session.sessionManager.getSessionDir());
+		const targetManager = await SessionManager.create(
+			runtimeHost.cwd,
+			runtimeHost.session.sessionManager.getSessionDir(),
+		);
 		targetManager.reserveClientInput("replacement-older", "steer", { message: "older durable input" });
 		targetManager.markClientInputQueued("replacement-older", {
 			delivery: "steer",
 			message: "older durable input",
 		});
 		await targetManager.flush();
-		const targetFile = targetManager.getSessionFile();
-		expect(targetFile).toBeDefined();
+		const targetRef = targetManager.getSessionRef();
+		expect(targetRef).toBeDefined();
 		faux.setResponses([fauxAssistantMessage("older done"), fauxAssistantMessage("fresh done")]);
 		await runtimeHost.startRecoveredClientInputs();
 		const phases: string[] = [];
 
-		const switchResult = await runtimeHost.switchSession(targetFile!, {
+		const switchResult = await runtimeHost.switchSession(targetRef!, {
 			withSession: async (ctx) => {
 				phases.push(runtimeHost.session.sessionManager.getClientInput("replacement-older")?.state ?? "missing");
 				await ctx.sendUserMessage("fresh callback input");
@@ -1198,7 +1216,10 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 	it("skips fresh replacement callbacks and fences new input when WAL recovery fails", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => {});
-		const targetManager = SessionManager.create(runtimeHost.cwd, runtimeHost.session.sessionManager.getSessionDir());
+		const targetManager = await SessionManager.create(
+			runtimeHost.cwd,
+			runtimeHost.session.sessionManager.getSessionDir(),
+		);
 		targetManager.reserveClientInput("replacement-retry", "steer", { message: "older durable input" });
 		targetManager.markClientInputQueued("replacement-retry", {
 			delivery: "steer",
@@ -1211,7 +1232,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			.spyOn(AgentSession.prototype, "resumeRecoveredClientInputs")
 			.mockRejectedValueOnce(new Error("injected recovery failure"));
 		try {
-			const result = await runtimeHost.switchSession(targetManager.getSessionFile()!, { withSession });
+			const result = await runtimeHost.switchSession(targetManager.getSessionRef()!, { withSession });
 			// The replacement applied, but the skipped callback must be surfaced so
 			// callers cannot mistake the non-cancelled result for a completed seed.
 			expect(result).toEqual({ cancelled: false, seeded: false });
@@ -1722,7 +1743,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 		await runtimeHost.session.prompt("hello");
 		const userMessage = runtimeHost.session.getUserMessagesForForking()[0];
-		const previousSessionFile = runtimeHost.session.sessionFile;
+		const previousSessionRef = runtimeHost.session.sessionRef;
 
 		const successResult = await runtimeHost.fork(userMessage.entryId);
 		expect(successResult.cancelled).toBe(false);
@@ -1730,8 +1751,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await runtimeHost.session.bindExtensions({});
 		expect(events).toEqual([
 			{ type: "session_before_fork", entryId: userMessage.entryId, position: "before" },
-			{ type: "session_shutdown", reason: "fork", targetSessionFile: runtimeHost.session.sessionFile },
-			{ type: "session_start", reason: "fork", previousSessionFile },
+			{ type: "session_shutdown", reason: "fork", targetSessionRef: runtimeHost.session.sessionRef },
+			{ type: "session_start", reason: "fork", previousSessionRef },
 		]);
 
 		events.length = 0;

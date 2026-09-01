@@ -50,7 +50,7 @@ describe("regression #5596: missing configured theme export", () => {
 		});
 
 		const settingsManager = SettingsManager.inMemory({ theme: "missing-theme" });
-		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const sessionManager = await SessionManager.create(tempDir, join(tempDir, "sessions"));
 		const session = new AgentSession({
 			...createTestAgentSessionRuntimeConfig({ model, apiKey: "faux-key" }),
 			sessionManager,

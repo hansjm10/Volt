@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -1219,7 +1219,10 @@ describe("review pipeline", () => {
 					{ stopReason: "toolUse" },
 				),
 		]);
-		const sessionManager = SessionManager.create(harness.tempDir, join(harness.tempDir, "presentation-sessions"));
+		const sessionManager = await SessionManager.create(
+			harness.tempDir,
+			join(harness.tempDir, "presentation-sessions"),
+		);
 		const outcome = await executeReviewWorkflow({
 			prepared: {
 				workflowId: "review:private-presentation-failure",
@@ -1251,7 +1254,7 @@ describe("review pipeline", () => {
 			record: { errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE },
 		});
 		expect(JSON.stringify(outcome.record)).not.toContain(privateMarker);
-		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
+		const reopened = await SessionManager.open(sessionManager.getSessionRef()!);
 		expect(getReviewRun(reopened, "review:private-presentation-failure")).toMatchObject({
 			status: "failed",
 			errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE,
@@ -1278,7 +1281,7 @@ describe("review pipeline", () => {
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: privateDiagnostic }),
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: privateDiagnostic }),
 		]);
-		const sessionManager = SessionManager.create(harness.tempDir, join(harness.tempDir, "remote-sessions"));
+		const sessionManager = await SessionManager.create(harness.tempDir, join(harness.tempDir, "remote-sessions"));
 		const remoteOutcome = await executeReviewWorkflow({
 			prepared: {
 				workflowId: "review:remote-provider-failure",
@@ -1311,7 +1314,7 @@ describe("review pipeline", () => {
 			record: { errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE },
 		});
 		expect(JSON.stringify(remoteOutcome)).not.toContain(privateDiagnostic);
-		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
+		const reopened = await SessionManager.open(sessionManager.getSessionRef()!);
 		expect(getReviewRun(reopened, "review:remote-provider-failure")).toMatchObject({
 			status: "failed",
 			errorMessage: REMOTE_REVIEW_FAILURE_MESSAGE,
@@ -1607,8 +1610,8 @@ describe("review pipeline", () => {
 		harnesses.push(harness);
 		const snapshot = await createSnapshotRepository(harness);
 		snapshots.push(snapshot);
-		const originManager = SessionManager.create(harness.tempDir, join(harness.tempDir, "origin-sessions"));
-		const originFile = originManager.getSessionFile()!;
+		const originManager = await SessionManager.create(harness.tempDir, join(harness.tempDir, "origin-sessions"));
+		const originRef = originManager.getSessionRef()!;
 		const originalMaterialize = originManager.materialize.bind(originManager);
 		let markMaterializeStarted!: () => void;
 		const materializeStarted = new Promise<void>((resolve) => {
@@ -1678,7 +1681,7 @@ describe("review pipeline", () => {
 		await materializeStarted;
 		try {
 			expect(settled).toBe(false);
-			expect(existsSync(originFile)).toBe(false);
+			expect(originManager.getSessionRef()).toEqual(originRef);
 			manager.cancel(workflowId);
 		} finally {
 			releaseMaterialize();
@@ -1695,7 +1698,7 @@ describe("review pipeline", () => {
 			status: "completed",
 			message: expect.stringContaining("Review incomplete"),
 		});
-		const reopened = SessionManager.open(originFile);
+		const reopened = await SessionManager.open(originRef);
 		expect(getReviewRun(reopened, workflowId)).toMatchObject({
 			runId: workflowId,
 			status: "incomplete",

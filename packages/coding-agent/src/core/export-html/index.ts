@@ -1,13 +1,13 @@
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { existsSync, readFileSync } from "fs";
-import { basename, join } from "path";
+import { join } from "path";
 import { APP_NAME, getExportTemplateDir } from "../../config.ts";
 import { writeDurableAtomicFileSync } from "../../utils/durable-atomic-write.ts";
 import { normalizePath, resolvePath } from "../../utils/paths.ts";
-import { PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../../utils/private-files.ts";
+import { hardenPrivateRegularFileSync, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../../utils/private-files.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
-import type { SessionEntry } from "../session-manager.ts";
-import { SessionManager } from "../session-manager.ts";
+import type { SessionEntry, SessionHeader, SessionManager } from "../session-manager.ts";
+import { isHostOnlySessionEntry, loadEntriesFromFile, migrateSessionEntries } from "../session-manager.ts";
 import { getResolvedThemeColors, getThemeExportColors } from "../theme/runtime.ts";
 
 /**
@@ -242,12 +242,9 @@ export async function exportSessionToHtml(
 ): Promise<string> {
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
 
-	const sessionFile = sm.getSessionFile();
-	if (!sessionFile) {
+	const sessionRef = sm.getSessionRef();
+	if (!sm.isPersisted() || !sessionRef) {
 		throw new Error("Cannot export in-memory session to HTML");
-	}
-	if (!existsSync(sessionFile)) {
-		throw new Error("Nothing to export yet - start a conversation first");
 	}
 
 	const entries = sm.getEntries();
@@ -275,8 +272,7 @@ export async function exportSessionToHtml(
 
 	let outputPath = opts.outputPath ? normalizePath(opts.outputPath) : undefined;
 	if (!outputPath) {
-		const sessionBasename = basename(sessionFile, ".jsonl");
-		outputPath = `${APP_NAME}-session-${sessionBasename}.html`;
+		outputPath = `${APP_NAME}-session-${sessionRef.sessionId}.html`;
 	}
 
 	writeDurableAtomicFileSync(outputPath, html, {
@@ -298,12 +294,32 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 		throw new Error(`File not found: ${resolvedInputPath}`);
 	}
 
-	const sm = SessionManager.open(resolvedInputPath);
+	hardenPrivateRegularFileSync(resolvedInputPath);
+	const fileEntries = loadEntriesFromFile(resolvedInputPath);
+	if (fileEntries.length === 0) {
+		throw new Error(`Session file has no valid session header: ${resolvedInputPath}`);
+	}
+	migrateSessionEntries(fileEntries);
+	const header = fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+	if (!header || !header.id) {
+		throw new Error(`Session file has no valid session header: ${resolvedInputPath}`);
+	}
+	const entries: SessionEntry[] = [];
+	let leafId: string | null = null;
+	for (const entry of fileEntries) {
+		if (entry.type === "session") continue;
+		if (entry.type === "leaf") {
+			leafId = entry.targetId;
+		} else if (!isHostOnlySessionEntry(entry)) {
+			entries.push(entry);
+			leafId = entry.id;
+		}
+	}
 
 	const sessionData: SessionData = {
-		header: sm.getHeader(),
-		entries: sm.getEntries(),
-		leafId: sm.getLeafId(),
+		header,
+		entries,
+		leafId,
 		systemPrompt: undefined,
 		tools: undefined,
 	};
@@ -312,8 +328,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	let outputPath = opts.outputPath ? normalizePath(opts.outputPath) : undefined;
 	if (!outputPath) {
-		const inputBasename = basename(resolvedInputPath, ".jsonl");
-		outputPath = `${APP_NAME}-session-${inputBasename}.html`;
+		outputPath = `${APP_NAME}-session-${header.id}.html`;
 	}
 
 	writeDurableAtomicFileSync(outputPath, html, {

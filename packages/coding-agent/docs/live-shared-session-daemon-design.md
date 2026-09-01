@@ -242,8 +242,8 @@ export type IrohRemoteSessionTarget =
   | { kind: "session"; sessionId: string };
 
 export interface ResolvedSessionTarget {
-  sessionId: string;                 // concrete id (existing file id, or freshly created)
-  sessionFilePath: string;
+  sessionId: string;                 // concrete id (existing row id, or freshly created)
+  sessionRef?: SessionReference;     // host-local SQLite store identity; never sent remotely
   selection: "created" | "created_after_missing" | "resumed";
   workspaceName: string;
   workspacePath: string;

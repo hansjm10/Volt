@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync as nodeRealpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync as nodeRealpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -606,26 +606,13 @@ describe("worktree session-dir keying (§5.1.7 filterCwd pin)", () => {
 			mkdirSync(worktreePath, { recursive: true });
 
 			const parentSessionDir = getDefaultSessionDir(parentPath, agentDir);
-			writeFileSync(
-				join(parentSessionDir, "worktree-session.jsonl"),
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "s-worktree",
-					timestamp: new Date().toISOString(),
-					cwd: worktreePath,
-				})}\n`,
-			);
-			writeFileSync(
-				join(parentSessionDir, "parent-session.jsonl"),
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "s-parent",
-					timestamp: new Date().toISOString(),
-					cwd: parentPath,
-				})}\n`,
-			);
+			const worktreeSession = await SessionManager.create(worktreePath, parentSessionDir, {
+				id: "s-worktree",
+			});
+			const parentSession = await SessionManager.create(parentPath, parentSessionDir, { id: "s-parent" });
+			worktreeSession.appendMessage({ role: "user", content: "worktree session", timestamp: Date.now() });
+			parentSession.appendMessage({ role: "user", content: "parent session", timestamp: Date.now() });
+			await Promise.all([worktreeSession.flush(), parentSession.flush()]);
 
 			// The daemon's list_sessions call shape: parent cwd + parent default dir.
 			const sessions = await SessionManager.list(parentPath, parentSessionDir);

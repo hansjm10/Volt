@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type IrohRemoteAuditEvent, IrohRemoteAuditLogger } from "../src/core/remote/iroh/audit.ts";
 import type { IrohRemoteHostState, IrohRemoteWorkspace } from "../src/core/remote/iroh/state.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
-import { getDefaultSessionDir, getDefaultSessionDirPath } from "../src/core/session-manager.ts";
+import { getDefaultSessionDir, getDefaultSessionDirPath, SessionManager } from "../src/core/session-manager.ts";
 import {
 	getWorkspaceWorktreesDir,
 	getWorktreeCheckoutPath,
@@ -1036,11 +1036,8 @@ describe("worktree manager (fake git)", () => {
 		expect(await manager.resolveSessionWorktree("repo", "s-unknown")).toBeUndefined();
 	});
 
-	function writeSessionFile(sessionDir: string, fileName: string, id: string, cwd: string): void {
-		writeFileSync(
-			join(sessionDir, fileName),
-			`${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd })}\n`,
-		);
+	async function createStoredSession(sessionDir: string, id: string, cwd: string): Promise<void> {
+		await SessionManager.create(cwd, sessionDir, { id });
 	}
 
 	it("resolveSessionWorktree heals a stranded binding from the session's stored cwd (#83)", async () => {
@@ -1049,10 +1046,10 @@ describe("worktree manager (fake git)", () => {
 		const checkoutPath = getWorktreeCheckoutPath(agentDir, workspaceDir, "heal");
 		mkdirSync(join(checkoutPath, "src"), { recursive: true });
 		// A rekeyed (fork/new) descendant of a worktree conversation: the session
-		// file lives in the PARENT-keyed session dir with the worktree cwd, but its
-		// id was never appended to worktrees[].sessionIds.
+		// lives in the parent-keyed store with the worktree cwd, but its id was
+		// never appended to worktrees[].sessionIds.
 		const sessionDir = getDefaultSessionDir(workspaceDir, agentDir);
-		writeSessionFile(sessionDir, "2026-07-20T13-00-00-000Z_s-rekeyed.jsonl", "s-rekeyed", join(checkoutPath, "src"));
+		await createStoredSession(sessionDir, "s-rekeyed", join(checkoutPath, "src"));
 
 		const resolved = await manager.resolveSessionWorktree("repo", "s-rekeyed");
 
@@ -1063,19 +1060,16 @@ describe("worktree manager (fake git)", () => {
 		expect(record?.sessionIds).toContain("s-rekeyed");
 	});
 
-	it("resolveSessionWorktree cwd fallback stays inert for parent-cwd, unknown, and ambiguous sessions", async () => {
+	it("resolveSessionWorktree cwd fallback stays inert for parent-cwd and unknown sessions", async () => {
 		const manager = createManager(okGit().runGit);
 		expect((await manager.create(workspace, { id: "heal" })).ok).toBe(true);
 		const checkoutPath = getWorktreeCheckoutPath(agentDir, workspaceDir, "heal");
 		mkdirSync(checkoutPath, { recursive: true });
 		const sessionDir = getDefaultSessionDir(workspaceDir, agentDir);
-		writeSessionFile(sessionDir, "a_s-parent.jsonl", "s-parent", workspaceDir);
-		writeSessionFile(sessionDir, "a_s-dup.jsonl", "s-dup", checkoutPath);
-		writeSessionFile(sessionDir, "b_s-dup.jsonl", "s-dup", checkoutPath);
+		await createStoredSession(sessionDir, "s-parent", workspaceDir);
 
 		expect(await manager.resolveSessionWorktree("repo", "s-parent")).toBeUndefined();
 		expect(await manager.resolveSessionWorktree("repo", "s-missing")).toBeUndefined();
-		expect(await manager.resolveSessionWorktree("repo", "s-dup")).toBeUndefined();
 		const record = (await stateManager.listWorktrees("repo")).find((entry) => entry.id === "heal");
 		expect(record?.sessionIds).toEqual([]);
 	});
@@ -1092,7 +1086,7 @@ describe("worktree manager (fake git)", () => {
 			// resolveSessionWorktree; the read-only lookup now fails closed.
 			const decoyDir = join(agentDir, "decoy-sessions");
 			mkdirSync(decoyDir, { recursive: true });
-			writeSessionFile(decoyDir, "a_s-link.jsonl", "s-link", checkoutPath);
+			await createStoredSession(decoyDir, "s-link", checkoutPath);
 			const sessionDir = getDefaultSessionDirPath(workspaceDir, agentDir);
 			mkdirSync(dirname(sessionDir), { recursive: true });
 			symlinkSync(decoyDir, sessionDir);

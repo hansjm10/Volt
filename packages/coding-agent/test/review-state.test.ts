@@ -327,12 +327,12 @@ describe("durable review state", () => {
 		const root = join(tmpdir(), `volt-review-state-empty-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(root, { recursive: true });
 		directories.push(root);
-		const manager = SessionManager.create(root, join(root, "sessions"));
+		const manager = await SessionManager.create(root, join(root, "sessions"));
 		await appendReviewRunDurably(manager, record("run-before-prompt", 1));
 
-		const file = manager.getSessionFile();
-		if (!file) throw new Error("Expected a persisted session file");
-		const reopened = SessionManager.open(file);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
 		expect(listReviewRuns(reopened).runs).toMatchObject([{ runId: "run-before-prompt", status: "completed" }]);
 	});
 
@@ -340,7 +340,7 @@ describe("durable review state", () => {
 		const root = join(tmpdir(), `volt-review-ack-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(root, { recursive: true });
 		directories.push(root);
-		const manager = SessionManager.create(root, join(root, "sessions"));
+		const manager = await SessionManager.create(root, join(root, "sessions"));
 		await appendReviewRunDurably(manager, record("run-acknowledged", 1));
 		const branchPoint = manager.appendCustomEntry("test.branch-point", { value: true });
 		manager.appendCustomEntry(REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE, {
@@ -368,9 +368,9 @@ describe("durable review state", () => {
 		).toBe(1);
 		await manager.flush();
 
-		const file = manager.getSessionFile();
-		if (!file) throw new Error("Expected a persisted session file");
-		const reopened = SessionManager.open(file);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
 		expect(getReviewRun(reopened, "run-acknowledged")).toMatchObject({
 			runId: "run-acknowledged",
 			acknowledgedAt: 123,
@@ -391,8 +391,9 @@ describe("durable review state", () => {
 		mkdirSync(root, { recursive: true });
 		directories.push(root);
 		mkdirSync(join(root, "sessions"), { recursive: true });
-		const manager = SessionManager.create(root, join(root, "sessions"));
-		manager.appendMessage({ role: "user", content: "Review the branch", timestamp: 1 });
+		const manager = await SessionManager.create(root, join(root, "sessions"));
+		const messageTimestamp = Date.now();
+		manager.appendMessage({ role: "user", content: "Review the branch", timestamp: messageTimestamp });
 		manager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "Starting review" }],
@@ -408,14 +409,14 @@ describe("durable review state", () => {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "stop",
-			timestamp: 2,
+			timestamp: messageTimestamp + 1,
 		});
 		appendReviewRun(manager, record("run-1", 1));
 		appendReviewRun(manager, record("run-2", 2));
 		await manager.flush();
-		const file = manager.getSessionFile();
-		if (!file) throw new Error("Expected a persisted session file");
-		const reopened = SessionManager.open(file);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
 		const first = listReviewRuns(reopened, { limit: 1 });
 		expect(first.runs[0]?.runId).toBe("run-2");
 		expect(first.nextCursor).toBeTruthy();

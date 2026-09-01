@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "fs";
+import { mkdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
@@ -409,14 +409,14 @@ describe("SessionManager append and tree traversal", () => {
 });
 
 describe("createBranchedSession", () => {
-	it("throws for non-existent entry", () => {
+	it("throws for non-existent entry", async () => {
 		const session = SessionManager.inMemory();
 		session.appendMessage(userMsg("hello"));
 
-		expect(() => session.createBranchedSession("nonexistent")).toThrow("Entry nonexistent not found");
+		await expect(session.createBranchedSession("nonexistent")).rejects.toThrow("Entry nonexistent not found");
 	});
 
-	it("creates new session with path to specified leaf (in-memory)", () => {
+	it("creates new session with path to specified leaf (in-memory)", async () => {
 		const session = SessionManager.inMemory();
 
 		// Build: 1 -> 2 -> 3 -> 4
@@ -430,8 +430,8 @@ describe("createBranchedSession", () => {
 		const _id5 = session.appendMessage(userMsg("5"));
 
 		// Create branched session from id2 (should only have 1 -> 2)
-		const result = session.createBranchedSession(id2);
-		expect(result).toBeUndefined(); // in-memory returns null
+		const result = await session.createBranchedSession(id2);
+		expect(result).toBeUndefined();
 
 		// Session should now only have entries 1 and 2
 		const entries = session.getEntries();
@@ -440,7 +440,7 @@ describe("createBranchedSession", () => {
 		expect(entries[1].id).toBe(id2);
 	});
 
-	it("extracts correct path from branched tree", () => {
+	it("extracts correct path from branched tree", async () => {
 		const session = SessionManager.inMemory();
 
 		// Build: 1 -> 2 -> 3
@@ -454,80 +454,57 @@ describe("createBranchedSession", () => {
 		const id5 = session.appendMessage(assistantMsg("5"));
 
 		// Create branched session from id5 (should have 1 -> 2 -> 4 -> 5)
-		session.createBranchedSession(id5);
+		await session.createBranchedSession(id5);
 
 		const entries = session.getEntries();
 		expect(entries).toHaveLength(4);
 		expect(entries.map((e) => e.id)).toEqual([id1, id2, id4, id5]);
 	});
 
-	it("does not duplicate entries when forking from first user message", async () => {
+	it("does not duplicate entries when branching from the first user message", async () => {
 		const tempDir = join(tmpdir(), `session-fork-dedup-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 
 		try {
-			// Create a persisted session with a couple of turns
-			const session = SessionManager.create(tempDir, tempDir);
+			const session = await SessionManager.create(tempDir, tempDir);
 			const id1 = session.appendMessage(userMsg("first question"));
 			session.appendMessage(assistantMsg("first answer"));
 			session.appendMessage(userMsg("second question"));
 			session.appendMessage(assistantMsg("second answer"));
 
-			// Fork from the very first user message (no assistant in the branched path)
-			const newFile = session.createBranchedSession(id1);
-			expect(newFile).toBeDefined();
-
-			// The branched path has no assistant, so the file should not exist yet
-			// (deferred to _persist on first assistant, matching newSession() contract)
-			expect(existsSync(newFile!)).toBe(false);
-
-			// Simulate extension adding entry before assistant (like preset on turn_start)
+			const branchedRef = await session.createBranchedSession(id1);
+			if (!branchedRef) throw new Error("Expected a persisted branched reference");
 			session.appendCustomEntry("preset-state", { name: "plan" });
-
-			// Now the assistant responds
 			session.appendMessage(assistantMsg("new answer"));
 			await session.flush();
 
-			// File should now exist with exactly one header and no duplicate IDs
-			expect(existsSync(newFile!)).toBe(true);
-			const content = readFileSync(newFile!, "utf-8");
-			const lines = content.trim().split("\n").filter(Boolean);
-			const records = lines.map((line) => JSON.parse(line));
-
-			expect(records.filter((r) => r.type === "session")).toHaveLength(1);
-
-			const entryIds = records
-				.filter((r) => r.type !== "session")
-				.map((r) => r.id)
-				.filter((id): id is string => typeof id === "string");
+			const reopened = await SessionManager.open(branchedRef);
+			const entryIds = reopened.getEntries().map((entry) => entry.id);
 			expect(new Set(entryIds).size).toBe(entryIds.length);
+			expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user" }, { role: "assistant" }]);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 
-	it("writes file immediately when forking from a point with assistant messages", async () => {
+	it("materializes a branch containing assistant messages", async () => {
 		const tempDir = join(tmpdir(), `session-fork-with-assistant-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 
 		try {
-			const session = SessionManager.create(tempDir, tempDir);
-			session.appendMessage(userMsg("first question"));
+			const session = await SessionManager.create(tempDir, tempDir);
+			const id1 = session.appendMessage(userMsg("first question"));
 			const id2 = session.appendMessage(assistantMsg("first answer"));
 			session.appendMessage(userMsg("second question"));
 			session.appendMessage(assistantMsg("second answer"));
 
-			// Fork including the assistant message
-			const newFile = session.createBranchedSession(id2);
-			expect(newFile).toBeDefined();
+			const branchedRef = await session.createBranchedSession(id2);
+			if (!branchedRef) throw new Error("Expected a persisted branched reference");
 			await session.flush();
 
-			// Path includes an assistant, so file should be written immediately
-			expect(existsSync(newFile!)).toBe(true);
-			const content = readFileSync(newFile!, "utf-8");
-			const lines = content.trim().split("\n").filter(Boolean);
-			const records = lines.map((line) => JSON.parse(line));
-			expect(records.filter((r) => r.type === "session")).toHaveLength(1);
+			const reopened = await SessionManager.open(branchedRef);
+			expect(reopened.getEntries().map((entry) => entry.id)).toEqual([id1, id2]);
+			expect(reopened.buildSessionContext().messages).toHaveLength(2);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

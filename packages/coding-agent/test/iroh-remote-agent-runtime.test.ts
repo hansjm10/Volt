@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -313,20 +313,12 @@ export default function (volt) {
 			expect(subagentEvents).toHaveLength(1);
 			const child = subagentEvents[0];
 			expect(child).toMatchObject({ parentSessionId: runtime.session.sessionId });
-			expect(child.parentSessionFile).toBe(runtime.session.sessionFile);
+			expect(child.parentSessionRef).toEqual(runtime.session.sessionRef);
 			expect(child.sessionId).toBe(child.runtime.session.sessionId);
-			expect(child.runtime.session.sessionFile).toBeTruthy();
+			expect(child.runtime.session.sessionRef).toBeDefined();
 			expect(child.runtime.session.getActiveToolNames()).toContain("subagent_registry");
 			expect(child.runtime.session.getActiveToolNames()).not.toContain("subagent");
-			if (!child.runtime.session.sessionFile) {
-				throw new Error("expected child session file");
-			}
-			const childHeaderLine = readFileSync(child.runtime.session.sessionFile, "utf-8").split("\n")[0];
-			if (!childHeaderLine) {
-				throw new Error("expected child session header");
-			}
-			const childHeader = JSON.parse(childHeaderLine) as { parentSession?: string };
-			expect(childHeader.parentSession).toBe(runtime.session.sessionFile);
+			expect(child.runtime.session.sessionManager.getHeader()?.parentSession).toEqual(runtime.session.sessionRef);
 			// The first subagent tool result is the registry preflight; the confirmed
 			// spawn's result is the last one.
 			const parentToolResult = runtime.session.sessionManager
@@ -434,14 +426,14 @@ export default function (volt) {
 			});
 			runtime = result.runtime;
 
-			expect(result.sessionSelection).toEqual({
+			expect(result.sessionSelection).toMatchObject({
 				kind: "resumed",
 				requestedSessionId: "remote-session",
-				sessionFile,
 				sessionId: "remote-session",
 			});
+			expect(result.sessionSelection.sessionRef).toEqual(runtime.session.sessionRef);
 			expect(runtime.session.sessionId).toBe("remote-session");
-			expect(runtime.session.sessionFile).toBe(sessionFile);
+			expect(runtime.session.sessionRef).toBeDefined();
 			expect(resumeRecoveredInputs).not.toHaveBeenCalled();
 		} finally {
 			resumeRecoveredInputs.mockRestore();
@@ -473,7 +465,7 @@ export default function (volt) {
 			expect(result.sessionSelection.requestedSessionId).toBe("missing-session");
 			expect(result.sessionSelection.sessionId).toBe(runtime.session.sessionId);
 			expect(result.sessionSelection.sessionId).not.toBe("missing-session");
-			expect(result.sessionSelection.sessionFile).toBe(runtime.session.sessionFile);
+			expect(result.sessionSelection.sessionRef).toEqual(runtime.session.sessionRef);
 		} finally {
 			errorSpy.mockRestore();
 			await runtime?.dispose();

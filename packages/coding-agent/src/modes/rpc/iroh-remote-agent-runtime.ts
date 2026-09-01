@@ -14,7 +14,7 @@ import {
 	parseIrohRemoteAllowTools,
 	usesDefaultIrohRemoteAllowTools,
 } from "../../core/remote/iroh/index.ts";
-import { getDefaultSessionDir, type SessionManager } from "../../core/session-manager.ts";
+import { getDefaultSessionDir, type SessionManager, type SessionReference } from "../../core/session-manager.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
 import {
 	SubagentManager,
@@ -60,7 +60,7 @@ export interface IrohRemoteAgentRuntimeOptions {
 
 export interface IrohRemoteSubagentRuntimeCreatedEvent extends SubagentRuntimeCreatedEvent {
 	parentSessionId: string;
-	parentSessionFile?: string;
+	parentSessionRef?: SessionReference;
 }
 
 export type IrohRemoteAgentRuntimeConversationTarget =
@@ -80,19 +80,19 @@ export type IrohRemoteAgentRuntimeConversationTarget =
 export type IrohRemoteAgentRuntimeSessionSelection =
 	| {
 			kind: "created";
-			sessionFile?: string;
+			sessionRef?: SessionReference;
 			sessionId: string;
 	  }
 	| {
 			kind: "created_after_missing";
 			requestedSessionId: string;
-			sessionFile?: string;
+			sessionRef?: SessionReference;
 			sessionId: string;
 	  }
 	| {
 			kind: "resumed";
 			requestedSessionId: string;
-			sessionFile?: string;
+			sessionRef?: SessionReference;
 			sessionId: string;
 	  };
 
@@ -151,9 +151,9 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 						options.onSubagentRuntimeCreated?.({
 							...event,
 							parentSessionId: runtimeOptions.sessionManager.getSessionId(),
-							...(runtimeOptions.sessionManager.getSessionFile()
-								? { parentSessionFile: runtimeOptions.sessionManager.getSessionFile() }
-								: {}),
+							...(runtimeOptions.sessionManager.getSessionRef() === undefined
+								? {}
+								: { parentSessionRef: runtimeOptions.sessionManager.getSessionRef() }),
 						})
 				: undefined,
 		});
@@ -216,18 +216,17 @@ async function createIrohRemoteSessionManager(
 function toSessionSelection(
 	resolved: ResolvedSessionTargetWithManager<SessionManager>,
 ): IrohRemoteAgentRuntimeSessionSelection {
-	const sessionFile = resolved.sessionManager.getSessionFile();
 	if (resolved.selection === "created") {
 		return {
 			kind: "created",
-			sessionFile,
+			...(resolved.sessionRef === undefined ? {} : { sessionRef: resolved.sessionRef }),
 			sessionId: resolved.sessionId,
 		};
 	}
 	return {
 		kind: resolved.selection,
 		requestedSessionId: resolved.requestedSessionId ?? resolved.sessionId,
-		sessionFile,
+		...(resolved.sessionRef === undefined ? {} : { sessionRef: resolved.sessionRef }),
 		sessionId: resolved.sessionId,
 	};
 }

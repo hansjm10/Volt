@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import type { AgentAbortSource, AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { AssistantMessage, Message, TextContent } from "@hansjm10/volt-ai";
 import { createInProcessRpcClient, type InProcessRpcClient } from "../../modes/rpc/in-process-rpc-client.ts";
@@ -15,7 +14,7 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import { parseModelPattern } from "../model-resolver.ts";
 import type { ResourceLoader } from "../resource-loader.ts";
 import type { RpcSessionState, RpcTranscriptResponse } from "../rpc/types.ts";
-import { SessionManager } from "../session-manager.ts";
+import { SessionManager, type SessionReference } from "../session-manager.ts";
 import type {
 	SubagentCapacityLimitSnapshot,
 	SubagentSpawnCapacityConstraint,
@@ -110,7 +109,7 @@ export interface SubagentRuntimeCreatedEvent {
 	runtime: AgentSessionRuntime;
 	definition?: SubagentDefinition;
 	parentSessionId?: string;
-	parentSessionFile?: string;
+	parentSessionRef?: SessionReference;
 }
 
 /** Host-owned registration prepared before prompting and committed only after prompt preflight succeeds. */
@@ -527,6 +526,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	readonly id: string;
 	readonly sessionId: string;
 	private readonly client: InProcessRpcClient;
+	private readonly sessionRef: SessionReference | undefined;
 	private readonly abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 	private readonly removeFromManager: (id: string) => void;
 	private readonly onPromptAccepted: (message: string) => void;
@@ -555,6 +555,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	constructor(options: {
 		id: string;
 		sessionId: string;
+		sessionRef: SessionReference | undefined;
 		client: InProcessRpcClient;
 		abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 		removeFromManager: (id: string) => void;
@@ -569,6 +570,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	}) {
 		this.id = options.id;
 		this.sessionId = options.sessionId;
+		this.sessionRef = options.sessionRef;
 		this.client = options.client;
 		this.abortRuntime = options.abortRuntime;
 		this.removeFromManager = options.removeFromManager;
@@ -647,7 +649,7 @@ class LocalSubagentHandle implements SubagentHandle {
 
 	async getSessionStats(): Promise<SessionStats> {
 		this.assertOpen();
-		return this.client.getSessionStats();
+		return { ...(await this.client.getSessionStats()), sessionRef: this.sessionRef };
 	}
 
 	waitForEnd(): Promise<SubagentResult> {
@@ -987,11 +989,14 @@ export class SubagentManager {
 		}
 		let handle: SubagentHandle;
 		try {
-			if (!existsSync(claim.childSessionFile)) {
+			let sessionManager: SessionManager;
+			try {
+				sessionManager = await SessionManager.open(claim.childSessionRef);
+			} catch {
 				throw new Error("The interrupted run's transcript no longer exists; it cannot be resumed.");
 			}
 			handle = await this.startByName(claim.agentName, {
-				sessionManager: SessionManager.open(claim.childSessionFile),
+				sessionManager,
 				resumeSubagentId: subagentId,
 				...(claim.task !== undefined ? { resumeTaskLabel: claim.task } : {}),
 				...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
@@ -1394,7 +1399,7 @@ export class SubagentManager {
 	): Promise<SubagentHandle> {
 		const cwd = options.cwd ?? this.cwd;
 		const agentDir = options.agentDir ?? this.agentDir;
-		const sessionManager = options.sessionManager ?? this.createDefaultChildSessionManager(cwd);
+		const sessionManager = options.sessionManager ?? (await this.createDefaultChildSessionManager(cwd));
 		const id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
 		if (!delegation) {
 			throw new Error("Subagent delegation scope is required");
@@ -1575,6 +1580,7 @@ export class SubagentManager {
 			handle = new LocalSubagentHandle({
 				id,
 				sessionId: runtime.session.sessionId,
+				sessionRef: runtime.session.sessionRef,
 				client,
 				abortRuntime: (source) => runtime.session.abort(source),
 				removeFromManager: (handleId) => {
@@ -1772,14 +1778,17 @@ export class SubagentManager {
 		}
 	}
 
-	private createDefaultChildSessionManager(cwd: string): SessionManager {
+	private async createDefaultChildSessionManager(cwd: string): Promise<SessionManager> {
 		if (!this.parentSessionManager?.isPersisted()) {
 			return SessionManager.inMemory(cwd);
 		}
-		const parentSession = this.parentSessionManager.getSessionFile();
+		const parentSession = this.parentSessionManager.getSessionRef();
+		if (!parentSession) {
+			throw new Error("Persisted parent session is missing its session reference");
+		}
 		return SessionManager.create(cwd, this.parentSessionManager.getSessionDir(), {
 			origin: "subagent",
-			...(parentSession ? { parentSession } : {}),
+			parentSession,
 		});
 	}
 
@@ -1791,10 +1800,10 @@ export class SubagentManager {
 	): void {
 		if (!spawnRecord || !this.parentSessionManager?.isPersisted()) return;
 		// Both identity fields come from the runtime's own session manager: a
-		// factory that swaps managers must not produce an edge whose id and file
-		// disagree.
+		// factory that swaps managers must not produce an edge whose id and
+		// reference disagree.
 		const childSessionManager = runtime.session.sessionManager;
-		const childSessionFile = childSessionManager.getSessionFile();
+		const childSessionRef = childSessionManager.getSessionRef();
 		try {
 			this.parentSessionManager.appendSubagentSpawn({
 				toolCallId: spawnRecord.toolCallId,
@@ -1802,7 +1811,7 @@ export class SubagentManager {
 				subagentId: id,
 				agent: definition?.name ?? "subagent",
 				childSessionId: childSessionManager.getSessionId(),
-				...(childSessionFile !== undefined ? { childSessionFile } : {}),
+				...(childSessionRef !== undefined ? { childSessionRef } : {}),
 			});
 		} catch {
 			// The child is already running: losing the recovery edge must not turn
@@ -1823,12 +1832,18 @@ export class SubagentManager {
 		if (this.subagentContext || !this.parentSessionManager?.isPersisted()) {
 			return;
 		}
+		const parentSessionRef = this.parentSessionManager.getSessionRef();
+		if (!parentSessionRef) {
+			return;
+		}
 		this.hydrationPromise ??= this.hydrateSpawnEdges(
 			this.getRegistry(),
 			this.parentSessionManager,
 			[],
 			undefined,
-			new Set([this.parentSessionManager.getSessionFile() ?? ""]),
+			new Set([
+				JSON.stringify([parentSessionRef.storeId, parentSessionRef.sessionId, parentSessionRef.sessionGeneration]),
+			]),
 		).catch((error) => {
 			// Per-edge failures are contained inside the walk; an unexpected
 			// rejection here must not brick every later registry read on a
@@ -1844,7 +1859,7 @@ export class SubagentManager {
 		sessionManager: SessionManager,
 		ancestorPath: string[],
 		parentRegistryId: string | undefined,
-		visitedFiles: Set<string>,
+		visitedSessions: Set<string>,
 	): Promise<void> {
 		const settledToolCallIds = collectSettledToolCallIds(sessionManager);
 		const presentToolCallIds = collectToolCallIds(sessionManager);
@@ -1873,7 +1888,8 @@ export class SubagentManager {
 				...(presentToolCallIds.has(edge.toolCallId) ? {} : { stranded: true }),
 				startedAt,
 			};
-			if (typeof edge.childSessionFile !== "string") {
+			const childSessionRef = edge.childSessionRef;
+			if (!childSessionRef) {
 				if (!settled) {
 					registry.hydrate({
 						...base,
@@ -1884,7 +1900,12 @@ export class SubagentManager {
 				}
 				continue;
 			}
-			if (visitedFiles.has(edge.childSessionFile)) {
+			const childSessionKey = JSON.stringify([
+				childSessionRef.storeId,
+				childSessionRef.sessionId,
+				childSessionRef.sessionGeneration,
+			]);
+			if (visitedSessions.has(childSessionKey)) {
 				if (!settled) {
 					registry.hydrate({
 						...base,
@@ -1895,18 +1916,13 @@ export class SubagentManager {
 				}
 				continue;
 			}
-			visitedFiles.add(edge.childSessionFile);
+			visitedSessions.add(childSessionKey);
 			// One macrotask per child keeps multi-megabyte transcript loads from
 			// monopolizing the event loop (the #46/#123 lesson).
 			await new Promise((resolve) => setImmediate(resolve));
 			let child: SessionManager;
 			try {
-				// open() treats a missing path as a fresh session, so absence needs
-				// an explicit check to classify the edge as unrecoverable.
-				if (!existsSync(edge.childSessionFile)) {
-					throw new Error("child transcript file does not exist");
-				}
-				child = SessionManager.open(edge.childSessionFile);
+				child = await SessionManager.open(childSessionRef);
 			} catch {
 				if (!settled) {
 					registry.hydrate({
@@ -1926,11 +1942,11 @@ export class SubagentManager {
 					...(state.task !== undefined ? { task: state.task } : {}),
 					...(state.output !== undefined ? { output: state.output } : {}),
 					...(state.error !== undefined ? { error: state.error } : {}),
-					childSessionFile: edge.childSessionFile,
+					childSessionRef,
 					finishedAt: state.finishedAt,
 				});
 			}
-			await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedFiles);
+			await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedSessions);
 		}
 	}
 
@@ -1942,6 +1958,7 @@ export class SubagentManager {
 		if (!this.onRuntimeCreated) {
 			return undefined;
 		}
+		const parentSessionRef = this.parentSessionManager?.getSessionRef();
 		return (
 			(await this.onRuntimeCreated({
 				id: options.id,
@@ -1949,9 +1966,7 @@ export class SubagentManager {
 				runtime: options.runtime,
 				...(options.definition ? { definition: options.definition } : {}),
 				...(this.parentSessionManager ? { parentSessionId: this.parentSessionManager.getSessionId() } : {}),
-				...(this.parentSessionManager?.getSessionFile()
-					? { parentSessionFile: this.parentSessionManager.getSessionFile() }
-					: {}),
+				...(parentSessionRef ? { parentSessionRef } : {}),
 			})) ?? undefined
 		);
 	}

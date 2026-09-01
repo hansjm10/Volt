@@ -182,6 +182,7 @@ export type {
 	ToolDefinition,
 } from "./extensions/index.ts";
 export type { PromptTemplate } from "./prompt-templates.ts";
+export type { SessionReference } from "./session-manager.ts";
 export type { Skill } from "./skills.ts";
 export type { Tool } from "./tools/index.ts";
 
@@ -265,7 +266,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			profile: options.profile,
 			...(options.projectTrusted !== undefined ? { projectTrusted: options.projectTrusted } : {}),
 		});
-	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	const sessionManager =
+		options.sessionManager ?? (await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir)));
 	await sessionManager.flush();
 
 	if (!resourceLoader) {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,7 +16,11 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
-import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "./utilities.ts";
+import {
+	createTestAgentSessionRuntimeConfig,
+	createTestResourceLoader,
+	loadPersistedSessionSnapshot,
+} from "./utilities.ts";
 
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
@@ -265,7 +269,7 @@ describe("RPC prompt response semantics", () => {
 	it("emits one success response when prompt preflight succeeds", async () => {
 		const sessionDir = join(tmpdir(), `volt-rpc-durable-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(sessionDir, { recursive: true });
-		const manager = SessionManager.create(sessionDir, sessionDir);
+		const manager = await SessionManager.create(sessionDir, sessionDir);
 		const { lineHandler, cleanup } = await startRpcMode({
 			withAuth: true,
 			responseDelayMs: 0,
@@ -277,18 +281,16 @@ describe("RPC prompt response semantics", () => {
 				(record) => record.id === "b2" && record.type === "response" && record.success === true,
 			);
 			if (!response) return;
-			const persistedEntries = readFileSync(manager.getSessionFile()!, "utf8")
-				.trim()
-				.split("\n")
-				.map((entry) => JSON.parse(entry) as Record<string, unknown>);
 			successObservedCanonicalCommit =
 				manager.getClientInput("client-b2")?.state === "completed" &&
-				persistedEntries.some(
-					(entry) =>
-						entry.type === "message" &&
-						(entry.message as Record<string, unknown> | undefined)?.role === "user" &&
-						(entry.message as Record<string, unknown> | undefined)?.clientMessageId === "client-b2",
-				);
+				manager
+					.getEntries()
+					.some(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							entry.message.clientMessageId === "client-b2",
+					);
 		};
 
 		try {
@@ -310,6 +312,8 @@ describe("RPC prompt response semantics", () => {
 				});
 			});
 			expect(successObservedCanonicalCommit).toBe(true);
+			const persisted = await loadPersistedSessionSnapshot(manager);
+			expect(JSON.stringify(persisted.entries)).toContain('"clientMessageId":"client-b2"');
 			await vi.waitFor(() => {
 				const userEnd = parseOutputLines(rpcIo.outputLines).find(
 					(record) =>
@@ -331,9 +335,9 @@ describe("RPC prompt response semantics", () => {
 	it("replays success after immediate teardown without dispatching the same durable input again", async () => {
 		const sessionDir = join(tmpdir(), `volt-rpc-crash-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(sessionDir, { recursive: true });
-		const manager = SessionManager.create(sessionDir, sessionDir);
-		const sessionFile = manager.getSessionFile();
-		if (!sessionFile) throw new Error("expected a persisted session file");
+		const manager = await SessionManager.create(sessionDir, sessionDir);
+		const sessionRef = manager.getSessionRef();
+		if (!sessionRef) throw new Error("expected a persisted session reference");
 		const command = {
 			type: "prompt",
 			clientMessageId: "client-success-crash",
@@ -365,7 +369,7 @@ describe("RPC prompt response semantics", () => {
 			expect(first.getStreamCallCount()).toBe(1);
 			await first.cleanup();
 
-			const reopened = SessionManager.open(sessionFile, sessionDir);
+			const reopened = await SessionManager.open(sessionRef, sessionDir);
 			second = await startRpcMode({ withAuth: true, responseDelayMs: 0, sessionManager: reopened });
 			second.lineHandler(JSON.stringify({ ...command, id: "after-crash" }));
 			await vi.waitFor(() => {

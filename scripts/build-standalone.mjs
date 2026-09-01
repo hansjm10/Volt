@@ -544,6 +544,7 @@ async function bundleStandalone(scratchDirectory, stageDirectory) {
 		entryPoints: {
 			volt: entryPoint,
 			"image-resize-worker": join(codingAgentRoot, "src", "utils", "image-resize-worker.ts"),
+			"session-store-worker": join(codingAgentRoot, "src", "core", "session-store", "worker.ts"),
 		},
 		outdir: scratchDirectory,
 		outExtension: { ".js": ".cjs" },
@@ -566,6 +567,7 @@ async function bundleStandalone(scratchDirectory, stageDirectory) {
 	const metafilePath = join(stageDirectory, "binary-metafile.json");
 	writeFileSync(metafilePath, `${JSON.stringify(result.metafile, null, 2)}\n`, { mode: 0o644 });
 	copyFileSync(join(scratchDirectory, "image-resize-worker.cjs"), join(stageDirectory, "image-resize-worker.cjs"));
+	copyFileSync(join(scratchDirectory, "session-store-worker.cjs"), join(stageDirectory, "session-store-worker.cjs"));
 
 	const licenseDirectory = join(stageDirectory, "LICENSES");
 	mkdirSync(licenseDirectory, { recursive: true, mode: 0o755 });

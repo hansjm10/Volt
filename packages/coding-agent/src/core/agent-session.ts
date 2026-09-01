@@ -175,6 +175,7 @@ import {
 	RUNTIME_QUEUE_ENTRY_ID_PREFIX,
 	SessionAtomicAppendError,
 	type SessionHeader,
+	type SessionReference,
 } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -469,7 +470,7 @@ export interface ModelCycleResult {
 
 /** Lifetime session statistics for /session and RPC consumers. */
 export interface SessionStats {
-	sessionFile: string | undefined;
+	sessionRef: SessionReference | undefined;
 	sessionId: string;
 	userMessages: number;
 	assistantMessages: number;
@@ -3216,9 +3217,9 @@ export class AgentSession {
 		return this._harness.getFollowUpMode();
 	}
 
-	/** Current session file path, or undefined if sessions are disabled */
-	get sessionFile(): string | undefined {
-		return this.sessionManager.getSessionFile();
+	/** Current persisted session reference, or undefined for in-memory sessions. */
+	get sessionRef(): SessionReference | undefined {
+		return this.sessionManager.getSessionRef();
 	}
 
 	/** Current session ID */
@@ -7209,7 +7210,7 @@ export class AgentSession {
 		}
 
 		return {
-			sessionFile: this.sessionFile,
+			sessionRef: this.sessionRef,
 			sessionId: this.sessionId,
 			userMessages,
 			assistantMessages,

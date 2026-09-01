@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "@hansjm10/volt-ai";
@@ -67,7 +67,7 @@ describe("SessionManager starting Git context", () => {
 	it("persists only the first observation for a newly created session", async () => {
 		const cwd = makeTempDir();
 		const sessionDir = join(cwd, "sessions");
-		const session = SessionManager.create(cwd, sessionDir, { id: "starting-git-session" });
+		const session = await SessionManager.create(cwd, sessionDir, { id: "starting-git-session" });
 
 		expect(session.recordStartingGitContext(session.getSessionId(), STARTING_GIT_CONTEXT)).toBe(true);
 		expect(session.getStartingGitContext()).toEqual(STARTING_GIT_CONTEXT);
@@ -77,9 +77,9 @@ describe("SessionManager starting Git context", () => {
 		expect(session.buildSessionContext().messages).toHaveLength(1);
 		await session.flush();
 
-		const sessionFile = session.getSessionFile();
-		expect(sessionFile).toBeDefined();
-		const reopened = SessionManager.open(sessionFile!, sessionDir);
+		const sessionRef = session.getSessionRef();
+		if (!sessionRef) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(sessionRef);
 		expect(reopened.getStartingGitContext()).toEqual(STARTING_GIT_CONTEXT);
 		expect(reopened.recordStartingGitContext(reopened.getSessionId(), null)).toBe(false);
 
@@ -97,22 +97,37 @@ describe("SessionManager starting Git context", () => {
 		expect(session.getStartingGitContext()).toBeUndefined();
 	});
 
-	it("rejects malformed current-format starting context on direct and enumerated reads", async () => {
+	it("rejects malformed starting context during explicit JSONL import", async () => {
 		const cwd = makeTempDir();
 		const sessionDir = join(cwd, "sessions");
-		const session = SessionManager.create(cwd, sessionDir, { id: "malformed-starting-git" });
-		session.recordStartingGitContext(session.getSessionId(), STARTING_GIT_CONTEXT);
-		session.appendMessage(assistantMessage("persist the session"));
-		await session.flush();
-		const sessionFile = session.getSessionFile()!;
-		const lines = readFileSync(sessionFile, "utf8").trimEnd().split("\n");
-		const entryIndex = lines.findIndex((line) => line.includes('"type":"session_start_git_context"'));
-		const entry = JSON.parse(lines[entryIndex]!) as { gitContext: { head: { oid: string } } };
-		entry.gitContext.head.oid = "not-an-object-id";
-		lines[entryIndex] = JSON.stringify(entry);
-		writeFileSync(sessionFile, `${lines.join("\n")}\n`);
+		const inputPath = join(cwd, "malformed-starting-git.jsonl");
+		const malformedContext = structuredClone(STARTING_GIT_CONTEXT);
+		if (!("oid" in malformedContext.head)) throw new Error("Expected an oid-bearing Git head");
+		malformedContext.head.oid = "not-an-object-id";
+		writeFileSync(
+			inputPath,
+			`${[
+				JSON.stringify({
+					type: "session",
+					version: 5,
+					id: "malformed-starting-git",
+					timestamp: "2026-08-29T00:00:00.000Z",
+					cwd,
+				}),
+				JSON.stringify({
+					type: "session_start_git_context",
+					id: "git-context",
+					parentId: null,
+					ordinal: 1,
+					timestamp: "2026-08-29T00:00:01.000Z",
+					gitContext: malformedContext,
+				}),
+			].join("\n")}\n`,
+		);
 
-		expect(() => SessionManager.open(sessionFile, sessionDir)).toThrow(/invalid starting Git context/i);
+		await expect(SessionManager.importFromJsonl(inputPath, cwd, sessionDir)).rejects.toThrow(
+			/invalid starting Git context/i,
+		);
 		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
 	});
 });

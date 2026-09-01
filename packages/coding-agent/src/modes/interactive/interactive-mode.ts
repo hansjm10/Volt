@@ -141,7 +141,12 @@ import {
 	getReviewRun,
 } from "../../core/review-state.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
-import { getDefaultSessionDir, type SessionContext, SessionManager } from "../../core/session-manager.ts";
+import {
+	getDefaultSessionDir,
+	type SessionContext,
+	SessionManager,
+	type SessionReference,
+} from "../../core/session-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { SubscriptionUsageService } from "../../core/subscription-usage.ts";
@@ -384,8 +389,7 @@ export function formatResumeCommand(sessionManager: SessionManager): string | un
 	if (!process.stdout.isTTY) return undefined;
 	if (!sessionManager.isPersisted()) return undefined;
 
-	const sessionFile = sessionManager.getSessionFile();
-	if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
+	if (!sessionManager.getSessionRef()) return undefined;
 
 	const args = [APP_NAME];
 	if (!sessionManager.usesDefaultSessionDir()) {
@@ -1906,8 +1910,8 @@ export class InteractiveMode {
 					void this.flushCompactionQueue({ willRetry: false });
 					return { cancelled: false };
 				},
-				switchSession: async (sessionPath, options) => {
-					return this.handleResumeSession(sessionPath, options);
+				switchSession: async (sessionRef, options) => {
+					return this.handleResumeSession(sessionRef, options);
 				},
 				reload: async () => {
 					await this.handleReloadCommand();
@@ -2084,13 +2088,13 @@ export class InteractiveMode {
 	 * or the re-open is cancelled.
 	 */
 	private async absorbRemoteSessionChangesFromDisk(): Promise<void> {
-		const sessionFile = this.session.sessionFile;
-		if (!sessionFile) {
+		const sessionRef = this.session.sessionRef;
+		if (!sessionRef) {
 			await this.session.reload().catch(() => {});
 			return;
 		}
 		try {
-			const result = await this.runtimeHost.switchSession(sessionFile, {
+			const result = await this.runtimeHost.switchSession(sessionRef, {
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
 			if (result.cancelled) {
@@ -7221,15 +7225,23 @@ export class InteractiveMode {
 	private showSessionSelector(): void {
 		this.showSelector((done) => {
 			const selector = new SessionSelectorComponent(
-				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
-				(onProgress) =>
-					this.sessionManager.usesDefaultSessionDir()
+				(onProgress, query) =>
+					query
+						? SessionManager.search(this.sessionManager.getCwd(), query, this.sessionManager.getSessionDir())
+						: SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
+				(onProgress, query) => {
+					if (query) {
+						return this.sessionManager.usesDefaultSessionDir()
+							? SessionManager.searchAll(query)
+							: SessionManager.searchAll(query, this.sessionManager.getSessionDir());
+					}
+					return this.sessionManager.usesDefaultSessionDir()
 						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
-				async (sessionPath) => {
+						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress);
+				},
+				async (sessionRef) => {
 					done();
-					await this.handleResumeSession(sessionPath);
+					await this.handleResumeSession(sessionRef);
 				},
 				() => {
 					done();
@@ -7240,31 +7252,36 @@ export class InteractiveMode {
 				},
 				() => this.ui.requestRender(),
 				{
-					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
+					renameSession: async (sessionRef, nextName) => {
 						const next = (nextName ?? "").trim();
 						if (!next) return;
-						const currentSessionFile = this.sessionManager.getSessionFile();
-						if (currentSessionFile && path.resolve(currentSessionFile) === path.resolve(sessionFilePath)) {
+						const currentRef = this.sessionManager.getSessionRef();
+						if (
+							currentRef &&
+							currentRef.storeId === sessionRef.storeId &&
+							currentRef.sessionId === sessionRef.sessionId &&
+							currentRef.sessionGeneration === sessionRef.sessionGeneration
+						) {
 							this.session.setSessionName(next);
 							await this.sessionManager.flush();
 							return;
 						}
-						const mgr = SessionManager.open(sessionFilePath);
-						mgr.appendSessionInfo(next);
-						await mgr.flush();
+						const manager = await SessionManager.open(sessionRef);
+						manager.appendSessionInfo(next);
+						await manager.flush();
 					},
 					showRenameHint: true,
 					keybindings: this.keybindings,
 				},
 
-				this.sessionManager.getSessionFile(),
+				this.sessionManager.getSessionRef(),
 			);
 			return { component: selector, focus: selector };
 		});
 	}
 
 	private async handleResumeSession(
-		sessionPath: string,
+		sessionRef: SessionReference,
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean; seeded: boolean }> {
 		if (this.loadingAnimation) {
@@ -7273,7 +7290,7 @@ export class InteractiveMode {
 		}
 		this.statusContainer.clear();
 		try {
-			const result = await this.runtimeHost.switchSession(sessionPath, {
+			const result = await this.runtimeHost.switchSession(sessionRef, {
 				withSession: options?.withSession,
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
@@ -7290,7 +7307,7 @@ export class InteractiveMode {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true, seeded: false };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
+				const result = await this.runtimeHost.switchSession(sessionRef, {
 					cwdOverride: selectedCwd,
 					withSession: options?.withSession,
 					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
@@ -8077,7 +8094,7 @@ export class InteractiveMode {
 		if (sessionName) {
 			info += `${theme.fg("dim", "Name:")} ${sessionName}\n`;
 		}
-		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
+		info += `${theme.fg("dim", "Store:")} ${stats.sessionRef?.sessionDirectory ?? "In-memory"}\n`;
 		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n\n`;
 		info += `${theme.bold("Messages")}\n`;
 		info += `${theme.fg("dim", "User:")} ${stats.userMessages}\n`;
@@ -9116,13 +9133,12 @@ export class InteractiveMode {
 				throw new Error("The review session opened without the selected findings.");
 			if (opened.seeded && requestedFindingIds === undefined) {
 				if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
-				const sourceSessionFile = sourceSessionManager.getSessionFile();
-				const acknowledgmentManager = sourceSessionFile
-					? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+				const sourceSessionRef = sourceSessionManager.getSessionRef();
+				const acknowledgmentManager = sourceSessionRef
+					? await SessionManager.open(sourceSessionRef)
 					: sourceSessionManager;
 				acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
 				await acknowledgmentManager.flush();
-				if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
 			}
 			if (!opened.cancelled) this.renderCurrentSessionState();
 			return {

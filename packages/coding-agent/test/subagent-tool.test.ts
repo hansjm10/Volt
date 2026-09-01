@@ -115,7 +115,7 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<v
 
 function createStats(sessionId: string): SessionStats {
 	return {
-		sessionFile: undefined,
+		sessionRef: undefined,
 		sessionId,
 		userMessages: 1,
 		assistantMessages: 1,
@@ -2893,7 +2893,7 @@ describe("subagent tool", () => {
 				throw new Error("not used");
 			},
 			getSessionStats: async () => ({
-				sessionFile: undefined,
+				sessionRef: undefined,
 				sessionId: result.sessionId,
 				userMessages: 1,
 				assistantMessages: 1,

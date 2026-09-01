@@ -1,4 +1,4 @@
-import { realpath, rm } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { relative, sep } from "node:path";
 import type {
 	AgentSessionReplacementTarget,
@@ -24,7 +24,7 @@ import {
 } from "../core/remote/iroh/protocol.ts";
 import type { IrohRemoteWorkspace, IrohRemoteWorkspaceWorktree } from "../core/remote/iroh/state.ts";
 import type { IrohRemoteHostStateManager } from "../core/remote/iroh/state-manager.ts";
-import { getDefaultSessionDir } from "../core/session-manager.ts";
+import { getDefaultSessionDir, SessionManager } from "../core/session-manager.ts";
 import type { SubagentRuntimeRegistration } from "../core/subagents/index.ts";
 import {
 	createIrohRemoteAgentRuntimeWithSessionSelection,
@@ -1834,12 +1834,10 @@ async function cleanupUncommittedRuntime(
 	runtime: AgentSessionRuntime,
 	sessionSelection: IntegratedConversationSessionSelection | undefined,
 ): Promise<void> {
-	const sessionFile = runtime.session.sessionFile;
+	const sessionRef = runtime.session.sessionRef;
 	await runtime.dispose().catch(() => {});
-	if (sessionSelection?.kind === "resumed") {
+	if (sessionSelection?.kind === "resumed" || sessionRef === undefined) {
 		return;
 	}
-	if (typeof sessionFile === "string" && sessionFile.length > 0) {
-		await rm(sessionFile, { force: true }).catch(() => {});
-	}
+	await SessionManager.delete(sessionRef).catch(() => {});
 }

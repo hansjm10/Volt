@@ -5,7 +5,16 @@ export const IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH = "[redacted bash output path
 export const IROH_REMOTE_REDACTED_EXPORT_PATH = "[redacted export path]";
 export const IROH_REMOTE_REDACTED_SESSION_FILE = "[redacted session file]";
 
-const OMIT_REMOTE_PATH_FIELDS = new Set(["fullOutputPath", "sessionFile"]);
+const OMIT_REMOTE_PATH_FIELDS = new Set([
+	"childSessionRef",
+	"fullOutputPath",
+	"parentSession",
+	"parentSessionRef",
+	"previousSessionRef",
+	"sessionFile",
+	"sessionRef",
+	"targetSessionRef",
+]);
 const STRICT_REMOTE_PATH_FIELDS = new Set([
 	"cwd",
 	"exportPath",

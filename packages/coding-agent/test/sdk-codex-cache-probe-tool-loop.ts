@@ -9,7 +9,7 @@
 
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import process from "node:process";
 import {
 	type Api,
@@ -38,7 +38,7 @@ type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
 
 interface Args {
 	turns: number;
-	sessionPath: string;
+	sessionDirectory: string;
 	transport: Transport;
 	maxTokens: number;
 }
@@ -69,7 +69,7 @@ const DEFAULT_MAX_TOKENS = 64;
 
 function parseArgs(argv: string[]): Args {
 	let turns = DEFAULT_TURNS;
-	let sessionPath = resolve(join(tmpdir(), `volt-sdk-codex-cache-probe-tool-loop-${Date.now()}.jsonl`));
+	let sessionDirectory = resolve(join(tmpdir(), `volt-sdk-codex-cache-probe-tool-loop-${Date.now()}`));
 	let transport: Transport = "sse";
 	let maxTokens = DEFAULT_MAX_TOKENS;
 
@@ -82,10 +82,10 @@ function parseArgs(argv: string[]): Args {
 				turns = Number.parseInt(value, 10);
 				break;
 			}
-			case "--session": {
+			case "--session-dir": {
 				const value = argv[++i];
-				if (!value) throw new Error("Missing value for --session");
-				sessionPath = resolve(value);
+				if (!value) throw new Error("Missing value for --session-dir");
+				sessionDirectory = resolve(value);
 				break;
 			}
 			case "--transport": {
@@ -105,7 +105,7 @@ function parseArgs(argv: string[]): Args {
 			case "--help": {
 				printHelp();
 				process.exit(0);
-				return { turns, sessionPath, transport, maxTokens };
+				return { turns, sessionDirectory, transport, maxTokens };
 			}
 			default:
 				throw new Error(`Unknown argument: ${arg}`);
@@ -119,7 +119,7 @@ function parseArgs(argv: string[]): Args {
 		throw new Error("--max-tokens must be a positive integer");
 	}
 
-	return { turns, sessionPath, transport, maxTokens };
+	return { turns, sessionDirectory, transport, maxTokens };
 }
 
 function printHelp(): void {
@@ -127,7 +127,7 @@ function printHelp(): void {
 
 Options:
   --turns <n>         Number of turns to run. Must be between ${MIN_TURNS} and ${MAX_TURNS}. Default: ${DEFAULT_TURNS}
-  --session <path>    Specific session jsonl file to write
+  --session-dir <path>  SQLite session store directory
   --transport <mode>  sse | websocket | websocket-cached | auto. Default: sse
   --max-tokens <n>    Max output tokens per subrequest. Default: ${DEFAULT_MAX_TOKENS}
   --help              Show this message
@@ -273,7 +273,7 @@ function deterministicProbeTool(): ToolDefinition<typeof deterministicProbeParam
 
 async function main(): Promise<void> {
 	const args = parseArgs(process.argv.slice(2));
-	mkdirSync(dirname(args.sessionPath), { recursive: true });
+	mkdirSync(args.sessionDirectory, { recursive: true });
 
 	const authStorage = AuthStorage.create();
 	const modelRegistry = ModelRegistry.create(authStorage);
@@ -309,12 +309,12 @@ async function main(): Promise<void> {
 
 	const { session } = await createAgentSession({
 		cwd: process.cwd(),
-		agentDir: dirname(args.sessionPath),
+		agentDir: args.sessionDirectory,
 		model: baseModel,
 		thinkingLevel: "low",
 		customTools: [deterministicProbeTool() as unknown as ToolDefinition],
 		resourceLoader,
-		sessionManager: SessionManager.open(args.sessionPath),
+		sessionManager: await SessionManager.continueRecent(process.cwd(), args.sessionDirectory),
 		settingsManager,
 		authStorage,
 		modelRegistry,
@@ -328,7 +328,7 @@ async function main(): Promise<void> {
 	let previousCacheRead: number | null = null;
 
 	console.log(`provider openai-codex, model gpt-5.5`);
-	console.log(`session ${session.sessionFile}`);
+	console.log(`session ${JSON.stringify(session.sessionRef)}`);
 	console.log(`turns ${args.turns}, transport ${args.transport}, reasoning low, maxTokens ${args.maxTokens}`);
 	console.log("");
 
@@ -485,7 +485,7 @@ async function main(): Promise<void> {
 			console.log(`  turn ${violation.turn}.${violation.subrequest}: ${violation.previous} -> ${violation.current}`);
 		}
 	}
-	console.log(`session file: ${session.sessionFile}`);
+	console.log(`session reference: ${JSON.stringify(session.sessionRef)}`);
 
 	unsubscribe();
 	session.dispose();

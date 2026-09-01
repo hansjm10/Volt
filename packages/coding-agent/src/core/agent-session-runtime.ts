@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { existsSync } from "node:fs";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -26,14 +25,18 @@ import { ReviewWorkflowManager } from "./review-workflows.ts";
 import { ConversationProjectionFeed, type ConversationProjectionSource } from "./rpc/conversation-projection-feed.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
-import { assertSessionCwdExists } from "./session-cwd.ts";
+import { assertSessionCwdExists, MissingSessionCwdError } from "./session-cwd.ts";
 import {
 	assertValidSessionId,
 	isHostOnlySessionEntry,
+	loadEntriesFromFile,
+	migrateSessionEntries,
 	type SessionEntry,
+	type SessionHeader,
 	type SessionInfo,
 	SessionManager,
 	type SessionOrigin,
+	type SessionReference,
 	summarizeSessionEntries,
 } from "./session-manager.ts";
 import type { SubagentDelegationScope } from "./subagents/delegation-scope.ts";
@@ -201,6 +204,15 @@ function toSessionTimestamp(value: string | undefined): string {
 	}
 	const date = new Date(value);
 	return Number.isNaN(date.getTime()) ? new Date(0).toISOString() : date.toISOString();
+}
+
+function sessionRefsEqual(left: SessionReference, right: SessionReference): boolean {
+	return (
+		resolvePath(left.sessionDirectory) === resolvePath(right.sessionDirectory) &&
+		left.storeId === right.storeId &&
+		left.sessionId === right.sessionId &&
+		left.sessionGeneration === right.sessionGeneration
+	);
 }
 
 function sessionInfoToSummary(info: SessionInfo, currentSessionId: string): WorkspaceSessionSummary {
@@ -642,7 +654,7 @@ export class AgentSessionRuntime {
 
 	private async emitBeforeSwitch(
 		reason: "new" | "resume",
-		targetSessionFile?: string,
+		targetSessionRef?: SessionReference,
 	): Promise<{ cancelled: boolean }> {
 		if (this.session.sessionManager.getConversationAuthorityStatus().status === "reconciliation_required") {
 			return { cancelled: false };
@@ -655,7 +667,7 @@ export class AgentSessionRuntime {
 		const result = await runner.emit({
 			type: "session_before_switch",
 			reason,
-			targetSessionFile,
+			targetSessionRef,
 		});
 		return { cancelled: result?.cancel === true };
 	}
@@ -682,14 +694,14 @@ export class AgentSessionRuntime {
 
 	private async teardownCurrent(
 		reason: SessionShutdownEvent["reason"],
-		targetSessionFile?: string,
+		targetSessionRef?: SessionReference,
 		onInvalidated?: () => void,
 	): Promise<void> {
 		if (this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
 			await emitSessionShutdownEvent(this.session.extensionRunner, {
 				type: "session_shutdown",
 				reason,
-				targetSessionFile,
+				targetSessionRef,
 			});
 		}
 		this.beforeSessionInvalidate?.();
@@ -747,15 +759,17 @@ export class AgentSessionRuntime {
 		const sessionId = options.sessionManager.getSessionId();
 		const sameSessionIdentity = previousSessionId === sessionId;
 		if (sameSessionIdentity) {
-			const previousSessionFile = this.session.sessionFile;
-			const replacementSessionFile = options.sessionManager.getSessionFile();
+			const previousSessionRef = this.session.sessionRef;
+			const replacementSessionRef = options.sessionManager.getSessionRef();
 			if (
 				!options.allowSameSessionIdentity ||
-				previousSessionFile === undefined ||
-				replacementSessionFile === undefined ||
-				resolvePath(previousSessionFile) !== resolvePath(replacementSessionFile)
+				previousSessionRef === undefined ||
+				replacementSessionRef === undefined ||
+				!sessionRefsEqual(previousSessionRef, replacementSessionRef)
 			) {
-				throw new Error("Cannot replace the current session with a different file using the same session ID");
+				throw new Error(
+					"Cannot replace the current session with a different persisted reference using the same session ID",
+				);
 			}
 		}
 		this.sessionReplacementInProgress = true;
@@ -777,7 +791,7 @@ export class AgentSessionRuntime {
 			let applied = false;
 			try {
 				this.assertStructuralOperationCurrent(options.operation);
-				await this.teardownCurrent(options.reason, options.sessionManager.getSessionFile(), () => {
+				await this.teardownCurrent(options.reason, options.sessionManager.getSessionRef(), () => {
 					this.assertStructuralOperationCurrent(options.operation);
 					invalidated = true;
 					this.sessionInvalidated = true;
@@ -967,7 +981,7 @@ export class AgentSessionRuntime {
 		).filter((session) => !session.cwd || resolvePath(session.cwd) === workspaceCwd);
 	}
 
-	private getCurrentSessionSummary(): WorkspaceSessionSummary {
+	getCurrentSessionSummary(): WorkspaceSessionSummary {
 		const header = this.session.sessionManager.getHeader();
 		const entries = this.session.sessionManager.getEntries();
 		const startingGitContext = this.session.sessionManager.getStartingGitContext();
@@ -1021,11 +1035,11 @@ export class AgentSessionRuntime {
 				// No replacement happens, so a requested withSession callback never runs.
 				return { cancelled: false, seeded: false };
 			}
-			const sessionFile = this.session.sessionFile;
-			if (sessionFile === undefined) {
-				throw new Error("Cannot reconcile an in-memory session without an authoritative session file");
+			const sessionRef = this.session.sessionRef;
+			if (sessionRef === undefined) {
+				throw new Error("Cannot reconcile an in-memory session without an authoritative session reference");
 			}
-			return this.switchSessionWithinOperation(sessionFile, options, operation, true);
+			return this.switchSessionWithinOperation(sessionRef, options, operation, true);
 		}
 		const target = (await this.listWorkspaceSessionInfos(true)).find((session) => session.id === sessionId);
 		this.assertStructuralOperationCurrent(operation);
@@ -1033,45 +1047,48 @@ export class AgentSessionRuntime {
 			throw new Error(`Session not found in current workspace: ${sessionId}`);
 		}
 		return this.switchSessionWithinOperation(
-			target.path,
+			target.ref,
 			target.cwd ? options : { ...options, cwdOverride: this.cwd },
 			operation,
 		);
 	}
 
 	async switchSession(
-		sessionPath: string,
+		sessionRef: SessionReference,
 		options?: AgentSessionSwitchOptions,
 	): Promise<AgentSessionReplacementResult> {
 		return this.runStructuralOperation(
-			(operation) => this.switchSessionWithinOperation(sessionPath, options, operation),
+			(operation) => this.switchSessionWithinOperation(sessionRef, options, operation),
 			options?.assertConversationGenerationCurrent,
 		);
 	}
 
 	private async switchSessionWithinOperation(
-		sessionPath: string,
+		sessionRef: SessionReference,
 		options: AgentSessionSwitchOptions | undefined,
 		operation: AgentSessionStructuralOperation,
 		refreshCurrentSession = false,
 	): Promise<AgentSessionReplacementResult> {
-		const resolvedSessionPath = resolvePath(sessionPath);
-		const targetsCurrentFile =
-			this.session.sessionFile !== undefined && resolvedSessionPath === resolvePath(this.session.sessionFile);
-		if (targetsCurrentFile && this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
+		const currentSessionRef = this.session.sessionRef;
+		const targetsCurrentSession = currentSessionRef !== undefined && sessionRefsEqual(sessionRef, currentSessionRef);
+		if (
+			targetsCurrentSession &&
+			this.session.sessionManager.getConversationAuthorityStatus().status === "available"
+		) {
 			// No replacement happens, so a requested withSession callback never runs.
 			return { cancelled: false, seeded: false };
 		}
-		if (targetsCurrentFile) refreshCurrentSession = true;
-		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
+		if (targetsCurrentSession) refreshCurrentSession = true;
+		const beforeResult = await this.emitBeforeSwitch("resume", sessionRef);
 		this.assertStructuralOperationCurrent(operation);
 		if (beforeResult.cancelled) {
 			return { cancelled: true, seeded: false };
 		}
 		this.assertNoActiveDetachedReview();
 
-		const previousSessionFile = this.session.sessionFile;
-		const sessionManager = SessionManager.open(resolvedSessionPath, undefined, options?.cwdOverride);
+		const previousSessionRef = this.session.sessionRef;
+		const sessionManager = await SessionManager.open(sessionRef, options?.cwdOverride);
+		this.assertStructuralOperationCurrent(operation);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		const replacement = await this.replaceCurrentSession({
 			operation,
@@ -1084,7 +1101,7 @@ export class AgentSessionRuntime {
 					agentDir: this.services.agentDir,
 					sessionManager,
 					...this.getReplacementGitContextOptions(sessionManager.getCwd()),
-					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionRef },
 					projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
@@ -1095,7 +1112,7 @@ export class AgentSessionRuntime {
 	}
 
 	async newSession(options?: {
-		parentSession?: string;
+		parentSessionRef?: SessionReference;
 		/** RPC request correlated with the replacement bootstrap, when any. */
 		rebindRequestId?: string;
 		/** Override the new session's cwd (e.g. a daemon-managed worktree checkout). */
@@ -1180,7 +1197,7 @@ export class AgentSessionRuntime {
 		}
 
 		const sourceSessionId = sourceSession.sessionId;
-		const sourceSessionFile = sourceSession.sessionFile;
+		const sourceSessionRef = sourceSession.sessionRef;
 		const sourceManager = sourceSession.sessionManager;
 		const sourceModel = sourceSession.model;
 		const sourceThinking = sourceSession.thinkingLevel;
@@ -1188,7 +1205,7 @@ export class AgentSessionRuntime {
 		const sourceReviewState = captureReviewStateForHandoff(sourceManager);
 		let execution: PlanExecution | undefined;
 		const replacement = await this.newSession({
-			...(sourceSessionFile ? { parentSession: sourceSessionFile } : {}),
+			...(sourceSessionRef ? { parentSessionRef: sourceSessionRef } : {}),
 			setup: async (sessionManager) => {
 				restoreReviewStateFromHandoff(sessionManager, sourceReviewState);
 				execution = {
@@ -1222,9 +1239,7 @@ export class AgentSessionRuntime {
 				// The source AgentSession has been disposed and its persistence lane
 				// sealed before this post-replacement handoff callback. Reopen persisted
 				// sources as the new exclusive writer; in-memory sources remain reusable.
-				const handoffManager = sourceSessionFile
-					? SessionManager.open(sourceSessionFile, sourceManager.getSessionDir())
-					: sourceManager;
+				const handoffManager = sourceSessionRef ? await SessionManager.open(sourceSessionRef) : sourceManager;
 				handoffManager.appendPlanningState({
 					mode: "build",
 					plan: {
@@ -1235,11 +1250,6 @@ export class AgentSessionRuntime {
 					},
 				});
 				await handoffManager.flush();
-				if (sourceSessionFile) {
-					// Keep references held by lifecycle observers coherent with the durable
-					// handoff record while leaving the old manager sealed against writes.
-					sourceManager.setSessionFile(sourceSessionFile);
-				}
 				const activePlan = this.session.planningState.plan;
 				if (!activePlan || activePlan.phase !== "active") {
 					throw new Error("Plan execution session did not restore its active plan");
@@ -1270,7 +1280,7 @@ export class AgentSessionRuntime {
 	private async newSessionWithinOperation(
 		options:
 			| {
-					parentSession?: string;
+					parentSessionRef?: SessionReference;
 					rebindRequestId?: string;
 					cwd?: string;
 					sessionDir?: string;
@@ -1290,15 +1300,23 @@ export class AgentSessionRuntime {
 		}
 		this.assertNoActiveDetachedReview();
 
-		const previousSessionFile = this.session.sessionFile;
+		const previousSessionRef = this.session.sessionRef;
 		const cwd = options?.cwd ?? this.cwd;
 		const sessionDir = options?.sessionDir ?? this.session.sessionManager.getSessionDir();
-		const sessionManager = this.session.sessionManager.isPersisted()
-			? SessionManager.create(cwd, sessionDir)
-			: SessionManager.inMemory(cwd);
-		if (options?.parentSession) {
-			sessionManager.newSession({ parentSession: options.parentSession });
+		let sessionManager: SessionManager;
+		if (this.session.sessionManager.isPersisted()) {
+			sessionManager = await SessionManager.create(
+				cwd,
+				sessionDir,
+				options?.parentSessionRef === undefined ? undefined : { parentSession: options.parentSessionRef },
+			);
+		} else {
+			sessionManager = SessionManager.inMemory(cwd);
+			if (options?.parentSessionRef) {
+				sessionManager.newSession({ parentSession: options.parentSessionRef });
+			}
 		}
+		this.assertStructuralOperationCurrent(operation);
 		if (options?.setup) {
 			await options.setup(sessionManager);
 			this.assertStructuralOperationCurrent(operation);
@@ -1317,7 +1335,7 @@ export class AgentSessionRuntime {
 					...this.getReplacementGitContextOptions(cwd),
 					...(options?.workspaceName === undefined ? {} : { workspaceName: options.workspaceName }),
 					...(options?.baseRef === undefined ? {} : { baseRef: options.baseRef }),
-					sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+					sessionStartEvent: { type: "session_start", reason: "new", previousSessionRef },
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
 				}),
@@ -1364,17 +1382,19 @@ export class AgentSessionRuntime {
 			selectedText = extractUserMessageText(selectedEntry.message.content);
 		}
 
-		const previousSessionFile = this.session.sessionFile;
+		const previousSessionRef = this.session.sessionRef;
 		const previousSessionId = this.session.sessionId;
 		if (this.session.sessionManager.isPersisted()) {
-			const currentSessionFile = this.session.sessionFile;
-			if (!currentSessionFile) {
-				throw new Error("Persisted session is missing a session file");
+			const currentSessionRef = this.session.sessionRef;
+			if (!currentSessionRef) {
+				throw new Error("Persisted session is missing a session reference");
 			}
 			const sessionDir = this.session.sessionManager.getSessionDir();
 			if (!targetLeafId) {
-				const sessionManager = SessionManager.create(this.cwd, sessionDir);
-				sessionManager.newSession({ parentSession: currentSessionFile });
+				const sessionManager = await SessionManager.create(this.cwd, sessionDir, {
+					parentSession: currentSessionRef,
+				});
+				this.assertStructuralOperationCurrent(operation);
 				const replacement = await this.replaceCurrentSession({
 					operation,
 					reason: "fork",
@@ -1386,7 +1406,7 @@ export class AgentSessionRuntime {
 							agentDir: this.services.agentDir,
 							sessionManager,
 							...this.getReplacementGitContextOptions(this.cwd),
-							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionRef },
 							profile: this.getReplacementProfile(),
 							subagentContext: this.subagentContext,
 						}),
@@ -1396,9 +1416,12 @@ export class AgentSessionRuntime {
 			}
 
 			await this.session.sessionManager.flush();
-			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
-			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
-			if (!forkedSessionPath) {
+			this.assertStructuralOperationCurrent(operation);
+			const sessionManager = await SessionManager.open(currentSessionRef);
+			this.assertStructuralOperationCurrent(operation);
+			const forkedSessionRef = await sessionManager.createBranchedSession(targetLeafId);
+			this.assertStructuralOperationCurrent(operation);
+			if (!forkedSessionRef) {
 				throw new Error("Failed to create forked session");
 			}
 			await sessionManager.flush();
@@ -1413,7 +1436,7 @@ export class AgentSessionRuntime {
 						agentDir: this.services.agentDir,
 						sessionManager,
 						...this.getReplacementGitContextOptions(sessionManager.getCwd()),
-						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionRef },
 						profile: this.getReplacementProfile(),
 						subagentContext: this.subagentContext,
 					}),
@@ -1424,10 +1447,11 @@ export class AgentSessionRuntime {
 
 		const sessionManager = this.session.sessionManager;
 		if (!targetLeafId) {
-			sessionManager.newSession({ parentSession: this.session.sessionFile });
+			sessionManager.newSession();
 		} else {
-			sessionManager.createBranchedSession(targetLeafId);
+			await sessionManager.createBranchedSession(targetLeafId);
 		}
+		this.assertStructuralOperationCurrent(operation);
 		const replacement = await this.replaceCurrentSession({
 			operation,
 			reason: "fork",
@@ -1439,7 +1463,7 @@ export class AgentSessionRuntime {
 					agentDir: this.services.agentDir,
 					sessionManager,
 					...this.getReplacementGitContextOptions(this.cwd),
-					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionRef },
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
 				}),
@@ -1461,6 +1485,166 @@ export class AgentSessionRuntime {
 		);
 	}
 
+	private async createImportedSessionManager(
+		inputPath: string,
+		cwdOverride: string | undefined,
+		assertCurrent: () => void,
+	): Promise<SessionManager> {
+		const fileEntries = loadEntriesFromFile(inputPath);
+		if (fileEntries.length === 0) {
+			throw new Error(`Session file has no valid session header: ${inputPath}`);
+		}
+		migrateSessionEntries(fileEntries);
+		const header = fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		if (!header?.id) {
+			throw new Error(`Session file has no valid session header: ${inputPath}`);
+		}
+
+		const importedCwd = resolvePath(cwdOverride ?? (header.cwd || this.cwd));
+		if (cwdOverride === undefined && !existsSync(importedCwd)) {
+			throw new MissingSessionCwdError({
+				sessionCwd: importedCwd,
+				fallbackCwd: this.cwd,
+			});
+		}
+
+		const newSessionOptions = {
+			id: header.id,
+			...(header.origin === undefined ? {} : { origin: header.origin }),
+		};
+		let sessionManager: SessionManager;
+		if (this.session.sessionManager.isPersisted()) {
+			sessionManager = await SessionManager.create(
+				importedCwd,
+				this.session.sessionManager.getSessionDir(),
+				newSessionOptions,
+			);
+		} else {
+			sessionManager = SessionManager.inMemory(importedCwd);
+			sessionManager.newSession(newSessionOptions);
+		}
+		assertCurrent();
+
+		const sourceById = new Map<string, SessionEntry>();
+		let sourceLeafId: string | null = null;
+		let startingGitContext: RpcGitContext | null | undefined;
+		for (const entry of fileEntries) {
+			if (entry.type === "session") continue;
+			sourceById.set(entry.id, entry);
+			if (entry.type === "session_start_git_context") {
+				startingGitContext = entry.gitContext;
+			}
+			if (entry.type === "leaf") {
+				sourceLeafId = entry.targetId;
+			} else if (!isHostOnlySessionEntry(entry)) {
+				sourceLeafId = entry.id;
+			}
+		}
+		if (startingGitContext !== undefined) {
+			sessionManager.recordStartingGitContext(sessionManager.getSessionId(), startingGitContext);
+		}
+
+		const nearestPublicSourceId = (sourceId: string | null): string | null => {
+			let currentId = sourceId;
+			while (currentId) {
+				const current = sourceById.get(currentId);
+				if (!current) return null;
+				if (!isHostOnlySessionEntry(current)) return current.id;
+				currentId = current.parentId;
+			}
+			return null;
+		};
+		const importedIds = new Map<string, string>();
+		const importedId = (sourceId: string | null): string | null => {
+			const publicSourceId = nearestPublicSourceId(sourceId);
+			return publicSourceId === null ? null : (importedIds.get(publicSourceId) ?? null);
+		};
+		const moveTo = (targetId: string | null): void => {
+			if (sessionManager.getLeafId() === targetId) return;
+			if (targetId === null) sessionManager.resetLeaf();
+			else sessionManager.branch(targetId);
+		};
+
+		for (const entry of fileEntries) {
+			if (entry.type === "session" || isHostOnlySessionEntry(entry)) continue;
+			const parentId = importedId(entry.parentId);
+			moveTo(parentId);
+			let nextId: string;
+			switch (entry.type) {
+				case "message": {
+					const message = entry.message;
+					if (message.role === "branchSummary" || message.role === "compactionSummary") {
+						throw new Error(`Cannot import non-canonical ${message.role} message entry`);
+					}
+					nextId = sessionManager.appendMessage(message);
+					break;
+				}
+				case "thinking_level_change":
+					nextId = sessionManager.appendThinkingLevelChange(entry.thinkingLevel);
+					break;
+				case "fast_mode_change":
+					nextId = sessionManager.appendFastModeChange(entry.enabled);
+					break;
+				case "model_change":
+					nextId = sessionManager.appendModelChange(entry.provider, entry.modelId);
+					break;
+				case "planning_state_change":
+					nextId = sessionManager.appendPlanningState(entry.planning);
+					break;
+				case "compaction": {
+					const firstKeptEntryId = importedId(entry.firstKeptEntryId);
+					if (!firstKeptEntryId) {
+						throw new Error(`Compaction entry ${entry.id} references an unavailable retained entry`);
+					}
+					nextId = sessionManager.appendCompaction(
+						entry.summary,
+						firstKeptEntryId,
+						entry.tokensBefore,
+						entry.details,
+						entry.fromHook,
+					);
+					break;
+				}
+				case "branch_summary":
+					nextId = sessionManager.branchWithSummary(
+						entry.fromId === "root" ? null : importedId(entry.fromId),
+						entry.summary,
+						entry.details,
+						entry.fromHook,
+					);
+					break;
+				case "custom":
+					nextId = sessionManager.appendCustomEntry(entry.customType, entry.data);
+					break;
+				case "custom_message":
+					nextId = sessionManager.appendCustomMessageEntry(
+						entry.customType,
+						entry.content,
+						entry.display,
+						entry.details,
+					);
+					break;
+				case "label": {
+					const targetId = importedId(entry.targetId);
+					if (!targetId) throw new Error(`Label entry ${entry.id} references an unavailable target`);
+					nextId = sessionManager.appendLabelChange(targetId, entry.label);
+					break;
+				}
+				case "session_info":
+					nextId = sessionManager.appendSessionInfo(entry.name ?? "");
+					break;
+				default:
+					throw new Error(`Cannot import unsupported session entry type: ${entry.type}`);
+			}
+			importedIds.set(entry.id, nextId);
+		}
+
+		moveTo(importedId(sourceLeafId));
+		await sessionManager.flush();
+		assertCurrent();
+		return sessionManager;
+	}
+
 	private async importFromJsonlWithinOperation(
 		inputPath: string,
 		cwdOverride: string | undefined,
@@ -1471,25 +1655,19 @@ export class AgentSessionRuntime {
 			throw new SessionImportFileNotFoundError(resolvedPath);
 		}
 
-		const sessionDir = this.session.sessionManager.getSessionDir();
-		const destinationPath = join(sessionDir, basename(resolvedPath));
-		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
+		const beforeResult = await this.emitBeforeSwitch("resume");
 		this.assertStructuralOperationCurrent(operation);
 		if (beforeResult.cancelled) {
 			return beforeResult;
 		}
 		this.assertNoActiveDetachedReview();
-		if (!existsSync(sessionDir)) {
-			mkdirSync(sessionDir, { recursive: true });
-		}
 
-		const previousSessionFile = this.session.sessionFile;
+		const previousSessionRef = this.session.sessionRef;
 		await this.session.sessionManager.flush();
-		if (resolve(destinationPath) !== resolvedPath) {
-			copyFileSync(resolvedPath, destinationPath);
-		}
-
-		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+		this.assertStructuralOperationCurrent(operation);
+		const sessionManager = await this.createImportedSessionManager(resolvedPath, cwdOverride, () =>
+			this.assertStructuralOperationCurrent(operation),
+		);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.replaceCurrentSession({
 			operation,
@@ -1501,7 +1679,7 @@ export class AgentSessionRuntime {
 					agentDir: this.services.agentDir,
 					sessionManager,
 					...this.getReplacementGitContextOptions(sessionManager.getCwd()),
-					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionRef },
 					profile: this.getReplacementProfile(),
 					subagentContext: this.subagentContext,
 				}),

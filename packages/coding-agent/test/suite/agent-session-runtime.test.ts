@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -105,7 +105,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: await SessionManager.create(tempDir),
 		});
 		await runtime.session.bindExtensions({});
 
@@ -331,7 +331,7 @@ describe("AgentSessionRuntime characterization", () => {
 		events.length = 0;
 
 		await runtime.session.prompt("hello");
-		const originalSessionFile = runtime.session.sessionFile;
+		const originalSessionRef = runtime.session.sessionRef;
 		const originalSession = runtime.session;
 
 		const newSessionResult = await runtime.newSession();
@@ -339,22 +339,22 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.session.bindExtensions({});
 		expect(runtime.session).not.toBe(originalSession);
 		expect(runtime.session.messages).toEqual([]);
-		const secondSessionFile = runtime.session.sessionFile;
+		const secondSessionRef = runtime.session.sessionRef;
 		expect(events).toEqual([
-			{ type: "session_before_switch", reason: "new", targetSessionFile: undefined },
-			{ type: "session_shutdown", reason: "new", targetSessionFile: secondSessionFile },
-			{ type: "session_start", reason: "new", previousSessionFile: originalSessionFile },
+			{ type: "session_before_switch", reason: "new", targetSessionRef: undefined },
+			{ type: "session_shutdown", reason: "new", targetSessionRef: secondSessionRef },
+			{ type: "session_start", reason: "new", previousSessionRef: originalSessionRef },
 		]);
 
 		events.length = 0;
 
-		const switchResult = await runtime.switchSession(originalSessionFile!);
+		const switchResult = await runtime.switchSession(originalSessionRef!);
 		expect(switchResult.cancelled).toBe(false);
 		await runtime.session.bindExtensions({});
 		expect(events).toEqual([
-			{ type: "session_before_switch", reason: "resume", targetSessionFile: originalSessionFile },
-			{ type: "session_shutdown", reason: "resume", targetSessionFile: originalSessionFile },
-			{ type: "session_start", reason: "resume", previousSessionFile: secondSessionFile },
+			{ type: "session_before_switch", reason: "resume", targetSessionRef: originalSessionRef },
+			{ type: "session_shutdown", reason: "resume", targetSessionRef: originalSessionRef },
+			{ type: "session_start", reason: "resume", previousSessionRef: secondSessionRef },
 		]);
 	});
 
@@ -419,16 +419,11 @@ describe("AgentSessionRuntime characterization", () => {
 
 		const foreignCwd = join(tempDir, "foreign-workspace");
 		mkdirSync(foreignCwd, { recursive: true });
-		writeFileSync(
-			join(runtime.session.sessionManager.getSessionDir(), "2026-01-01T00-00-00-000Z_foreign-session.jsonl"),
-			`${JSON.stringify({
-				cwd: foreignCwd,
-				id: "foreign-session",
-				timestamp: "2026-01-01T00:00:00.000Z",
-				type: "session",
-				version: 3,
-			})}\n`,
-		);
+		const foreignSession = await SessionManager.create(foreignCwd, runtime.session.sessionManager.getSessionDir(), {
+			id: "foreign-session",
+		});
+		foreignSession.appendMessage({ role: "user", content: "foreign prompt", timestamp: Date.now() });
+		await foreignSession.flush();
 
 		const sessions = await runtime.listSessions();
 		expect(sessions).toEqual(
@@ -500,23 +495,23 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 
 		await runtime.session.prompt("hello");
-		const originalSessionFile = runtime.session.sessionFile;
+		const originalSessionRef = runtime.session.sessionRef;
 
 		cancelReason = "new";
 		const newResult = await runtime.newSession();
 		expect(newResult.cancelled).toBe(true);
-		expect(runtime.session.sessionFile).toBe(originalSessionFile);
+		expect(runtime.session.sessionRef).toEqual(originalSessionRef);
 
 		events.length = 0;
 		const otherDir = join(tmpdir(), `volt-runtime-other-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(otherDir, { recursive: true });
-		const otherSession = SessionManager.create(otherDir);
+		const otherSession = await SessionManager.create(otherDir);
 		otherSession.appendMessage({ role: "user", content: [{ type: "text", text: "other" }], timestamp: Date.now() });
-		const otherSessionFile = otherSession.getSessionFile();
+		const otherSessionRef = otherSession.getSessionRef();
 		cancelReason = "resume";
-		const resumeResult = await runtime.switchSession(otherSessionFile!);
+		const resumeResult = await runtime.switchSession(otherSessionRef!);
 		expect(resumeResult.cancelled).toBe(true);
-		expect(runtime.session.sessionFile).toBe(originalSessionFile);
+		expect(runtime.session.sessionRef).toEqual(originalSessionRef);
 	});
 
 	it("emits session_before_fork and session_start and honors cancellation", async () => {
@@ -541,7 +536,7 @@ describe("AgentSessionRuntime characterization", () => {
 		events.length = 0;
 		await runtime.session.prompt("hello");
 		const userMessage = runtime.session.getUserMessagesForForking()[0]!;
-		const previousSessionFile = runtime.session.sessionFile;
+		const previousSessionRef = runtime.session.sessionRef;
 
 		const successResult = await runtime.fork(userMessage.entryId);
 		expect(successResult.cancelled).toBe(false);
@@ -549,11 +544,10 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.session.bindExtensions({});
 		expect(events).toEqual([
 			{ type: "session_before_fork", entryId: userMessage.entryId, position: "before" },
-			{ type: "session_shutdown", reason: "fork", targetSessionFile: runtime.session.sessionFile },
-			{ type: "session_start", reason: "fork", previousSessionFile },
+			{ type: "session_shutdown", reason: "fork", targetSessionRef: runtime.session.sessionRef },
+			{ type: "session_start", reason: "fork", previousSessionRef },
 		]);
-		const sessionFileName = parse(runtime.session.sessionFile!).name;
-		expect(sessionFileName.endsWith(`_${runtime.session.sessionId}`)).toBe(true);
+		expect(runtime.session.sessionRef?.sessionId).toBe(runtime.session.sessionId);
 
 		events.length = 0;
 		cancelNextFork = true;
@@ -585,13 +579,13 @@ describe("AgentSessionRuntime characterization", () => {
 								.join("")
 					: undefined,
 		}));
-		const previousSessionFile = runtime.session.sessionFile;
+		const previousSessionRef = runtime.session.sessionRef;
 		const leafId = runtime.session.sessionManager.getLeafId();
 		expect(leafId).toBeTruthy();
 
 		const result = await runtime.fork(leafId!, { position: "at" });
 		expect(result).toEqual({ cancelled: false, seeded: false, selectedText: undefined });
-		expect(runtime.session.sessionFile).not.toBe(previousSessionFile);
+		expect(runtime.session.sessionRef).not.toEqual(previousSessionRef);
 		expect(
 			runtime.session.messages.map((message) => ({
 				role: message.role,
@@ -702,11 +696,11 @@ describe("AgentSessionRuntime characterization", () => {
 		}));
 		const leafId = runtime.session.sessionManager.getLeafId();
 		expect(leafId).toBeTruthy();
-		expect(runtime.session.sessionFile).toBeUndefined();
+		expect(runtime.session.sessionRef).toBeUndefined();
 
 		const result = await runtime.fork(leafId!, { position: "at" });
 		expect(result).toEqual({ cancelled: false, seeded: false, selectedText: undefined });
-		expect(runtime.session.sessionFile).toBeUndefined();
+		expect(runtime.session.sessionRef).toBeUndefined();
 		expect(
 			runtime.session.messages.map((message) => ({
 				role: message.role,
@@ -786,16 +780,16 @@ describe("AgentSessionRuntime characterization", () => {
 		const otherRuntime = await createAgentSessionRuntime(createOtherRuntime, {
 			cwd: secondDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(secondDir),
+			sessionManager: await SessionManager.create(secondDir),
 		});
 		cleanups.push(async () => {
 			await otherRuntime.dispose();
 		});
 		await otherRuntime.session.prompt("other");
 		await otherRuntime.session.sessionManager.flush();
-		const otherSessionFile = otherRuntime.session.sessionFile!;
+		const otherSessionRef = otherRuntime.session.sessionRef!;
 
-		await runtime.switchSession(otherSessionFile);
+		await runtime.switchSession(otherSessionRef);
 
 		expect(realpathSync(runtime.session.sessionManager.getCwd())).toBe(realpathSync(secondDir));
 		expect(realpathSync(runtime.cwd)).toBe(realpathSync(secondDir));
@@ -860,7 +854,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const otherRuntime = await createAgentSessionRuntime(createOtherRuntime, {
 			cwd: otherDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(otherDir),
+			sessionManager: await SessionManager.create(otherDir),
 		});
 		cleanups.push(async () => {
 			await otherRuntime.dispose();
@@ -869,9 +863,9 @@ describe("AgentSessionRuntime characterization", () => {
 		otherRuntime.session.setThinkingLevel("off");
 		await otherRuntime.session.prompt("hello");
 		await otherRuntime.session.sessionManager.flush();
-		const targetSessionFile = otherRuntime.session.sessionFile!;
+		const targetSessionRef = otherRuntime.session.sessionRef!;
 
-		await runtime.switchSession(targetSessionFile);
+		await runtime.switchSession(targetSessionRef);
 
 		expect(runtime.session.model?.id).toBe("faux-2");
 		expect(runtime.session.thinkingLevel).toBe("off");

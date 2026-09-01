@@ -13,7 +13,12 @@ async function flushPromises(): Promise<void> {
 
 function makeSession(overrides: Partial<SessionInfo> & { id: string }): SessionInfo {
 	return {
-		path: overrides.path ?? `/tmp/${overrides.id}.jsonl`,
+		ref: overrides.ref ?? {
+			sessionDirectory: "/tmp/sessions",
+			storeId: "store",
+			sessionGeneration: "generation-test",
+			sessionId: overrides.id,
+		},
 		id: overrides.id,
 		cwd: overrides.cwd ?? "",
 		name: overrides.name,
@@ -21,7 +26,6 @@ function makeSession(overrides: Partial<SessionInfo> & { id: string }): SessionI
 		modified: overrides.modified ?? new Date(0),
 		messageCount: overrides.messageCount ?? 1,
 		firstMessage: overrides.firstMessage ?? "hello",
-		allMessagesText: overrides.allMessagesText ?? "hello",
 	};
 }
 
@@ -106,6 +110,6 @@ describe("session selector rename", () => {
 		await flushPromises();
 
 		expect(renameSession).toHaveBeenCalledTimes(1);
-		expect(renameSession).toHaveBeenCalledWith(sessions[0]!.path, "XOld");
+		expect(renameSession).toHaveBeenCalledWith(sessions[0]!.ref, "XOld");
 	});
 });

@@ -4613,6 +4613,12 @@ describe("Iroh remote core helpers", () => {
 				success: true,
 				data: {
 					sessionFile,
+					sessionRef: {
+						sessionDirectory: "/Users/jordan/.volt/agent/sessions/project",
+						storeId: "store",
+						sessionId: "session",
+						sessionGeneration: "generation",
+					},
 					sessionPath: sessionFile,
 					sourceInfo: { path: `${workspacePath}/src/index.ts` },
 					remotePathList: { path: "/workspace/bin:/Users/jordan/.volt/auth.json" },
@@ -4649,6 +4655,7 @@ describe("Iroh remote core helpers", () => {
 				keyedPaths: Record<string, string>;
 				remotePathList: { path: string };
 				sessionFile?: string;
+				sessionRef?: unknown;
 				sessionPath: string;
 				sourceInfo: { path: string };
 				tildeSessionPath: string;
@@ -4658,6 +4665,7 @@ describe("Iroh remote core helpers", () => {
 
 		expect(sanitized.id).toBe("/Users/jordan/private/request-id");
 		expect(sanitized.data.sessionFile).toBeUndefined();
+		expect(sanitized.data.sessionRef).toBeUndefined();
 		expect(sanitized.data.sessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
 		expect(sanitized.data.tildeSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
 		expect(sanitized.data.tildeUserSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);

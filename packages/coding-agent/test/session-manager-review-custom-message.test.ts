@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -27,18 +27,15 @@ describe("review custom-message sessions", () => {
 	});
 
 	it("persists displayed review-only custom messages so they remain listable", async () => {
-		const session = SessionManager.create(cwd, sessionDir);
-		const sessionFile = session.getSessionFile();
-		expect(sessionFile).toBeTruthy();
-		expect(existsSync(sessionFile!)).toBe(false);
+		const session = await SessionManager.create(cwd, sessionDir);
+		const sessionRef = session.getSessionRef();
+		expect(sessionRef).toBeDefined();
+		expect(existsSync(join(sessionDir, "sessions.sqlite"))).toBe(true);
 
 		session.appendCustomMessageEntry("review", "Automated review result\n\nFindings:\n1. Fix the bug", true, {
 			findings: [{ title: "Fix the bug" }],
 		});
 		await session.flush();
-
-		expect(existsSync(sessionFile!)).toBe(true);
-		expect(readFileSync(sessionFile!, "utf8")).toContain('"type":"custom_message"');
 
 		const sessions = await SessionManager.list(cwd, sessionDir);
 		const summary = sessions.find((item) => item.id === session.getSessionId());
@@ -48,11 +45,13 @@ describe("review custom-message sessions", () => {
 			messageCount: 1,
 			firstMessage: "Automated review result\n\nFindings:\n1. Fix the bug",
 		});
-		expect(summary?.allMessagesText).toContain("Fix the bug");
+		expect((await SessionManager.search(cwd, "Fix the bug", sessionDir)).map((item) => item.ref)).toEqual([
+			sessionRef,
+		]);
 	});
 
 	it("uses displayed review custom messages in the current runtime summary", async () => {
-		const sessionManager = SessionManager.create(cwd, sessionDir);
+		const sessionManager = await SessionManager.create(cwd, sessionDir);
 		sessionManager.appendCustomMessageEntry("review", "Automated review result\n\nNo issues found.", true);
 
 		const runtimeHost = new AgentSessionRuntime(

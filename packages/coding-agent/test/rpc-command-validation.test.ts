@@ -58,8 +58,8 @@ const invalidPayloadCases: Array<{ name: string; payload: unknown; error: string
 	},
 	{
 		name: "rejects invalid new-session parents",
-		payload: { type: "new_session", parentSession: 1 },
-		error: 'Invalid RPC command payload: "parentSession" must be a string',
+		payload: { type: "new_session", parentSessionId: 1 },
+		error: 'Invalid RPC command payload: "parentSessionId" must be a non-empty string',
 	},
 	{
 		name: "rejects invalid client capability lists",
@@ -250,9 +250,9 @@ const invalidPayloadCases: Array<{ name: string; payload: unknown; error: string
 		error: 'Invalid RPC command payload: "outputPath" must be a string',
 	},
 	{
-		name: "rejects invalid switch-session paths",
-		payload: { type: "switch_session", sessionPath: 1 },
-		error: 'Invalid RPC command payload: "sessionPath" must be a string',
+		name: "rejects invalid switch-session IDs",
+		payload: { type: "switch_session", sessionId: 1 },
+		error: 'Invalid RPC command payload: "sessionId" must be a string',
 	},
 	{
 		name: "rejects invalid switch-session IDs",

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -171,23 +171,9 @@ describe("session_contexts workspace discovery", () => {
 		const directory = await mkdtemp(join(tmpdir(), "volt-session-context-backend-"));
 		temporaryDirectories.push(directory);
 		const persistedId = "session-persisted";
-		await writeFile(
-			join(directory, `2026-08-30T00-00-00-000Z_${persistedId}.jsonl`),
-			`${JSON.stringify({
-				type: "session",
-				version: 3,
-				id: persistedId,
-				timestamp: "2026-08-30T00:00:00.000Z",
-				cwd: "/workspace",
-			})}\n${JSON.stringify({
-				type: "session_start_git_context",
-				id: "entry-persisted",
-				parentId: null,
-				timestamp: "2026-08-30T00:00:01.000Z",
-				ordinal: 1,
-				gitContext,
-			})}\n`,
-		);
+		const persisted = await SessionManager.create("/workspace", directory, { id: persistedId });
+		persisted.recordStartingGitContext(persistedId, gitContext);
+		await persisted.flush();
 		const listSpy = vi.spyOn(SessionManager, "list");
 		const workLookups: string[] = [];
 		const sessionBackend = createIrohRemoteSessionContextsRpcBackend({
@@ -211,40 +197,27 @@ describe("session_contexts workspace discovery", () => {
 		expect(listSpy).not.toHaveBeenCalled();
 	});
 
-	test("targeted starting Git lookup ignores unrelated history and validates the target header", async () => {
+	test("targeted starting Git lookup ignores unrelated SQLite sessions and validates requested ids", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "volt-session-contexts-"));
 		temporaryDirectories.push(directory);
 		const sessionId = "session-a";
-		const header = {
-			type: "session",
-			version: 3,
-			id: sessionId,
-			timestamp: "2026-08-30T00:00:00.000Z",
-			cwd: "/workspace",
-		};
-		const starting = {
-			type: "session_start_git_context",
-			id: "entry-a",
-			parentId: null,
-			timestamp: "2026-08-30T00:00:01.000Z",
-			ordinal: 1,
-			gitContext,
-		};
-		await writeFile(
-			join(directory, `2026-08-30T00-00-00-000Z_${sessionId}.jsonl`),
-			`${JSON.stringify(header)}\n${JSON.stringify(starting)}\n`,
-		);
-		await writeFile(join(directory, "unrelated.jsonl"), "not json and never opened\n");
+		const target = await SessionManager.create("/workspace", directory, { id: sessionId });
+		target.recordStartingGitContext(sessionId, gitContext);
+		await target.flush();
+		const unrelated = await SessionManager.create("/workspace", directory, { id: "session-unrelated" });
+		unrelated.recordStartingGitContext("session-unrelated", null);
+		await unrelated.flush();
+		const listSpy = vi.spyOn(SessionManager, "list");
 
 		const contexts = await SessionManager.readStartingGitContexts(directory, [sessionId, "session-missing"]);
-		expect(contexts.get(sessionId)).toEqual(gitContext);
-		expect(contexts.get("session-missing")).toBeNull();
-
-		await writeFile(
-			join(directory, "2026-08-30T00-00-01-000Z_session-b.jsonl"),
-			`${JSON.stringify({ ...header, id: "wrong-id" })}\n`,
+		expect(contexts).toEqual(
+			new Map([
+				[sessionId, gitContext],
+				["session-missing", null],
+			]),
 		);
-		await expect(SessionManager.readStartingGitContexts(directory, ["session-b"])).rejects.toThrow("invalid header");
+		expect(listSpy).not.toHaveBeenCalled();
+		await expect(SessionManager.readStartingGitContexts(directory, ["-bad"])).rejects.toThrow(/Session id/);
 	});
 
 	test("requires conversation observation authority", () => {

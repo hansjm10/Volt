@@ -1,10 +1,10 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { getMissingSessionCwdIssue, MissingSessionCwdError } from "../src/core/session-cwd.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { SessionManager, type SessionReference } from "../src/core/session-manager.ts";
 
 function createTempDir(name: string): string {
 	const dir = join(tmpdir(), `${name}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -12,54 +12,43 @@ function createTempDir(name: string): string {
 	return dir;
 }
 
-function writeSessionFile(path: string, cwd: string): void {
-	writeFileSync(
-		path,
-		`${JSON.stringify({
-			type: "session",
-			version: 3,
-			id: "session-id",
-			timestamp: new Date().toISOString(),
-			cwd,
-		})}\n`,
-	);
+async function createSessionWithMissingCwd(sessionDir: string, missingCwd: string): Promise<SessionReference> {
+	const manager = await SessionManager.create(missingCwd, sessionDir, { id: "session-id" });
+	const ref = manager.getSessionRef();
+	if (!ref) throw new Error("Expected a persisted session reference");
+	return ref;
 }
 
 describe("session cwd handling", () => {
 	const cleanupPaths: string[] = [];
 
 	afterEach(() => {
-		for (const path of cleanupPaths.splice(0)) {
-			rmSync(path, { recursive: true, force: true });
-		}
+		for (const path of cleanupPaths.splice(0)) rmSync(path, { recursive: true, force: true });
 	});
 
-	it("detects missing session cwd from persisted sessions", () => {
+	it("detects missing session cwd from persisted sessions", async () => {
 		const fallbackCwd = createTempDir("volt-session-cwd-fallback");
 		const missingCwd = join(fallbackCwd, "does-not-exist");
 		const sessionDir = createTempDir("volt-session-cwd-session-dir");
-		const sessionFile = join(sessionDir, "session.jsonl");
 		cleanupPaths.push(fallbackCwd, sessionDir);
-		writeSessionFile(sessionFile, missingCwd);
+		const ref = await createSessionWithMissingCwd(sessionDir, missingCwd);
 
-		const sessionManager = SessionManager.open(sessionFile);
-		const issue = getMissingSessionCwdIssue(sessionManager, fallbackCwd);
-		expect(issue).toEqual({
-			sessionFile: sessionManager.getSessionFile(),
+		const sessionManager = await SessionManager.open(ref);
+		expect(getMissingSessionCwdIssue(sessionManager, fallbackCwd)).toEqual({
+			sessionRef: ref,
 			sessionCwd: missingCwd,
 			fallbackCwd,
 		});
 	});
 
-	it("supports overriding the effective cwd when opening a session", () => {
+	it("supports overriding the effective cwd when opening a session", async () => {
 		const fallbackCwd = createTempDir("volt-session-cwd-override");
 		const missingCwd = join(fallbackCwd, "does-not-exist");
 		const sessionDir = createTempDir("volt-session-cwd-override-session-dir");
-		const sessionFile = join(sessionDir, "session.jsonl");
 		cleanupPaths.push(fallbackCwd, sessionDir);
-		writeSessionFile(sessionFile, missingCwd);
+		const ref = await createSessionWithMissingCwd(sessionDir, missingCwd);
 
-		const sessionManager = SessionManager.open(sessionFile, undefined, fallbackCwd);
+		const sessionManager = await SessionManager.open(ref, fallbackCwd);
 		expect(sessionManager.getCwd()).toBe(fallbackCwd);
 		expect(getMissingSessionCwdIssue(sessionManager, fallbackCwd)).toBeUndefined();
 	});
@@ -68,11 +57,9 @@ describe("session cwd handling", () => {
 		const fallbackCwd = createTempDir("volt-session-cwd-runtime");
 		const missingCwd = join(fallbackCwd, "does-not-exist");
 		const sessionDir = createTempDir("volt-session-cwd-runtime-session-dir");
-		const sessionFile = join(sessionDir, "session.jsonl");
 		cleanupPaths.push(fallbackCwd, sessionDir);
-		writeSessionFile(sessionFile, missingCwd);
-
-		const sessionManager = SessionManager.open(sessionFile);
+		const ref = await createSessionWithMissingCwd(sessionDir, missingCwd);
+		const sessionManager = await SessionManager.open(ref);
 		let createRuntimeCalled = false;
 		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
 			createRuntimeCalled = true;

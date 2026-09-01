@@ -10,7 +10,7 @@ import {
 	isIrohRemoteWorktreeParentWorkspaceNotFoundError,
 	isIrohRemoteWorktreePersistenceError,
 } from "../core/remote/iroh/state-manager.ts";
-import { getDefaultSessionDirPath, readSessionHeader } from "../core/session-manager.ts";
+import { getDefaultSessionDirPath, SessionManager } from "../core/session-manager.ts";
 import { spawnProcess, waitForChildProcess } from "../utils/child-process.ts";
 import { writeDurableAtomicFile } from "../utils/durable-atomic-write.ts";
 import { ensurePrivateDirectorySync } from "../utils/private-files.ts";
@@ -1103,10 +1103,9 @@ export class WorktreeManager {
 	 * Binding-miss fallback (#83): worktrees[].sessionIds historically only
 	 * recorded ids bound at creation, so rekeyed descendants (fork/new),
 	 * subagent sessions, and pre-fix stranded sessions can live under a
-	 * checkout without a binding. Resolve those from the session file's stored
-	 * cwd — a header-only read of the filename-matching candidate in the
-	 * parent-keyed session dir — and self-heal the durable binding. Anything
-	 * ambiguous or unreadable fails closed to undefined (current behavior).
+	 * checkout without a binding. Resolve those from the authoritative session
+	 * store's cwd in the parent-keyed session directory, then self-heal the
+	 * durable binding. Missing, ambiguous, or unreadable state fails closed.
 	 */
 	private async resolveSessionWorktreeByStoredCwd(
 		workspaceName: string,
@@ -1122,26 +1121,15 @@ export class WorktreeManager {
 			return undefined;
 		}
 		const sessionDir = getDefaultSessionDirPath(workspace.path, this.agentDir);
-		let candidates: string[];
+		let storedCwd: string;
 		try {
-			// Read-only lookup: reject a symlinked leaf without re-hardening a
-			// directory this daemon-side path does not own (mirrors the
-			// findForResume/findMostRecentSession read paths), and fail closed on
-			// any fs error instead of letting it escape resolveSessionWorktree.
-			ensurePrivateDirectorySync(sessionDir, { hardenExisting: false });
-			candidates = (await readdir(sessionDir)).filter((name) => name.endsWith(`_${sessionId}.jsonl`));
+			const sessionRef = await SessionManager.findForResume(sessionDir, sessionId);
+			if (sessionRef === undefined) return undefined;
+			storedCwd = (await SessionManager.open(sessionRef)).getCwd();
 		} catch {
 			return undefined;
 		}
-		const candidate = candidates.length === 1 ? candidates[0] : undefined;
-		if (candidate === undefined) {
-			return undefined;
-		}
-		const header = readSessionHeader(join(sessionDir, candidate));
-		if (header?.id !== sessionId || typeof header.cwd !== "string" || header.cwd.length === 0) {
-			return undefined;
-		}
-		const cwdReal = await realpathOrResolve(header.cwd);
+		const cwdReal = await realpathOrResolve(storedCwd);
 		let match: { worktree: IrohRemoteWorkspaceWorktree; checkoutPath: string } | undefined;
 		for (const worktree of worktrees) {
 			const checkoutPath = await realpathOrResolve(worktree.path);

@@ -107,7 +107,7 @@ describe("AgentSessionRuntime profile propagation", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: await SessionManager.create(tempDir),
 		});
 
 		cleanups.push(async () => {

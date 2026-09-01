@@ -76,7 +76,7 @@ async function createRuntime(options: {
 					options.provider,
 					options.models ?? [{ id: `${options.provider}-reasoning`, reasoning: true }],
 				);
-	const manager = options.manager ?? SessionManager.create(tempDir, tempDir);
+	const manager = options.manager ?? (await SessionManager.create(tempDir, tempDir));
 	const settings = options.settings ?? SettingsManager.inMemory({ defaultThinkingLevel: "medium" });
 	const created = await createAgentSession({
 		cwd: tempDir,
@@ -142,13 +142,13 @@ describe("issue #110: durable Fast mode state", () => {
 			expect(first.session.thinkingLevel).toBe("high");
 			expect(first.manager.buildSessionContext().fastMode).toEqual({ enabled: true });
 			expect(buildRpcSessionState(first.session).fastModeEnabled).toBe(true);
-			const sessionFile = first.manager.getSessionFile()!;
+			const sessionRef = first.manager.getSessionRef()!;
 			first.session.dispose();
 			await first.session.waitForClosed();
 
 			const resumed = await createRuntime({
 				provider,
-				manager: SessionManager.open(sessionFile, first.tempDir),
+				manager: await SessionManager.open(sessionRef, first.tempDir),
 				modelRegistry: first.modelRegistry,
 				faux: first.faux,
 				settings: first.settings,
@@ -175,14 +175,14 @@ describe("issue #110: durable Fast mode state", () => {
 			explicitThinking: "high",
 		});
 		first.session.setFastModeEnabled(true);
-		const sessionFile = first.manager.getSessionFile()!;
+		const sessionRef = first.manager.getSessionRef()!;
 		const secondModel = first.modelRegistry.find("openai", "second")!;
 		first.session.dispose();
 		await first.session.waitForClosed();
 
 		const resumed = await createRuntime({
 			provider: "openai",
-			manager: SessionManager.open(sessionFile, first.tempDir),
+			manager: await SessionManager.open(sessionRef, first.tempDir),
 			modelRegistry: first.modelRegistry,
 			faux: first.faux,
 			settings: first.settings,
@@ -205,15 +205,15 @@ describe("issue #110: durable Fast mode state", () => {
 			settings: sharedSettings,
 		});
 		first.session.setFastModeEnabled(true);
-		const firstFile = first.manager.getSessionFile()!;
-		const secondFile = second.manager.getSessionFile()!;
+		const firstRef = first.manager.getSessionRef()!;
+		const secondRef = second.manager.getSessionRef()!;
 		first.session.dispose();
 		second.session.dispose();
 		await Promise.all([first.session.waitForClosed(), second.session.waitForClosed()]);
 
 		const reopenedFirst = await createRuntime({
 			provider: "openai",
-			manager: SessionManager.open(firstFile, first.tempDir),
+			manager: await SessionManager.open(firstRef, first.tempDir),
 			modelRegistry: first.modelRegistry,
 			faux: first.faux,
 			settings: sharedSettings,
@@ -221,7 +221,7 @@ describe("issue #110: durable Fast mode state", () => {
 		});
 		const reopenedSecond = await createRuntime({
 			provider: "openai-codex",
-			manager: SessionManager.open(secondFile, second.tempDir),
+			manager: await SessionManager.open(secondRef, second.tempDir),
 			modelRegistry: second.modelRegistry,
 			faux: second.faux,
 			settings: sharedSettings,
@@ -271,7 +271,11 @@ describe("issue #110: durable Fast mode state", () => {
 
 	it("restores branch-local Fast and thinking states before publishing navigation", async () => {
 		const runtime = await createRuntime({ provider: "openai", explicitThinking: "high" });
-		const branchPoint = runtime.manager.appendMessage({ role: "user", content: "branch point", timestamp: 1 });
+		const branchPoint = runtime.manager.appendMessage({
+			role: "user",
+			content: "branch point",
+			timestamp: Date.now(),
+		});
 		runtime.session.setFastModeEnabled(true);
 		const enabledLeaf = runtime.manager.getLeafId()!;
 

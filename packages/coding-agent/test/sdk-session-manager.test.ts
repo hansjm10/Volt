@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { type FauxProviderRegistration, getModel, registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
@@ -67,10 +67,12 @@ describe("createAgentSession session manager defaults", () => {
 		const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 		const expectedSessionDir = join(agentDir, "sessions", safePath);
 		const sessionDir = session.sessionManager.getSessionDir();
-		const sessionFile = session.sessionManager.getSessionFile();
+		const sessionRef = session.sessionManager.getSessionRef();
 
 		expect(sessionDir).toBe(expectedSessionDir);
-		expect(sessionFile ? dirname(sessionFile) : undefined).toBe(expectedSessionDir);
+		expect(sessionRef?.sessionDirectory).toBe(expectedSessionDir);
+		expect(sessionRef?.sessionId).toBe(session.sessionManager.getSessionId());
+		expect(existsSync(join(expectedSessionDir, "sessions.sqlite"))).toBe(true);
 
 		session.dispose();
 	});
@@ -170,7 +172,7 @@ describe("createAgentSession session manager defaults", () => {
 			api: faux.api,
 			models: faux.models,
 		});
-		const sessionManager = SessionManager.create(cwd, agentDir);
+		const sessionManager = await SessionManager.create(cwd, agentDir);
 		sessionManager.appendFastModeChange(true);
 
 		const { session } = await createAgentSession({
@@ -197,7 +199,8 @@ describe("createAgentSession session manager defaults", () => {
 			modelId: model.id,
 		});
 
-		const sessionFile = sessionManager.getSessionFile()!;
+		const sessionRef = sessionManager.getSessionRef();
+		if (!sessionRef) throw new Error("Expected a persisted session reference");
 		const resumed = await createAgentSession({
 			cwd,
 			agentDir,
@@ -208,7 +211,7 @@ describe("createAgentSession session manager defaults", () => {
 				defaultModel: laterDefault.id,
 			}),
 			resourceLoader: createTestResourceLoader(),
-			sessionManager: SessionManager.open(sessionFile, agentDir),
+			sessionManager: await SessionManager.open(sessionRef, agentDir),
 			disableMcp: true,
 			noTools: "all",
 		});

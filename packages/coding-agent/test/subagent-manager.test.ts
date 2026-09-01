@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentLoopNextActionContext } from "@hansjm10/volt-agent-core";
@@ -271,13 +271,13 @@ describe("SubagentManager", () => {
 				rmSync(parentRoot, { recursive: true, force: true });
 			}
 		});
-		const parentSessionManager = SessionManager.create(parentRoot, join(parentRoot, "sessions"));
+		const parentSessionManager = await SessionManager.create(parentRoot, join(parentRoot, "sessions"));
 		parentSessionManager.appendMessage({
 			role: "user",
 			content: [{ type: "text", text: "parent prompt" }],
 			timestamp: 1,
 		});
-		const parentSessionFile = parentSessionManager.getSessionFile();
+		const parentSessionRef = parentSessionManager.getSessionRef();
 		const { manager } = await createTestManager({ parentSessionManager, responseText: "persisted child" });
 		const handle = await manager.start();
 
@@ -286,23 +286,18 @@ describe("SubagentManager", () => {
 		await completion;
 		const stats = await handle.getSessionStats();
 
-		expect(stats.sessionFile).toBeTruthy();
-		if (!stats.sessionFile) {
-			throw new Error("expected persisted child session file");
+		expect(stats.sessionRef).toBeTruthy();
+		if (!stats.sessionRef) {
+			throw new Error("expected persisted child session reference");
 		}
-		expect(stats.sessionFile.startsWith(parentSessionManager.getSessionDir())).toBe(true);
-		const headerLine = readFileSync(stats.sessionFile, "utf-8").split("\n")[0];
-		if (!headerLine) {
-			throw new Error("expected child session header");
-		}
-		const header = JSON.parse(headerLine) as { id?: string; origin?: string; parentSession?: string; type?: string };
-		expect(header).toMatchObject({
+		expect(stats.sessionRef.sessionDirectory).toBe(parentSessionManager.getSessionDir());
+		const reopened = await SessionManager.open(stats.sessionRef);
+		expect(reopened.getHeader()).toMatchObject({
 			type: "session",
 			id: handle.sessionId,
-			parentSession: parentSessionFile,
+			parentSession: parentSessionRef,
 			origin: "subagent",
 		});
-		const reopened = SessionManager.open(stats.sessionFile);
 		expect(reopened.getBranch().some((entry) => entry.type === "message" && entry.message.role === "assistant")).toBe(
 			true,
 		);

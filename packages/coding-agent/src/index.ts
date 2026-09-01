@@ -640,6 +640,7 @@ export {
 	type SessionListOptions,
 	SessionManager,
 	type SessionMessageEntry,
+	type SessionReference,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
 export {

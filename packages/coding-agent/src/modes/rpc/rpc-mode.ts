@@ -67,7 +67,7 @@ import {
 } from "../../core/review-state.ts";
 import { type ProjectionDiagnostic, StreamProjector } from "../../core/rpc/stream-projection.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
-import { SessionManager } from "../../core/session-manager.ts";
+import { SessionManager, type SessionReference } from "../../core/session-manager.ts";
 import type { SubagentDefinition, SubagentHandle } from "../../core/subagents/index.ts";
 import { SubscriptionUsageService } from "../../core/subscription-usage.ts";
 import {
@@ -160,7 +160,7 @@ function parseHostActionResponseDecision(value: unknown): RpcHostActionResponse[
 }
 
 export interface RpcSessionChange {
-	sessionFile?: string;
+	sessionRef?: SessionReference;
 	sessionId: string;
 }
 
@@ -1010,7 +1010,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		// disposed one and silently stop delivering. Same-id consumers no-op safely.
 		if (options.onSessionChanged && session !== lastNotifiedSession) {
 			lastNotifiedSession = session;
-			await options.onSessionChanged({ sessionFile: session.sessionFile, sessionId: session.sessionId });
+			const sessionRef = session.sessionManager.getSessionRef();
+			await options.onSessionChanged({
+				...(sessionRef ? { sessionRef } : {}),
+				sessionId: session.sessionId,
+			});
 		}
 	};
 
@@ -1316,13 +1320,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					throw new Error("The review session opened without the selected findings.");
 				if (opened.seeded && requestedFindingIds === undefined) {
 					if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
-					const sourceSessionFile = sourceSessionManager.getSessionFile();
-					const acknowledgmentManager = sourceSessionFile
-						? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+					const sourceSessionRef = sourceSessionManager.getSessionRef();
+					const acknowledgmentManager = sourceSessionRef
+						? await SessionManager.open(sourceSessionRef)
 						: sourceSessionManager;
 					acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
 					await acknowledgmentManager.flush();
-					if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
 				}
 				return {
 					action,

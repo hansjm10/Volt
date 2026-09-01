@@ -108,4 +108,4 @@ docker run --rm -it \
 
 The `-v "$PWD:/workspace"` mounts your current directory into the container at /workspace such that reads and writes in `/workspace` inside Docker directly affect your host files, like in the Gondolin example.
 
-Use a named volume for `/root/.volt/agent` if you want container-local settings and sessions. Mounting your host `~/.volt/agent` exposes host auth and session files to the container.
+Use a named volume for the whole `/root/.volt/agent` directory if you want container-local settings and durable sessions. Each workspace store includes `sessions.sqlite` and may have active `sessions.sqlite-wal` and `sessions.sqlite-shm` sidecars; keep the directory together rather than mounting or copying only the database file. Mounting host `~/.volt/agent` exposes host credentials and live session stores to the container.

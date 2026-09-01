@@ -155,7 +155,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/resume` | Pick from previous sessions |
 | `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
-| `/session` | Show session info (file, ID, messages, tokens, cost) |
+| `/session` | Show session info (store, ID, messages, tokens, cost) |
 | `/usage` | Show remaining subscription quota and local reset times |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/subagents` | Inspect active or completed subagent conversations and tool flow |
@@ -234,26 +234,28 @@ Approval freezes the plan title, summary, outcome and substep text, ordering, hi
 
 ## Sessions
 
-Sessions are stored as JSONL files with a tree structure. Each entry has an `id` and `parentId`, enabling in-place branching without creating new files. See [docs/session-format.md](docs/session-format.md) for file format.
+Persisted sessions use a tree structure in SQLite. Each entry has an `id` and `parentId`, enabling in-place branching without creating another session. See [docs/session-format.md](docs/session-format.md) for storage and JSONL snapshot details.
 
 ### Management
 
-Sessions auto-save to `~/.volt/agent/sessions/` organized by working directory.
+Volt creates one authoritative `sessions.sqlite` store per workspace directory under `~/.volt/agent/sessions/`, or one in a custom session directory. Live sessions are addressed by stable IDs, and list/search/resume operations use SQLite indexes.
 
 ```bash
 volt -c                  # Continue most recent session
 volt -r                  # Browse and select from past sessions
 volt --no-session        # Ephemeral mode (don't save)
 volt --name "my task"    # Set session display name at startup
-volt --session <path|id> # Use specific session file or ID
-volt --fork <path|id>    # Fork specific session file or ID into a new session
+volt --session <id|path> # Resume by partial ID, or import a JSONL snapshot by path
+volt --fork <id|path>    # Fork by partial ID, or import a JSONL snapshot as a new session
 ```
 
-Use `/session` in interactive mode to see the current session ID before reusing it with `--session <id>` or `--fork <id>`.
+Paths are one-time JSONL snapshot imports, never live session files. On first store open, Volt imports legacy JSONL sessions and moves successful imports to a private `legacy-jsonl/` archive.
+
+Use `/session` in interactive mode to see the current store directory and session ID before reusing the ID with `--session <id>` or `--fork <id>`.
 
 ### Branching
 
-**`/tree`** - Navigate the session tree in-place. Select any previous point, continue from there, and switch between branches. All history preserved in a single file.
+**`/tree`** - Navigate the session tree in-place. Select any previous point, continue from there, and switch between branches. All history remains under the same session ID.
 
 <p align="center"><img src="docs/images/tree-view.png" alt="Tree View" width="600"></p>
 
@@ -261,11 +263,11 @@ Use `/session` in interactive mode to see the current session ID before reusing 
 - Filter modes (Ctrl+O): default → no-tools → user-only → labeled-only → all
 - Press Shift+L to label entries as bookmarks and Shift+T to toggle label timestamps
 
-**`/fork`** - Create a new session file from a previous user message on the active branch. Opens a selector, copies the active path up to that point, and places the selected prompt in the editor for modification.
+**`/fork`** - Create a new session from a previous user message on the active branch. Opens a selector, copies the active path up to that point, and places the selected prompt in the editor for modification.
 
-**`/clone`** - Duplicate the current active branch into a new session file at the current position. The new session keeps the full active-path history and opens with an empty editor.
+**`/clone`** - Duplicate the current active branch into a new session at the current position. The new session keeps the full active-path history and opens with an empty editor.
 
-**`--fork <path|id>`** - Fork an existing session file or partial session UUID directly from the CLI. This copies the full source session into a new session file in the current project.
+**`--fork <id|path>`** - Fork an existing session by partial ID. If the argument is a path, Volt imports that JSONL snapshot once as a new session in the current project.
 
 ### Compaction
 
@@ -275,7 +277,7 @@ Long sessions can exhaust context windows. Compaction summarizes older messages 
 
 **Automatic:** Enabled by default. Triggers on context overflow (recovers and retries) or when approaching the limit (proactive). Configure via `/settings` or `settings.json`.
 
-Compaction is lossy. The full history remains in the JSONL file; use `/tree` to revisit. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
+Compaction is lossy for model context. The full history remains in the SQLite session tree; use `/tree` to revisit it. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
 
 ---
 
@@ -620,9 +622,9 @@ cat README.md | volt -p "Summarize this text"
 |--------|-------------|
 | `-c`, `--continue` | Continue most recent session |
 | `-r`, `--resume` | Browse and select session |
-| `--session <path\|id>` | Use specific session file or partial UUID |
-| `--fork <path\|id>` | Fork specific session file or partial UUID into a new session |
-| `--session-dir <dir>` | Custom session storage directory |
+| `--session <id\|path>` | Resume by partial session ID, or import a JSONL snapshot path |
+| `--fork <id\|path>` | Fork by partial session ID, or import a JSONL snapshot as a new session |
+| `--session-dir <dir>` | Directory containing the authoritative `sessions.sqlite` store |
 | `--no-session` | Ephemeral mode (don't save) |
 | `--name <name>`, `-n <name>` | Set session display name at startup |
 
@@ -717,7 +719,7 @@ volt --thinking high "Solve this complex problem"
 | Variable | Description |
 |----------|-------------|
 | `VOLT_CODING_AGENT_DIR` | Override config directory (default: `~/.volt/agent`) |
-| `VOLT_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
+| `VOLT_CODING_AGENT_SESSION_DIR` | Override the directory containing `sessions.sqlite` (overridden by `--session-dir`) |
 | `VOLT_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
 | `VOLT_PROFILE` | Apply a named settings profile |
 | `VOLT_OFFLINE` | Disable startup network operations, including update checks, package update checks, and install/update telemetry |

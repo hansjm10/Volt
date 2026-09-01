@@ -9,7 +9,7 @@ import { CanonicalDataError, cloneCanonicalData } from "../canonical-data.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
-import type { SessionManager } from "../session-manager.ts";
+import type { SessionManager, SessionReference } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import { type Theme, theme } from "../theme/runtime.ts";
 import type {
@@ -180,7 +180,7 @@ export class ExtensionMessageRoleMismatchError extends Error {
 }
 
 export type NewSessionHandler = (options?: {
-	parentSession?: string;
+	parentSessionRef?: SessionReference;
 	setup?: (sessionManager: SessionManager) => Promise<void>;
 	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 }) => Promise<{ cancelled: boolean; seeded: boolean }>;
@@ -196,7 +196,7 @@ export type NavigateTreeHandler = (
 ) => Promise<{ cancelled: boolean }>;
 
 export type SwitchSessionHandler = (
-	sessionPath: string,
+	sessionRef: SessionReference,
 	options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 ) => Promise<{ cancelled: boolean; seeded: boolean }>;
 
@@ -785,9 +785,9 @@ export class ExtensionRunner {
 			this.assertActive();
 			return this.navigateTreeHandler(targetId, options);
 		};
-		context.switchSession = (sessionPath, options) => {
+		context.switchSession = (sessionRef, options) => {
 			this.assertActive();
-			return this.switchSessionHandler(sessionPath, options);
+			return this.switchSessionHandler(sessionRef, options);
 		};
 		context.reload = () => {
 			this.assertActive();

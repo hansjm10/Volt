@@ -151,6 +151,18 @@ export interface RemoteSessionListCursorEntry {
 	expiresAt: number;
 }
 
+interface ConversationSessionSummary {
+	sessionId: string;
+	sessionName?: string;
+	createdAt: string;
+	modifiedAt: string;
+	messageCount: number;
+	firstMessage: string;
+	cwd?: string;
+	origin?: "subagent";
+	startingGitContext?: RpcGitContext | null;
+}
+
 /** Minimal runtime surface the conversation command handlers consume. */
 export interface ConversationCommandRuntime {
 	session: {
@@ -158,19 +170,8 @@ export interface ConversationCommandRuntime {
 		sessionManager: Pick<SessionManager, "getBranch" | "getBranchWindow" | "getLeafEntry"> &
 			Partial<Pick<SessionManager, "getEntries">>;
 	};
-	listSessions(): Promise<
-		Array<{
-			sessionId: string;
-			sessionName?: string;
-			createdAt: string;
-			modifiedAt: string;
-			messageCount: number;
-			firstMessage: string;
-			cwd?: string;
-			origin?: "subagent";
-			startingGitContext?: RpcGitContext | null;
-		}>
-	>;
+	listSessions(): Promise<ConversationSessionSummary[]>;
+	getCurrentSessionSummary?(): ConversationSessionSummary;
 }
 
 export interface ConversationCommandContext {
@@ -1731,7 +1732,11 @@ export async function listRemoteWorkspaceSessionSummaries(
 		}
 	}
 	if (runtime !== undefined) {
-		for (const liveSummary of await runtime.listSessions()) {
+		const liveSummaries =
+			context.agentDir !== undefined && runtime.getCurrentSessionSummary
+				? [runtime.getCurrentSessionSummary()]
+				: await runtime.listSessions();
+		for (const liveSummary of liveSummaries) {
 			const summary = createRemoteSessionSummary(
 				{
 					sessionId: liveSummary.sessionId,
