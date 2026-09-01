@@ -120,23 +120,24 @@ describe("SessionManager asynchronous SQLite persistence", () => {
 		);
 	});
 
-	it("imports legacy JSONL once and continues only in SQLite", async () => {
+	it("imports a current JSONL snapshot once and continues only in SQLite", async () => {
 		const root = createTempDir();
-		const legacyPath = join(root, "legacy.jsonl");
-		const legacyBytes = `${JSON.stringify({
+		const snapshotPath = join(root, "snapshot.jsonl");
+		const snapshotBytes = `${JSON.stringify({
 			type: "session",
-			version: 4,
-			id: "legacy",
+			version: 5,
+			snapshotVersion: 1,
+			id: "snapshot",
 			timestamp: "2025-01-01T00:00:00.000Z",
 			cwd: root,
 		})}\n`;
-		writeFileSync(legacyPath, legacyBytes);
+		writeFileSync(snapshotPath, snapshotBytes);
 
-		const manager = await SessionManager.importFromJsonl(legacyPath, root, join(root, "sqlite-store"));
+		const manager = await SessionManager.importFromJsonl(snapshotPath, root, join(root, "sqlite-store"));
 		manager.appendCustomMessageEntry("test", "SQLite entry", true);
 		await manager.flush();
 
-		expect(readFileSync(legacyPath, "utf8")).toBe(legacyBytes);
+		expect(readFileSync(snapshotPath, "utf8")).toBe(snapshotBytes);
 		const ref = manager.getSessionRef();
 		if (!ref) throw new Error("Expected a persisted session reference");
 		expect((await SessionManager.open(ref)).buildSessionContext().messages).toMatchObject([

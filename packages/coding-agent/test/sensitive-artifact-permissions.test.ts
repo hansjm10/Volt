@@ -76,7 +76,7 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		writeFileSync(sessionFile, original, { mode: 0o666 });
 
 		await expect(SessionManager.importFromJsonl(sessionFile, cwd, sessionDir)).rejects.toThrow(
-			"Current session JSONL is malformed at committed line 1",
+			"Session snapshot JSONL is malformed at committed line 1",
 		);
 
 		expect(mode(sessionDir)).toBe(0o700);
@@ -93,7 +93,7 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		writeFileSync(sessionFile, original, { mode: 0o666 });
 
 		await expect(SessionManager.importFromJsonl(sessionFile, cwd)).rejects.toThrow(
-			"Current session JSONL is malformed at committed line 1",
+			"Session snapshot JSONL is malformed at committed line 1",
 		);
 
 		expect(mode(sharedDir)).toBe(0o777);
@@ -105,7 +105,14 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		const sessionFile = join(root, "session.jsonl");
 		writeFileSync(
 			sessionFile,
-			`${JSON.stringify({ type: "session", version: 5, id: "linked-source", timestamp: new Date().toISOString(), cwd })}\n`,
+			`${JSON.stringify({
+				type: "session",
+				version: 5,
+				snapshotVersion: 1,
+				id: "linked-source",
+				timestamp: new Date().toISOString(),
+				cwd,
+			})}\n`,
 			{ mode: 0o600 },
 		);
 		const symbolicLink = join(root, "linked-session.jsonl");
@@ -138,7 +145,7 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		expect(lstatSync(jsonlPath).isSymbolicLink()).toBe(false);
 		expect(mode(jsonlPath)).toBe(0o600);
 		expect(readFileSync(victimPath, "utf8")).toBe("do not replace");
-		expect(readFileSync(jsonlPath, "utf8")).toContain('"type":"session"');
+		expect(readFileSync(jsonlPath, "utf8")).toContain('"snapshotVersion":1');
 	});
 
 	it("creates private scratch directories and removes partially written new files on failure", () => {

@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -174,58 +173,66 @@ describe("SQLite-backed SessionManager", () => {
 		roots.splice(roots.indexOf(root), 1);
 	});
 
-	it("rejects cyclic imported entry parents without retaining a hidden row", async () => {
+	it("rejects invalid imported parent ordering without retaining a hidden row", async () => {
 		const { cwd, sessionDir, root } = fixture();
 		const jsonl = join(root, "cycle.jsonl");
 		const timestamp = "2026-08-31T12:00:00.000Z";
 		writeFileSync(
 			jsonl,
 			`${[
-				{ type: "session", version: CURRENT_SESSION_VERSION, id: "cycle", timestamp, cwd },
-				{ type: "leaf", id: "a", parentId: "b", ordinal: 1, timestamp, targetId: null },
-				{ type: "leaf", id: "b", parentId: "a", ordinal: 2, timestamp, targetId: null },
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: 1,
+					id: "cycle",
+					timestamp,
+					cwd,
+				},
 				{
 					type: "message",
-					id: "message",
-					parentId: "a",
-					ordinal: 3,
+					id: "a",
+					parentId: "b",
+					ordinal: 1,
 					timestamp,
-					message: { role: "user", content: "cycle", timestamp: Date.now() },
+					message: { role: "user", content: "first", timestamp: Date.now() },
 				},
+				{
+					type: "message",
+					id: "b",
+					parentId: "a",
+					ordinal: 2,
+					timestamp,
+					message: { role: "user", content: "second", timestamp: Date.now() },
+				},
+				{ type: "leaf", id: "leaf", parentId: "b", ordinal: 3, timestamp, targetId: "b" },
 			]
 				.map((entry) => JSON.stringify(entry))
 				.join("\n")}\n`,
 		);
-		await expect(SessionManager.importFromJsonl(jsonl, cwd, sessionDir)).rejects.toThrow(/host-only parent cycle/);
+		await expect(SessionManager.importFromJsonl(jsonl, cwd, sessionDir)).rejects.toThrow(/invalid or forward parent/);
 		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual([]);
 	});
 
-	it("imports legacy JSONL once and moves the source to the retained backup", async () => {
+	it("ignores unmarked JSONL beside the store and rejects it as an explicit snapshot", async () => {
 		const { cwd, sessionDir } = fixture();
 		mkdirSync(sessionDir, { recursive: true });
-		const sessionId = "legacy-session";
+		const jsonl = join(sessionDir, "unmarked.jsonl");
 		const timestamp = "2026-08-31T12:00:00.000Z";
 		writeFileSync(
-			join(sessionDir, `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`),
+			jsonl,
 			`${JSON.stringify({
 				type: "session",
 				version: CURRENT_SESSION_VERSION,
-				id: sessionId,
+				id: "unmarked",
 				timestamp,
 				cwd,
-			})}\n${JSON.stringify({
-				type: "message",
-				id: "message-1",
-				parentId: null,
-				ordinal: 1,
-				timestamp: "2026-08-31T12:01:00.000Z",
-				message: { role: "user", content: "legacy history", timestamp: 1_788_177_660_000 },
 			})}\n`,
 		);
 
-		const sessions = await SessionManager.list(cwd, sessionDir);
-		expect(sessions).toMatchObject([{ id: sessionId, firstMessage: "legacy history" }]);
-		expect(await own(SessionManager.open(sessions[0]!.ref))).toBeInstanceOf(SessionManager);
-		await expect(readdir(join(sessionDir, "legacy-jsonl"))).resolves.toHaveLength(1);
+		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
+		expect(existsSync(jsonl)).toBe(true);
+		await expect(SessionManager.importFromJsonl(jsonl, cwd, sessionDir)).rejects.toThrow(
+			"Session snapshot version must be 1",
+		);
 	});
 });

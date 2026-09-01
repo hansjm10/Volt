@@ -249,7 +249,7 @@ volt --session <id|path> # Resume by partial ID, or import a JSONL snapshot by p
 volt --fork <id|path>    # Fork by partial ID, or import a JSONL snapshot as a new session
 ```
 
-Paths are one-time JSONL snapshot imports, never live session files. On first store open, Volt imports legacy JSONL sessions and moves successful imports to a private `legacy-jsonl/` archive.
+Paths are one-time JSONL snapshot imports, never live session files. Imports require the current marked snapshot format.
 
 Use `/session` in interactive mode to see the current store directory and session ID before reusing the ID with `--session <id>` or `--fork <id>`.
 

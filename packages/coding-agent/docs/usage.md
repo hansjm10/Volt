@@ -90,7 +90,7 @@ volt --session <id|path> # Resume by partial ID, or import a JSONL snapshot by p
 volt --fork <id|path>    # Fork by partial ID, or import a JSONL snapshot as a new session
 ```
 
-A path argument is always a one-time JSONL snapshot import; Volt never uses that file as live storage. On first store open, legacy JSONL sessions are imported and moved to the private `legacy-jsonl/` archive.
+A path argument is always a one-time JSONL snapshot import; Volt never uses that file as live storage. Imports require the current `snapshotVersion: 1` format.
 
 Useful session commands:
 

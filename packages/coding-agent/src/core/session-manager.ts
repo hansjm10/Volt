@@ -2,9 +2,8 @@ import { type AgentMessage, uuidv7 } from "@hansjm10/volt-agent-core";
 import type { ImageContent, JsonCompatibleInput, JsonValue, Message, TextContent } from "@hansjm10/volt-ai";
 import { createHash, randomUUID } from "crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync } from "fs";
-import { readdir, rename, stat } from "fs/promises";
+import { readdir } from "fs/promises";
 import { basename, join } from "path";
-import lockfile from "proper-lockfile";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { TextDecoder } from "util";
@@ -47,7 +46,6 @@ import {
 	type SessionStoreApplyTransactionInput,
 	type SessionStoreClientInputWrite,
 	type SessionStoreEntryWrite,
-	SessionStoreError,
 	type SessionStoreJsonValue,
 	type SessionStoreLabelWrite,
 	type SessionStoreSearchChunkWrite,
@@ -69,6 +67,7 @@ function deepFreezeCanonicalData<T>(value: T): T {
 }
 
 export const CURRENT_SESSION_VERSION = 5;
+export const CURRENT_SESSION_SNAPSHOT_VERSION = 1;
 
 export interface SessionReference {
 	readonly sessionDirectory: string;
@@ -79,12 +78,26 @@ export interface SessionReference {
 
 export interface SessionHeader {
 	type: "session";
-	version?: number; // v1 sessions don't have this
+	version: number;
 	id: string;
 	timestamp: string;
 	cwd: string;
 	parentSession?: SessionReference;
 	/** "subagent" when this session was created for a delegated subagent run. */
+	origin?: SessionOrigin;
+}
+
+export interface SessionSnapshotHeader {
+	type: "session";
+	version: number;
+	snapshotVersion: number;
+	id: string;
+	timestamp: string;
+	cwd: string;
+	parentSessionDirectory?: string;
+	parentStoreId?: string;
+	parentSessionId?: string;
+	parentSessionGeneration?: string;
 	origin?: SessionOrigin;
 }
 
@@ -291,7 +304,7 @@ export interface SessionEntryBase {
 	id: string;
 	parentId: string | null;
 	timestamp: string;
-	/** Monotonic file commit order. Added on append and backfilled by v4 migration. */
+	/** Monotonic commit order assigned when the entry is persisted. */
 	ordinal?: number;
 }
 
@@ -983,90 +996,6 @@ function generateId(byId: { has(id: string): boolean }): string {
 	return randomUUID();
 }
 
-/** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
-function migrateV1ToV2(entries: FileEntry[]): void {
-	const ids = new Set<string>();
-	let prevId: string | null = null;
-
-	for (const entry of entries) {
-		if (entry.type === "session") {
-			entry.version = 2;
-			continue;
-		}
-
-		entry.id = generateId(ids);
-		entry.parentId = prevId;
-		prevId = entry.id;
-
-		// Convert firstKeptEntryIndex to firstKeptEntryId for compaction
-		if (entry.type === "compaction") {
-			const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
-			if (typeof comp.firstKeptEntryIndex === "number") {
-				const targetEntry = entries[comp.firstKeptEntryIndex];
-				if (targetEntry && targetEntry.type !== "session") {
-					comp.firstKeptEntryId = targetEntry.id;
-				}
-				delete comp.firstKeptEntryIndex;
-			}
-		}
-	}
-}
-
-/** Migrate v2 → v3: rename hookMessage role to custom. Mutates in place. */
-function migrateV2ToV3(entries: FileEntry[]): void {
-	for (const entry of entries) {
-		if (entry.type === "session") {
-			entry.version = 3;
-			continue;
-		}
-
-		// Update message entries with hookMessage role
-		if (entry.type === "message") {
-			const msgEntry = entry as SessionMessageEntry;
-			if (msgEntry.message && (msgEntry.message as { role: string }).role === "hookMessage") {
-				(msgEntry.message as { role: string }).role = "custom";
-			}
-		}
-	}
-}
-
-/** Migrate v3 → v4: assign stable file-order commit ordinals. Mutates in place. */
-function migrateV3ToV4(entries: FileEntry[]): void {
-	let ordinal = 1;
-	for (const entry of entries) {
-		if (entry.type === "session") {
-			entry.version = 4;
-			continue;
-		}
-		entry.ordinal = ordinal++;
-	}
-}
-
-/** Migrate v4 → v5: discard unreplayable legacy WAL while preserving canonical transcript entries. */
-function migrateV4ToV5(entries: FileEntry[]): void {
-	const retainedEntries = entries.filter(
-		(entry) =>
-			entry.type !== "client_input_receipt" &&
-			entry.type !== "client_input_queued" &&
-			entry.type !== "client_input_state",
-	);
-	entries.splice(0, entries.length, ...retainedEntries);
-	let ordinal = 1;
-	for (const entry of retainedEntries) {
-		if (entry.type === "session") {
-			entry.version = 5;
-		} else {
-			entry.ordinal = ordinal++;
-		}
-		if (entry.type === "message" && entry.message.role === "user") {
-			// v4 receipts did not retain the replayable payload required by v5. Once
-			// their WAL is discarded, the transport identity must go with it so the
-			// migrated canonical transcript cannot impersonate a v5 completion boundary.
-			delete (entry.message as { clientMessageId?: string }).clientMessageId;
-		}
-	}
-}
-
 function withoutClientInputIdentity(entry: SessionEntry): SessionEntry {
 	if (entry.type !== "message" || entry.message.role !== "user" || entry.message.clientMessageId === undefined) {
 		return entry;
@@ -1076,36 +1005,49 @@ function withoutClientInputIdentity(entry: SessionEntry): SessionEntry {
 	return { ...entry, message };
 }
 
-/**
- * Run all necessary migrations to bring entries to current version.
- * Mutates entries in place. Returns true if any migration was applied.
- */
-function migrateToCurrentVersion(entries: FileEntry[]): boolean {
-	const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
-	const version = header?.version ?? 1;
-
-	if (!Number.isSafeInteger(version) || version < 1) {
-		throw new Error(`Session has an invalid schema version: ${String(version)}`);
-	}
-	if (version > CURRENT_SESSION_VERSION) {
-		throw new Error(`Session schema version ${version} is newer than supported version ${CURRENT_SESSION_VERSION}`);
-	}
-	if (version === CURRENT_SESSION_VERSION) return false;
-
-	if (version < 2) migrateV1ToV2(entries);
-	if (version < 3) migrateV2ToV3(entries);
-	if (version < 4) migrateV3ToV4(entries);
-	if (version < 5) migrateV4ToV5(entries);
-
-	return true;
+export function createSessionSnapshotHeader(header: SessionHeader): SessionSnapshotHeader {
+	return {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+		id: header.id,
+		timestamp: header.timestamp,
+		cwd: header.cwd,
+		...(header.parentSession === undefined
+			? {}
+			: {
+					parentSessionDirectory: header.parentSession.sessionDirectory,
+					parentStoreId: header.parentSession.storeId,
+					parentSessionId: header.parentSession.sessionId,
+					parentSessionGeneration: header.parentSession.sessionGeneration,
+				}),
+		...(header.origin === undefined ? {} : { origin: header.origin }),
+	};
 }
 
-/** Exported for testing */
-export function migrateSessionEntries(entries: FileEntry[]): void {
-	migrateToCurrentVersion(entries);
+export function serializeSessionJsonlSnapshot(
+	header: SessionHeader,
+	entries: readonly SessionEntry[],
+	leafId: string | null,
+): string {
+	const snapshotEntries = entries.map((entry, index) => ({
+		...withoutClientInputIdentity(entry),
+		ordinal: index + 1,
+	}));
+	const leaf: LeafEntry = {
+		type: "leaf",
+		id: generateId(new Set(snapshotEntries.map((entry) => entry.id))),
+		parentId: snapshotEntries.at(-1)?.id ?? null,
+		timestamp: new Date().toISOString(),
+		targetId: leafId,
+		ordinal: snapshotEntries.length + 1,
+	};
+	return `${[createSessionSnapshotHeader(header), ...snapshotEntries, leaf]
+		.map((entry) => JSON.stringify(entry))
+		.join("\n")}\n`;
 }
 
-/** Exported for compaction.test.ts */
+/** Exported for compaction tests and snapshot consumers. */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const entries: FileEntry[] = [];
 	const lines = content.trim().split("\n");
@@ -1301,8 +1243,6 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 }
 
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
-const SESSION_HEADER_MAX_BYTES = 64 * 1024;
-const SESSION_HEADER_READ_CHUNK_BYTES = 4 * 1024;
 
 function parseSessionEntryLine(line: string): FileEntry | null {
 	if (!line.trim()) return null;
@@ -1385,9 +1325,8 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			}
 		}
 
-		// A malformed unterminated final fragment may be a torn append. Every
-		// newline-terminated malformed record is a committed interior corruption
-		// candidate and is handled fail-closed below for current WAL sessions.
+		// Ignore a malformed unterminated final fragment as a torn write. Every
+		// newline-terminated malformed record is committed corruption.
 		if (pendingBytes > 0) {
 			const finalLine = Buffer.concat(pendingChunks, pendingBytes);
 			const parsed = parseSessionEntryBytes(finalLine);
@@ -1397,20 +1336,8 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		closeSync(fd);
 	}
 
-	// Validate session header. Current WAL sessions cannot silently skip a
-	// malformed committed line: it might be the only started/canonical boundary
-	// preventing duplicate side effects. A parseable legacy header retains its
-	// historical best-effort behavior. A file with no parseable records fails
-	// because it cannot be proven to be legacy rather than a current WAL whose
-	// header or only durable boundary was destroyed.
-	const parsedHeader = entries[0];
-	if (
-		malformedCompleteLine !== undefined &&
-		(entries.length === 0 ||
-			(parsedHeader?.type === "session" && (parsedHeader.version ?? 1) >= CURRENT_SESSION_VERSION) ||
-			entries.some(isClientInputWalEntry))
-	) {
-		throw new Error(`Current session JSONL is malformed at committed line ${malformedCompleteLine}`);
+	if (malformedCompleteLine !== undefined) {
+		throw new Error(`Session snapshot JSONL is malformed at committed line ${malformedCompleteLine}`);
 	}
 	if (entries.length === 0) return entries;
 	const header = entries[0];
@@ -1421,64 +1348,71 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	return entries;
 }
 
-/**
- * Hardened first-line header read (O_NOFOLLOW, single-link regular files
- * only). Exported for daemon worktree resolution, which needs a session's
- * stored cwd without paying a full WAL-validating open.
- */
-export function readSessionHeader(filePath: string): SessionHeader | null {
-	let fd: number | undefined;
-	try {
-		hardenPrivateRegularFileSync(filePath);
-		const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-		fd = openSync(filePath, constants.O_RDONLY | noFollow);
-		const fileStat = fstatSync(fd);
-		if (!fileStat.isFile() || fileStat.nlink !== 1) return null;
-		if (noFollow === 0) {
-			const pathStat = lstatSync(filePath);
-			if (
-				pathStat.isSymbolicLink() ||
-				!pathStat.isFile() ||
-				pathStat.dev !== fileStat.dev ||
-				pathStat.ino !== fileStat.ino
-			) {
-				return null;
-			}
-		}
-
-		const chunks: Buffer[] = [];
-		let byteCount = 0;
-		let reachedBoundary = false;
-		while (byteCount <= SESSION_HEADER_MAX_BYTES) {
-			const remainingProbeBytes = SESSION_HEADER_MAX_BYTES + 1 - byteCount;
-			const buffer = Buffer.allocUnsafe(Math.min(SESSION_HEADER_READ_CHUNK_BYTES, remainingProbeBytes));
-			const bytesRead = readSync(fd, buffer, 0, buffer.length, byteCount);
-			if (bytesRead === 0) {
-				reachedBoundary = true;
-				break;
-			}
-			const newlineIndex = buffer.subarray(0, bytesRead).indexOf(0x0a);
-			const retainedBytes = newlineIndex === -1 ? bytesRead : newlineIndex;
-			if (retainedBytes > 0) chunks.push(buffer.subarray(0, retainedBytes));
-			byteCount += retainedBytes;
-			if (newlineIndex !== -1) {
-				reachedBoundary = true;
-				break;
-			}
-		}
-		if (!reachedBoundary || byteCount > SESSION_HEADER_MAX_BYTES) return null;
-		const firstLine = Buffer.concat(chunks, byteCount).toString("utf8");
-		if (!firstLine) return null;
-		const header = JSON.parse(firstLine) as Record<string, unknown>;
-		if (header.type !== "session" || typeof header.id !== "string") {
-			return null;
-		}
-		return header as unknown as SessionHeader;
-	} catch {
-		return null;
-	} finally {
-		if (fd !== undefined) closeSync(fd);
+export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnapshotHeader {
+	const header = entries[0] as unknown;
+	if (!isRecord(header) || header.type !== "session") {
+		throw new Error("Session snapshot has no valid header");
 	}
+	const allowedHeaderKeys = new Set([
+		"type",
+		"version",
+		"snapshotVersion",
+		"id",
+		"timestamp",
+		"cwd",
+		"parentSessionDirectory",
+		"parentStoreId",
+		"parentSessionId",
+		"parentSessionGeneration",
+		"origin",
+	]);
+	for (const key of Object.keys(header)) {
+		if (!allowedHeaderKeys.has(key)) throw new Error(`Session snapshot header has unsupported field: ${key}`);
+	}
+	if (header.version !== CURRENT_SESSION_VERSION) {
+		throw new Error(`Session snapshot entry version must be ${CURRENT_SESSION_VERSION}`);
+	}
+	if (header.snapshotVersion !== CURRENT_SESSION_SNAPSHOT_VERSION) {
+		throw new Error(`Session snapshot version must be ${CURRENT_SESSION_SNAPSHOT_VERSION}`);
+	}
+	if (typeof header.id !== "string") throw new Error("Session snapshot header has an invalid id");
+	assertValidSessionId(header.id);
+	if (typeof header.timestamp !== "string" || !header.timestamp) {
+		throw new Error("Session snapshot header has an invalid timestamp");
+	}
+	if (typeof header.cwd !== "string" || !header.cwd) throw new Error("Session snapshot header has an invalid cwd");
+	if (header.origin !== undefined && header.origin !== "subagent") {
+		throw new Error("Session snapshot header has an invalid origin");
+	}
+	const parentFields = [
+		header.parentSessionDirectory,
+		header.parentStoreId,
+		header.parentSessionId,
+		header.parentSessionGeneration,
+	];
+	if (parentFields.some((value) => value !== undefined) && parentFields.some((value) => typeof value !== "string")) {
+		throw new Error("Session snapshot parent reference must be complete");
+	}
+
+	let sawLeaf = false;
+	for (let index = 1; index < entries.length; index++) {
+		const entry = entries[index]!;
+		if (entry.type === "session") throw new Error("Session snapshot contains more than one header");
+		if (entry.type === "leaf") {
+			if (sawLeaf || index !== entries.length - 1) {
+				throw new Error("Session snapshot leaf must be the final entry");
+			}
+			sawLeaf = true;
+			continue;
+		}
+		if (isHostOnlySessionEntry(entry)) {
+			throw new Error(`Session snapshot contains unsupported host-only entry: ${entry.type}`);
+		}
+		if (entry.type === "message" && entry.message.role === "user" && entry.message.clientMessageId !== undefined) {
+			throw new Error("Session snapshot contains a transport-owned client message identity");
+		}
+	}
+	return header as unknown as SessionSnapshotHeader;
 }
 
 function isMessageWithContent(message: AgentMessage): message is Message {
@@ -1599,22 +1533,6 @@ export interface SessionListOptions {
 	includeMessageFreeDurable?: boolean;
 }
 
-class LegacySessionCorruptError extends Error {
-	constructor(message: string, options?: ErrorOptions) {
-		super(message, options);
-		this.name = "LegacySessionCorruptError";
-	}
-}
-
-class LegacySessionMigrationRetryError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "LegacySessionMigrationRetryError";
-	}
-}
-
-const sessionStoreMigrationTasks = new Map<string, Promise<void>>();
-
 /**
  * Manages conversation sessions as append-only trees stored in SQLite.
  *
@@ -1696,6 +1614,9 @@ export class SessionManager {
 
 	private _loadStoreSnapshot(snapshot: SessionStoreSnapshot, cwdOverride?: string): void {
 		const summary = snapshot.session;
+		if (summary.formatVersion !== CURRENT_SESSION_VERSION) {
+			throw new Error(`Session entry version must be ${CURRENT_SESSION_VERSION}`);
+		}
 		const parentSession =
 			summary.parentSessionId === null ||
 			summary.parentStoreId === null ||
@@ -1790,43 +1711,38 @@ export class SessionManager {
 		this.leafId = null;
 		this.nextOrdinal = 1;
 		this.canonicalRevision = 0;
-		const currentVersion =
-			(this.fileEntries.find((entry) => entry.type === "session") as SessionHeader | undefined)?.version ===
-			CURRENT_SESSION_VERSION;
 		const seenEntryIds = new Set<string>();
 		let lastWalOrdinal = 0;
 		let sawStartingGitContext = false;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
-			if (currentVersion) {
-				if (entry.type === "session_start_git_context") {
-					if (!isValidSessionStartGitContextEntry(entry) || sawStartingGitContext) {
-						throw new Error("Current session contains invalid starting Git context metadata");
-					}
-					sawStartingGitContext = true;
+			if (entry.type === "session_start_git_context") {
+				if (!isValidSessionStartGitContextEntry(entry) || sawStartingGitContext) {
+					throw new Error("Current session contains invalid starting Git context metadata");
 				}
-				if (typeof entry.id !== "string" || entry.id.length === 0 || seenEntryIds.has(entry.id)) {
-					throw new Error("Current session contains an invalid or duplicate entry identity");
+				sawStartingGitContext = true;
+			}
+			if (typeof entry.id !== "string" || entry.id.length === 0 || seenEntryIds.has(entry.id)) {
+				throw new Error("Current session contains an invalid or duplicate entry identity");
+			}
+			if (entry.parentId === entry.id || (entry.parentId !== null && !seenEntryIds.has(entry.parentId))) {
+				throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
+			}
+			seenEntryIds.add(entry.id);
+			if (entry.type === "fast_mode_change" && typeof entry.enabled !== "boolean") {
+				throw new Error(`Fast mode entry ${entry.id} has an invalid enabled state`);
+			}
+			if (isClientInputWalEntry(entry)) {
+				if (!Number.isSafeInteger(entry.ordinal) || (entry.ordinal ?? 0) <= lastWalOrdinal) {
+					throw new Error(`Client input WAL entry ${entry.id} has an invalid commit ordinal`);
 				}
-				if (entry.parentId === entry.id || (entry.parentId !== null && !seenEntryIds.has(entry.parentId))) {
-					throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
-				}
-				seenEntryIds.add(entry.id);
-				if (entry.type === "fast_mode_change" && typeof entry.enabled !== "boolean") {
-					throw new Error(`Fast mode entry ${entry.id} has an invalid enabled state`);
-				}
-				if (isClientInputWalEntry(entry)) {
-					if (!Number.isSafeInteger(entry.ordinal) || (entry.ordinal ?? 0) <= lastWalOrdinal) {
-						throw new Error(`Client input WAL entry ${entry.id} has an invalid commit ordinal`);
-					}
-					lastWalOrdinal = entry.ordinal!;
-					assertClientMessageId(entry.clientMessageId);
-					if (
-						(entry.type === "client_input_queued" || entry.type === "client_input_state") &&
-						(typeof entry.receiptId !== "string" || entry.receiptId.length === 0)
-					) {
-						throw new Error(`Client input WAL entry ${entry.id} has an invalid receipt identity`);
-					}
+				lastWalOrdinal = entry.ordinal!;
+				assertClientMessageId(entry.clientMessageId);
+				if (
+					(entry.type === "client_input_queued" || entry.type === "client_input_state") &&
+					(typeof entry.receiptId !== "string" || entry.receiptId.length === 0)
+				) {
+					throw new Error(`Client input WAL entry ${entry.id} has an invalid receipt identity`);
 				}
 			}
 			if (Number.isSafeInteger(entry.ordinal) && (entry.ordinal ?? 0) > 0) {
@@ -3687,196 +3603,6 @@ export class SessionManager {
 		return this.getSessionRef();
 	}
 
-	private static async _migrateLegacyDirectory(dir: string, store: SQLiteSessionStoreClient): Promise<void> {
-		const pendingDir = join(dir, "legacy-jsonl-pending");
-		ensurePrivateDirectorySync(pendingDir);
-		const directNames = (await readdir(dir)).filter((name) => name.endsWith(".jsonl"));
-		for (const name of directNames) {
-			const pendingPath = join(pendingDir, name);
-			if (existsSync(pendingPath)) {
-				throw new LegacySessionMigrationRetryError(`Pending legacy session already exists: ${pendingPath}`);
-			}
-			await rename(join(dir, name), pendingPath);
-		}
-		const names = (await readdir(pendingDir)).filter((name) => name.endsWith(".jsonl"));
-		if (names.length === 0) return;
-		const ownershipStats = new Map<string, { size: number; mtimeMs: number }>();
-		for (const name of names) {
-			const value = await stat(join(pendingDir, name));
-			ownershipStats.set(name, { size: value.size, mtimeMs: value.mtimeMs });
-		}
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		for (const name of names) {
-			const before = ownershipStats.get(name)!;
-			const after = await stat(join(pendingDir, name));
-			if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-				throw new LegacySessionMigrationRetryError(`Legacy session is still being written: ${name}`);
-			}
-		}
-		const sessionsByPath = new Map<string, { id: string; generation: string }>();
-		for (const name of names) {
-			const path = join(pendingDir, name);
-			const originalPath = join(dir, name);
-			const header = readSessionHeader(path);
-			if (header?.id) {
-				const identity = {
-					id: header.id,
-					generation: `legacy-${createHash("sha256")
-						.update(`${resolvePath(originalPath)}\0${header.id}`)
-						.digest("hex")}`,
-				};
-				sessionsByPath.set(resolvePath(path), identity);
-				sessionsByPath.set(resolvePath(originalPath), identity);
-			}
-		}
-		const failures: string[] = [];
-		for (const name of names) {
-			const path = join(pendingDir, name);
-			try {
-				const before = await stat(path);
-				let sourceEntries: FileEntry[];
-				let sourceHeader: SessionHeader;
-				try {
-					sourceEntries = loadEntriesFromFile(path);
-					if (sourceEntries.length === 0) throw new Error("session JSONL has no valid header");
-					migrateSessionEntries(sourceEntries);
-					const parsedHeader = sourceEntries.find((entry): entry is SessionHeader => entry.type === "session");
-					if (!parsedHeader) throw new Error("session JSONL has no header");
-					sourceHeader = parsedHeader;
-				} catch (error) {
-					if (error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string") {
-						throw error;
-					}
-					throw new LegacySessionCorruptError(error instanceof Error ? error.message : String(error), {
-						cause: error,
-					});
-				}
-				const content = Buffer.from(sourceEntries.map((entry) => JSON.stringify(entry)).join("\n"), "utf8");
-				const legacyParent = (sourceHeader as unknown as { parentSession?: unknown }).parentSession;
-				const parentSession =
-					typeof legacyParent === "string" ? sessionsByPath.get(resolvePath(legacyParent)) : undefined;
-				const legacyIdentity = sessionsByPath.get(resolvePath(path));
-				if (!legacyIdentity) throw new Error("session JSONL identity was not indexed");
-				const parentRef =
-					parentSession === undefined
-						? undefined
-						: sessionReference(dir, store.info.storeId, parentSession.id, parentSession.generation);
-				const header: SessionHeader = {
-					type: "session",
-					version: CURRENT_SESSION_VERSION,
-					id: sourceHeader.id,
-					timestamp: sourceHeader.timestamp,
-					cwd: sourceHeader.cwd,
-					...(parentRef === undefined ? {} : { parentSession: parentRef }),
-					...(sourceHeader.origin === undefined ? {} : { origin: sourceHeader.origin }),
-				};
-				const normalizedEntries = sourceEntries
-					.filter((entry): entry is SessionEntry => entry.type !== "session")
-					.map((entry) => {
-						if (entry.type !== "subagent_spawn") return entry;
-						const legacyChild = (entry as unknown as { childSessionFile?: unknown }).childSessionFile;
-						if (typeof legacyChild !== "string") return entry;
-						const childIdentity = sessionsByPath.get(resolvePath(legacyChild));
-						const childSessionId = childIdentity?.id ?? entry.childSessionId;
-						const copy = { ...entry, childSessionId };
-						delete (copy as { childSessionFile?: unknown }).childSessionFile;
-						return {
-							...copy,
-							...(childIdentity === undefined
-								? {}
-								: {
-										childSessionRef: sessionReference(
-											dir,
-											store.info.storeId,
-											childSessionId,
-											childIdentity.generation,
-										),
-									}),
-						};
-					});
-				const manager = new SessionManager(header.cwd, "", false);
-				manager.sessionDir = dir;
-				manager.storeId = store.info.storeId;
-				manager.sessionGeneration = legacyIdentity.generation;
-				manager.fileEntries = [header, ...normalizedEntries];
-				manager.acceptsStartingGitContext = false;
-				try {
-					manager._buildIndex();
-				} catch (error) {
-					throw new LegacySessionCorruptError(error instanceof Error ? error.message : String(error), {
-						cause: error,
-					});
-				}
-				const payload = manager._storePayload(normalizedEntries);
-				const commitId = `legacy-${createHash("sha256").update(content).digest("hex")}`;
-				const digest = digestSessionStoreTransactionPayload(payload);
-				const after = await stat(path);
-				if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-					throw new LegacySessionMigrationRetryError("session JSONL changed during migration");
-				}
-				const imported = await store.importTransaction({
-					session: {
-						id: header.id,
-						sessionGeneration: legacyIdentity.generation,
-						formatVersion: CURRENT_SESSION_VERSION,
-						cwd: header.cwd,
-						createdAt: header.timestamp,
-						parentSessionDirectory: parentRef?.sessionDirectory ?? null,
-						parentStoreId: parentRef?.storeId ?? null,
-						parentSessionId: parentRef?.sessionId ?? null,
-						parentSessionGeneration: parentRef?.sessionGeneration ?? null,
-						origin: header.origin ?? null,
-					},
-					transaction: {
-						sessionId: header.id,
-						sessionGeneration: legacyIdentity.generation,
-						expectedRevision: 0,
-						commitId,
-						digest,
-						payload,
-					},
-				});
-				if (imported.transaction.status !== "committed") {
-					throw new LegacySessionMigrationRetryError(
-						`legacy import conflicted at revision ${imported.transaction.actualRevision}`,
-					);
-				}
-				const afterImport = await stat(path);
-				if (after.size !== afterImport.size || after.mtimeMs !== afterImport.mtimeMs) {
-					if (imported.createdSession) {
-						await store.deleteSession({
-							sessionId: header.id,
-							sessionGeneration: legacyIdentity.generation,
-							expectedRevision: imported.transaction.evidence.afterRevision,
-						});
-					}
-					throw new LegacySessionMigrationRetryError("session JSONL changed while its import committed");
-				}
-				const backupDir = join(dir, "legacy-jsonl");
-				ensurePrivateDirectorySync(backupDir);
-				await rename(path, join(backupDir, name));
-			} catch (error) {
-				const structuralStoreFailure =
-					error instanceof SessionStoreError &&
-					(error.code === "constraint_failed" ||
-						error.code === "commit_digest_mismatch" ||
-						error.code === "commit_identity_conflict" ||
-						error.code === "session_already_exists");
-				const shouldQuarantine = error instanceof LegacySessionCorruptError || structuralStoreFailure;
-				if (!shouldQuarantine) {
-					failures.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
-					continue;
-				}
-				const failedDir = join(dir, "legacy-jsonl-failed");
-				ensurePrivateDirectorySync(failedDir);
-				const failedPath = join(failedDir, `${Date.now()}-${name}`);
-				await rename(path, failedPath).catch(() => undefined);
-				failures.push(`${failedPath}: ${error instanceof Error ? error.message : String(error)}`);
-			}
-		}
-		if (failures.length > 0) throw new Error(`Some legacy sessions could not be imported:\n${failures.join("\n")}`);
-	}
-
 	private static async _releaseLeaseAfterFailure(
 		lease: SQLiteSessionStoreLease,
 		error: unknown,
@@ -3891,40 +3617,7 @@ export class SessionManager {
 	}
 
 	private static async _store(dir: string): Promise<SQLiteSessionStoreLease> {
-		const normalized = normalizePath(dir);
-		let migration = sessionStoreMigrationTasks.get(normalized);
-		if (!migration) {
-			migration = (async () => {
-				const lease = await acquireSharedSQLiteSessionStore(normalized);
-				try {
-					let releaseLock: (() => Promise<void>) | undefined;
-					try {
-						releaseLock = await lockfile.lock(lease.client.info.databasePath, {
-							lockfilePath: `${lease.client.info.databasePath}.migration.lock`,
-							realpath: false,
-							retries: { retries: 10, factor: 2, minTimeout: 50, maxTimeout: 1000, randomize: true },
-							stale: 30_000,
-						});
-						await SessionManager._migrateLegacyDirectory(normalized, lease.client);
-					} finally {
-						await releaseLock?.().catch(() => undefined);
-					}
-				} catch (error) {
-					await SessionManager._releaseLeaseAfterFailure(
-						lease,
-						error,
-						"Session store migration failed and its lease could not be released",
-					);
-				}
-				await lease.release();
-			})().catch((error: unknown) => {
-				sessionStoreMigrationTasks.delete(normalized);
-				throw error;
-			});
-			sessionStoreMigrationTasks.set(normalized, migration);
-		}
-		await migration;
-		return acquireSharedSQLiteSessionStore(normalized);
+		return acquireSharedSQLiteSessionStore(normalizePath(dir));
 	}
 
 	private static async _scopedStore<T>(
@@ -4064,46 +3757,30 @@ export class SessionManager {
 		if (existsSync(resolvedPath)) hardenPrivateRegularFileSync(resolvedPath);
 		const sourceEntries = loadEntriesFromFile(resolvedPath);
 		if (sourceEntries.length === 0) throw new Error(`Cannot import invalid session JSONL: ${resolvedPath}`);
-		migrateSessionEntries(sourceEntries);
-		const header = sourceEntries.find((entry): entry is SessionHeader => entry.type === "session");
-		if (!header) throw new Error(`Cannot import session without a header: ${resolvedPath}`);
+		const header = assertCurrentSessionSnapshot(sourceEntries);
 
 		const cwd = targetCwd ?? header.cwd;
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		const snapshotParent = header as unknown as {
-			parentSessionDirectory?: unknown;
-			parentStoreId?: unknown;
-			parentSessionId?: unknown;
-			parentSessionGeneration?: unknown;
-		};
 		const parentSession =
-			typeof snapshotParent.parentSessionDirectory === "string" &&
-			typeof snapshotParent.parentStoreId === "string" &&
-			typeof snapshotParent.parentSessionId === "string" &&
-			typeof snapshotParent.parentSessionGeneration === "string"
+			header.parentSessionDirectory !== undefined &&
+			header.parentStoreId !== undefined &&
+			header.parentSessionId !== undefined &&
+			header.parentSessionGeneration !== undefined
 				? sessionReference(
-						snapshotParent.parentSessionDirectory,
-						snapshotParent.parentStoreId,
-						snapshotParent.parentSessionId,
-						snapshotParent.parentSessionGeneration,
+						header.parentSessionDirectory,
+						header.parentStoreId,
+						header.parentSessionId,
+						header.parentSessionGeneration,
 					)
 				: undefined;
 
 		const sourceById = new Map<string, SessionEntry>();
 		let sourceLeafId: string | null = null;
-		let startingGitContext: RpcGitContext | null | undefined;
 		for (const entry of sourceEntries) {
 			if (entry.type === "session") continue;
 			sourceById.set(entry.id, entry);
-			if (entry.type === "session_start_git_context") startingGitContext = entry.gitContext;
 			if (entry.type === "leaf") sourceLeafId = entry.targetId;
-			else if (!isHostOnlySessionEntry(entry)) sourceLeafId = entry.id;
-		}
-		if (
-			startingGitContext !== undefined &&
-			!Check(Type.Union([RpcGitContextSchema, Type.Null()]), startingGitContext)
-		) {
-			throw new Error("Imported session contains invalid starting Git context metadata");
+			else sourceLeafId = entry.id;
 		}
 		const nearestPublicParent = (parentId: string | null): string | null => {
 			let currentId = parentId;
@@ -4126,21 +3803,10 @@ export class SessionManager {
 				return entry;
 			});
 		const finalLeafId = nearestPublicParent(sourceLeafId);
-		const gitEntry: SessionStartGitContextEntry | undefined =
-			startingGitContext === undefined
-				? undefined
-				: {
-						type: "session_start_git_context",
-						id: randomUUID().slice(0, 8),
-						parentId: null,
-						timestamp: new Date().toISOString(),
-						gitContext: startingGitContext,
-					};
 		const targetId = options?.id ?? header.id;
 		const stage = async (manager: SessionManager): Promise<void> => {
 			await manager.appendAtomically(
 				() => {
-					if (gitEntry) manager._appendEntry(gitEntry);
 					for (const entry of publicEntries) manager._appendEntry(entry);
 					if (finalLeafId !== manager.getLeafId()) {
 						if (finalLeafId === null) manager.resetLeaf();
@@ -4149,7 +3815,6 @@ export class SessionManager {
 				},
 				() => {},
 			);
-			if (gitEntry) manager.acceptsStartingGitContext = false;
 		};
 
 		const validationManager = SessionManager.inMemory(cwd);
@@ -4316,12 +3981,7 @@ export class SessionManager {
 			.map((entry) => join(sessionsRoot, entry.name));
 		const result: SessionInfo[] = [];
 		for (const directory of directories) {
-			if (
-				!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME)) &&
-				!(await readdir(directory)).some((name) => name.endsWith(".jsonl"))
-			) {
-				continue;
-			}
+			if (!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) continue;
 			result.push(
 				...(await SessionManager._scopedStore(directory, async (store) => {
 					const summaries = await store.searchSessionSummaries(query);
@@ -4338,33 +3998,7 @@ export class SessionManager {
 		try {
 			const header = manager.getHeader();
 			if (!header) throw new Error("Cannot export a session without a header");
-			const snapshotHeader = {
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: header.id,
-				timestamp: header.timestamp,
-				cwd: header.cwd,
-				snapshotVersion: 1,
-				...(header.parentSession === undefined
-					? {}
-					: {
-							parentSessionDirectory: header.parentSession.sessionDirectory,
-							parentStoreId: header.parentSession.storeId,
-							parentSessionId: header.parentSession.sessionId,
-							parentSessionGeneration: header.parentSession.sessionGeneration,
-						}),
-				...(header.origin === undefined ? {} : { origin: header.origin }),
-			};
-			const entries = manager.getEntries().map(withoutClientInputIdentity);
-			const leaf: LeafEntry = {
-				type: "leaf",
-				id: generateId(new Set(entries.map((entry) => entry.id))),
-				parentId: entries.at(-1)?.id ?? null,
-				timestamp: new Date().toISOString(),
-				targetId: manager.getLeafId(),
-				ordinal: (entries.at(-1)?.ordinal ?? entries.length) + 1,
-			};
-			const content = `${[snapshotHeader, ...entries, leaf].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+			const content = serializeSessionJsonlSnapshot(header, manager.getEntries(), manager.getLeafId());
 			writeDurableAtomicFileSync(resolvePath(outputPath), content, {
 				directoryMode: PRIVATE_DIRECTORY_MODE,
 				fileMode: PRIVATE_FILE_MODE,
@@ -4441,10 +4075,7 @@ export class SessionManager {
 		const result: SessionInfo[] = [];
 		let loaded = 0;
 		for (const directory of directories) {
-			if (
-				!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME)) &&
-				!(await readdir(directory)).some((name) => name.endsWith(".jsonl"))
-			) {
+			if (!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) {
 				loaded += 1;
 				progress?.(loaded, directories.length);
 				continue;

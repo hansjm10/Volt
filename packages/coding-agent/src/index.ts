@@ -617,18 +617,20 @@ export {
 	type SubagentRuntimeContext,
 } from "./core/sdk.ts";
 export {
+	assertCurrentSessionSnapshot,
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
+	CURRENT_SESSION_SNAPSHOT_VERSION,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
+	createSessionSnapshotHeader,
 	type FastModeChangeEntry,
 	type FileEntry,
 	getDefaultSessionDir,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,
-	migrateSessionEntries,
 	type NewSessionOptions,
 	parseSessionEntries,
 	type SessionContext,
@@ -641,6 +643,8 @@ export {
 	SessionManager,
 	type SessionMessageEntry,
 	type SessionReference,
+	type SessionSnapshotHeader,
+	serializeSessionJsonlSnapshot,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
 export {

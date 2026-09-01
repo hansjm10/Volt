@@ -195,16 +195,6 @@ export type SessionStoreDeleteSessionResult =
 	| { readonly status: "not_found" }
 	| { readonly status: "conflict"; readonly actualRevision: number };
 
-export interface SessionStoreImportTransactionInput {
-	readonly session: SessionStoreCreateSessionInput;
-	readonly transaction: SessionStoreApplyTransactionInput;
-}
-
-export interface SessionStoreImportTransactionResult {
-	readonly createdSession: boolean;
-	readonly transaction: SessionStoreTransactionResult;
-}
-
 export interface SessionStoreSnapshot {
 	readonly session: SessionStoreSessionSummary;
 	readonly entries: readonly SessionStoreEntry[];

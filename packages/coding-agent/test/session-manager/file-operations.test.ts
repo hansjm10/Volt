@@ -2,7 +2,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	CURRENT_SESSION_SNAPSHOT_VERSION,
+	CURRENT_SESSION_VERSION,
+	loadEntriesFromFile,
+	SessionManager,
+} from "../../src/core/session-manager.ts";
 import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 async function commitPlanningState(manager: SessionManager, mode: "build" | "plan"): Promise<void> {
@@ -13,11 +18,12 @@ async function commitPlanningState(manager: SessionManager, mode: "build" | "pla
 	});
 }
 
-function legacySessionJsonl(id: string, cwd: string, message = "hello"): string {
+function sessionSnapshotJsonl(id: string, cwd: string, message = "hello"): string {
 	return `${[
 		JSON.stringify({
 			type: "session",
-			version: 3,
+			version: CURRENT_SESSION_VERSION,
+			snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
 			id,
 			timestamp: "2025-01-01T00:00:00.000Z",
 			cwd,
@@ -26,13 +32,14 @@ function legacySessionJsonl(id: string, cwd: string, message = "hello"): string 
 			type: "message",
 			id: `${id}-message`,
 			parentId: null,
+			ordinal: 1,
 			timestamp: "2025-01-01T00:00:01.000Z",
 			message: { role: "user", content: message, timestamp: Date.parse("2025-01-01T00:00:01.000Z") },
 		}),
 	].join("\n")}\n`;
 }
 
-describe("legacy JSONL import parsing", () => {
+describe("JSONL snapshot import parsing", () => {
 	let tempDir: string;
 	const managerOwner = createSessionManagerTestOwner();
 
@@ -59,7 +66,7 @@ describe("legacy JSONL import parsing", () => {
 
 	it("loads a valid import snapshot", () => {
 		const path = join(tempDir, "valid.jsonl");
-		writeFileSync(path, legacySessionJsonl("legacy", tempDir));
+		writeFileSync(path, sessionSnapshotJsonl("snapshot", tempDir));
 
 		const entries = loadEntriesFromFile(path);
 		expect(entries.map((entry) => entry.type)).toEqual(["session", "message"]);
@@ -84,18 +91,19 @@ describe("legacy JSONL import parsing", () => {
 
 	it("rejects unsupported imports without mutating their bytes", async () => {
 		const path = join(tempDir, "future.jsonl");
-		const content = '{"type":"session","version":6,"id":"future","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n';
+		const content =
+			'{"type":"session","version":6,"snapshotVersion":1,"id":"future","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}\n';
 		writeFileSync(path, content);
 
 		await expect(SessionManager.importFromJsonl(path, tempDir, tempDir)).rejects.toThrow(
-			"newer than supported version 5",
+			"Session snapshot entry version must be 5",
 		);
 		expect(readFileSync(path, "utf8")).toBe(content);
 	});
 
 	it("imports a snapshot into SQLite and never treats the source as live storage", async () => {
 		const path = join(tempDir, "source.jsonl");
-		const sourceBytes = legacySessionJsonl("imported", tempDir, "legacy message");
+		const sourceBytes = sessionSnapshotJsonl("imported", tempDir, "snapshot message");
 		writeFileSync(path, sourceBytes);
 		const sessionDir = join(tempDir, "sqlite-store");
 		const manager = await SessionManager.importFromJsonl(path, tempDir, sessionDir);
@@ -111,24 +119,11 @@ describe("legacy JSONL import parsing", () => {
 		expect((await SessionManager.open(ref)).buildSessionContext().messages).toEqual([
 			{
 				role: "user",
-				content: "legacy message",
+				content: "snapshot message",
 				timestamp: Date.parse("2025-01-01T00:00:01.000Z"),
 			},
 			{ role: "user", content: "SQLite message", timestamp: sqliteMessageTimestamp },
 		]);
-	});
-
-	it("migrates legacy files discovered in a session directory and archives them", async () => {
-		const path = join(tempDir, "legacy.jsonl");
-		writeFileSync(path, legacySessionJsonl("auto-imported", tempDir));
-
-		const sessions = await SessionManager.list(tempDir, tempDir);
-
-		expect(sessions).toMatchObject([{ id: "auto-imported", firstMessage: "hello" }]);
-		expect(existsSync(path)).toBe(false);
-		expect(existsSync(join(tempDir, "legacy-jsonl", "legacy.jsonl"))).toBe(true);
-		const reopened = await SessionManager.open(sessions[0]!.ref);
-		expect(reopened.getSessionId()).toBe("auto-imported");
 	});
 });
 

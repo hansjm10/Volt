@@ -169,13 +169,12 @@ import type {
 } from "./session-manager.ts";
 import {
 	CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES,
-	CURRENT_SESSION_VERSION,
 	createClientInputSemanticDigest,
 	getLatestCompactionEntry,
 	RUNTIME_QUEUE_ENTRY_ID_PREFIX,
 	SessionAtomicAppendError,
-	type SessionHeader,
 	type SessionReference,
+	serializeSessionJsonlSnapshot,
 } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -7310,26 +7309,17 @@ export class AgentSession {
 			outputPath ?? `session-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
 			process.cwd(),
 		);
-		const header: SessionHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: this.sessionManager.getSessionId(),
-			timestamp: new Date().toISOString(),
-			cwd: this.sessionManager.getCwd(),
-		};
+		const header = this.sessionManager.getHeader();
+		if (!header) throw new Error("Cannot export a session without a header");
+		let parentId: string | null = null;
+		const branchEntries = this.sessionManager.getBranch().map((entry) => {
+			const linear = { ...entry, parentId };
+			parentId = entry.id;
+			return linear;
+		});
+		const content = serializeSessionJsonlSnapshot(header, branchEntries, this.sessionManager.getLeafId());
 
-		const branchEntries = this.sessionManager.getBranch();
-		const lines = [JSON.stringify(header)];
-
-		// Re-chain parentIds to form a linear sequence
-		let prevId: string | null = null;
-		for (const entry of branchEntries) {
-			const linear = { ...entry, parentId: prevId };
-			lines.push(JSON.stringify(linear));
-			prevId = entry.id;
-		}
-
-		writeDurableAtomicFileSync(filePath, `${lines.join("\n")}\n`, {
+		writeDurableAtomicFileSync(filePath, content, {
 			directoryMode: PRIVATE_DIRECTORY_MODE,
 			fileMode: PRIVATE_FILE_MODE,
 		});

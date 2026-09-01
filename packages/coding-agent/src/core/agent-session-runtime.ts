@@ -27,12 +27,11 @@ import type { RpcGitContext } from "./rpc/types.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists, MissingSessionCwdError } from "./session-cwd.ts";
 import {
+	assertCurrentSessionSnapshot,
 	assertValidSessionId,
 	isHostOnlySessionEntry,
 	loadEntriesFromFile,
-	migrateSessionEntries,
 	type SessionEntry,
-	type SessionHeader,
 	type SessionInfo,
 	SessionManager,
 	type SessionOrigin,
@@ -1565,11 +1564,7 @@ export class AgentSessionRuntime {
 		if (fileEntries.length === 0) {
 			throw new Error(`Session file has no valid session header: ${inputPath}`);
 		}
-		migrateSessionEntries(fileEntries);
-		const header = fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
-		if (!header?.id) {
-			throw new Error(`Session file has no valid session header: ${inputPath}`);
-		}
+		const header = assertCurrentSessionSnapshot(fileEntries);
 
 		const importedCwd = resolvePath(cwdOverride ?? (header.cwd || this.cwd));
 		if (cwdOverride === undefined && !existsSync(importedCwd)) {
@@ -1579,8 +1574,21 @@ export class AgentSessionRuntime {
 			});
 		}
 
+		const parentSession: SessionReference | undefined =
+			header.parentSessionDirectory !== undefined &&
+			header.parentStoreId !== undefined &&
+			header.parentSessionId !== undefined &&
+			header.parentSessionGeneration !== undefined
+				? Object.freeze({
+						sessionDirectory: header.parentSessionDirectory,
+						storeId: header.parentStoreId,
+						sessionId: header.parentSessionId,
+						sessionGeneration: header.parentSessionGeneration,
+					})
+				: undefined;
 		const newSessionOptions = {
 			id: header.id,
+			...(parentSession === undefined ? {} : { parentSession }),
 			...(header.origin === undefined ? {} : { origin: header.origin }),
 		};
 		let sessionManager: SessionManager;
@@ -1599,21 +1607,11 @@ export class AgentSessionRuntime {
 
 			const sourceById = new Map<string, SessionEntry>();
 			let sourceLeafId: string | null = null;
-			let startingGitContext: RpcGitContext | null | undefined;
 			for (const entry of fileEntries) {
 				if (entry.type === "session") continue;
 				sourceById.set(entry.id, entry);
-				if (entry.type === "session_start_git_context") {
-					startingGitContext = entry.gitContext;
-				}
-				if (entry.type === "leaf") {
-					sourceLeafId = entry.targetId;
-				} else if (!isHostOnlySessionEntry(entry)) {
-					sourceLeafId = entry.id;
-				}
-			}
-			if (startingGitContext !== undefined) {
-				sessionManager.recordStartingGitContext(sessionManager.getSessionId(), startingGitContext);
+				if (entry.type === "leaf") sourceLeafId = entry.targetId;
+				else sourceLeafId = entry.id;
 			}
 
 			const nearestPublicSourceId = (sourceId: string | null): string | null => {

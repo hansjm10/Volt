@@ -14,8 +14,6 @@ import {
 	type SessionStoreEntry,
 	type SessionStoreEntryWrite,
 	type SessionStoreErrorCode,
-	type SessionStoreImportTransactionInput,
-	type SessionStoreImportTransactionResult,
 	type SessionStoreInfo,
 	type SessionStoreJsonValue,
 	type SessionStoreLabel,
@@ -57,7 +55,6 @@ export type SessionStoreWorkerOperation =
 	| { readonly kind: "apply_transaction"; readonly input: SessionStoreApplyTransactionInput }
 	| { readonly kind: "reconcile_commit"; readonly input: SessionStoreReconcileCommitInput }
 	| { readonly kind: "delete_session"; readonly input: SessionStoreDeleteSessionInput }
-	| { readonly kind: "import_transaction"; readonly input: SessionStoreImportTransactionInput }
 	| { readonly kind: "close" };
 
 export interface SessionStoreWorkerRequestEnvelope {
@@ -427,18 +424,6 @@ function parseDeleteInput(value: unknown, path: string): SessionStoreDeleteSessi
 	};
 }
 
-function parseImportInput(value: unknown, path: string): SessionStoreImportTransactionInput {
-	const input = record(value, path);
-	exactKeys(input, path, ["session", "transaction"]);
-	const session = parseCreateSession(input.session, `${path}.session`);
-	const transaction = parseApplyTransaction(input.transaction, `${path}.transaction`);
-	if (transaction.sessionId !== session.id) fail(`${path}.transaction.sessionId`, "must match session.id");
-	if (transaction.sessionGeneration !== session.sessionGeneration) {
-		fail(`${path}.transaction.sessionGeneration`, "must match session.sessionGeneration");
-	}
-	return { session, transaction };
-}
-
 export function parseSessionStoreWorkerData(value: unknown): SessionStoreWorkerData {
 	const input = record(value, "$workerData");
 	exactKeys(input, "$workerData", ["sessionDirectory"]);
@@ -491,9 +476,6 @@ export function parseSessionStoreWorkerOperation(value: unknown): SessionStoreWo
 		case "reconcile_commit":
 			exactKeys(input, "$operation", ["kind", "input"]);
 			return { kind, input: parseReconcileInput(input.input, "$operation.input") };
-		case "import_transaction":
-			exactKeys(input, "$operation", ["kind", "input"]);
-			return { kind, input: parseImportInput(input.input, "$operation.input") };
 		default:
 			return fail("$operation.kind", `unsupported operation ${JSON.stringify(kind)}`);
 	}
@@ -725,7 +707,6 @@ export function parseSessionStoreOperationResult(
 	| SessionStoreSnapshot
 	| SessionStoreTransactionResult
 	| SessionStoreCommitReconciliation
-	| SessionStoreImportTransactionResult
 	| SessionStoreDeleteSessionResult
 	| null {
 	switch (kind) {
@@ -747,14 +728,6 @@ export function parseSessionStoreOperationResult(
 			return parseReconciliation(value, "$result");
 		case "delete_session":
 			return parseDeleteResult(value, "$result");
-		case "import_transaction": {
-			const input = record(value, "$result");
-			exactKeys(input, "$result", ["createdSession", "transaction"]);
-			return {
-				createdSession: booleanValue(input.createdSession, "$result.createdSession"),
-				transaction: parseTransactionResult(input.transaction, "$result.transaction"),
-			};
-		}
 		case "close":
 			if (value !== null) fail("$result", "expected null");
 			return null;

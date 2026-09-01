@@ -43,8 +43,7 @@ Project trust is only an input-loading guard. It prevents a repository from sile
 Each workspace or custom session directory contains the authoritative
 `sessions.sqlite` database. Volt creates the directory with owner-only `0700`
 permissions and hardens `sessions.sqlite`, `sessions.sqlite-wal`, and
-`sessions.sqlite-shm` to `0600`. Explicit JSONL snapshot exports use `0600`,
-and one-time legacy migration archives remain inside owner-only directories.
+`sessions.sqlite-shm` to `0600`. Explicit JSONL snapshot exports use `0600`.
 
 Treat the database and its WAL/SHM sidecars as one sensitive live store. Do not
 copy only `sessions.sqlite` while Volt is running. Session content can include

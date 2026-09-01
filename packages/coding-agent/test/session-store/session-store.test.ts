@@ -556,22 +556,6 @@ describe("SQLite session store", () => {
 		).toEqual({ status: "not_found" });
 	});
 
-	it("imports a hidden session and its first transaction atomically", async () => {
-		const client = await openStore();
-		const payload = emptyPayload({ visible: true, name: "Imported" });
-		const result = await client.importTransaction({
-			session: createInput("imported"),
-			transaction: transaction("imported", 0, "commit-import", payload),
-		});
-		expect(result.createdSession).toBe(true);
-		expect(result.transaction.status).toBe("committed");
-		expect(await client.findSessionSummary("imported", generationFor("imported"))).toMatchObject({
-			name: "Imported",
-			visible: true,
-			revision: 1,
-		});
-	});
-
 	it.each([
 		[
 			"unexpected triggers",

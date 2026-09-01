@@ -41,8 +41,6 @@ import {
 	type SessionStoreDeleteSessionResult,
 	type SessionStoreEntry,
 	SessionStoreError,
-	type SessionStoreImportTransactionInput,
-	type SessionStoreImportTransactionResult,
 	type SessionStoreInfo,
 	type SessionStoreLabel,
 	type SessionStoreSearchChunk,
@@ -986,55 +984,6 @@ function applyTransaction(input: SessionStoreApplyTransactionInput): SessionStor
 	}
 }
 
-function immutableSessionMatches(summary: SessionStoreSessionSummary, input: SessionStoreCreateSessionInput): boolean {
-	return (
-		summary.id === input.id &&
-		summary.sessionGeneration === input.sessionGeneration &&
-		summary.formatVersion === input.formatVersion &&
-		summary.cwd === input.cwd &&
-		summary.createdAt === input.createdAt &&
-		summary.parentSessionDirectory === input.parentSessionDirectory &&
-		summary.parentStoreId === input.parentStoreId &&
-		summary.parentSessionId === input.parentSessionId &&
-		summary.parentSessionGeneration === input.parentSessionGeneration &&
-		summary.origin === input.origin
-	);
-}
-
-function importTransaction(input: SessionStoreImportTransactionInput): SessionStoreImportTransactionResult {
-	assertMatchingDigest(input.transaction);
-	const db = requireDatabase();
-	try {
-		return withTransaction(db, () => {
-			const existing = findSummary(db, input.session.id);
-			let createdSession = false;
-			if (!existing) {
-				if (input.transaction.expectedRevision !== 0) {
-					throw new SessionStoreError("constraint_failed", "A new imported session must start at revision zero");
-				}
-				insertSession(db, input.session);
-				createdSession = true;
-			} else if (!immutableSessionMatches(existing, input.session)) {
-				throw new SessionStoreError(
-					"session_already_exists",
-					`Session ${JSON.stringify(input.session.id)} exists with different immutable metadata`,
-				);
-			}
-			return {
-				createdSession,
-				transaction: applyTransactionInCurrentTransaction(db, input.transaction),
-			};
-		});
-	} catch (error) {
-		if (error instanceof SessionStoreError) throw error;
-		const operationalError = classifyOperationalStoreError(error);
-		if (operationalError) throw operationalError;
-		throw new SessionStoreError("constraint_failed", "SQLite rejected the imported session transaction", {
-			cause: error,
-		});
-	}
-}
-
 function deleteSession(input: SessionStoreDeleteSessionInput): SessionStoreDeleteSessionResult {
 	const db = requireDatabase();
 	return withTransaction(db, () => {
@@ -1085,8 +1034,6 @@ function execute(operation: SessionStoreWorkerOperation): unknown {
 			return reconcileCommit(operation.input);
 		case "delete_session":
 			return deleteSession(operation.input);
-		case "import_transaction":
-			return importTransaction(operation.input);
 		case "close":
 			return closeDatabase();
 	}

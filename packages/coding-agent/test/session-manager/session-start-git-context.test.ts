@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "@hansjm10/volt-ai";
@@ -98,39 +98,5 @@ describe("SessionManager starting Git context", () => {
 
 		expect(session.recordStartingGitContext(replacedSessionId, STARTING_GIT_CONTEXT)).toBe(false);
 		expect(session.getStartingGitContext()).toBeUndefined();
-	});
-
-	it("rejects malformed starting context during explicit JSONL import", async () => {
-		const cwd = makeTempDir();
-		const sessionDir = join(cwd, "sessions");
-		const inputPath = join(cwd, "malformed-starting-git.jsonl");
-		const malformedContext = structuredClone(STARTING_GIT_CONTEXT);
-		if (!("oid" in malformedContext.head)) throw new Error("Expected an oid-bearing Git head");
-		malformedContext.head.oid = "not-an-object-id";
-		writeFileSync(
-			inputPath,
-			`${[
-				JSON.stringify({
-					type: "session",
-					version: 5,
-					id: "malformed-starting-git",
-					timestamp: "2026-08-29T00:00:00.000Z",
-					cwd,
-				}),
-				JSON.stringify({
-					type: "session_start_git_context",
-					id: "git-context",
-					parentId: null,
-					ordinal: 1,
-					timestamp: "2026-08-29T00:00:01.000Z",
-					gitContext: malformedContext,
-				}),
-			].join("\n")}\n`,
-		);
-
-		await expect(SessionManager.importFromJsonl(inputPath, cwd, sessionDir)).rejects.toThrow(
-			/invalid starting Git context/i,
-		);
-		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
 	});
 });

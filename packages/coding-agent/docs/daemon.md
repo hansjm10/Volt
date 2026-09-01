@@ -96,9 +96,8 @@ indexes. The daemon addresses conversations by stable workspace/session IDs and
 never sends the database path, session directory, or host-side
 `SessionReference` over the remote wire.
 
-Legacy session JSONL is imported once when a store first opens and archived
-under that private session directory. Daemon handoffs reopen the stable session
-identity from SQLite; they do not transfer or reopen a JSONL file.
+Daemon handoffs reopen stable session identities from SQLite; they do not
+transfer or reopen JSONL snapshot files.
 
 ## Configured remote agents
 

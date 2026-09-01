@@ -17,8 +17,6 @@ import {
 	type SessionStoreDeleteSessionInput,
 	type SessionStoreDeleteSessionResult,
 	SessionStoreError,
-	type SessionStoreImportTransactionInput,
-	type SessionStoreImportTransactionResult,
 	type SessionStoreInfo,
 	type SessionStoreListOptions,
 	type SessionStoreReconcileCommitInput,
@@ -270,10 +268,6 @@ export class SQLiteSessionStoreClient {
 
 	async deleteSession(input: SessionStoreDeleteSessionInput): Promise<SessionStoreDeleteSessionResult> {
 		return (await this.call({ kind: "delete_session", input })) as SessionStoreDeleteSessionResult;
-	}
-
-	async importTransaction(input: SessionStoreImportTransactionInput): Promise<SessionStoreImportTransactionResult> {
-		return (await this.call({ kind: "import_transaction", input })) as SessionStoreImportTransactionResult;
 	}
 
 	async close(): Promise<void> {

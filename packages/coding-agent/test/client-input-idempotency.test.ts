@@ -16,7 +16,6 @@ import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manage
 import { projectSessionTranscript } from "../src/core/rpc/transcript.ts";
 import {
 	CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES,
-	createClientInputSemanticDigest,
 	getDefaultSessionDir,
 	isValidClientMessageId,
 	SessionManager,
@@ -36,18 +35,6 @@ function createTempDir(): string {
 	const tempDir = join(tmpdir(), `volt-client-input-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 	return tempDir;
-}
-
-async function loadPersistedJsonlEntries(manager: SessionManager): Promise<Array<Record<string, unknown>>> {
-	const header = manager.getHeader();
-	if (!header) throw new Error("Expected a persisted session header");
-	const snapshot = await loadPersistedSessionSnapshot(manager);
-	return [header, ...snapshot.entries.map((entry) => entry.payload)].map((entry) => {
-		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-			throw new Error("Expected a persisted JSONL object entry");
-		}
-		return structuredClone(entry) as Record<string, unknown>;
-	});
 }
 
 function createAuthorization(workspacePath: string): IrohRemoteClientAuthorizationSuccess {
@@ -938,7 +925,7 @@ describe("durable client input idempotency", () => {
 		expect(harness.sessionManager.getClientInput("client-consuming")?.state).toBe("completed");
 	});
 
-	it("starts an accepted-but-not-started receipt after JSONL reload", async () => {
+	it("starts an accepted-but-not-started receipt after SQLite reopen", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = await SessionManager.create(tempDir, tempDir);
@@ -1316,36 +1303,6 @@ describe("durable client input idempotency", () => {
 		).toBe("completed");
 	});
 
-	it("fails closed when a v5 recovery file exceeds the outstanding receipt count cap", async () => {
-		const tempDir = createTempDir();
-		tempDirs.push(tempDir);
-		const sessionFile = join(tempDir, "outstanding-count-overflow-v5.jsonl");
-		const timestamp = new Date().toISOString();
-		const input = { message: "x", images: [] };
-		const semanticDigest = createClientInputSemanticDigest("prompt", input);
-		const receipts = Array.from({ length: CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES + 1 }, (_, index) => ({
-			type: "client_input_receipt",
-			id: `receipt-${index}`,
-			parentId: null,
-			timestamp,
-			ordinal: index + 1,
-			clientMessageId: `count-overflow-${index}`,
-			command: "prompt",
-			semanticDigest,
-			input,
-		}));
-		writeFileSync(
-			sessionFile,
-			`${[{ type: "session", version: 5, id: "outstanding-count-overflow-v5", timestamp, cwd: tempDir }, ...receipts]
-				.map((entry) => JSON.stringify(entry))
-				.join("\n")}\n`,
-		);
-
-		await expect(
-			SessionManager.list(tempDir, tempDir, undefined, { includeMessageFreeDurable: true }),
-		).rejects.toThrow(`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES}-entry limit`);
-	});
-
 	it("counts a started receipt's original payload when it is durably re-admitted to the queue", () => {
 		const manager = SessionManager.inMemory();
 		const nearMaximumMessage = "x".repeat(512 * 1024 - 1024);
@@ -1416,125 +1373,15 @@ describe("durable client input idempotency", () => {
 		}
 	});
 
-	it("fails closed when a durable receipt contains a noncanonical escaped identity", async () => {
+	it("rejects host-only recovery state in an explicit conversation snapshot", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
-		const sessionFile = join(tempDir, "invalid-identity-v5.jsonl");
-		const timestamp = new Date().toISOString();
-		const invalidId = `client-${"\0".repeat(40)}`;
-		const input = { message: "must not reload", images: [] };
-		const validManager = SessionManager.inMemory();
-		const semanticDigest = validManager.reserveClientInput("digest-source", "prompt", input).record.semanticDigest;
-		writeFileSync(
-			sessionFile,
-			`${[
-				{ type: "session", version: 5, id: "invalid-identity-v5", timestamp, cwd: tempDir },
-				{
-					type: "client_input_receipt",
-					id: "invalid-identity-receipt",
-					parentId: null,
-					timestamp,
-					ordinal: 1,
-					clientMessageId: invalidId,
-					command: "prompt",
-					semanticDigest,
-					input,
-				},
-			]
-				.map((entry) => JSON.stringify(entry))
-				.join("\n")}\n`,
-		);
-
-		expect(Buffer.byteLength(invalidId, "utf8")).toBeLessThanOrEqual(256);
-		expect(JSON.stringify(invalidId).length).toBeGreaterThan(invalidId.length);
-		await expect(
-			SessionManager.list(tempDir, tempDir, undefined, { includeMessageFreeDurable: true }),
-		).rejects.toThrow("Client input id must match");
-	});
-
-	it("migrates a v4 session by dropping unreplayable legacy WAL and preserving canonical transcript", async () => {
-		const tempDir = createTempDir();
-		tempDirs.push(tempDir);
-		const sessionFile = join(tempDir, "legacy-v4.jsonl");
+		const sessionFile = join(tempDir, "snapshot.jsonl");
 		const timestamp = new Date().toISOString();
 		writeFileSync(
 			sessionFile,
 			`${[
-				{ type: "session", version: 4, id: "legacy-v4", timestamp, cwd: tempDir },
-				{
-					type: "client_input_receipt",
-					id: "legacy-receipt",
-					parentId: null,
-					timestamp,
-					ordinal: 1,
-					clientMessageId: "legacy-client-id",
-					command: "prompt",
-					semanticDigest: "legacy-digest-without-payload",
-				},
-				{
-					type: "client_input_state",
-					id: "legacy-started",
-					parentId: null,
-					timestamp,
-					ordinal: 2,
-					receiptId: "legacy-receipt",
-					clientMessageId: "legacy-client-id",
-					state: "started",
-				},
-				{
-					type: "message",
-					id: "canonical-user",
-					parentId: null,
-					timestamp,
-					ordinal: 3,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "canonical survives" }],
-						clientMessageId: "legacy-client-id",
-						timestamp: Date.now(),
-					},
-				},
-			]
-				.map((entry) => JSON.stringify(entry))
-				.join("\n")}\n`,
-		);
-		const sessions = await SessionManager.list(tempDir, tempDir);
-		expect(sessions).toMatchObject([{ id: "legacy-v4", firstMessage: "canonical survives" }]);
-		expect(existsSync(sessionFile)).toBe(false);
-		expect(existsSync(join(tempDir, "legacy-jsonl", "legacy-v4.jsonl"))).toBe(true);
-
-		const reopened = await SessionManager.open(sessions[0]!.ref);
-		expect(reopened.getHeader()?.version).toBe(5);
-		expect(reopened.buildSessionContext().messages).toMatchObject([
-			{ role: "user", content: [{ type: "text", text: "canonical survives" }] },
-		]);
-		expect(reopened.buildSessionContext().messages[0]).not.toHaveProperty("clientMessageId");
-		expect(reopened.getClientInput("legacy-client-id")).toBeUndefined();
-		const migrated = await loadPersistedSessionSnapshot(reopened);
-		expect(migrated.entries.map((entry) => entry.type)).toEqual(["message"]);
-		expect(migrated.clientInputs).toEqual([]);
-
-		reopened.appendCustomMessageEntry("migration-test", "writer acquired", true);
-		await reopened.flush();
-		expect((await loadPersistedSessionSnapshot(reopened)).entries.map((entry) => entry.type)).toEqual([
-			"message",
-			"custom_message",
-		]);
-	});
-
-	it("excludes replay-capable v5 WAL from an explicit conversation snapshot import", async () => {
-		const tempDir = createTempDir();
-		tempDirs.push(tempDir);
-		const sourceDir = join(tempDir, "source");
-		mkdirSync(sourceDir, { recursive: true });
-		const sessionFile = join(sourceDir, "snapshot-v5.jsonl");
-		const timestamp = new Date().toISOString();
-		const input = { message: "original", images: [] };
-		const semanticDigest = createClientInputSemanticDigest("steer", input);
-		writeFileSync(
-			sessionFile,
-			`${[
-				{ type: "session", version: 5, id: "snapshot-v5", timestamp, cwd: tempDir },
+				{ type: "session", version: 5, snapshotVersion: 1, id: "snapshot", timestamp, cwd: tempDir },
 				{
 					type: "client_input_receipt",
 					id: "snapshot-receipt",
@@ -1543,164 +1390,20 @@ describe("durable client input idempotency", () => {
 					ordinal: 1,
 					clientMessageId: "snapshot-client-id",
 					command: "steer",
-					semanticDigest,
-					input,
-				},
-				{
-					type: "client_input_queued",
-					id: "snapshot-queued",
-					parentId: null,
-					timestamp,
-					ordinal: 2,
-					receiptId: "snapshot-receipt",
-					clientMessageId: "snapshot-client-id",
-					queuedInput: { delivery: "steer", message: "queued", images: [] },
-				},
-				{
-					type: "client_input_state",
-					id: "snapshot-started",
-					parentId: null,
-					timestamp,
-					ordinal: 3,
-					receiptId: "snapshot-receipt",
-					clientMessageId: "snapshot-client-id",
-					state: "started",
-				},
-				{
-					type: "message",
-					id: "snapshot-user",
-					parentId: null,
-					timestamp,
-					ordinal: 4,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "queued" }],
-						clientMessageId: "snapshot-client-id",
-						timestamp: Date.now(),
-					},
+					semanticDigest: "not-an-interchange-field",
+					input: { message: "original", images: [] },
 				},
 			]
 				.map((entry) => JSON.stringify(entry))
 				.join("\n")}\n`,
 		);
 
-		const imported = await SessionManager.importFromJsonl(sessionFile, tempDir, join(tempDir, "sqlite-store"));
-		expect(imported.getClientInput("snapshot-client-id")).toBeUndefined();
-		expect(imported.getRecoverableQueuedClientInputs()).toEqual([]);
-		expect(imported.buildSessionContext().messages).toMatchObject([
-			{ role: "user", content: [{ type: "text", text: "queued" }] },
-		]);
-		expect(imported.buildSessionContext().messages[0]).not.toHaveProperty("clientMessageId");
-		const importedSnapshot = await loadPersistedSessionSnapshot(imported);
-		expect(importedSnapshot.entries.map((entry) => entry.type)).toEqual(["message"]);
-		expect(importedSnapshot.clientInputs).toEqual([]);
-	});
-
-	it("fails closed when a v5 durable receipt is missing its replay payload", async () => {
-		const tempDir = createTempDir();
-		tempDirs.push(tempDir);
-		const sessionFile = join(tempDir, "invalid-v5.jsonl");
-		const timestamp = new Date().toISOString();
-		writeFileSync(
-			sessionFile,
-			`${[
-				{ type: "session", version: 5, id: "invalid-v5", timestamp, cwd: tempDir },
-				{
-					type: "client_input_receipt",
-					id: "invalid-receipt",
-					parentId: null,
-					timestamp,
-					ordinal: 1,
-					clientMessageId: "missing-payload",
-					command: "steer",
-					semanticDigest: "invalid",
-				},
-			]
-				.map((entry) => JSON.stringify(entry))
-				.join("\n")}\n`,
+		await expect(SessionManager.importFromJsonl(sessionFile, tempDir, join(tempDir, "sqlite-store"))).rejects.toThrow(
+			"Session snapshot contains unsupported host-only entry: client_input_receipt",
 		);
-
-		await expect(
-			SessionManager.list(tempDir, tempDir, undefined, { includeMessageFreeDurable: true }),
-		).rejects.toThrow("receipt payload is invalid");
 	});
 
-	it("fails closed for invalid v5 WAL state, error, and commit ordinal fields", async () => {
-		const tempDir = createTempDir();
-		tempDirs.push(tempDir);
-		const manager = await SessionManager.create(tempDir, join(tempDir, "baseline-store"));
-		manager.reserveClientInput("wal-fields", "steer", { message: "original" });
-		manager.markClientInputQueued("wal-fields", { delivery: "steer", message: "queued" });
-		manager.transitionClientInput("wal-fields", "started");
-		await manager.flush();
-		const entries = await loadPersistedJsonlEntries(manager);
-		const stateIndex = entries.findIndex((entry) => entry.type === "client_input_state");
-		const queuedIndex = entries.findIndex((entry) => entry.type === "client_input_queued");
-		expect(stateIndex).toBeGreaterThan(0);
-		expect(queuedIndex).toBeGreaterThan(0);
-
-		for (const [name, mutate, expected] of [
-			[
-				"invalid-state",
-				(copy: Array<Record<string, unknown>>) => {
-					copy[stateIndex]!.state = "bogus";
-				},
-				"invalid state",
-			],
-			[
-				"invalid-error",
-				(copy: Array<Record<string, unknown>>) => {
-					copy[stateIndex]!.error = "not allowed for started";
-				},
-				"invalid error",
-			],
-			[
-				"missing-ordinal",
-				(copy: Array<Record<string, unknown>>) => {
-					delete copy[queuedIndex]!.ordinal;
-				},
-				"invalid commit ordinal",
-			],
-		] as const) {
-			const copy = structuredClone(entries);
-			mutate(copy);
-			const candidateDir = join(tempDir, `candidate-${name}`);
-			mkdirSync(candidateDir, { recursive: true });
-			writeFileSync(
-				join(candidateDir, `${name}.jsonl`),
-				`${copy.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-			);
-			await expect(
-				SessionManager.list(tempDir, candidateDir, undefined, { includeMessageFreeDurable: true }),
-			).rejects.toThrow(expected);
-		}
-	});
-
-	it("fails closed when a committed interior JSONL line could hide a dispatch boundary", async () => {
-		const tempDir = createTempDir();
-		tempDirs.push(tempDir);
-		const manager = await SessionManager.create(tempDir, join(tempDir, "baseline-store"));
-		manager.reserveClientInput("interior-corruption", "steer", { message: "original" });
-		manager.markClientInputQueued("interior-corruption", { delivery: "steer", message: "queued" });
-		manager.transitionClientInput("interior-corruption", "started");
-		manager.appendCustomMessageEntry("later-valid-entry", "later", true);
-		await manager.flush();
-		const lines = (await loadPersistedJsonlEntries(manager)).map((entry) => JSON.stringify(entry));
-		const stateIndex = lines.findIndex(
-			(line) => (JSON.parse(line) as { type: string }).type === "client_input_state",
-		);
-		expect(stateIndex).toBeGreaterThan(0);
-		lines[stateIndex] = '{"type":"client_input_state"';
-		const candidateDir = join(tempDir, "corrupt-candidate");
-		mkdirSync(candidateDir, { recursive: true });
-		writeFileSync(join(candidateDir, "interior-corruption.jsonl"), `${lines.join("\n")}\n`);
-
-		await expect(
-			SessionManager.list(tempDir, candidateDir, undefined, { includeMessageFreeDurable: true }),
-		).rejects.toThrow(/JSONL is malformed at committed line/);
-	});
-
-	it("fails closed for a started receipt with no terminal record after JSONL reload", async () => {
+	it("fails closed for a started receipt with no terminal record after SQLite reopen", async () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = await SessionManager.create(tempDir, tempDir);
@@ -1758,87 +1461,7 @@ describe("durable client input idempotency", () => {
 		expect(reopened.buildSessionContext().messages).toHaveLength(1);
 	});
 
-	it.each([
-		{ boundary: "missing", expected: "has no matching durable receipt" },
-		{ boundary: "accepted", expected: "requires a started receipt; found accepted" },
-		{ boundary: "failed", expected: "requires a started receipt; found failed" },
-		{ boundary: "completed", expected: "requires a started receipt; found completed" },
-		{ boundary: "duplicate", expected: "requires a started receipt; found completed" },
-		{ boundary: "reordered", expected: "has no matching durable receipt" },
-	])("rejects a $boundary canonical boundary during v5 legacy-directory migration", async ({ boundary, expected }) => {
-		const tempDir = createTempDir();
-		tempDirs.push(tempDir);
-		const sessionFile = join(tempDir, `canonical-${boundary}-v5.jsonl`);
-		const timestamp = new Date().toISOString();
-		const clientMessageId = `canonical-${boundary}`;
-		const input = { message: "canonical", images: [] };
-		const semanticDigest = createClientInputSemanticDigest("prompt", input);
-		let ordinal = 0;
-		const nextBase = (id: string) => ({
-			id,
-			parentId: null,
-			timestamp,
-			ordinal: ++ordinal,
-		});
-		const receipt = () => ({
-			type: "client_input_receipt",
-			...nextBase(`${boundary}-receipt`),
-			clientMessageId,
-			command: "prompt",
-			semanticDigest,
-			input,
-		});
-		const state = (value: "started" | "completed" | "failed") => ({
-			type: "client_input_state",
-			...nextBase(`${boundary}-${value}`),
-			receiptId: `${boundary}-receipt`,
-			clientMessageId,
-			state: value,
-		});
-		const canonical = (suffix = "canonical") => ({
-			type: "message",
-			...nextBase(`${boundary}-${suffix}`),
-			message: {
-				role: "user",
-				content: [{ type: "text", text: "canonical" }],
-				clientMessageId,
-				timestamp: Date.now(),
-			},
-		});
-		const entries: object[] = [];
-		switch (boundary) {
-			case "missing":
-				entries.push(canonical());
-				break;
-			case "accepted":
-				entries.push(receipt(), canonical());
-				break;
-			case "failed":
-				entries.push(receipt(), state("started"), state("failed"), canonical());
-				break;
-			case "completed":
-				entries.push(receipt(), state("started"), state("completed"), canonical());
-				break;
-			case "duplicate":
-				entries.push(receipt(), state("started"), canonical("first"), canonical("second"));
-				break;
-			case "reordered":
-				entries.push(canonical(), receipt(), state("started"));
-				break;
-		}
-		writeFileSync(
-			sessionFile,
-			`${[{ type: "session", version: 5, id: `canonical-${boundary}-v5`, timestamp, cwd: tempDir }, ...entries]
-				.map((entry) => JSON.stringify(entry))
-				.join("\n")}\n`,
-		);
-
-		await expect(
-			SessionManager.list(tempDir, tempDir, undefined, { includeMessageFreeDurable: true }),
-		).rejects.toThrow(expected);
-	});
-
-	it("replays completed and failed terminal outcomes after reopening the JSONL", async () => {
+	it("replays completed and failed terminal outcomes after reopening SQLite", async () => {
 		const completedDir = createTempDir();
 		const failedDir = createTempDir();
 		tempDirs.push(completedDir, failedDir);

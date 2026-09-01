@@ -17,7 +17,7 @@ volt --fork <id|path>    # Fork by partial ID, or import a JSONL snapshot as a n
 
 Use `/session` in interactive mode to see the current store directory, session ID, message count, tokens, and cost.
 
-JSONL is not live storage. On first use, Volt atomically moves old session paths into a private `legacy-jsonl-pending/` ownership area, imports stable files, and archives successful imports under `legacy-jsonl/`. Stop older Volt/voltd processes before upgrading so no legacy writer still holds an open file descriptor. JSONL is otherwise used only for explicit snapshot import and export; passing a path to `--session` or `--fork` imports that snapshot into SQLite.
+JSONL is not live storage. It is used only for explicit snapshot import and export; passing a path to `--session` or `--fork` imports a current `snapshotVersion: 1` snapshot into SQLite.
 
 For storage, snapshots, and the `SessionManager` API, see [Session Format](session-format.md).
 

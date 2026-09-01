@@ -6,8 +6,8 @@ import { writeDurableAtomicFileSync } from "../../utils/durable-atomic-write.ts"
 import { normalizePath, resolvePath } from "../../utils/paths.ts";
 import { hardenPrivateRegularFileSync, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from "../../utils/private-files.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
-import type { SessionEntry, SessionHeader, SessionManager } from "../session-manager.ts";
-import { isHostOnlySessionEntry, loadEntriesFromFile, migrateSessionEntries } from "../session-manager.ts";
+import type { SessionEntry, SessionManager } from "../session-manager.ts";
+import { assertCurrentSessionSnapshot, isHostOnlySessionEntry, loadEntriesFromFile } from "../session-manager.ts";
 import { getResolvedThemeColors, getThemeExportColors } from "../theme/runtime.ts";
 
 /**
@@ -299,11 +299,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	if (fileEntries.length === 0) {
 		throw new Error(`Session file has no valid session header: ${resolvedInputPath}`);
 	}
-	migrateSessionEntries(fileEntries);
-	const header = fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
-	if (!header || !header.id) {
-		throw new Error(`Session file has no valid session header: ${resolvedInputPath}`);
-	}
+	const header = assertCurrentSessionSnapshot(fileEntries);
 	const entries: SessionEntry[] = [];
 	let leafId: string | null = null;
 	for (const entry of fileEntries) {

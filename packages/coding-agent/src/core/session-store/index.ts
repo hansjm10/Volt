@@ -15,8 +15,6 @@ export type {
 	SessionStoreEntry,
 	SessionStoreEntryWrite,
 	SessionStoreErrorCode,
-	SessionStoreImportTransactionInput,
-	SessionStoreImportTransactionResult,
 	SessionStoreInfo,
 	SessionStoreJsonPrimitive,
 	SessionStoreJsonValue,
