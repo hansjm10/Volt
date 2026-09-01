@@ -10217,7 +10217,8 @@
 					"required": [
 						"description",
 						"diffCommand",
-						"identity"
+						"identity",
+						"files"
 					],
 					"properties": {
 						"description": {
@@ -10233,7 +10234,12 @@
 							"type": "object",
 							"required": [
 								"provider",
-								"number"
+								"number",
+								"title",
+								"url",
+								"baseRefName",
+								"headRefName",
+								"headRefOid"
 							],
 							"properties": {
 								"provider": {
@@ -10246,6 +10252,184 @@
 									"type": "integer",
 									"minimum": 1,
 									"maximum": 2147483647
+								},
+								"title": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 512
+								},
+								"url": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 2000
+								},
+								"baseRefName": {
+									"$ref": "#/$defs/RpcGitRef"
+								},
+								"headRefName": {
+									"$ref": "#/$defs/RpcGitRef"
+								},
+								"headRefOid": {
+									"type": "string",
+									"pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+								},
+								"author": {
+									"type": "object",
+									"required": [
+										"login"
+									],
+									"properties": {
+										"login": {
+											"type": "string",
+											"minLength": 1,
+											"maxLength": 256
+										},
+										"avatarUrl": {
+											"type": "string",
+											"maxLength": 2000,
+											"pattern": "^https://"
+										}
+									},
+									"additionalProperties": false
+								},
+								"reviewState": {
+									"type": "string",
+									"enum": [
+										"draft",
+										"ready",
+										"merged",
+										"closed"
+									]
+								},
+								"mergeability": {
+									"type": "string",
+									"enum": [
+										"mergeable",
+										"conflicting",
+										"unknown"
+									]
+								},
+								"checks": {
+									"type": "object",
+									"required": [
+										"state",
+										"totalCount",
+										"passedCount",
+										"pendingCount",
+										"failedCount",
+										"neutralCount",
+										"unknownCount"
+									],
+									"properties": {
+										"state": {
+											"type": "string",
+											"enum": [
+												"passing",
+												"pending",
+												"failing",
+												"none",
+												"unknown"
+											]
+										},
+										"totalCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"passedCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"pendingCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"failedCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"neutralCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"unknownCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										}
+									},
+									"additionalProperties": false
+								},
+								"observedAt": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								}
+							},
+							"additionalProperties": false
+						},
+						"files": {
+							"type": "object",
+							"required": [
+								"totalCount",
+								"projectedCount",
+								"omittedCount",
+								"additions",
+								"deletions",
+								"isComplete",
+								"items"
+							],
+							"properties": {
+								"totalCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"projectedCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"omittedCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"additions": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"deletions": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"isComplete": {
+									"type": "boolean"
+								},
+								"items": {
+									"type": "array",
+									"items": {
+										"type": "object",
+										"required": [
+											"path",
+											"status",
+											"additions",
+											"deletions"
+										],
+										"properties": {
+											"path": {
+												"type": "string",
+												"minLength": 1,
+												"maxLength": 4096
+											},
+											"previousPath": {
+												"type": "string",
+												"minLength": 1,
+												"maxLength": 4096
+											},
+											"status": {
+												"type": "string",
+												"enum": [
+													"added",
+													"modified",
+													"deleted",
+													"renamed",
+													"copied",
+													"type-changed"
+												]
+											},
+											"additions": {
+												"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+											},
+											"deletions": {
+												"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+											}
+										},
+										"additionalProperties": false
+									},
+									"maxItems": 200
 								}
 							},
 							"additionalProperties": false
@@ -10369,7 +10553,6 @@
 					"required": [
 						"number",
 						"title",
-						"body",
 						"url",
 						"baseRefName",
 						"headRefName",
@@ -10443,7 +10626,12 @@
 							"type": "object",
 							"required": [
 								"provider",
-								"number"
+								"number",
+								"title",
+								"url",
+								"baseRefName",
+								"headRefName",
+								"headRefOid"
 							],
 							"properties": {
 								"provider": {
@@ -10456,6 +10644,184 @@
 									"type": "integer",
 									"minimum": 1,
 									"maximum": 2147483647
+								},
+								"title": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 512
+								},
+								"url": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 2000
+								},
+								"baseRefName": {
+									"$ref": "#/$defs/RpcGitRef"
+								},
+								"headRefName": {
+									"$ref": "#/$defs/RpcGitRef"
+								},
+								"headRefOid": {
+									"type": "string",
+									"pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+								},
+								"author": {
+									"type": "object",
+									"required": [
+										"login"
+									],
+									"properties": {
+										"login": {
+											"type": "string",
+											"minLength": 1,
+											"maxLength": 256
+										},
+										"avatarUrl": {
+											"type": "string",
+											"maxLength": 2000,
+											"pattern": "^https://"
+										}
+									},
+									"additionalProperties": false
+								},
+								"reviewState": {
+									"type": "string",
+									"enum": [
+										"draft",
+										"ready",
+										"merged",
+										"closed"
+									]
+								},
+								"mergeability": {
+									"type": "string",
+									"enum": [
+										"mergeable",
+										"conflicting",
+										"unknown"
+									]
+								},
+								"checks": {
+									"type": "object",
+									"required": [
+										"state",
+										"totalCount",
+										"passedCount",
+										"pendingCount",
+										"failedCount",
+										"neutralCount",
+										"unknownCount"
+									],
+									"properties": {
+										"state": {
+											"type": "string",
+											"enum": [
+												"passing",
+												"pending",
+												"failing",
+												"none",
+												"unknown"
+											]
+										},
+										"totalCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"passedCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"pendingCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"failedCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"neutralCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"unknownCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										}
+									},
+									"additionalProperties": false
+								},
+								"observedAt": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								}
+							},
+							"additionalProperties": false
+						},
+						"files": {
+							"type": "object",
+							"required": [
+								"totalCount",
+								"projectedCount",
+								"omittedCount",
+								"additions",
+								"deletions",
+								"isComplete",
+								"items"
+							],
+							"properties": {
+								"totalCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"projectedCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"omittedCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"additions": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"deletions": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"isComplete": {
+									"type": "boolean"
+								},
+								"items": {
+									"type": "array",
+									"items": {
+										"type": "object",
+										"required": [
+											"path",
+											"status",
+											"additions",
+											"deletions"
+										],
+										"properties": {
+											"path": {
+												"type": "string",
+												"minLength": 1,
+												"maxLength": 4096
+											},
+											"previousPath": {
+												"type": "string",
+												"minLength": 1,
+												"maxLength": 4096
+											},
+											"status": {
+												"type": "string",
+												"enum": [
+													"added",
+													"modified",
+													"deleted",
+													"renamed",
+													"copied",
+													"type-changed"
+												]
+											},
+											"additions": {
+												"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+											},
+											"deletions": {
+												"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+											}
+										},
+										"additionalProperties": false
+									},
+									"maxItems": 200
 								}
 							},
 							"additionalProperties": false
@@ -10547,7 +10913,8 @@
 					"required": [
 						"description",
 						"diffCommand",
-						"identity"
+						"identity",
+						"files"
 					],
 					"properties": {
 						"description": {
@@ -10563,7 +10930,12 @@
 							"type": "object",
 							"required": [
 								"provider",
-								"number"
+								"number",
+								"title",
+								"url",
+								"baseRefName",
+								"headRefName",
+								"headRefOid"
 							],
 							"properties": {
 								"provider": {
@@ -10576,6 +10948,184 @@
 									"type": "integer",
 									"minimum": 1,
 									"maximum": 2147483647
+								},
+								"title": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 512
+								},
+								"url": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 2000
+								},
+								"baseRefName": {
+									"$ref": "#/$defs/RpcGitRef"
+								},
+								"headRefName": {
+									"$ref": "#/$defs/RpcGitRef"
+								},
+								"headRefOid": {
+									"type": "string",
+									"pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+								},
+								"author": {
+									"type": "object",
+									"required": [
+										"login"
+									],
+									"properties": {
+										"login": {
+											"type": "string",
+											"minLength": 1,
+											"maxLength": 256
+										},
+										"avatarUrl": {
+											"type": "string",
+											"maxLength": 2000,
+											"pattern": "^https://"
+										}
+									},
+									"additionalProperties": false
+								},
+								"reviewState": {
+									"type": "string",
+									"enum": [
+										"draft",
+										"ready",
+										"merged",
+										"closed"
+									]
+								},
+								"mergeability": {
+									"type": "string",
+									"enum": [
+										"mergeable",
+										"conflicting",
+										"unknown"
+									]
+								},
+								"checks": {
+									"type": "object",
+									"required": [
+										"state",
+										"totalCount",
+										"passedCount",
+										"pendingCount",
+										"failedCount",
+										"neutralCount",
+										"unknownCount"
+									],
+									"properties": {
+										"state": {
+											"type": "string",
+											"enum": [
+												"passing",
+												"pending",
+												"failing",
+												"none",
+												"unknown"
+											]
+										},
+										"totalCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"passedCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"pendingCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"failedCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"neutralCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										},
+										"unknownCount": {
+											"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+										}
+									},
+									"additionalProperties": false
+								},
+								"observedAt": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								}
+							},
+							"additionalProperties": false
+						},
+						"files": {
+							"type": "object",
+							"required": [
+								"totalCount",
+								"projectedCount",
+								"omittedCount",
+								"additions",
+								"deletions",
+								"isComplete",
+								"items"
+							],
+							"properties": {
+								"totalCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"projectedCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"omittedCount": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"additions": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"deletions": {
+									"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+								},
+								"isComplete": {
+									"type": "boolean"
+								},
+								"items": {
+									"type": "array",
+									"items": {
+										"type": "object",
+										"required": [
+											"path",
+											"status",
+											"additions",
+											"deletions"
+										],
+										"properties": {
+											"path": {
+												"type": "string",
+												"minLength": 1,
+												"maxLength": 4096
+											},
+											"previousPath": {
+												"type": "string",
+												"minLength": 1,
+												"maxLength": 4096
+											},
+											"status": {
+												"type": "string",
+												"enum": [
+													"added",
+													"modified",
+													"deleted",
+													"renamed",
+													"copied",
+													"type-changed"
+												]
+											},
+											"additions": {
+												"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+											},
+											"deletions": {
+												"$ref": "#/$defs/RpcSafeNonNegativeInteger"
+											}
+										},
+										"additionalProperties": false
+									},
+									"maxItems": 200
 								}
 							},
 							"additionalProperties": false

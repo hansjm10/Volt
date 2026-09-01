@@ -96,7 +96,15 @@ const config = JSON.parse(readFileSync(${JSON.stringify(configPath)}, "utf8"));
 const args = process.argv.slice(2);
 if (args[0] === "pr" && args[1] === "view") {
   const fields = args[args.indexOf("--json") + 1];
-  process.stdout.write(JSON.stringify(fields === "headRefOid" ? { headRefOid: config.finalHeadOid ?? config.view.headRefOid } : config.view));
+  const view = {
+    author: { login: "review-author" },
+    state: "OPEN",
+    isDraft: false,
+    mergeable: "UNKNOWN",
+    statusCheckRollup: [],
+    ...config.view
+  };
+  process.stdout.write(JSON.stringify(fields === "headRefOid" ? { headRefOid: config.finalHeadOid ?? view.headRefOid } : view));
 } else if (args[0] === "api" && args[1] === "graphql") {
   let input = "";
   for await (const chunk of process.stdin) input += chunk;
@@ -703,16 +711,22 @@ describe("review snapshots", () => {
 		const second = await resolve({ kind: "uncommitted" }, repository);
 		expect(first.changedFiles.find((file) => file.path === "tracked.txt")).toMatchObject({
 			status: "modified",
+			additions: 1,
+			deletions: 1,
 			binary: false,
 			reviewable: true,
 		});
 		expect(first.changedFiles.find((file) => file.path === "new-name.txt")).toMatchObject({
 			status: "renamed",
 			previousPath: "old-name.txt",
+			additions: 1,
+			deletions: 1,
 			binary: false,
 			reviewable: true,
 		});
 		expect(first.changedFiles.find((file) => file.path === "existing.bin")).toMatchObject({
+			additions: 0,
+			deletions: 0,
 			binary: true,
 			reviewable: false,
 			unsupportedReason: "Binary content has no reviewable text hunks.",
@@ -1610,6 +1624,15 @@ describe("review snapshots", () => {
 				number: 7,
 				title: "Context PR",
 				body: "PR body",
+				author: { login: "review-author" },
+				state: "OPEN",
+				isDraft: true,
+				mergeable: "CONFLICTING",
+				statusCheckRollup: [
+					{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" },
+					{ __typename: "CheckRun", status: "IN_PROGRESS", conclusion: null },
+					{ __typename: "StatusContext", state: "FAILURE" },
+				],
 				baseRefName: "main",
 				headRefName: "feature",
 				url: "https://example.test/pr/7",
@@ -1638,6 +1661,22 @@ describe("review snapshots", () => {
 		const captured = await capturePromise;
 		expect(captured.ok).toBe(true);
 		if (!captured.ok) throw new Error(captured.error);
+		expect(captured.pullRequest).toMatchObject({
+			author: {
+				login: "review-author",
+				avatarUrl: "https://example.test/review-author.png",
+			},
+			reviewState: "draft",
+			mergeability: "conflicting",
+			checks: {
+				state: "failing",
+				totalCount: 3,
+				passedCount: 1,
+				pendingCount: 1,
+				failedCount: 1,
+			},
+			observedAt: expect.any(Number),
+		});
 		expect(captured.context.manifest).toMatchObject({
 			status: "complete",
 			linkedIssueCount: 2,

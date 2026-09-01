@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ExecuteReviewWorkflowResult, ParsedReview } from "../src/core/review.ts";
 import {
+	createReviewFileMetadata,
 	MAX_ACTIVE_REVIEW_WORKFLOWS,
 	MAX_RETAINED_REVIEW_RESULTS,
 	type ReviewWorkflowExecuteHooks,
@@ -102,15 +103,42 @@ function prepared(
 							headTree: "head-tree",
 							pullRequest: {
 								...options.pullRequest,
-								title: "PRIVATE_PULL_REQUEST_TITLE",
+								title: "Review target title",
 								body: "PRIVATE_PULL_REQUEST_BODY",
 								url: "https://example.test/pull/7",
 								baseRefName: "main",
 								headRefName: "feature/review",
-								baseRefOid: "base-oid",
-								headRefOid: "head-oid",
+								baseRefOid: "a".repeat(40),
+								headRefOid: "b".repeat(40),
+								author: {
+									login: "review-author",
+									avatarUrl: "https://example.test/review-author.png",
+								},
+								reviewState: "draft" as const,
+								mergeability: "conflicting" as const,
+								checks: {
+									state: "failing" as const,
+									totalCount: 2,
+									passedCount: 1,
+									pendingCount: 0,
+									failedCount: 1,
+									neutralCount: 0,
+									unknownCount: 0,
+								},
+								observedAt: 1_782_470_399_000,
 							},
 						},
+						changedFiles: [
+							{
+								path: "src/review.ts",
+								status: "modified" as const,
+								hunks: [],
+								additions: 4,
+								deletions: 2,
+								binary: false,
+								reviewable: true,
+							},
+						],
 					}
 				: {}),
 			...(options.dispose ? { dispose: options.dispose } : {}),
@@ -183,7 +211,7 @@ describe("ReviewWorkflowManager", () => {
 		});
 	});
 
-	test("retains only the sanitized workflow description and bounded pull request reference", () => {
+	test("retains bounded pull request display and changed-file metadata without the private body", () => {
 		const manager = new ReviewWorkflowManager();
 		const { descriptor } = manager.start({
 			prepared: prepared("review:safe", {
@@ -192,13 +220,63 @@ describe("ReviewWorkflowManager", () => {
 			}),
 			execute: async () => completed(),
 		});
-		expect(descriptor.target).toEqual({
+		expect(descriptor.target).toMatchObject({
 			description: "PR #7",
 			diffCommand: "git diff exact-base..exact-head",
-			pullRequest: { provider: "github", number: 7 },
+			pullRequest: {
+				provider: "github",
+				number: 7,
+				title: "Review target title",
+				author: { login: "review-author", avatarUrl: "https://example.test/review-author.png" },
+				reviewState: "draft",
+				mergeability: "conflicting",
+				checks: { state: "failing", totalCount: 2 },
+			},
+			files: {
+				totalCount: 1,
+				projectedCount: 1,
+				omittedCount: 0,
+				additions: 4,
+				deletions: 2,
+				isComplete: true,
+				items: [{ path: "src/review.ts", status: "modified", additions: 4, deletions: 2 }],
+			},
 		});
 		expect(JSON.stringify(descriptor)).not.toContain("private metadata");
-		expect(JSON.stringify(descriptor)).not.toContain("PRIVATE_PULL_REQUEST");
+		expect(JSON.stringify(descriptor)).not.toContain("PRIVATE_PULL_REQUEST_BODY");
+	});
+
+	test("reports bounded file projection completeness instead of treating omitted files as an empty change", () => {
+		const files = Array.from({ length: 201 }, (_, index) => ({
+			path: `src/file-${index}.ts`,
+			status: "modified" as const,
+			additions: 2,
+			deletions: 1,
+		}));
+		expect(createReviewFileMetadata(files)).toMatchObject({
+			totalCount: 201,
+			projectedCount: 200,
+			omittedCount: 1,
+			additions: 402,
+			deletions: 201,
+			isComplete: false,
+		});
+		expect(
+			createReviewFileMetadata([], {
+				totalCount: 3,
+				additions: 8,
+				deletions: 5,
+				inventoryComplete: false,
+			}),
+		).toEqual({
+			totalCount: 3,
+			projectedCount: 0,
+			omittedCount: 3,
+			additions: 8,
+			deletions: 5,
+			isComplete: false,
+			items: [],
+		});
 	});
 
 	test("publishes and updates a launched provisional workflow before execution admission", async () => {
