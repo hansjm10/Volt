@@ -24,6 +24,7 @@ import {
 	type HydratedReviewRunRecord,
 	listReviewRuns,
 } from "../../core/review-state.ts";
+import { createReviewPullRequestReference } from "../../core/review-workflows.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
 import { projectSessionTreePage } from "../../core/rpc/session-tree.ts";
@@ -228,6 +229,7 @@ export { getRpcErrorResponseTarget };
 
 function projectReviewRun(record: HydratedReviewRunRecord, includeResult: boolean): Record<string, unknown> {
 	const result = record.result;
+	const pullRequest = createReviewPullRequestReference(record.target.identity);
 	return {
 		runId: record.runId,
 		workflowAction: record.workflowAction,
@@ -239,6 +241,7 @@ function projectReviewRun(record: HydratedReviewRunRecord, includeResult: boolea
 			description: record.target.description,
 			diffCommand: record.target.diffCommand,
 			identity: record.target.identity,
+			...(pullRequest ? { pullRequest } : {}),
 			...(record.target.context ? { context: record.target.context } : {}),
 		},
 		options: record.options,
