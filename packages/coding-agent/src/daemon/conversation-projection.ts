@@ -179,7 +179,7 @@ export function projectRemoteConversationActiveAssistant(
 
 function workflowIdentityKeys(type: unknown): readonly string[] {
 	if (type === "workflow_start" || type === "workflow_update" || type === "workflow_end") {
-		return ["type", "workflowId", "kind", "action", "status"];
+		return ["type", "workflowId", "kind", "action", "status", "pullRequest"];
 	}
 	if (type === "tool_execution_start") {
 		return ["type", "workflowId", "workflowKind", "workflowAction", "toolCallId", "toolName"];

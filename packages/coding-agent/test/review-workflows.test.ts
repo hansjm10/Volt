@@ -78,15 +78,41 @@ function completed(
 	};
 }
 
-function prepared(workflowId: string, options: { workflowDescription?: string; dispose?: () => Promise<void> } = {}) {
+function prepared(
+	workflowId: string,
+	options: {
+		workflowDescription?: string;
+		dispose?: () => Promise<void>;
+		pullRequest?: { providerId: string; number: number };
+	} = {},
+) {
 	return {
 		workflowId,
-		action: "review.uncommitted",
+		action: options.pullRequest ? "review.pr" : "review.uncommitted",
 		startedAt: 1_782_470_400_000,
 		resolution: {
 			description: "uncommitted changes with private metadata",
 			...(options.workflowDescription ? { workflowDescription: options.workflowDescription } : {}),
 			diffCommand: "git diff exact-base..exact-head",
+			...(options.pullRequest
+				? {
+						identity: {
+							kind: "pr" as const,
+							baseTree: "base-tree",
+							headTree: "head-tree",
+							pullRequest: {
+								...options.pullRequest,
+								title: "PRIVATE_PULL_REQUEST_TITLE",
+								body: "PRIVATE_PULL_REQUEST_BODY",
+								url: "https://example.test/pull/7",
+								baseRefName: "main",
+								headRefName: "feature/review",
+								baseRefOid: "base-oid",
+								headRefOid: "head-oid",
+							},
+						},
+					}
+				: {}),
 			...(options.dispose ? { dispose: options.dispose } : {}),
 		},
 	};
@@ -157,14 +183,22 @@ describe("ReviewWorkflowManager", () => {
 		});
 	});
 
-	test("retains only the sanitized workflow description", () => {
+	test("retains only the sanitized workflow description and bounded pull request reference", () => {
 		const manager = new ReviewWorkflowManager();
 		const { descriptor } = manager.start({
-			prepared: prepared("review:safe", { workflowDescription: "PR #7" }),
+			prepared: prepared("review:safe", {
+				workflowDescription: "PR #7",
+				pullRequest: { providerId: "github", number: 7 },
+			}),
 			execute: async () => completed(),
 		});
-		expect(descriptor.target.description).toBe("PR #7");
+		expect(descriptor.target).toEqual({
+			description: "PR #7",
+			diffCommand: "git diff exact-base..exact-head",
+			pullRequest: { provider: "github", number: 7 },
+		});
 		expect(JSON.stringify(descriptor)).not.toContain("private metadata");
+		expect(JSON.stringify(descriptor)).not.toContain("PRIVATE_PULL_REQUEST");
 	});
 
 	test("publishes and updates a launched provisional workflow before execution admission", async () => {
@@ -202,8 +236,17 @@ describe("ReviewWorkflowManager", () => {
 			},
 		]);
 
-		started.updatePrepared(prepared("review:preparing", { workflowDescription: "PR #7", dispose }));
-		expect(manager.get("review:preparing")?.target.description).toBe("PR #7");
+		started.updatePrepared(
+			prepared("review:preparing", {
+				workflowDescription: "PR #7",
+				dispose,
+				pullRequest: { providerId: "github", number: 7 },
+			}),
+		);
+		expect(manager.get("review:preparing")?.target).toMatchObject({
+			description: "PR #7",
+			pullRequest: { provider: "github", number: 7 },
+		});
 		expect(projection.activeWorkflows).toMatchObject([
 			{
 				workflowId: "review:preparing",
@@ -211,6 +254,7 @@ describe("ReviewWorkflowManager", () => {
 					type: "workflow_update",
 					workflowId: "review:preparing",
 					message: "Reviewing PR #7.",
+					pullRequest: { provider: "github", number: 7 },
 				},
 				activeTools: [],
 			},

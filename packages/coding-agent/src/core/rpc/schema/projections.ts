@@ -12,6 +12,14 @@ import { openStringEnum, stringEnum } from "./helpers.ts";
 export const RpcWorkflowKindSchema = openStringEnum(["review"]);
 export const RpcWorkflowStatusSchema = openStringEnum(["running", "finalizing", "completed", "cancelled", "failed"]);
 
+export const RpcReviewPullRequestReferenceSchema = Type.Object(
+	{
+		provider: Type.String({ minLength: 1, maxLength: 64, pattern: "^[^\\s\\x00-\\x1f\\x7f]+$" }),
+		number: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+	},
+	{ additionalProperties: false },
+);
+
 /** Describes a value whose wire projection was reduced to satisfy a byte budget. */
 export const RpcProjectionTruncationSchema = Type.Unsafe<RpcProjectionTruncation>(
 	Type.Cyclic(
@@ -72,6 +80,7 @@ export const RpcWorkflowEventSchema = Type.Object(
 		/** Host-authoritative Unix epoch milliseconds for timed workflow presentation. */
 		startedAt: Type.Optional(Type.Number()),
 		endedAt: Type.Optional(Type.Number()),
+		pullRequest: Type.Optional(RpcReviewPullRequestReferenceSchema),
 		projection: Type.Optional(RpcProjectionTruncationSchema),
 	},
 	{ additionalProperties: false },
@@ -120,7 +129,14 @@ const reviewWorkflowDescriptorProperties = {
 	workflowId: Type.String(),
 	action: Type.String(),
 	status: RpcReviewWorkflowLifecycleStatusSchema,
-	target: Type.Object({ description: Type.String(), diffCommand: Type.String() }, { additionalProperties: false }),
+	target: Type.Object(
+		{
+			description: Type.String(),
+			diffCommand: Type.String(),
+			pullRequest: Type.Optional(RpcReviewPullRequestReferenceSchema),
+		},
+		{ additionalProperties: false },
+	),
 	findingsCount: Type.Optional(Type.Number()),
 	errorMessage: Type.Optional(Type.String()),
 	startedAt: Type.Number(),
@@ -252,6 +268,7 @@ const reviewRunProperties = {
 			description: Type.String(),
 			diffCommand: Type.String(),
 			identity: RpcReviewTargetIdentitySchema,
+			pullRequest: Type.Optional(RpcReviewPullRequestReferenceSchema),
 			context: Type.Optional(
 				Type.Object(
 					{

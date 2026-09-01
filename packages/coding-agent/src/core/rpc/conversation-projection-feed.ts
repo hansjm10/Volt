@@ -365,6 +365,22 @@ function isOptionalRecord(value: unknown): boolean {
 	return value === undefined || isRecord(value);
 }
 
+function isReviewPullRequestReference(value: unknown): boolean {
+	if (value === undefined) return true;
+	if (!isRecord(value) || Object.keys(value).some((key) => key !== "provider" && key !== "number")) {
+		return false;
+	}
+	return (
+		isCanonicalExternalIdentifier(value.provider) &&
+		!projectRpcUtf8Prefix(value.provider, 64).truncated &&
+		!/[\u0000-\u001f\u007f]/u.test(value.provider) &&
+		typeof value.number === "number" &&
+		Number.isSafeInteger(value.number) &&
+		value.number >= 1 &&
+		value.number <= 2_147_483_647
+	);
+}
+
 function isPositiveCommitOrdinal(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -739,6 +755,7 @@ function assertCanonicalExternalEvent(event: object): asserts event is Record<st
 			!isOptionalString(event.title) ||
 			!isOptionalString(event.message) ||
 			!isOptionalString(event.status) ||
+			!isReviewPullRequestReference(event.pullRequest) ||
 			(event.startedAt !== undefined && !isNonNegativeFiniteNumber(event.startedAt)) ||
 			(event.endedAt !== undefined && !isNonNegativeFiniteNumber(event.endedAt))
 		) {

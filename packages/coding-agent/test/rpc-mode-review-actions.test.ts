@@ -78,6 +78,35 @@ function durableRecord(runId = "review:test"): ReviewRunRecord {
 	};
 }
 
+function durablePullRequestRecord(runId = "review:test"): ReviewRunRecord {
+	const record = durableRecord(runId);
+	return {
+		...record,
+		workflowAction: "review.pr",
+		target: {
+			...record.target,
+			description: "PR #243",
+			diffCommand: "gh pr diff 243",
+			identity: {
+				kind: "pr",
+				baseTree: "base-tree",
+				headTree: "head-tree",
+				pullRequest: {
+					providerId: "github",
+					number: 243,
+					title: "PRIVATE_PULL_REQUEST_TITLE",
+					body: "PRIVATE_PULL_REQUEST_BODY",
+					url: "https://example.test/pull/243",
+					baseRefName: "main",
+					headRefName: "fix/compact-width-ui",
+					baseRefOid: "base-oid",
+					headRefOid: "head-oid",
+				},
+			},
+		},
+	};
+}
+
 function durableBranchRecord(runId = "review:test"): ReviewRunRecord {
 	const record = durableRecord(runId);
 	return {
@@ -419,7 +448,7 @@ describe("RPC durable review actions", () => {
 	test("hydrates durable paginated results and exposes structured context coverage without raw GitHub text", async () => {
 		const manager = SessionManager.inMemory("/workspace");
 		appendReviewRun(manager, durableRecord("review:older"));
-		const newer = { ...durableRecord("review:newer"), endedAt: 3 };
+		const newer = { ...durablePullRequestRecord("review:newer"), endedAt: 3 };
 		newer.target.context = {
 			captureStatus: "complete",
 			linkedIssueCount: 2,
@@ -448,10 +477,12 @@ describe("RPC durable review actions", () => {
 		line(JSON.stringify({ id: "get", type: "get_review_result", runId: "review:newer" }));
 		await vi.waitFor(() => expect(response(collecting.writes, "get")).toBeDefined());
 		const listData = response(collecting.writes, "list")?.data as {
-			runs: Array<{ runId: string }>;
+			runs: Array<{ runId: string; target: { pullRequest?: { provider: string; number: number } } }>;
 			nextCursor?: string;
 		};
 		expect(listData.runs).toHaveLength(1);
+		expect(listData.runs[0]?.target.pullRequest).toEqual({ provider: "github", number: 243 });
+		expect(Object.keys(listData.runs[0]?.target.pullRequest ?? {})).toEqual(["provider", "number"]);
 		expect(listData.nextCursor).toBeTruthy();
 		line(JSON.stringify({ id: "next", type: "list_review_workflows", cursor: listData.nextCursor, limit: 1 }));
 		line(JSON.stringify({ id: "oversized", type: "list_review_workflows", limit: 101 }));
@@ -469,7 +500,10 @@ describe("RPC durable review actions", () => {
 			runId: "review:newer",
 			completionStatus: "complete",
 			overallCorrectness: "incorrect",
-			target: { context: { linkedIssueCount: 2, discussionEntryCount: 5, fingerprint: "c".repeat(64) } },
+			target: {
+				pullRequest: { provider: "github", number: 243 },
+				context: { linkedIssueCount: 2, discussionEntryCount: 5, fingerprint: "c".repeat(64) },
+			},
 			coverage: {
 				context: {
 					discoveryInspectionComplete: true,

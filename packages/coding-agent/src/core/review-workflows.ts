@@ -15,6 +15,8 @@
  * projection feed) and to per-mode sinks attached with `attachSink`.
  */
 
+import { Buffer } from "node:buffer";
+
 // Types only: a runtime import edge from this module (reached via
 // AgentSessionRuntime) into review.ts would also defeat test doubles that
 // replace review.ts for the RPC modes.
@@ -25,6 +27,7 @@ import type {
 	ReviewWorkflowEvent,
 	ReviewWorkflowToolEvent,
 } from "./review.ts";
+import type { ReviewSnapshotIdentity } from "./review-snapshot.ts";
 
 /** Maximum concurrently running detached reviews per runtime. */
 export const MAX_ACTIVE_REVIEW_WORKFLOWS = 3;
@@ -35,12 +38,40 @@ export const MAX_RETAINED_REVIEW_RAW_CHARS = 65_536;
 
 export type ReviewWorkflowLifecycleStatus = "running" | "completed" | "cancelled" | "failed";
 
+export interface ReviewPullRequestReference {
+	provider: string;
+	number: number;
+}
+
+const REVIEW_PULL_REQUEST_PROVIDER_MAX_UTF8_BYTES = 64;
+const REVIEW_PULL_REQUEST_NUMBER_MAX = 2_147_483_647;
+
+export function createReviewPullRequestReference(
+	identity: Pick<ReviewSnapshotIdentity, "pullRequest"> | undefined,
+): ReviewPullRequestReference | undefined {
+	const pullRequest = identity?.pullRequest;
+	if (!pullRequest) return undefined;
+	const provider = pullRequest.providerId;
+	if (
+		provider.length === 0 ||
+		provider !== provider.trim() ||
+		Buffer.byteLength(provider, "utf8") > REVIEW_PULL_REQUEST_PROVIDER_MAX_UTF8_BYTES ||
+		/[\u0000-\u001f\u007f]/u.test(provider) ||
+		!Number.isSafeInteger(pullRequest.number) ||
+		pullRequest.number < 1 ||
+		pullRequest.number > REVIEW_PULL_REQUEST_NUMBER_MAX
+	) {
+		return undefined;
+	}
+	return { provider, number: pullRequest.number };
+}
+
 export interface ReviewWorkflowDescriptor {
 	workflowId: string;
 	/** Review host-action id, e.g. `review.branch`. */
 	action: string;
 	status: ReviewWorkflowLifecycleStatus;
-	target: { description: string; diffCommand: string };
+	target: { description: string; diffCommand: string; pullRequest?: ReviewPullRequestReference };
 	findingsCount?: number;
 	completionStatus?: ParsedReview["completionStatus"];
 	errorMessage?: string;
@@ -71,7 +102,7 @@ export interface ReviewWorkflowStartOptions {
 	provisional?: boolean;
 	prepared: Pick<PreparedReviewWorkflow, "workflowId" | "action" | "startedAt"> & {
 		resolution: Pick<PreparedReviewWorkflow["resolution"], "description" | "workflowDescription" | "diffCommand"> &
-			Partial<Pick<PreparedReviewWorkflow["resolution"], "dispose">>;
+			Partial<Pick<PreparedReviewWorkflow["resolution"], "dispose" | "identity">>;
 	};
 	fastModeEnabled?: boolean;
 	execute: (hooks: ReviewWorkflowExecuteHooks) => Promise<ExecuteReviewWorkflowResult>;
@@ -170,6 +201,7 @@ export class ReviewWorkflowManager {
 			throw new Error(`Review workflow already exists: ${workflowId}`);
 		}
 
+		const initialPullRequest = createReviewPullRequestReference(resolution.identity);
 		const descriptor: ReviewWorkflowDescriptor = {
 			workflowId,
 			action,
@@ -177,6 +209,7 @@ export class ReviewWorkflowManager {
 			target: {
 				description: resolution.workflowDescription ?? resolution.description,
 				diffCommand: resolution.diffCommand,
+				...(initialPullRequest ? { pullRequest: initialPullRequest } : {}),
 			},
 			startedAt: options.prepared.startedAt,
 		};
@@ -205,9 +238,11 @@ export class ReviewWorkflowManager {
 			}
 			entry.awaitingPreparation = false;
 			descriptor.action = prepared.action;
+			const pullRequest = createReviewPullRequestReference(prepared.resolution.identity);
 			descriptor.target = {
 				description: prepared.resolution.workflowDescription ?? prepared.resolution.description,
 				diffCommand: prepared.resolution.diffCommand,
+				...(pullRequest ? { pullRequest } : {}),
 			};
 			descriptor.startedAt = prepared.startedAt;
 			entry.disposePending = () => prepared.resolution.dispose?.() ?? Promise.resolve();
@@ -221,6 +256,7 @@ export class ReviewWorkflowManager {
 					message: formatRunningReviewMessage(descriptor.target.description, false),
 					status: "running",
 					startedAt: descriptor.startedAt,
+					...(descriptor.target.pullRequest ? { pullRequest: { ...descriptor.target.pullRequest } } : {}),
 				});
 			}
 		};
@@ -239,6 +275,7 @@ export class ReviewWorkflowManager {
 				message: formatRunningReviewMessage(descriptor.target.description, entry.awaitingPreparation),
 				status: "running",
 				startedAt: descriptor.startedAt,
+				...(descriptor.target.pullRequest ? { pullRequest: { ...descriptor.target.pullRequest } } : {}),
 			});
 			void (async () => {
 				let result: ExecuteReviewWorkflowResult;
@@ -246,7 +283,18 @@ export class ReviewWorkflowManager {
 					result = await options.execute({
 						signal: entry.abortController.signal,
 						onEvent: (event) => {
-							if (event.type !== "workflow_start" || event.workflowId !== workflowId) this.emit(event);
+							if (event.type === "workflow_start" && event.workflowId === workflowId) return;
+							if (
+								descriptor.target.pullRequest &&
+								(event.type === "workflow_update" || event.type === "workflow_end")
+							) {
+								this.emit({
+									...event,
+									pullRequest: { ...descriptor.target.pullRequest },
+								});
+								return;
+							}
+							this.emit(event);
 						},
 					});
 				} catch (error) {
@@ -296,10 +344,26 @@ export class ReviewWorkflowManager {
 	get(workflowId: string): ReviewWorkflowResultRecord | undefined {
 		const activeEntry = this.active.get(workflowId);
 		if (activeEntry) {
-			return { ...activeEntry.descriptor };
+			return {
+				...activeEntry.descriptor,
+				target: {
+					...activeEntry.descriptor.target,
+					...(activeEntry.descriptor.target.pullRequest
+						? { pullRequest: { ...activeEntry.descriptor.target.pullRequest } }
+						: {}),
+				},
+			};
 		}
 		const record = this.results.get(workflowId);
-		return record ? { ...record } : undefined;
+		return record
+			? {
+					...record,
+					target: {
+						...record.target,
+						...(record.target.pullRequest ? { pullRequest: { ...record.target.pullRequest } } : {}),
+					},
+				}
+			: undefined;
 	}
 
 	/** Active workflows (oldest first) followed by retained terminal results (oldest first). */
@@ -308,7 +372,10 @@ export class ReviewWorkflowManager {
 			workflowId: record.workflowId,
 			action: record.action,
 			status: record.status,
-			target: { ...record.target },
+			target: {
+				...record.target,
+				...(record.target.pullRequest ? { pullRequest: { ...record.target.pullRequest } } : {}),
+			},
 			...(record.findingsCount === undefined ? {} : { findingsCount: record.findingsCount }),
 			...(record.completionStatus === undefined ? {} : { completionStatus: record.completionStatus }),
 			...(record.errorMessage === undefined ? {} : { errorMessage: record.errorMessage }),
@@ -398,6 +465,7 @@ export class ReviewWorkflowManager {
 			status: result.status,
 			startedAt: descriptor.startedAt,
 			endedAt: descriptor.endedAt,
+			...(descriptor.target.pullRequest ? { pullRequest: { ...descriptor.target.pullRequest } } : {}),
 		});
 		entry.settle(record);
 	}
