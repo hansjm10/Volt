@@ -6,6 +6,7 @@
  */
 
 import { createInterface } from "node:readline";
+import { createSessionId } from "@hansjm10/volt-agent-core";
 import { type ImageContent, modelsAreEqual } from "@hansjm10/volt-ai";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.ts";
@@ -284,7 +285,7 @@ async function forkSessionOrExit(
 ): Promise<SessionManager> {
 	try {
 		return source.type === "path"
-			? await SessionManager.importFromJsonl(source.path, cwd, sessionDir, { id: sessionId })
+			? await SessionManager.importFromJsonl(source.path, cwd, sessionDir, { id: sessionId ?? createSessionId() })
 			: await SessionManager.forkFrom(source.ref, cwd, sessionDir, { id: sessionId });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
