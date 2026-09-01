@@ -1113,7 +1113,7 @@ describe("review snapshots", () => {
 		installNodeCommandShim(
 			bin,
 			"git",
-			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir?.includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, gitDir);\n  process.stderr.write("forced branch fetch failure\\n");\n  process.exitCode = 1;\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
+			`import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nconst args = process.argv.slice(2);\nconst gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length);\nif (args.includes("fetch") && gitDir?.includes("volt-review-branch-")) {\n  writeFileSync(${JSON.stringify(temporaryDirectoryPath)}, gitDir);\n  process.stderr.write("forced branch fetch failure\\n");\n  process.exit(1);\n} else {\n  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });\n  if (result.error) throw result.error;\n  process.exitCode = result.status ?? 1;\n}\n`,
 		);
 		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
 
@@ -1125,6 +1125,9 @@ describe("review snapshots", () => {
 		expect(git(repository, "rev-parse", "main")).toBe(staleBase);
 		const temporaryDirectory = readFileSync(temporaryDirectoryPath, "utf8");
 		expect(existsSync(temporaryDirectory)).toBe(false);
+		tempDirectories.splice(tempDirectories.indexOf(repository), 1);
+		rmSync(repository, { recursive: true });
+		expect(existsSync(repository)).toBe(false);
 	});
 
 	it("cancels a remote base fetch and removes the temporary source", async () => {
@@ -1171,8 +1174,12 @@ describe("review snapshots", () => {
 			await vi.waitFor(() => expect(processIsAlive(startedPath)).toBe(false), waitOptions);
 			const temporaryDirectory = readFileSync(temporaryDirectoryPath, "utf8");
 			expect(existsSync(temporaryDirectory)).toBe(false);
+			tempDirectories.splice(tempDirectories.indexOf(repository), 1);
+			rmSync(repository, { recursive: true });
+			expect(existsSync(repository)).toBe(false);
 		} finally {
 			controller.abort();
+			await resolution;
 		}
 	});
 
