@@ -33,9 +33,15 @@ interface PendingRequest {
 	readonly reject: (error: Error) => void;
 }
 
+export interface SQLiteSessionStoreLease {
+	readonly client: SQLiteSessionStoreClient;
+	release(): Promise<void>;
+}
+
 interface SharedStoreEntry {
-	readonly promise: Promise<SQLiteSessionStoreClient>;
+	promise: Promise<SQLiteSessionStoreClient>;
 	client?: SQLiteSessionStoreClient;
+	references: number;
 }
 
 const sharedStores = new Map<string, SharedStoreEntry>();
@@ -296,21 +302,55 @@ function evictSharedClient(client: SQLiteSessionStoreClient): void {
 	if (entry?.client === client) sharedStores.delete(client.sessionDirectory);
 }
 
-export function getSharedSQLiteSessionStore(sessionDirectory: string): Promise<SQLiteSessionStoreClient> {
-	const resolvedDirectory = resolve(sessionDirectory);
-	const existing = sharedStores.get(resolvedDirectory);
-	if (existing) return existing.promise;
-
+function createSharedStoreEntry(resolvedDirectory: string): SharedStoreEntry {
+	let entry: SharedStoreEntry;
 	const promise = SQLiteSessionStoreClient.open(resolvedDirectory)
 		.then((client) => {
-			const entry = sharedStores.get(resolvedDirectory);
-			if (entry?.promise === promise) entry.client = client;
+			entry.client = client;
 			return client;
 		})
 		.catch((error: unknown) => {
-			if (sharedStores.get(resolvedDirectory)?.promise === promise) sharedStores.delete(resolvedDirectory);
+			if (sharedStores.get(resolvedDirectory) === entry) sharedStores.delete(resolvedDirectory);
 			throw error;
 		});
-	sharedStores.set(resolvedDirectory, { promise });
-	return promise;
+	entry = { promise, references: 0 };
+	return entry;
+}
+
+async function releaseSharedStoreEntry(resolvedDirectory: string, entry: SharedStoreEntry): Promise<void> {
+	entry.references -= 1;
+	if (entry.references > 0) return;
+	if (sharedStores.get(resolvedDirectory) === entry) sharedStores.delete(resolvedDirectory);
+	let client: SQLiteSessionStoreClient;
+	try {
+		client = entry.client ?? (await entry.promise);
+	} catch {
+		return;
+	}
+	await client.close();
+}
+
+export async function acquireSharedSQLiteSessionStore(sessionDirectory: string): Promise<SQLiteSessionStoreLease> {
+	const resolvedDirectory = resolve(sessionDirectory);
+	let entry = sharedStores.get(resolvedDirectory);
+	if (!entry) {
+		entry = createSharedStoreEntry(resolvedDirectory);
+		sharedStores.set(resolvedDirectory, entry);
+	}
+	entry.references += 1;
+	let client: SQLiteSessionStoreClient;
+	try {
+		client = await entry.promise;
+	} catch (error) {
+		await releaseSharedStoreEntry(resolvedDirectory, entry);
+		throw error;
+	}
+	let releasePromise: Promise<void> | undefined;
+	return Object.freeze({
+		client,
+		release(): Promise<void> {
+			releasePromise ??= releaseSharedStoreEntry(resolvedDirectory, entry);
+			return releasePromise;
+		},
+	});
 }

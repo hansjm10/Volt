@@ -194,6 +194,8 @@ Important behavior:
 - creation returns diagnostics on `runtime.diagnostics`
 - if runtime creation or replacement fails, the method throws and the caller decides how to handle it
 
+`AgentSession` owns its manager: `session.dispose()` installs the shutdown fence, and `await session.waitForClosed()` drains persistence and releases the SQLite store. `AgentSessionRuntime` does the same for its active session during `await runtime.dispose()`.
+
 ```typescript
 let session = runtime.session;
 let unsubscribe = session.subscribe(() => {});
@@ -886,9 +888,13 @@ if (selectedRef) {
 
 // Explicitly import or export a JSONL interchange snapshot
 const imported = await SessionManager.importFromJsonl("/path/to/session-snapshot.jsonl");
-const importedRef = imported.getSessionRef();
-if (importedRef) {
-  await SessionManager.exportJsonlSnapshot(importedRef, "/path/to/export.jsonl");
+try {
+  const importedRef = imported.getSessionRef();
+  if (importedRef) {
+    await SessionManager.exportJsonlSnapshot(importedRef, "/path/to/export.jsonl");
+  }
+} finally {
+  await imported.closePersistence();
 }
 
 // Session replacement API for /clear, /resume, /fork, /clone, and import flows.
@@ -925,22 +931,27 @@ await runtime.importFromJsonl("/path/to/session-snapshot.jsonl");
 ```typescript
 if (!selectedRef) throw new Error("No saved session");
 const sm = await SessionManager.open(selectedRef);
+try {
+  const entries = sm.getEntries();
+  const tree = sm.getTree();
+  const path = sm.getBranch();
+  const leaf = sm.getLeafEntry();
+  const entry = sm.getEntry(id);
+  const children = sm.getChildren(id);
 
-const entries = sm.getEntries();
-const tree = sm.getTree();
-const path = sm.getBranch();
-const leaf = sm.getLeafEntry();
-const entry = sm.getEntry(id);
-const children = sm.getChildren(id);
+  const label = sm.getLabel(id);
+  sm.appendLabelChange(id, "checkpoint");
 
-const label = sm.getLabel(id);
-sm.appendLabelChange(id, "checkpoint");
-
-sm.branch(entryId);
-sm.branchWithSummary(id, "Summary...");
-await sm.createBranchedSession(leafId);
-await sm.flush();
+  sm.branch(entryId);
+  sm.branchWithSummary(id, "Summary...");
+  await sm.createBranchedSession(leafId);
+  await sm.flush();
+} finally {
+  await sm.closePersistence();
+}
 ```
+
+Callers that directly own a persisted `SessionManager` must await `closePersistence()` before deleting its session directory or exiting. Static list, search, context lookup, export, and delete operations release their scoped store ownership before resolving.
 
 > See [examples/sdk/11-sessions.ts](../examples/sdk/11-sessions.ts) and [Session Format](session-format.md)
 

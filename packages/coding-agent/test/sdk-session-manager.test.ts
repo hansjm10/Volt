@@ -10,6 +10,7 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==";
@@ -31,8 +32,10 @@ describe("createAgentSession session manager defaults", () => {
 	let agentDir: string;
 	const sessions: AgentSession[] = [];
 	const fauxProviders: FauxProviderRegistration[] = [];
+	const managerOwner = createSessionManagerTestOwner();
 
 	beforeEach(() => {
+		managerOwner.start();
 		tempDir = join(tmpdir(), `volt-sdk-session-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		cwd = join(tempDir, "project");
 		agentDir = join(tempDir, "agent");
@@ -40,18 +43,17 @@ describe("createAgentSession session manager defaults", () => {
 		mkdirSync(agentDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.unstubAllGlobals();
-		vi.restoreAllMocks();
 		while (sessions.length > 0) {
-			sessions.pop()?.dispose();
+			const session = sessions.pop()!;
+			session.dispose();
+			await session.waitForClosed();
 		}
-		while (fauxProviders.length > 0) {
-			fauxProviders.pop()?.unregister();
-		}
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
+		await managerOwner.drain();
+		vi.restoreAllMocks();
+		while (fauxProviders.length > 0) fauxProviders.pop()?.unregister();
+		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("uses agentDir for the default persisted session path", async () => {
@@ -75,6 +77,7 @@ describe("createAgentSession session manager defaults", () => {
 		expect(existsSync(join(expectedSessionDir, "sessions.sqlite"))).toBe(true);
 
 		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("uses agentDir and session identity for generated image artifacts", async () => {
@@ -151,6 +154,7 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
 		session.dispose();
+		await session.waitForClosed();
 	});
 
 	it("persists a model policy when Fast mode is pre-seeded for a new session", async () => {
@@ -295,5 +299,6 @@ describe("createAgentSession session manager defaults", () => {
 		expect(realpathSync(output.trim())).toBe(realpathSync(sessionCwd));
 
 		session.dispose();
+		await session.waitForClosed();
 	});
 });

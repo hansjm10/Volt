@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 async function commitPlanningState(manager: SessionManager, mode: "build" | "plan"): Promise<void> {
 	const projection = manager.issueCanonicalProjection();
@@ -33,13 +34,16 @@ function legacySessionJsonl(id: string, cwd: string, message = "hello"): string 
 
 describe("legacy JSONL import parsing", () => {
 	let tempDir: string;
+	const managerOwner = createSessionManagerTestOwner();
 
 	beforeEach(() => {
+		managerOwner.start();
 		tempDir = join(tmpdir(), `session-import-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		await managerOwner.drain();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -132,8 +136,10 @@ describe("SessionManager SQLite session behavior", () => {
 	let tempDir: string;
 	let projectA: string;
 	let projectB: string;
+	const managerOwner = createSessionManagerTestOwner();
 
 	beforeEach(() => {
+		managerOwner.start();
 		tempDir = join(tmpdir(), `session-store-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		projectA = join(tempDir, "project-a");
 		projectB = join(tempDir, "project-b");
@@ -141,7 +147,8 @@ describe("SessionManager SQLite session behavior", () => {
 		mkdirSync(projectB, { recursive: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		await managerOwner.drain();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 

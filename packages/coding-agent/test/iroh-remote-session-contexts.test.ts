@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { getIrohRemoteRpcCommandCapabilities } from "../src/core/remote/iroh/access-grant.ts";
 import { sanitizeIrohRemoteOutbound } from "../src/core/remote/iroh/outbound-filter.ts";
 import {
@@ -13,6 +13,7 @@ import {
 } from "../src/core/remote/iroh/session-contexts.ts";
 import type { RpcGitContext, RpcSessionWorkContext } from "../src/core/rpc/types.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const gitContext: RpcGitContext = {
 	repository: "Volt",
@@ -52,7 +53,12 @@ function backend(): IrohRemoteSessionContextsRpcBackend {
 }
 
 const temporaryDirectories: string[] = [];
+const managerOwner = createSessionManagerTestOwner();
+
+beforeEach(() => managerOwner.start());
+
 afterEach(async () => {
+	await managerOwner.drain();
 	vi.restoreAllMocks();
 	await Promise.all(
 		temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),

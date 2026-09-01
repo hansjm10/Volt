@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 function assistantMessage(text: string, timestamp: number) {
 	return {
@@ -27,9 +28,12 @@ function assistantMessage(text: string, timestamp: number) {
 
 describe("SessionInfo.modified", () => {
 	const tempDirs: string[] = [];
+	const managerOwner = createSessionManagerTestOwner();
 	beforeAll(() => initTheme("dark"));
+	beforeEach(() => managerOwner.start());
 
-	afterEach(() => {
+	afterEach(async () => {
+		await managerOwner.drain();
 		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	});
 

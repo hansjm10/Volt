@@ -4,15 +4,19 @@ import { join } from "node:path";
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type SessionEntry, SessionManager, type SessionReference } from "../../../src/core/session-manager.ts";
-import { getSharedSQLiteSessionStore } from "../../../src/core/session-store/index.ts";
+import {
+	acquireSharedSQLiteSessionStore,
+	type SQLiteSessionStoreLease,
+} from "../../../src/core/session-store/index.ts";
 import { createHarness, getMessageText, type Harness } from "../harness.ts";
 
 async function faultNextTransaction(
 	manager: SessionManager,
 	stage: "before" | "pause",
 	pause?: { started(): void; release: Promise<void> },
-): Promise<void> {
-	const store = await getSharedSQLiteSessionStore(manager.getSessionDir());
+): Promise<SQLiteSessionStoreLease> {
+	const lease = await acquireSharedSQLiteSessionStore(manager.getSessionDir());
+	const store = lease.client;
 	const applyTransaction = store.applyTransaction.bind(store);
 	vi.spyOn(store, "applyTransaction").mockImplementation(async (input) => {
 		if (!input.payload.entries.some((entry) => entry.type === "planning_state_change")) {
@@ -23,6 +27,7 @@ async function faultNextTransaction(
 		await pause?.release;
 		return applyTransaction(input);
 	});
+	return lease;
 }
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -60,7 +65,12 @@ function snapshotHarness(harness: Harness): PlanningSnapshot {
 }
 
 async function snapshotReopened(sessionRef: SessionReference): Promise<PlanningSnapshot> {
-	return snapshotEntries((await SessionManager.open(sessionRef)).getBranch());
+	const manager = await SessionManager.open(sessionRef);
+	try {
+		return snapshotEntries(manager.getBranch());
+	} finally {
+		await manager.closePersistence();
+	}
 }
 
 async function createReadyPlan(harness: Harness): Promise<void> {
@@ -81,18 +91,20 @@ async function createReadyPlan(harness: Harness): Promise<void> {
 
 describe("regression #212: planning and canonical delivery atomicity", () => {
 	const harnesses: Harness[] = [];
+	const managers: SessionManager[] = [];
+	const storeLeases: SQLiteSessionStoreLease[] = [];
 	const tempDirs: string[] = [];
 
 	afterEach(async () => {
-		while (harnesses.length > 0) {
-			const session = harnesses.pop()!.session;
-			session.dispose();
-			await session.waitForClosed();
-		}
-		while (tempDirs.length > 0) {
-			rmSync(tempDirs.pop()!, { recursive: true, force: true });
-		}
+		while (harnesses.length > 0)
+			await harnesses
+				.pop()!
+				.cleanupAsync()
+				.catch(() => {});
+		while (managers.length > 0) await managers.pop()!.drainPersistence();
 		vi.restoreAllMocks();
+		while (storeLeases.length > 0) await storeLeases.pop()!.release();
+		while (tempDirs.length > 0) rmSync(tempDirs.pop()!, { recursive: true, force: true });
 	});
 
 	async function setup(): Promise<{ harness: Harness; sessionRef: SessionReference; baseline: PlanningSnapshot }> {
@@ -160,7 +172,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 	it("keeps the ready plan when the SQLite transaction rolls back", async () => {
 		const { harness, sessionRef, baseline } = await setup();
 		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		await faultNextTransaction(harness.sessionManager, "before");
+		storeLeases.push(await faultNextTransaction(harness.sessionManager, "before"));
 
 		await expectRetainedFailure(harness, sessionRef, baseline, "issue-212-first-durability");
 	});
@@ -170,7 +182,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		harnesses.pop();
 		harness.session.dispose();
 		await harness.session.waitForClosed();
-		harness.cleanup();
+		await harness.cleanupAsync();
 
 		const resumed = await createHarness({ sessionManager: await SessionManager.open(sessionRef) });
 		harnesses.push(resumed);
@@ -193,6 +205,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		await harness.session.steer("revise this ready plan", undefined, clientMessageId);
 		await harness.sessionManager.flush();
 		const otherManager = await SessionManager.open(sessionRef);
+		managers.push(otherManager);
 		otherManager.appendFastModeChange(true);
 		await otherManager.flush();
 		await expect(harness.control.continue()).resolves.toMatchObject({
@@ -203,6 +216,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		expect(harness.sessionManager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
 		expect(harness.getPendingResponseCount()).toBe(1);
 		const reopened = await SessionManager.open(sessionRef);
+		managers.push(reopened);
 		expect(snapshotEntries(reopened.getBranch())).toEqual(baseline);
 		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 		expect(reopened.getEntries().filter((entry) => entry.type === "fast_mode_change" && entry.enabled)).toHaveLength(
@@ -211,7 +225,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		harnesses.pop();
 		harness.session.dispose();
 		await harness.session.waitForClosed().catch(() => {});
-		harness.cleanup();
+		await harness.cleanupAsync().catch(() => {});
 	});
 
 	it("assigns one ready-plan transition across a mixed prompt and steer batch", async () => {
@@ -239,10 +253,12 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 		harness.setResponses([fauxAssistantMessage("feedback applied")]);
 		const started = deferred();
 		const release = deferred();
-		await faultNextTransaction(harness.sessionManager, "pause", {
-			started: started.resolve,
-			release: release.promise,
-		});
+		storeLeases.push(
+			await faultNextTransaction(harness.sessionManager, "pause", {
+				started: started.resolve,
+				release: release.promise,
+			}),
+		);
 
 		await harness.session.steer("revise this ready plan", undefined, "issue-212-session-replacement");
 		const attempt = harness.control.continue();
@@ -287,7 +303,7 @@ describe("regression #212: planning and canonical delivery atomicity", () => {
 	it("retains an identified direct prompt after a proven pre-replacement failure", async () => {
 		const { harness, sessionRef, baseline } = await setup();
 		harness.setResponses([fauxAssistantMessage("must remain unused")]);
-		await faultNextTransaction(harness.sessionManager, "before");
+		storeLeases.push(await faultNextTransaction(harness.sessionManager, "before"));
 		const clientMessageId = "issue-212-direct-pre-replacement";
 
 		await expect(

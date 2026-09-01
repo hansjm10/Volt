@@ -6,13 +6,16 @@ import type { AgentSession } from "../src/core/agent-session.ts";
 import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import type { AgentSessionServices } from "../src/core/agent-session-services.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 describe("review custom-message sessions", () => {
 	let tempDir: string;
 	let cwd: string;
 	let sessionDir: string;
+	const managerOwner = createSessionManagerTestOwner();
 
 	beforeEach(() => {
+		managerOwner.start();
 		tempDir = join(tmpdir(), `volt-review-custom-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		cwd = join(tempDir, "workspace");
 		sessionDir = join(tempDir, "sessions");
@@ -20,10 +23,9 @@ describe("review custom-message sessions", () => {
 		mkdirSync(sessionDir, { recursive: true });
 	});
 
-	afterEach(() => {
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
+	afterEach(async () => {
+		await managerOwner.drain();
+		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("persists displayed review-only custom messages so they remain listable", async () => {

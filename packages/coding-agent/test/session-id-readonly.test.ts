@@ -2,17 +2,20 @@ import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const cliPath = resolve(__dirname, "source-cli-runner.mjs");
 const tempDirs: string[] = [];
+const managerOwner = createSessionManagerTestOwner();
 
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) {
-		rmSync(dir, { recursive: true, force: true });
-	}
+beforeEach(() => managerOwner.start());
+
+afterEach(async () => {
+	await managerOwner.drain();
+	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function createTempDir(): string {

@@ -1,10 +1,11 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { getMissingSessionCwdIssue, MissingSessionCwdError } from "../src/core/session-cwd.ts";
 import { SessionManager, type SessionReference } from "../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 function createTempDir(name: string): string {
 	const dir = join(tmpdir(), `${name}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -21,8 +22,12 @@ async function createSessionWithMissingCwd(sessionDir: string, missingCwd: strin
 
 describe("session cwd handling", () => {
 	const cleanupPaths: string[] = [];
+	const managerOwner = createSessionManagerTestOwner();
 
-	afterEach(() => {
+	beforeEach(() => managerOwner.start());
+
+	afterEach(async () => {
+		await managerOwner.drain();
 		for (const path of cleanupPaths.splice(0)) rmSync(path, { recursive: true, force: true });
 	});
 

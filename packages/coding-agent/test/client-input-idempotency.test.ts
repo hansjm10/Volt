@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	ClientInputConflictError,
 	ClientInputOutcomeAmbiguousError,
@@ -21,13 +21,14 @@ import {
 	isValidClientMessageId,
 	SessionManager,
 } from "../src/core/session-manager.ts";
-import { getSharedSQLiteSessionStore } from "../src/core/session-store/index.ts";
+import { acquireSharedSQLiteSessionStore, type SQLiteSessionStoreLease } from "../src/core/session-store/index.ts";
 import {
 	type ConversationCommandContext,
 	type ConversationCommandRuntime,
 	createRemoteConversationTranscriptPage,
 	listRemoteWorkspaceSessionSummaries,
 } from "../src/daemon/conversation-commands.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 import { createHarness, getUserTexts, type Harness } from "./suite/harness.ts";
 import { loadPersistedSessionSnapshot } from "./utilities.ts";
 
@@ -72,20 +73,24 @@ function createAuthorization(workspacePath: string): IrohRemoteClientAuthorizati
 
 describe("durable client input idempotency", () => {
 	const harnesses: Harness[] = [];
+	const managerOwner = createSessionManagerTestOwner();
+	const storeLeases: SQLiteSessionStoreLease[] = [];
 	const tempDirs: string[] = [];
 
+	beforeEach(() => managerOwner.start());
+
 	afterEach(async () => {
-		while (harnesses.length > 0) {
-			const harness = harnesses.pop()!;
-			harness.session.dispose();
-			await harness.session.waitForClosed();
-			harness.cleanup();
-		}
+		while (harnesses.length > 0)
+			await harnesses
+				.pop()!
+				.cleanupAsync()
+				.catch(() => {});
+		await managerOwner.drain();
+		vi.restoreAllMocks();
+		while (storeLeases.length > 0) await storeLeases.pop()!.release();
 		while (tempDirs.length > 0) {
 			const tempDir = tempDirs.pop();
-			if (tempDir && existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true, force: true });
-			}
+			if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 
@@ -2029,10 +2034,13 @@ describe("durable client input idempotency", () => {
 		const tempDir = createTempDir();
 		tempDirs.push(tempDir);
 		const manager = await SessionManager.create(tempDir, tempDir);
-		const store = await getSharedSQLiteSessionStore(manager.getSessionDir());
-		vi.spyOn(store, "applyTransaction").mockRejectedValueOnce(new Error("injected uncertain store failure"));
+		const storeLease = await acquireSharedSQLiteSessionStore(manager.getSessionDir());
+		storeLeases.push(storeLease);
+		vi.spyOn(storeLease.client, "applyTransaction").mockRejectedValueOnce(
+			new Error("injected uncertain store failure"),
+		);
 		const reconcile = vi
-			.spyOn(store, "reconcileCommit")
+			.spyOn(storeLease.client, "reconcileCommit")
 			.mockRejectedValueOnce(new Error("injected reconciliation failure"));
 
 		expect(manager.reserveClientInput("uncertain", "prompt", { message: "uncertain" }).record.state).toBe("accepted");

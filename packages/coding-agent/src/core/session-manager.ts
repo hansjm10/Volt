@@ -41,8 +41,8 @@ import {
 	RPC_SESSION_QUEUE_MAX_ITEMS,
 } from "./rpc/wire-limits.ts";
 import {
+	acquireSharedSQLiteSessionStore,
 	digestSessionStoreTransactionPayload,
-	getSharedSQLiteSessionStore,
 	SESSION_STORE_DATABASE_FILENAME,
 	type SessionStoreApplyTransactionInput,
 	type SessionStoreClientInputWrite,
@@ -57,6 +57,7 @@ import {
 	type SessionStoreSubagentSpawnWrite,
 	type SessionStoreTransactionPayload,
 	type SQLiteSessionStoreClient,
+	type SQLiteSessionStoreLease,
 } from "./session-store/index.ts";
 
 function deepFreezeCanonicalData<T>(value: T): T {
@@ -1631,7 +1632,7 @@ export class SessionManager {
 	private sessionDir: string;
 	private cwd: string;
 	private persist: boolean;
-	private sessionStore: SQLiteSessionStoreClient | undefined;
+	private sessionStoreLease: SQLiteSessionStoreLease | undefined;
 	private storeId: string | undefined;
 	private storeRevision = 0;
 	private nextSearchChunkIndex = 0;
@@ -1656,6 +1657,7 @@ export class SessionManager {
 	private persistenceQueue: Promise<void> = Promise.resolve();
 	/** Promise for all persistence work accepted through the latest synchronous mutation. */
 	private persistenceWatermark: Promise<void> = Promise.resolve();
+	private persistenceDrainPromise: Promise<SessionPersistenceDrainResult> | undefined;
 	private readonly entryListeners = new Set<SessionEntryListener>();
 	private readonly branchListeners = new Set<SessionBranchListener>();
 	private readonly conversationAuthorityListeners = new Set<SessionConversationAuthorityListener>();
@@ -1679,14 +1681,14 @@ export class SessionManager {
 		sessionDir: string,
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
-		sessionStore?: SQLiteSessionStoreClient,
+		sessionStoreLease?: SQLiteSessionStoreLease,
 		snapshot?: SessionStoreSnapshot,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
-		this.sessionStore = sessionStore;
-		this.storeId = sessionStore?.info.storeId;
+		this.sessionStoreLease = sessionStoreLease;
+		this.storeId = sessionStoreLease?.client.info.storeId;
 		if (persist && this.sessionDir) ensurePrivateDirectorySync(this.sessionDir);
 		if (snapshot) this._loadStoreSnapshot(snapshot, cwd);
 		else this.newSession(newSessionOptions);
@@ -1729,7 +1731,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): SessionReference | undefined {
-		this.assertConversationAuthorityAvailable();
+		this._assertPersistenceHealthy();
 		if (this.atomicAppendInFlight) throw new Error("Cannot create a new session during an atomic append");
 		if (options?.id !== undefined) assertValidSessionId(options.id);
 		this.sessionId = options?.id ?? createSessionId();
@@ -1757,7 +1759,7 @@ export class SessionManager {
 		this.acceptsStartingGitContext = true;
 
 		if (this.persist) {
-			const store = this.sessionStore;
+			const store = this.sessionStoreLease?.client;
 			if (!store || !this.storeId) throw new Error("Persisted session requires an initialized session store");
 			const sessionId = this.sessionId;
 			const sessionGeneration = this.sessionGeneration;
@@ -2049,6 +2051,10 @@ export class SessionManager {
 
 	private async _commitStorePayload(payload: SessionStoreTransactionPayload): Promise<void> {
 		if (!this.persist) return;
+		const currentLease = this.sessionStoreLease;
+		if (!currentLease || !this.storeId) {
+			throw new Error("Persisted session requires an initialized session store lease");
+		}
 		const commitId = randomUUID();
 		const digest = digestSessionStoreTransactionPayload(payload);
 		const expectedRevision = this.storeRevision;
@@ -2060,7 +2066,7 @@ export class SessionManager {
 			digest,
 			payload,
 		};
-		let store = this.sessionStore ?? (await getSharedSQLiteSessionStore(this.sessionDir));
+		let store = currentLease.client;
 		try {
 			const result = await store.applyTransaction(input);
 			if (result.status === "conflict") {
@@ -2071,13 +2077,20 @@ export class SessionManager {
 				);
 			}
 			this.storeRevision = result.evidence.afterRevision;
-			this.sessionStore = store;
 			return;
 		} catch (error) {
 			if (error instanceof AtomicAppendPersistenceFailure) throw error;
+			let replacementLease: SQLiteSessionStoreLease | undefined;
+			let replacementInstalled = false;
 			try {
-				store = await getSharedSQLiteSessionStore(this.sessionDir);
-				this.sessionStore = store;
+				replacementLease = await acquireSharedSQLiteSessionStore(this.sessionDir);
+				if (replacementLease.client.info.storeId !== this.storeId) {
+					throw new Error("Replacement session store identity changed during reconciliation");
+				}
+				this.sessionStoreLease = replacementLease;
+				replacementInstalled = true;
+				store = replacementLease.client;
+				await currentLease.release();
 				const reconciliation = await store.reconcileCommit({
 					sessionId: this.sessionId,
 					sessionGeneration: this.sessionGeneration,
@@ -2098,12 +2111,23 @@ export class SessionManager {
 					);
 				}
 			} catch (reconciliationError) {
-				if (reconciliationError instanceof AtomicAppendPersistenceFailure) throw reconciliationError;
+				let effectiveError: unknown = reconciliationError;
+				if (replacementLease && !replacementInstalled) {
+					try {
+						await replacementLease.release();
+					} catch (releaseError) {
+						effectiveError = new AggregateError(
+							[reconciliationError, releaseError],
+							"Session store replacement failed and its lease could not be released",
+						);
+					}
+				}
+				if (effectiveError instanceof AtomicAppendPersistenceFailure) throw effectiveError;
 				throw new AtomicAppendPersistenceFailure(
 					"SQLite session transaction outcome could not be reconciled",
 					"uncertain",
 					"reconciliation_required",
-					{ cause: reconciliationError },
+					{ cause: effectiveError },
 				);
 			}
 			throw new AtomicAppendPersistenceFailure(
@@ -2689,23 +2713,58 @@ export class SessionManager {
 	}
 
 	/** Seal persistence and classify only this manager's recorded reconciliation failure. */
-	async drainPersistence(): Promise<SessionPersistenceDrainResult> {
-		if (this.persist) {
-			this.persistenceClosed = true;
-		}
-		try {
-			await this.flush();
-		} catch (error) {
-			const authority = this.conversationAuthorityStatus;
-			if (authority.status === "reconciliation_required" && authority.error.cause === error) {
-				return { status: "reconciliation_required", error: authority.error };
+	drainPersistence(): Promise<SessionPersistenceDrainResult> {
+		if (this.persistenceDrainPromise) return this.persistenceDrainPromise;
+		if (this.persist) this.persistenceClosed = true;
+		const watermark = this.persistenceWatermark;
+		this.persistenceDrainPromise = (async () => {
+			let result: SessionPersistenceDrainResult | undefined;
+			let persistenceError: unknown;
+			try {
+				await watermark;
+				const authority = this.conversationAuthorityStatus;
+				result =
+					authority.status === "reconciliation_required"
+						? { status: "reconciliation_required", error: authority.error }
+						: { status: "closed" };
+			} catch (error) {
+				const authority = this.conversationAuthorityStatus;
+				if (authority.status === "reconciliation_required" && authority.error.cause === error) {
+					result = { status: "reconciliation_required", error: authority.error };
+				} else {
+					persistenceError = error;
+				}
 			}
-			throw error;
-		}
-		const authority = this.conversationAuthorityStatus;
-		return authority.status === "reconciliation_required"
-			? { status: "reconciliation_required", error: authority.error }
-			: { status: "closed" };
+
+			const lease = this.sessionStoreLease;
+			let releaseError: unknown;
+			try {
+				await lease?.release();
+			} catch (error) {
+				releaseError = error;
+			} finally {
+				if (this.sessionStoreLease === lease) this.sessionStoreLease = undefined;
+			}
+			if (releaseError !== undefined) {
+				const authoritativeError =
+					persistenceError ??
+					(result?.status === "reconciliation_required"
+						? result.error.cause instanceof Error
+							? result.error.cause
+							: result.error
+						: undefined);
+				if (authoritativeError !== undefined) {
+					throw new AggregateError(
+						[authoritativeError, releaseError],
+						"Session persistence failed and its store lease could not be released",
+					);
+				}
+				throw releaseError;
+			}
+			if (persistenceError !== undefined) throw persistenceError;
+			return result ?? { status: "closed" };
+		})();
+		return this.persistenceDrainPromise;
 	}
 
 	/** Seal a persisted manager against later writes and reject on every failed watermark. */
@@ -3818,24 +3877,46 @@ export class SessionManager {
 		if (failures.length > 0) throw new Error(`Some legacy sessions could not be imported:\n${failures.join("\n")}`);
 	}
 
-	private static async _store(dir: string): Promise<SQLiteSessionStoreClient> {
+	private static async _releaseLeaseAfterFailure(
+		lease: SQLiteSessionStoreLease,
+		error: unknown,
+		message: string,
+	): Promise<never> {
+		try {
+			await lease.release();
+		} catch (releaseError) {
+			throw new AggregateError([error, releaseError], message);
+		}
+		throw error;
+	}
+
+	private static async _store(dir: string): Promise<SQLiteSessionStoreLease> {
 		const normalized = normalizePath(dir);
 		let migration = sessionStoreMigrationTasks.get(normalized);
 		if (!migration) {
 			migration = (async () => {
-				const store = await getSharedSQLiteSessionStore(normalized);
-				let release: (() => Promise<void>) | undefined;
+				const lease = await acquireSharedSQLiteSessionStore(normalized);
 				try {
-					release = await lockfile.lock(store.info.databasePath, {
-						lockfilePath: `${store.info.databasePath}.migration.lock`,
-						realpath: false,
-						retries: { retries: 10, factor: 2, minTimeout: 50, maxTimeout: 1000, randomize: true },
-						stale: 30_000,
-					});
-					await SessionManager._migrateLegacyDirectory(normalized, store);
-				} finally {
-					await release?.().catch(() => undefined);
+					let releaseLock: (() => Promise<void>) | undefined;
+					try {
+						releaseLock = await lockfile.lock(lease.client.info.databasePath, {
+							lockfilePath: `${lease.client.info.databasePath}.migration.lock`,
+							realpath: false,
+							retries: { retries: 10, factor: 2, minTimeout: 50, maxTimeout: 1000, randomize: true },
+							stale: 30_000,
+						});
+						await SessionManager._migrateLegacyDirectory(normalized, lease.client);
+					} finally {
+						await releaseLock?.().catch(() => undefined);
+					}
+				} catch (error) {
+					await SessionManager._releaseLeaseAfterFailure(
+						lease,
+						error,
+						"Session store migration failed and its lease could not be released",
+					);
 				}
+				await lease.release();
 			})().catch((error: unknown) => {
 				sessionStoreMigrationTasks.delete(normalized);
 				throw error;
@@ -3843,38 +3924,92 @@ export class SessionManager {
 			sessionStoreMigrationTasks.set(normalized, migration);
 		}
 		await migration;
-		return getSharedSQLiteSessionStore(normalized);
+		return acquireSharedSQLiteSessionStore(normalized);
+	}
+
+	private static async _scopedStore<T>(
+		dir: string,
+		operation: (store: SQLiteSessionStoreClient) => Promise<T>,
+	): Promise<T> {
+		const lease = await SessionManager._store(dir);
+		let result: T;
+		try {
+			result = await operation(lease.client);
+		} catch (error) {
+			try {
+				await lease.release();
+			} catch (releaseError) {
+				throw new AggregateError(
+					[error, releaseError],
+					"Session store operation failed and its lease could not be released",
+				);
+			}
+			throw error;
+		}
+		await lease.release();
+		return result;
 	}
 
 	/** Create and durably reserve a hidden persisted session. */
 	static async create(cwd: string, sessionDir?: string, options?: NewSessionOptions): Promise<SessionManager> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		const store = await SessionManager._store(dir);
-		const manager = new SessionManager(cwd, dir, true, options, store);
-		await manager.flush();
-		return manager;
+		const lease = await SessionManager._store(dir);
+		try {
+			const manager = new SessionManager(cwd, dir, true, options, lease);
+			await manager.flush();
+			return manager;
+		} catch (error) {
+			return await SessionManager._releaseLeaseAfterFailure(
+				lease,
+				error,
+				"Session creation failed and its store lease could not be released",
+			);
+		}
 	}
 
 	/** Open one authoritative SQLite session reference. */
 	static async open(ref: SessionReference, cwdOverride?: string): Promise<SessionManager> {
 		const dir = normalizePath(ref.sessionDirectory);
-		const store = await SessionManager._store(dir);
-		if (store.info.storeId !== ref.storeId) throw new Error("Session reference belongs to a different store");
-		const snapshot = await store.loadSession(ref.sessionId, ref.sessionGeneration);
-		if (!snapshot) throw new Error(`Session not found: ${ref.sessionId}`);
-		return new SessionManager(cwdOverride ?? snapshot.session.cwd, dir, true, undefined, store, snapshot);
+		const lease = await SessionManager._store(dir);
+		try {
+			if (lease.client.info.storeId !== ref.storeId) {
+				throw new Error("Session reference belongs to a different store");
+			}
+			const snapshot = await lease.client.loadSession(ref.sessionId, ref.sessionGeneration);
+			if (!snapshot) throw new Error(`Session not found: ${ref.sessionId}`);
+			return new SessionManager(cwdOverride ?? snapshot.session.cwd, dir, true, undefined, lease, snapshot);
+		} catch (error) {
+			return await SessionManager._releaseLeaseAfterFailure(
+				lease,
+				error,
+				"Session open failed and its store lease could not be released",
+			);
+		}
 	}
 
 	/** Continue the most recent visible session for a cwd, or create one. */
 	static async continueRecent(cwd: string, sessionDir?: string): Promise<SessionManager> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		const store = await SessionManager._store(dir);
-		const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
-		const summaries = await store.listSessionSummaries(filterCwd ? { cwd: resolvePath(cwd) } : {});
-		const latest = summaries[0];
-		return latest
-			? SessionManager.open(sessionReference(dir, store.info.storeId, latest.id, latest.sessionGeneration))
-			: SessionManager.create(cwd, dir);
+		const lease = await SessionManager._store(dir);
+		try {
+			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
+			const summaries = await lease.client.listSessionSummaries(filterCwd ? { cwd: resolvePath(cwd) } : {});
+			const latest = summaries[0];
+			if (!latest) {
+				const manager = new SessionManager(cwd, dir, true, undefined, lease);
+				await manager.flush();
+				return manager;
+			}
+			const snapshot = await lease.client.loadSession(latest.id, latest.sessionGeneration);
+			if (!snapshot) throw new Error(`Session not found: ${latest.id}`);
+			return new SessionManager(snapshot.session.cwd, dir, true, undefined, lease, snapshot);
+		} catch (error) {
+			return await SessionManager._releaseLeaseAfterFailure(
+				lease,
+				error,
+				"Session continuation failed and its store lease could not be released",
+			);
+		}
 	}
 
 	static async readStartingGitContexts(
@@ -3887,27 +4022,29 @@ export class SessionManager {
 		}
 		const contexts = new Map<string, RpcGitContext | null>(sessionIds.map((sessionId) => [sessionId, null]));
 		if (sessionIds.length === 0) return contexts;
-		const store = await SessionManager._store(normalizePath(sessionDir));
-		for (const sessionId of sessionIds) {
-			const summary = await store.findSessionSummaryById(sessionId);
-			if (!summary?.startingGitContextRecorded) continue;
-			if (!Check(Type.Union([RpcGitContextSchema, Type.Null()]), summary.startingGitContext)) {
-				throw new Error(`Session ${sessionId} has invalid starting Git context metadata`);
+		return SessionManager._scopedStore(normalizePath(sessionDir), async (store) => {
+			for (const sessionId of sessionIds) {
+				const summary = await store.findSessionSummaryById(sessionId);
+				if (!summary?.startingGitContextRecorded) continue;
+				if (!Check(Type.Union([RpcGitContextSchema, Type.Null()]), summary.startingGitContext)) {
+					throw new Error(`Session ${sessionId} has invalid starting Git context metadata`);
+				}
+				contexts.set(sessionId, summary.startingGitContext);
 			}
-			contexts.set(sessionId, summary.startingGitContext);
-		}
-		return contexts;
+			return contexts;
+		});
 	}
 
 	static async findForResume(sessionDir: string, sessionId: string): Promise<SessionReference | undefined> {
 		assertValidSessionId(sessionId);
 		const dir = normalizePath(sessionDir);
-		const store = await SessionManager._store(dir);
-		const summary = await store.findSessionSummaryById(sessionId);
-		if (!summary) return undefined;
-		const ref = sessionReference(dir, store.info.storeId, sessionId, summary.sessionGeneration);
-		await SessionManager.open(ref);
-		return ref;
+		return SessionManager._scopedStore(dir, async (store) => {
+			const summary = await store.findSessionSummaryById(sessionId);
+			if (!summary) return undefined;
+			const snapshot = await store.loadSession(sessionId, summary.sessionGeneration);
+			if (!snapshot) throw new Error(`Session not found: ${sessionId}`);
+			return sessionReference(dir, store.info.storeId, sessionId, summary.sessionGeneration);
+		});
 	}
 
 	/** Create an in-memory session (no persistence). */
@@ -4032,13 +4169,25 @@ export class SessionManager {
 			await stage(manager);
 			return manager;
 		} catch (error) {
+			const cleanupErrors: unknown[] = [];
+			try {
+				await manager.closePersistence();
+			} catch (closeError) {
+				cleanupErrors.push(closeError);
+			}
 			const ref = manager.getSessionRef();
 			if (ref) {
 				try {
 					await SessionManager.delete(ref, manager.storeRevision);
 				} catch (cleanupError) {
-					throw new AggregateError([error, cleanupError], "Session import failed and cleanup could not be proven");
+					cleanupErrors.push(cleanupError);
 				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError(
+					[error, ...cleanupErrors],
+					"Session import failed and cleanup could not be proven",
+				);
 			}
 			throw error;
 		}
@@ -4052,34 +4201,68 @@ export class SessionManager {
 		options?: NewSessionOptions,
 	): Promise<SessionManager> {
 		const source = await SessionManager.open(sourceRef);
-		const target = await SessionManager.create(targetCwd, sessionDir, {
-			...options,
-			parentSession: sourceRef,
-		});
-		const sourceById = source.byId;
-		const nearestPublicParent = (parentId: string | null): string | null => {
-			let currentId = parentId;
-			while (currentId) {
-				const current = sourceById.get(currentId);
-				if (!current) return null;
-				if (!isHostOnlySessionEntry(current)) return current.id;
-				currentId = current.parentId;
-			}
-			return null;
-		};
-		const entries = source
-			.getEntries()
-			.map((entry) => withoutClientInputIdentity({ ...entry, parentId: nearestPublicParent(entry.parentId) }))
-			.map((entry) => {
-				delete entry.ordinal;
-				return entry;
+		let target: SessionManager | undefined;
+		try {
+			target = await SessionManager.create(targetCwd, sessionDir, {
+				...options,
+				parentSession: sourceRef,
 			});
-		await target.appendAtomically(
-			() => {
-				for (const entry of entries) target._appendEntry(entry);
-			},
-			() => {},
-		);
+			const sourceById = source.byId;
+			const nearestPublicParent = (parentId: string | null): string | null => {
+				let currentId = parentId;
+				while (currentId) {
+					const current = sourceById.get(currentId);
+					if (!current) return null;
+					if (!isHostOnlySessionEntry(current)) return current.id;
+					currentId = current.parentId;
+				}
+				return null;
+			};
+			const entries = source
+				.getEntries()
+				.map((entry) => withoutClientInputIdentity({ ...entry, parentId: nearestPublicParent(entry.parentId) }))
+				.map((entry) => {
+					delete entry.ordinal;
+					return entry;
+				});
+			await target.appendAtomically(
+				() => {
+					for (const entry of entries) target!._appendEntry(entry);
+				},
+				() => {},
+			);
+		} catch (error) {
+			const cleanupErrors: unknown[] = [];
+			if (target) {
+				try {
+					await target.closePersistence();
+				} catch (closeError) {
+					cleanupErrors.push(closeError);
+				}
+			}
+			try {
+				await source.closePersistence();
+			} catch (closeError) {
+				cleanupErrors.push(closeError);
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Session fork failed and cleanup did not complete");
+			}
+			throw error;
+		}
+		try {
+			await source.closePersistence();
+		} catch (error) {
+			try {
+				await target.closePersistence();
+			} catch (closeError) {
+				throw new AggregateError(
+					[error, closeError],
+					"Session fork source and unreturned target could not be closed",
+				);
+			}
+			throw error;
+		}
 		return target;
 	}
 
@@ -4090,14 +4273,15 @@ export class SessionManager {
 		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		const store = await SessionManager._store(dir);
-		const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
-		const summaries = await store.listSessionSummaries({
-			includeHidden: options?.includeMessageFreeDurable,
-			...(filterCwd ? { cwd: resolvePath(cwd) } : {}),
+		return SessionManager._scopedStore(dir, async (store) => {
+			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
+			const summaries = await store.listSessionSummaries({
+				includeHidden: options?.includeMessageFreeDurable,
+				...(filterCwd ? { cwd: resolvePath(cwd) } : {}),
+			});
+			onProgress?.(summaries.length, summaries.length);
+			return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
 		});
-		onProgress?.(summaries.length, summaries.length);
-		return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
 	}
 
 	static async search(
@@ -4107,21 +4291,23 @@ export class SessionManager {
 		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		const store = await SessionManager._store(dir);
-		const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
-		const summaries = await store.searchSessionSummaries(query, {
-			includeHidden: options?.includeMessageFreeDurable,
-			...(filterCwd ? { cwd: resolvePath(cwd) } : {}),
+		return SessionManager._scopedStore(dir, async (store) => {
+			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
+			const summaries = await store.searchSessionSummaries(query, {
+				includeHidden: options?.includeMessageFreeDurable,
+				...(filterCwd ? { cwd: resolvePath(cwd) } : {}),
+			});
+			return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
 		});
-		return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
 	}
 
 	static async searchAll(query: string, sessionDir?: string): Promise<SessionInfo[]> {
 		if (sessionDir) {
 			const dir = normalizePath(sessionDir);
-			const store = await SessionManager._store(dir);
-			const summaries = await store.searchSessionSummaries(query);
-			return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
+			return SessionManager._scopedStore(dir, async (store) => {
+				const summaries = await store.searchSessionSummaries(query);
+				return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
+			});
 		}
 		const sessionsRoot = getSessionsDir();
 		if (!existsSync(sessionsRoot)) return [];
@@ -4136,10 +4322,11 @@ export class SessionManager {
 			) {
 				continue;
 			}
-			const store = await SessionManager._store(directory);
-			const summaries = await store.searchSessionSummaries(query);
 			result.push(
-				...summaries.map((summary) => sessionInfoFromStoreSummary(directory, store.info.storeId, summary)),
+				...(await SessionManager._scopedStore(directory, async (store) => {
+					const summaries = await store.searchSessionSummaries(query);
+					return summaries.map((summary) => sessionInfoFromStoreSummary(directory, store.info.storeId, summary));
+				})),
 			);
 		}
 		return result.sort((left, right) => right.modified.getTime() - left.modified.getTime());
@@ -4147,56 +4334,69 @@ export class SessionManager {
 
 	static async exportJsonlSnapshot(ref: SessionReference, outputPath: string): Promise<{ revision: number }> {
 		const manager = await SessionManager.open(ref);
-		const header = manager.getHeader();
-		if (!header) throw new Error("Cannot export a session without a header");
-		const snapshotHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: header.id,
-			timestamp: header.timestamp,
-			cwd: header.cwd,
-			snapshotVersion: 1,
-			...(header.parentSession === undefined
-				? {}
-				: {
-						parentSessionDirectory: header.parentSession.sessionDirectory,
-						parentStoreId: header.parentSession.storeId,
-						parentSessionId: header.parentSession.sessionId,
-						parentSessionGeneration: header.parentSession.sessionGeneration,
-					}),
-			...(header.origin === undefined ? {} : { origin: header.origin }),
-		};
-		const entries = manager.getEntries().map(withoutClientInputIdentity);
-		const leaf: LeafEntry = {
-			type: "leaf",
-			id: generateId(new Set(entries.map((entry) => entry.id))),
-			parentId: entries.at(-1)?.id ?? null,
-			timestamp: new Date().toISOString(),
-			targetId: manager.getLeafId(),
-			ordinal: (entries.at(-1)?.ordinal ?? entries.length) + 1,
-		};
-		const content = `${[snapshotHeader, ...entries, leaf].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-		writeDurableAtomicFileSync(resolvePath(outputPath), content, {
-			directoryMode: PRIVATE_DIRECTORY_MODE,
-			fileMode: PRIVATE_FILE_MODE,
-		});
-		return { revision: manager.storeRevision };
+		let result: { revision: number };
+		try {
+			const header = manager.getHeader();
+			if (!header) throw new Error("Cannot export a session without a header");
+			const snapshotHeader = {
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: header.id,
+				timestamp: header.timestamp,
+				cwd: header.cwd,
+				snapshotVersion: 1,
+				...(header.parentSession === undefined
+					? {}
+					: {
+							parentSessionDirectory: header.parentSession.sessionDirectory,
+							parentStoreId: header.parentSession.storeId,
+							parentSessionId: header.parentSession.sessionId,
+							parentSessionGeneration: header.parentSession.sessionGeneration,
+						}),
+				...(header.origin === undefined ? {} : { origin: header.origin }),
+			};
+			const entries = manager.getEntries().map(withoutClientInputIdentity);
+			const leaf: LeafEntry = {
+				type: "leaf",
+				id: generateId(new Set(entries.map((entry) => entry.id))),
+				parentId: entries.at(-1)?.id ?? null,
+				timestamp: new Date().toISOString(),
+				targetId: manager.getLeafId(),
+				ordinal: (entries.at(-1)?.ordinal ?? entries.length) + 1,
+			};
+			const content = `${[snapshotHeader, ...entries, leaf].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+			writeDurableAtomicFileSync(resolvePath(outputPath), content, {
+				directoryMode: PRIVATE_DIRECTORY_MODE,
+				fileMode: PRIVATE_FILE_MODE,
+			});
+			result = { revision: manager.storeRevision };
+		} catch (error) {
+			try {
+				await manager.closePersistence();
+			} catch (closeError) {
+				throw new AggregateError([error, closeError], "Session export failed and its manager could not be closed");
+			}
+			throw error;
+		}
+		await manager.closePersistence();
+		return result;
 	}
 
 	static async delete(ref: SessionReference, expectedRevision?: number): Promise<boolean> {
-		const store = await SessionManager._store(ref.sessionDirectory);
-		if (store.info.storeId !== ref.storeId) throw new Error("Session reference belongs to a different store");
-		const summary = await store.findSessionSummary(ref.sessionId, ref.sessionGeneration);
-		if (!summary) return false;
-		const result = await store.deleteSession({
-			sessionId: ref.sessionId,
-			sessionGeneration: ref.sessionGeneration,
-			expectedRevision: expectedRevision ?? summary.revision,
+		return SessionManager._scopedStore(ref.sessionDirectory, async (store) => {
+			if (store.info.storeId !== ref.storeId) throw new Error("Session reference belongs to a different store");
+			const summary = await store.findSessionSummary(ref.sessionId, ref.sessionGeneration);
+			if (!summary) return false;
+			const result = await store.deleteSession({
+				sessionId: ref.sessionId,
+				sessionGeneration: ref.sessionGeneration,
+				expectedRevision: expectedRevision ?? summary.revision,
+			});
+			if (result.status === "conflict") {
+				throw new Error(`Session changed before deletion (revision ${result.actualRevision})`);
+			}
+			return result.status === "deleted";
 		});
-		if (result.status === "conflict") {
-			throw new Error(`Session changed before deletion (revision ${result.actualRevision})`);
-		}
-		return result.status === "deleted";
 	}
 
 	static async listAll(onProgress?: SessionListProgress, options?: SessionListOptions): Promise<SessionInfo[]>;
@@ -4224,12 +4424,13 @@ export class SessionManager {
 					? onProgressOrOptions
 					: options;
 		if (customDir) {
-			const store = await SessionManager._store(customDir);
-			const summaries = await store.listSessionSummaries({
-				includeHidden: listOptions?.includeMessageFreeDurable,
+			return SessionManager._scopedStore(customDir, async (store) => {
+				const summaries = await store.listSessionSummaries({
+					includeHidden: listOptions?.includeMessageFreeDurable,
+				});
+				progress?.(summaries.length, summaries.length);
+				return summaries.map((summary) => sessionInfoFromStoreSummary(customDir, store.info.storeId, summary));
 			});
-			progress?.(summaries.length, summaries.length);
-			return summaries.map((summary) => sessionInfoFromStoreSummary(customDir, store.info.storeId, summary));
 		}
 
 		const sessionsRoot = getSessionsDir();
@@ -4248,12 +4449,13 @@ export class SessionManager {
 				progress?.(loaded, directories.length);
 				continue;
 			}
-			const store = await SessionManager._store(directory);
-			const summaries = await store.listSessionSummaries({
-				includeHidden: listOptions?.includeMessageFreeDurable,
-			});
 			result.push(
-				...summaries.map((summary) => sessionInfoFromStoreSummary(directory, store.info.storeId, summary)),
+				...(await SessionManager._scopedStore(directory, async (store) => {
+					const summaries = await store.listSessionSummaries({
+						includeHidden: listOptions?.includeMessageFreeDurable,
+					});
+					return summaries.map((summary) => sessionInfoFromStoreSummary(directory, store.info.storeId, summary));
+				})),
 			);
 			loaded += 1;
 			progress?.(loaded, directories.length);

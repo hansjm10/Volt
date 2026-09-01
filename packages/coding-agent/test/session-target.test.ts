@@ -10,6 +10,7 @@ import {
 	resolveIrohRemoteSessionTarget,
 	type SessionTargetSessionStore,
 } from "../src/daemon/session-target.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 interface FakeHandle {
 	getSessionId(): string;
@@ -178,6 +179,8 @@ describe("resolveIrohRemoteSessionTarget", () => {
 
 	it("strictly resumes selector-hidden WAL-only SQLite sessions", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-session-target-wal-"));
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
 			const manager = await SessionManager.create(tempDir, tempDir, { id: "wal-only-resume" });
 			manager.reserveClientInput("handled-terminal", "prompt", { message: "/handled" });
@@ -201,6 +204,7 @@ describe("resolveIrohRemoteSessionTarget", () => {
 			expect(resumed.sessionRef).toEqual(managerRef);
 			expect(resumed.sessionManager.getClientInput("handled-terminal")?.state).toBe("completed");
 		} finally {
+			await managerOwner.drain();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

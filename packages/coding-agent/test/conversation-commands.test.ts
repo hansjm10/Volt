@@ -28,6 +28,7 @@ import {
 	type RemoteSessionRuntimeState,
 	TURN_INITIATING_RPC_TYPES,
 } from "../src/daemon/conversation-commands.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 import { loadPersistedSessionSnapshot } from "./utilities.ts";
 
 const STARTING_GIT_CONTEXT: RpcGitContext = {
@@ -553,6 +554,8 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		const sessionDir = join(root, "sessions");
 		mkdirSync(workspacePath, { recursive: true });
 		mkdirSync(sessionDir, { recursive: true });
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
 			const manager = await SessionManager.create(workspacePath, sessionDir);
 			manager.reserveClientInput("client-message-42", "prompt", {
@@ -589,6 +592,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			const persisted = await loadPersistedSessionSnapshot(manager);
 			expect(JSON.stringify(persisted.entries)).toContain('"clientMessageId":"client-message-42"');
 		} finally {
+			await managerOwner.drain();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -1428,6 +1432,8 @@ describe("handleIntegratedConversationRpcCommand", () => {
 
 	it("includes parent workspace sessions when the active runtime cwd is a subfolder", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-conversation-list-"));
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
 			const workspacePath = join(tempDir, "repo");
 			const subfolderPath = join(workspacePath, "packages", "app");
@@ -1463,6 +1469,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			expect(bySessionId.get("s-root")).toBeDefined();
 			expect(bySessionId.get("s-subfolder")?.workingDirectory).toBe("packages/app");
 		} finally {
+			await managerOwner.drain();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

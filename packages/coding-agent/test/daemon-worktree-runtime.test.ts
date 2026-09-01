@@ -18,6 +18,7 @@ import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manage
 import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
 import { createConversationOpenError, IntegratedRuntimeRegistry } from "../src/daemon/integrated-runtimes.ts";
 import { createTestSession } from "./iroh-stream-doubles.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const realpathSync = nodeRealpathSync.native;
 
@@ -596,6 +597,8 @@ describe("worktree session-dir keying (§5.1.7 filterCwd pin)", () => {
 	it("a session with a worktree cwd in the parent session dir stays visible in the parent listing", async () => {
 		const agentDir = realpathSync(mkdtempSync(join(tmpdir(), "volt-worktree-sessiondir-")));
 		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
 			// The daemon always uses the env-aware agent dir; pin that setup here so
 			// SessionManager.list's filterCwd stays OFF for the parent's default dir.
@@ -620,6 +623,7 @@ describe("worktree session-dir keying (§5.1.7 filterCwd pin)", () => {
 			expect(ids).toContain("s-worktree");
 			expect(ids).toContain("s-parent");
 		} finally {
+			await managerOwner.drain();
 			if (originalAgentDir === undefined) {
 				delete process.env[ENV_AGENT_DIR];
 			} else {

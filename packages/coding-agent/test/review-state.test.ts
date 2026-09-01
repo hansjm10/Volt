@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ParsedReview, ReviewFinding } from "../src/core/review-report.ts";
 import type { ReviewSnapshot } from "../src/core/review-snapshot.ts";
 import {
@@ -24,6 +24,7 @@ import {
 	restoreReviewStateFromHandoff,
 } from "../src/core/review-state.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
 	return {
@@ -219,8 +220,12 @@ function prSnapshot(
 
 describe("durable review state", () => {
 	const directories: string[] = [];
+	const managerOwner = createSessionManagerTestOwner();
 
-	afterEach(() => {
+	beforeEach(() => managerOwner.start());
+
+	afterEach(async () => {
+		await managerOwner.drain();
 		for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 	});
 

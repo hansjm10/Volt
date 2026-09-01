@@ -1037,7 +1037,8 @@ describe("worktree manager (fake git)", () => {
 	});
 
 	async function createStoredSession(sessionDir: string, id: string, cwd: string): Promise<void> {
-		await SessionManager.create(cwd, sessionDir, { id });
+		const manager = await SessionManager.create(cwd, sessionDir, { id });
+		await manager.closePersistence();
 	}
 
 	it("resolveSessionWorktree heals a stranded binding from the session's stored cwd (#83)", async () => {

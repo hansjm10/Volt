@@ -2,10 +2,20 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_SESSION_VERSION, SessionManager } from "../../src/core/session-manager.ts";
+import { acquireSharedSQLiteSessionStore, type SQLiteSessionStoreLease } from "../../src/core/session-store/index.ts";
+import { createHarness } from "../suite/harness.ts";
 
 const roots: string[] = [];
+const managers: SessionManager[] = [];
+const storeLeases: SQLiteSessionStoreLease[] = [];
+
+async function own(manager: Promise<SessionManager>): Promise<SessionManager> {
+	const resolved = await manager;
+	managers.push(resolved);
+	return resolved;
+}
 
 function fixture(): { root: string; cwd: string; sessionDir: string } {
 	const root = mkdtempSync(join(tmpdir(), "volt-session-manager-sqlite-"));
@@ -16,14 +26,17 @@ function fixture(): { root: string; cwd: string; sessionDir: string } {
 	return { root, cwd, sessionDir };
 }
 
-afterEach(() => {
+afterEach(async () => {
+	for (const manager of managers.splice(0)) await manager.drainPersistence();
+	vi.restoreAllMocks();
+	for (const lease of storeLeases.splice(0)) await lease.release();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("SQLite-backed SessionManager", () => {
 	it("keeps new sessions hidden until visible content and reopens by stable reference", async () => {
 		const { cwd, sessionDir } = fixture();
-		const manager = await SessionManager.create(cwd, sessionDir);
+		const manager = await own(SessionManager.create(cwd, sessionDir));
 		const ref = manager.getSessionRef();
 		expect(ref).toBeDefined();
 		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
@@ -38,13 +51,13 @@ describe("SQLite-backed SessionManager", () => {
 		expect(listed).toMatchObject([{ id: manager.getSessionId(), firstMessage: "hello sqlite", messageCount: 1 }]);
 		expect(listed[0]?.ref).toEqual(ref);
 
-		const reopened = await SessionManager.open(ref!);
+		const reopened = await own(SessionManager.open(ref!));
 		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "hello sqlite" }]);
 	});
 
 	it("searches indexed history beyond the first message without loading transcript payloads", async () => {
 		const { cwd, sessionDir } = fixture();
-		const manager = await SessionManager.create(cwd, sessionDir);
+		const manager = await own(SessionManager.create(cwd, sessionDir));
 		manager.appendMessage({ role: "user", content: "first message", timestamp: Date.now() });
 		manager.appendCustomEntry("large-private-payload", { payload: "x".repeat(128 * 1024) });
 		manager.appendMessage({ role: "user", content: "deep-only-needle", timestamp: Date.now() + 1 });
@@ -56,13 +69,13 @@ describe("SQLite-backed SessionManager", () => {
 
 	it("fails stale managers closed after delete and same-id recreation", async () => {
 		const { cwd, sessionDir } = fixture();
-		const original = await SessionManager.create(cwd, sessionDir, { id: "reused-id" });
+		const original = await own(SessionManager.create(cwd, sessionDir, { id: "reused-id" }));
 		original.appendMessage({ role: "user", content: "original", timestamp: Date.now() });
 		await original.flush();
 		const originalRef = original.getSessionRef()!;
 		expect(await SessionManager.delete(originalRef, 1)).toBe(true);
 
-		const replacement = await SessionManager.create(cwd, sessionDir, { id: "reused-id" });
+		const replacement = await own(SessionManager.create(cwd, sessionDir, { id: "reused-id" }));
 		expect(replacement.getSessionRef()?.sessionGeneration).not.toBe(originalRef.sessionGeneration);
 		original.appendSessionInfo("stale write");
 		await expect(original.flush()).rejects.toThrow(/ambiguous|reconcil/i);
@@ -72,20 +85,93 @@ describe("SQLite-backed SessionManager", () => {
 	it("preserves complete parent references across stores", async () => {
 		const first = fixture();
 		const second = fixture();
-		const parent = await SessionManager.create(first.cwd, first.sessionDir);
+		const parent = await own(SessionManager.create(first.cwd, first.sessionDir));
 		parent.appendMessage({ role: "user", content: "parent", timestamp: Date.now() });
 		await parent.flush();
-		const child = await SessionManager.forkFrom(parent.getSessionRef()!, second.cwd, second.sessionDir);
+		const child = await own(SessionManager.forkFrom(parent.getSessionRef()!, second.cwd, second.sessionDir));
 		const childInfo = (await SessionManager.list(second.cwd, second.sessionDir))[0]!;
 		expect(childInfo.parentSessionRef).toEqual(parent.getSessionRef());
-		await expect(SessionManager.open(childInfo.parentSessionRef!)).resolves.toBeInstanceOf(SessionManager);
+		const reopenedParent = await own(SessionManager.open(childInfo.parentSessionRef!));
+		expect(reopenedParent).toBeInstanceOf(SessionManager);
 		expect(child.getSessionId()).toBe(childInfo.id);
 
 		const snapshotPath = join(second.root, "child-snapshot.jsonl");
 		const snapshot = await SessionManager.exportJsonlSnapshot(childInfo.ref, snapshotPath);
 		expect(await SessionManager.delete(childInfo.ref, snapshot.revision)).toBe(true);
-		const restored = await SessionManager.importFromJsonl(snapshotPath, second.cwd, second.sessionDir);
+		const restored = await own(SessionManager.importFromJsonl(snapshotPath, second.cwd, second.sessionDir));
 		expect(restored.getHeader()?.parentSession).toEqual(parent.getSessionRef());
+	});
+
+	it("keeps another manager usable when reconciliation replaces a same-store lease", async () => {
+		const { cwd, sessionDir } = fixture();
+		const first = await own(SessionManager.create(cwd, sessionDir));
+		const second = await own(SessionManager.open(first.getSessionRef()!));
+		const faultLease = await acquireSharedSQLiteSessionStore(sessionDir);
+		storeLeases.push(faultLease);
+		vi.spyOn(faultLease.client, "applyTransaction").mockRejectedValueOnce(
+			new Error("injected pre-commit response failure"),
+		);
+
+		first.appendSessionInfo("rolled back");
+		await expect(first.flush()).rejects.toThrow("transaction was rolled back");
+		second.appendSessionInfo("surviving owner");
+		await second.flush();
+		expect(second.getSessionName()).toBe("surviving owner");
+	});
+
+	it("releases a replacement lease installed while shutdown awaits reconciliation", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		const faultLease = await acquireSharedSQLiteSessionStore(sessionDir);
+		storeLeases.push(faultLease);
+		const close = vi.spyOn(faultLease.client, "close");
+		vi.spyOn(faultLease.client, "applyTransaction").mockRejectedValueOnce(
+			new Error("injected pre-commit response failure"),
+		);
+
+		manager.appendSessionInfo("rolled back during shutdown");
+		await expect(manager.drainPersistence()).resolves.toMatchObject({ status: "reconciliation_required" });
+		await faultLease.release();
+		expect(close).toHaveBeenCalledOnce();
+	});
+
+	it("shares one idempotent shutdown drain and seals writes synchronously", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		manager.appendSessionInfo("before close");
+
+		const firstDrain = manager.drainPersistence();
+		expect(manager.drainPersistence()).toBe(firstDrain);
+		expect(() => manager.appendSessionInfo("after close")).toThrow("Session persistence is closed");
+		expect(() => manager.newSession()).toThrow("Session persistence is closed");
+		await expect(firstDrain).resolves.toEqual({ status: "closed" });
+		await expect(manager.closePersistence()).resolves.toBeUndefined();
+	});
+
+	it("keeps another manager usable and permits immediate deletion after the final close", async () => {
+		const { root, cwd, sessionDir } = fixture();
+		const first = await own(SessionManager.create(cwd, sessionDir));
+		first.appendMessage({ role: "user", content: "shared owner", timestamp: Date.now() });
+		await first.flush();
+		const second = await own(SessionManager.open(first.getSessionRef()!));
+
+		await first.closePersistence();
+		second.appendSessionInfo("still open");
+		await second.flush();
+		await second.closePersistence();
+
+		rmSync(root, { recursive: true });
+		roots.splice(roots.indexOf(root), 1);
+	});
+
+	it("releases the final manager when awaited AgentSession shutdown completes", async () => {
+		const { root, cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		const harness = await createHarness({ sessionManager: manager });
+
+		await harness.cleanupAsync();
+		rmSync(root, { recursive: true });
+		roots.splice(roots.indexOf(root), 1);
 	});
 
 	it("rejects cyclic imported entry parents without retaining a hidden row", async () => {
@@ -139,7 +225,7 @@ describe("SQLite-backed SessionManager", () => {
 
 		const sessions = await SessionManager.list(cwd, sessionDir);
 		expect(sessions).toMatchObject([{ id: sessionId, firstMessage: "legacy history" }]);
-		expect(await SessionManager.open(sessions[0]!.ref)).toBeInstanceOf(SessionManager);
+		expect(await own(SessionManager.open(sessions[0]!.ref))).toBeInstanceOf(SessionManager);
 		await expect(readdir(join(sessionDir, "legacy-jsonl"))).resolves.toHaveLength(1);
 	});
 });

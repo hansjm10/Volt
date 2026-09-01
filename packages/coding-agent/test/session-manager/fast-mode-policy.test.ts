@@ -1,10 +1,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildSessionContext, SessionManager } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 const tempDirs: string[] = [];
+const managerOwner = createSessionManagerTestOwner();
 
 function createTempDir(): string {
 	const dir = mkdtempSync(join(tmpdir(), "volt-fast-mode-policy-"));
@@ -12,8 +14,11 @@ function createTempDir(): string {
 	return dir;
 }
 
-afterEach(() => {
+beforeEach(() => managerOwner.start());
+
+afterEach(async () => {
 	vi.unstubAllEnvs();
+	await managerOwner.drain();
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 

@@ -3,6 +3,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
 import { type CustomEntry, SessionManager } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 import { assistantMsg, userMsg } from "../utilities.ts";
 
 describe("SessionManager append and tree traversal", () => {
@@ -464,6 +465,8 @@ describe("createBranchedSession", () => {
 	it("does not duplicate entries when branching from the first user message", async () => {
 		const tempDir = join(tmpdir(), `session-fork-dedup-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 
 		try {
 			const session = await SessionManager.create(tempDir, tempDir);
@@ -483,6 +486,7 @@ describe("createBranchedSession", () => {
 			expect(new Set(entryIds).size).toBe(entryIds.length);
 			expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user" }, { role: "assistant" }]);
 		} finally {
+			await managerOwner.drain();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -490,6 +494,8 @@ describe("createBranchedSession", () => {
 	it("materializes a branch containing assistant messages", async () => {
 		const tempDir = join(tmpdir(), `session-fork-with-assistant-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 
 		try {
 			const session = await SessionManager.create(tempDir, tempDir);
@@ -506,6 +512,7 @@ describe("createBranchedSession", () => {
 			expect(reopened.getEntries().map((entry) => entry.id)).toEqual([id1, id2]);
 			expect(reopened.buildSessionContext().messages).toHaveLength(2);
 		} finally {
+			await managerOwner.drain();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

@@ -17,7 +17,7 @@ import { convertToLlm } from "../src/core/messages.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import type { ResourceLoader } from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import { getSharedSQLiteSessionStore, type SessionStoreSnapshot } from "../src/core/session-store/index.ts";
+import { acquireSharedSQLiteSessionStore, type SessionStoreSnapshot } from "../src/core/session-store/index.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createCodingTools } from "../src/index.ts";
 
@@ -202,7 +202,7 @@ export interface TestSessionContext {
 	session: AgentSession;
 	sessionManager: SessionManager;
 	tempDir: string;
-	cleanup: () => void;
+	cleanup: () => Promise<void>;
 }
 
 export interface CreateTestExtensionsResultInput {
@@ -301,8 +301,9 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
 		// Must subscribe to enable session persistence
 		session.subscribe(() => {});
 
-		const cleanup = () => {
+		const cleanup = async () => {
 			session.dispose();
+			await session.waitForClosed();
 			if (tempDir && existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true });
 			}
@@ -317,10 +318,14 @@ export function createTestSession(options: TestSessionOptions = {}): TestSession
 export async function loadPersistedSessionSnapshot(manager: SessionManager): Promise<SessionStoreSnapshot> {
 	const ref = manager.getSessionRef();
 	if (!ref) throw new Error("Expected a persisted session reference");
-	const store = await getSharedSQLiteSessionStore(ref.sessionDirectory);
-	const snapshot = await store.loadSession(ref.sessionId, ref.sessionGeneration);
-	if (!snapshot) throw new Error(`Expected persisted session ${ref.sessionId}`);
-	return snapshot;
+	const lease = await acquireSharedSQLiteSessionStore(ref.sessionDirectory);
+	try {
+		const snapshot = await lease.client.loadSession(ref.sessionId, ref.sessionGeneration);
+		if (!snapshot) throw new Error(`Expected persisted session ${ref.sessionId}`);
+		return snapshot;
+	} finally {
+		await lease.release();
+	}
 }
 
 /**

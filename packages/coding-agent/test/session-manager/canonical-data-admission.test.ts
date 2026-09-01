@@ -1,10 +1,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager, type SessionReference } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 const cleanups: Array<{ manager: SessionManager; root: string }> = [];
+const managerOwner = createSessionManagerTestOwner();
 
 async function createManager(): Promise<{ manager: SessionManager; root: string; ref: SessionReference }> {
 	const root = mkdtempSync(join(tmpdir(), "volt-canonical-session-"));
@@ -15,11 +17,11 @@ async function createManager(): Promise<{ manager: SessionManager; root: string;
 	return { manager, root, ref };
 }
 
+beforeEach(() => managerOwner.start());
+
 afterEach(async () => {
-	for (const { manager, root } of cleanups.splice(0)) {
-		await manager.flush().catch(() => undefined);
-		rmSync(root, { recursive: true, force: true });
-	}
+	await managerOwner.drain();
+	for (const { root } of cleanups.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("SessionManager canonical data admission", () => {

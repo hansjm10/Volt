@@ -18,8 +18,10 @@ import {
 	type SessionReference,
 } from "../../../src/core/session-manager.ts";
 import {
-	getSharedSQLiteSessionStore,
+	acquireSharedSQLiteSessionStore,
 	type SessionStoreTransactionResult,
+	type SQLiteSessionStoreClient,
+	type SQLiteSessionStoreLease,
 } from "../../../src/core/session-store/index.ts";
 import type { BashOperations } from "../../../src/core/tools/bash.ts";
 import type { ExtensionAPI } from "../../../src/index.ts";
@@ -32,6 +34,21 @@ import {
 	type Harness,
 	type HarnessOptions,
 } from "../harness.ts";
+
+const managers: SessionManager[] = [];
+const storeLeases: SQLiteSessionStoreLease[] = [];
+
+async function own(manager: Promise<SessionManager>): Promise<SessionManager> {
+	const resolved = await manager;
+	managers.push(resolved);
+	return resolved;
+}
+
+async function trackedStore(sessionDirectory: string): Promise<SQLiteSessionStoreClient> {
+	const lease = await acquireSharedSQLiteSessionStore(sessionDirectory);
+	storeLeases.push(lease);
+	return lease.client;
+}
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
 	let resolve = (): void => undefined;
@@ -109,7 +126,7 @@ async function faultNextPlanningTransaction(
 	mode: TransactionFaultMode,
 	pause?: { started(): void; release: Promise<void> },
 ): Promise<TransactionFaultEvidence> {
-	const store = await getSharedSQLiteSessionStore(manager.getSessionDir());
+	const store = await trackedStore(manager.getSessionDir());
 	const applyTransaction = store.applyTransaction.bind(store);
 	const reconcileCommit = store.reconcileCommit.bind(store);
 	const evidence: TransactionFaultEvidence = { reconcileCalls: 0 };
@@ -149,20 +166,16 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 	const tempDirs: string[] = [];
 
 	afterEach(async () => {
-		while (runtimeCleanups.length > 0) {
-			await runtimeCleanups.pop()?.();
-		}
-		while (harnesses.length > 0) {
-			const harness = harnesses.pop()!;
-			harness.session.dispose();
-			await harness.session.waitForClosed().catch(() => {});
-			harness.faux.unregister();
-			rmSync(harness.tempDir, { recursive: true, force: true });
-		}
-		while (tempDirs.length > 0) {
-			rmSync(tempDirs.pop()!, { recursive: true, force: true });
-		}
+		while (runtimeCleanups.length > 0) await runtimeCleanups.pop()?.();
+		while (harnesses.length > 0)
+			await harnesses
+				.pop()!
+				.cleanupAsync()
+				.catch(() => {});
+		while (managers.length > 0) await managers.pop()!.drainPersistence();
 		vi.restoreAllMocks();
+		while (storeLeases.length > 0) await storeLeases.pop()!.release();
+		while (tempDirs.length > 0) rmSync(tempDirs.pop()!, { recursive: true, force: true });
 	});
 
 	async function setupRuntime(replacementHook: () => void = () => {}): Promise<{
@@ -223,7 +236,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: await SessionManager.create(tempDir, join(tempDir, "sessions")),
+			sessionManager: await own(SessionManager.create(tempDir, join(tempDir, "sessions"))),
 		});
 		await runtime.session.bindExtensions({});
 		runtimeCleanups.push(async () => {
@@ -265,7 +278,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 	}> {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-"));
 		tempDirs.push(tempDir);
-		const sessionManager = await SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const sessionManager = await own(SessionManager.create(tempDir, join(tempDir, "sessions")));
 		const harness = await createHarness({ ...options, sessionManager });
 		harnesses.push(harness);
 		await createReadyPlan(harness);
@@ -323,15 +336,15 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 	it("rejects a stale manager at the revision boundary without changing the committed winner", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-stale-manager-"));
 		tempDirs.push(tempDir);
-		const current = await SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const current = await own(SessionManager.create(tempDir, join(tempDir, "sessions")));
 		current.appendPlanningState({ mode: "build", plan: null });
 		await current.flush();
 		const sessionRef = current.getSessionRef()!;
-		const stale = await SessionManager.open(sessionRef, tempDir);
+		const stale = await own(SessionManager.open(sessionRef, tempDir));
 
 		current.appendPlanningState({ mode: "plan", plan: null });
 		await current.flush();
-		const store = await getSharedSQLiteSessionStore(sessionRef.sessionDirectory);
+		const store = await trackedStore(sessionRef.sessionDirectory);
 		const winner = await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration);
 
 		await expect(commitPlanningState(stale, "build")).rejects.toMatchObject({
@@ -346,7 +359,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		expect(stale.getConversationAuthorityStatus().status).toBe("reconciliation_required");
 		expect(() => stale.getEntries()).toThrow(SessionConversationStateUnavailableError);
 		await expect(stale.drainPersistence()).resolves.toMatchObject({ status: "reconciliation_required" });
-		expect((await SessionManager.open(sessionRef, tempDir)).buildSessionContext().planning).toEqual({
+		expect((await own(SessionManager.open(sessionRef, tempDir))).buildSessionContext().planning).toEqual({
 			mode: "plan",
 			plan: null,
 		});
@@ -365,10 +378,10 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		});
 
 		expect(snapshotHarness(harness)).toEqual(baseline);
-		const reopened = await SessionManager.open(sessionRef);
+		const reopened = await own(SessionManager.open(sessionRef));
 		expect(snapshotEntries(reopened.getBranch())).toEqual(baseline);
 		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
-		const summary = await (await getSharedSQLiteSessionStore(sessionRef.sessionDirectory)).findSessionSummary(
+		const summary = await (await trackedStore(sessionRef.sessionDirectory)).findSessionSummary(
 			sessionRef.sessionId,
 			sessionRef.sessionGeneration,
 		);
@@ -397,7 +410,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 			userTexts: ["publish the reconciled commit"],
 		};
 		expect(snapshotHarness(harness)).toEqual(expected);
-		const reopened = await SessionManager.open(sessionRef);
+		const reopened = await own(SessionManager.open(sessionRef));
 		expect(snapshotEntries(reopened.getBranch())).toEqual(expected);
 		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
 		expect(evidence.applyResult).toMatchObject({ status: "committed" });
@@ -407,7 +420,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 			beforeRevision: evidence.expectedRevision,
 			afterRevision: (evidence.expectedRevision ?? Number.NaN) + 1,
 		});
-		const summary = await (await getSharedSQLiteSessionStore(sessionRef.sessionDirectory)).findSessionSummary(
+		const summary = await (await trackedStore(sessionRef.sessionDirectory)).findSessionSummary(
 			sessionRef.sessionId,
 			sessionRef.sessionGeneration,
 		);
@@ -460,10 +473,10 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		await harness.session.steer("recover from the authoritative revision", undefined, clientMessageId);
 		await harness.sessionManager.flush();
 
-		const current = await SessionManager.open(sessionRef);
+		const current = await own(SessionManager.open(sessionRef));
 		current.appendSessionInfo("newer manager generation");
 		await current.flush();
-		const store = await getSharedSQLiteSessionStore(sessionRef.sessionDirectory);
+		const store = await trackedStore(sessionRef.sessionDirectory);
 		const winnerRevision = (await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration))
 			?.revision;
 
@@ -479,7 +492,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		expect(harness.control.hasPendingPrompt()).toBe(false);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
-		const reopened = await SessionManager.open(sessionRef);
+		const reopened = await own(SessionManager.open(sessionRef));
 		expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "accepted" });
 		expect(reopened.getClientInputRecoveryPlan()).toMatchObject({
 			kind: "replay",
@@ -606,7 +619,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 			expect(harness.getPendingResponseCount()).toBe(1);
 			expect(harness.sessionManager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
 			expect(evidence.reconcileCalls).toBe(1);
-			const store = await getSharedSQLiteSessionStore(sessionRef.sessionDirectory);
+			const store = await trackedStore(sessionRef.sessionDirectory);
 			const summary = await store.findSessionSummary(sessionRef.sessionId, sessionRef.sessionGeneration);
 			expect(summary?.revision).toBe(
 				authoritativeOutcome === "committed"
@@ -622,7 +635,7 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 				status: "reconciliation_required",
 			});
 
-			const reopened = await SessionManager.open(sessionRef);
+			const reopened = await own(SessionManager.open(sessionRef));
 			const replacement = await createHarness({ sessionManager: reopened });
 			harnesses.push(replacement);
 			if (authoritativeOutcome === "committed") {

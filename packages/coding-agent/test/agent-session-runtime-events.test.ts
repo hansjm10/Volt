@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -31,6 +31,7 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../src/index.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -40,16 +41,21 @@ type RecordedSessionEvent =
 
 describe("AgentSessionRuntime session lifecycle events", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
+	const tempDirs: string[] = [];
+	const managerOwner = createSessionManagerTestOwner();
+
+	beforeEach(() => managerOwner.start());
 
 	afterEach(async () => {
-		while (cleanups.length > 0) {
-			await cleanups.pop()?.();
-		}
+		while (cleanups.length > 0) await cleanups.pop()?.();
+		await managerOwner.drain();
+		for (const tempDir of tempDirs.splice(0)) rmSync(tempDir, { recursive: true, force: true });
 	});
 
 	async function createRuntimeHost(extensionFactory: ExtensionFactory) {
 		const tempDir = join(tmpdir(), `volt-runtime-events-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		tempDirs.push(tempDir);
 
 		const faux = registerFauxProvider();
 		faux.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
@@ -94,9 +100,6 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		cleanups.push(async () => {
 			await runtimeHost.dispose();
 			faux.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true, force: true });
-			}
 		});
 
 		return { runtimeHost, faux };

@@ -2,10 +2,10 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	acquireSharedSQLiteSessionStore,
 	digestSessionStoreTransactionPayload,
-	getSharedSQLiteSessionStore,
 	SESSION_STORE_BUSY_TIMEOUT_MS,
 	SESSION_STORE_DATABASE_FILENAME,
 	SESSION_STORE_SCHEMA_VERSION,
@@ -13,6 +13,7 @@ import {
 	type SessionStoreCreateSessionInput,
 	type SessionStoreTransactionPayload,
 	SQLiteSessionStoreClient,
+	type SQLiteSessionStoreLease,
 } from "../../src/core/session-store/index.ts";
 import { SESSION_STORE_SCHEMA_SQL } from "../../src/core/session-store/schema.ts";
 
@@ -25,6 +26,7 @@ function generationFor(id: string): string {
 
 const roots: string[] = [];
 const clients: SQLiteSessionStoreClient[] = [];
+const leases: SQLiteSessionStoreLease[] = [];
 
 function makeSessionDirectory(): string {
 	const root = mkdtempSync(join(tmpdir(), "volt-session-store-"));
@@ -92,6 +94,12 @@ async function openStore(sessionDirectory = makeSessionDirectory()): Promise<SQL
 	return client;
 }
 
+async function acquireStore(sessionDirectory = makeSessionDirectory()): Promise<SQLiteSessionStoreLease> {
+	const lease = await acquireSharedSQLiteSessionStore(sessionDirectory);
+	leases.push(lease);
+	return lease;
+}
+
 function mutateStoreSchema(databasePath: string, sql: string): void {
 	execFileSync(
 		process.execPath,
@@ -107,6 +115,7 @@ function mutateStoreSchema(databasePath: string, sql: string): void {
 }
 
 afterEach(async () => {
+	await Promise.all(leases.splice(0).map((lease) => lease.release()));
 	await Promise.all(clients.splice(0).map((client) => client.close()));
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -136,26 +145,62 @@ describe("SQLite session store", () => {
 		expect(await reopened.listSessionSummaries({ includeHidden: true })).toEqual([]);
 	});
 
-	it("shares one client per resolved directory and evicts closed or failed clients", async () => {
+	it("shares concurrent leases until the idempotent final release and supports fresh reacquisition", async () => {
+		const sessionDirectory = makeSessionDirectory();
+		const [first, same] = await Promise.all([
+			acquireStore(sessionDirectory),
+			acquireStore(resolve(sessionDirectory, ".")),
+		]);
+		expect(same.client).toBe(first.client);
+		const close = vi.spyOn(first.client, "close");
+		const storeId = first.client.info.storeId;
+
+		await first.release();
+		await first.release();
+		expect(close).not.toHaveBeenCalled();
+		expect(await same.client.listSessionSummaries({ includeHidden: true })).toEqual([]);
+
+		await same.release();
+		expect(close).toHaveBeenCalledOnce();
+		const replacement = await acquireStore(sessionDirectory);
+		expect(replacement.client).not.toBe(first.client);
+		expect(replacement.client.info.storeId).toBe(storeId);
+	});
+
+	it("isolates failed initialization from a later lease generation", async () => {
 		const sessionDirectory = makeSessionDirectory();
 		writeFileSync(sessionDirectory, "not a directory", { mode: 0o600 });
-		await expect(getSharedSQLiteSessionStore(sessionDirectory)).rejects.toBeInstanceOf(Error);
+		await expect(acquireSharedSQLiteSessionStore(sessionDirectory)).rejects.toBeInstanceOf(Error);
 		rmSync(sessionDirectory);
 
-		const [first, same] = await Promise.all([
-			getSharedSQLiteSessionStore(sessionDirectory),
-			getSharedSQLiteSessionStore(resolve(sessionDirectory, ".")),
-		]);
-		clients.push(first);
-		expect(same).toBe(first);
-		const storeId = first.info.storeId;
+		const replacement = await acquireStore(sessionDirectory);
+		expect(replacement.client.info.databasePath).toBe(join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME));
+	});
 
-		await first.close();
-		clients.splice(clients.indexOf(first), 1);
-		const replacement = await getSharedSQLiteSessionStore(sessionDirectory);
-		clients.push(replacement);
-		expect(replacement).not.toBe(first);
-		expect(replacement.info.storeId).toBe(storeId);
+	it("replaces a failed pooled client without letting its release close the new generation", async () => {
+		const sessionDirectory = makeSessionDirectory();
+		const failed = await acquireStore(sessionDirectory);
+		const worker = (failed.client as unknown as { worker: { terminate(): Promise<number> } }).worker;
+		await worker.terminate();
+		await vi.waitFor(async () => {
+			await expect(failed.client.listSessionSummaries()).rejects.toMatchObject({ code: "closed" });
+		});
+
+		const replacement = await acquireStore(sessionDirectory);
+		expect(replacement.client).not.toBe(failed.client);
+		await failed.release();
+		expect(await replacement.client.listSessionSummaries({ includeHidden: true })).toEqual([]);
+	});
+
+	it("permits immediate directory deletion after the final release", async () => {
+		const sessionDirectory = makeSessionDirectory();
+		const root = roots.at(-1)!;
+		const lease = await acquireStore(sessionDirectory);
+		await lease.release();
+
+		rmSync(root, { recursive: true });
+		roots.splice(roots.indexOf(root), 1);
+		expect(existsSync(root)).toBe(false);
 	});
 
 	it("creates hidden sessions and loads indexed transaction state", async () => {

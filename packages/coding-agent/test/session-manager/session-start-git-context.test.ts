@@ -2,9 +2,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RpcGitContext } from "../../src/core/rpc/types.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 const STARTING_GIT_CONTEXT: RpcGitContext = {
 	repository: "volt-app",
@@ -51,6 +52,7 @@ function assistantMessage(text: string): Message {
 
 describe("SessionManager starting Git context", () => {
 	const tempDirs: string[] = [];
+	const managerOwner = createSessionManagerTestOwner();
 
 	function makeTempDir(): string {
 		const dir = mkdtempSync(join(tmpdir(), "volt-session-start-git-"));
@@ -58,10 +60,11 @@ describe("SessionManager starting Git context", () => {
 		return dir;
 	}
 
-	afterEach(() => {
-		for (const dir of tempDirs.splice(0)) {
-			rmSync(dir, { recursive: true, force: true });
-		}
+	beforeEach(() => managerOwner.start());
+
+	afterEach(async () => {
+		await managerOwner.drain();
+		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	});
 
 	it("persists only the first observation for a newly created session", async () => {

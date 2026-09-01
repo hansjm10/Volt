@@ -1,5 +1,6 @@
 export { digestSessionStoreTransactionPayload } from "./canonical-json.ts";
-export { getSharedSQLiteSessionStore, SQLiteSessionStoreClient } from "./client.ts";
+export type { SQLiteSessionStoreLease } from "./client.ts";
+export { acquireSharedSQLiteSessionStore, SQLiteSessionStoreClient } from "./client.ts";
 export type {
 	SessionStoreApplyTransactionInput,
 	SessionStoreClientInput,

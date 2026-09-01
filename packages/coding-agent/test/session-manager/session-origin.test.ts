@@ -2,8 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "@hansjm10/volt-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 /** Session files only flush once assistant content exists. */
 function assistantMessage(text: string): Message {
@@ -28,6 +29,7 @@ function assistantMessage(text: string): Message {
 
 describe("SessionManager session origin", () => {
 	const tempDirs: string[] = [];
+	const managerOwner = createSessionManagerTestOwner();
 
 	function makeTempDir(): string {
 		const dir = mkdtempSync(join(tmpdir(), "volt-session-origin-"));
@@ -35,10 +37,11 @@ describe("SessionManager session origin", () => {
 		return dir;
 	}
 
-	afterEach(() => {
-		for (const dir of tempDirs.splice(0)) {
-			rmSync(dir, { recursive: true, force: true });
-		}
+	beforeEach(() => managerOwner.start());
+
+	afterEach(async () => {
+		await managerOwner.drain();
+		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	});
 
 	it("persists the subagent origin in the header and surfaces it through list()", async () => {

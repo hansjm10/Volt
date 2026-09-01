@@ -22,8 +22,8 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 		});
 	});
 
-	afterEach(() => {
-		ctx.cleanup();
+	afterEach(async () => {
+		await ctx.cleanup();
 	});
 
 	it("should navigate to user message and put text in editor", async () => {
@@ -285,8 +285,8 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation - branch scenarios", () 
 		});
 	});
 
-	afterEach(() => {
-		ctx.cleanup();
+	afterEach(async () => {
+		await ctx.cleanup();
 	});
 
 	it("should navigate between branches correctly", async () => {

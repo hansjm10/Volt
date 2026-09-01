@@ -10,7 +10,7 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession, AgentSessionEvent } from "../src/core/agent-session.ts";
 import { AgentSessionRuntime, type CreateAgentSessionRuntimeResult } from "../src/core/agent-session-runtime.ts";
 import type { AgentSessionServices } from "../src/core/agent-session-services.ts";
@@ -52,22 +52,27 @@ import {
 	ManualIrohSendStream,
 	parseWrittenObjects,
 } from "./iroh-stream-doubles.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
+const tempDirs: string[] = [];
+const managerOwner = createSessionManagerTestOwner();
 const HOST_FIXTURE_ROOT = join(tmpdir(), "volt-worktree-tui");
 const HOST_PARENT_PATH = join(HOST_FIXTURE_ROOT, "parent-repo");
 const HOST_AGENT_DIR = join(HOST_FIXTURE_ROOT, ".volt", "agent");
 const HOST_WORKTREE_PATH = join(getWorktreesRoot(HOST_AGENT_DIR), "--repo--", "fix-login");
 
+beforeEach(() => managerOwner.start());
+
 afterEach(async () => {
-	for (const cleanup of cleanups.splice(0)) {
-		await cleanup();
-	}
+	while (cleanups.length > 0) await cleanups.pop()?.();
+	await managerOwner.drain();
+	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function makeTempDir(prefix: string): string {
 	const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
-	cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+	tempDirs.push(dir);
 	return dir;
 }
 

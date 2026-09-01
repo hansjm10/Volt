@@ -1,10 +1,12 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 const cleanups: string[] = [];
+const managerOwner = createSessionManagerTestOwner();
 
 function createTempDir(): string {
 	const root = mkdtempSync(join(tmpdir(), "volt-async-session-"));
@@ -12,7 +14,10 @@ function createTempDir(): string {
 	return root;
 }
 
-afterEach(() => {
+beforeEach(() => managerOwner.start());
+
+afterEach(async () => {
+	await managerOwner.drain();
 	for (const path of cleanups.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 

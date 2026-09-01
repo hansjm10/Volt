@@ -12,12 +12,10 @@ import { initTheme } from "../../../src/core/theme/runtime.ts";
 import { createTestAgentSessionRuntimeConfig, createTestResourceLoader } from "../../utilities.ts";
 
 describe("regression #5596: missing configured theme export", () => {
-	const cleanups: Array<() => void> = [];
+	const cleanups: Array<() => Promise<void>> = [];
 
-	afterEach(() => {
-		while (cleanups.length > 0) {
-			cleanups.pop()?.();
-		}
+	afterEach(async () => {
+		while (cleanups.length > 0) await cleanups.pop()?.();
 		initTheme("dark");
 	});
 
@@ -59,12 +57,11 @@ describe("regression #5596: missing configured theme export", () => {
 			modelRegistry,
 			resourceLoader: createTestResourceLoader(),
 		});
-		cleanups.push(() => {
+		cleanups.push(async () => {
 			session.dispose();
+			await session.waitForClosed();
 			faux.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true, force: true });
-			}
+			if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
 		});
 
 		await session.prompt("hi");

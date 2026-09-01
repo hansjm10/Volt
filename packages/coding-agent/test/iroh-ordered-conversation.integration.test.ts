@@ -280,6 +280,7 @@ async function createFixture(
 				await modePromise;
 			} finally {
 				runtimeHost.conversationProjectionFeed.dispose();
+				await manager.closePersistence();
 				rmSync(root, { recursive: true, force: true });
 			}
 		},
