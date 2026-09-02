@@ -14,6 +14,7 @@ import {
 	type SessionStoreEntry,
 	type SessionStoreEntryWrite,
 	type SessionStoreErrorCode,
+	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
 	type SessionStoreJsonValue,
 	type SessionStoreLabel,
@@ -38,6 +39,7 @@ export interface SessionStoreWorkerData {
 
 export type SessionStoreWorkerOperation =
 	| { readonly kind: "initialize" }
+	| { readonly kind: "verify_foreign_keys" }
 	| { readonly kind: "create_session"; readonly input: SessionStoreCreateSessionInput }
 	| { readonly kind: "load_session"; readonly sessionId: string; readonly sessionGeneration: string }
 	| {
@@ -151,6 +153,12 @@ function safeInteger(value: unknown, path: string, minimum = 0): number {
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) {
 		fail(path, `expected a safe integer greater than or equal to ${minimum}`);
 	}
+	return value;
+}
+
+function nullableSafeInteger(value: unknown, path: string): number | null {
+	if (value === null) return null;
+	if (typeof value !== "number" || !Number.isSafeInteger(value)) fail(path, "expected a safe integer or null");
 	return value;
 }
 
@@ -441,6 +449,7 @@ export function parseSessionStoreWorkerOperation(value: unknown): SessionStoreWo
 	const kind = stringValue(input.kind, "$operation.kind");
 	switch (kind) {
 		case "initialize":
+		case "verify_foreign_keys":
 		case "close":
 			exactKeys(input, "$operation", ["kind"]);
 			return { kind };
@@ -660,6 +669,26 @@ function parseReconciliation(value: unknown, path: string): SessionStoreCommitRe
 	return fail(`${path}.status`, "unsupported reconciliation status");
 }
 
+function parseForeignKeyVerificationResult(value: unknown, path: string): SessionStoreForeignKeyVerificationResult {
+	const input = record(value, path);
+	const status = stringValue(input.status, `${path}.status`);
+	if (status === "valid") {
+		exactKeys(input, path, ["status"]);
+		return { status };
+	}
+	if (status === "violation") {
+		exactKeys(input, path, ["status", "table", "rowId", "parentTable", "constraintIndex"]);
+		return {
+			status,
+			table: nonEmptyString(input.table, `${path}.table`),
+			rowId: nullableSafeInteger(input.rowId, `${path}.rowId`),
+			parentTable: nonEmptyString(input.parentTable, `${path}.parentTable`),
+			constraintIndex: safeInteger(input.constraintIndex, `${path}.constraintIndex`),
+		};
+	}
+	return fail(`${path}.status`, "unsupported foreign-key verification status");
+}
+
 function parseInfo(value: unknown, path: string): SessionStoreInfo {
 	const input = record(value, path);
 	exactKeys(input, path, [
@@ -717,6 +746,7 @@ export function parseSessionStoreOperationResult(
 	value: unknown,
 ):
 	| SessionStoreInfo
+	| SessionStoreForeignKeyVerificationResult
 	| SessionStoreSessionSummary
 	| SessionStoreSessionSummary[]
 	| SessionStoreSearchResult[]
@@ -728,6 +758,8 @@ export function parseSessionStoreOperationResult(
 	switch (kind) {
 		case "initialize":
 			return parseInfo(value, "$result");
+		case "verify_foreign_keys":
+			return parseForeignKeyVerificationResult(value, "$result");
 		case "create_session":
 			return parseSummary(value, "$result");
 		case "load_session":

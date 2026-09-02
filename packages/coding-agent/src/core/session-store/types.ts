@@ -22,6 +22,16 @@ export interface SessionStoreInfo {
 	readonly busyTimeoutMs: number;
 }
 
+export type SessionStoreForeignKeyVerificationResult =
+	| { readonly status: "valid" }
+	| {
+			readonly status: "violation";
+			readonly table: string;
+			readonly rowId: number | null;
+			readonly parentTable: string;
+			readonly constraintIndex: number;
+	  };
+
 export interface SessionStoreCreateSessionInput {
 	readonly id: string;
 	readonly sessionGeneration: string;

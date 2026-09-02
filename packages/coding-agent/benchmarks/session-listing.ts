@@ -3,6 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { SessionManager } from "../src/core/session-manager.ts";
+import {
+	acquireSharedSQLiteSessionStore,
+	type SQLiteSessionStoreLease,
+} from "../src/core/session-store/index.ts";
 
 const sessionCount = Number.parseInt(process.env.VOLT_BENCH_SESSION_COUNT ?? "100", 10);
 const payloadBytes = Number.parseInt(process.env.VOLT_BENCH_SESSION_PAYLOAD_BYTES ?? String(256 * 1024), 10);
@@ -24,27 +28,47 @@ async function measured<T>(name: string, operation: () => Promise<T>): Promise<T
 	return result;
 }
 
+const managers = new Set<SessionManager>();
+let warmLease: SQLiteSessionStoreLease | undefined;
 try {
 	const payload = "x".repeat(payloadBytes);
 	for (let index = 0; index < sessionCount; index += 1) {
 		const manager = await SessionManager.create(cwd, sessionDir);
+		managers.add(manager);
 		manager.appendMessage({ role: "user", content: `session ${index}`, timestamp: Date.now() + index });
 		manager.appendCustomEntry("benchmark-payload", { payload });
 		await manager.flush();
 	}
+	await Promise.all([...managers].map((manager) => manager.closePersistence()));
+	managers.clear();
 
 	const cold = await measured("cold list", () => SessionManager.list(cwd, sessionDir));
-	await measured("warm list", () => SessionManager.list(cwd, sessionDir));
-	await measured("exact lookup + open", async () => {
+	warmLease = await acquireSharedSQLiteSessionStore(sessionDir);
+	try {
+		await measured("warm list", () => SessionManager.list(cwd, sessionDir));
+	} finally {
+		await warmLease.release();
+		warmLease = undefined;
+	}
+
+	const opened = await measured("exact lookup + open", async () => {
 		const ref = await SessionManager.findForResume(sessionDir, cold[Math.floor(cold.length / 2)]!.id);
 		if (!ref) throw new Error("Benchmark session disappeared");
 		return SessionManager.open(ref);
 	});
-	await measured("deep search", () => SessionManager.search(cwd, `session ${sessionCount - 1}`, sessionDir));
+	managers.add(opened);
+	await measured("warm deep search", () => SessionManager.search(cwd, `session ${sessionCount - 1}`, sessionDir));
+	await opened.closePersistence();
+	managers.delete(opened);
 
 	console.log(
 		JSON.stringify({ sessionCount, payloadBytesPerSession: payloadBytes, totalPayloadMiB: (sessionCount * payloadBytes) / 1024 / 1024 }),
 	);
 } finally {
-	rmSync(root, { recursive: true, force: true });
+	try {
+		await warmLease?.release();
+		await Promise.all([...managers].map((manager) => manager.closePersistence()));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 }

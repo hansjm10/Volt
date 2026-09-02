@@ -1,9 +1,14 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_SESSION_VERSION, SessionManager } from "../../src/core/session-manager.ts";
-import { acquireSharedSQLiteSessionStore, type SQLiteSessionStoreLease } from "../../src/core/session-store/index.ts";
+import {
+	acquireSharedSQLiteSessionStore,
+	SESSION_STORE_DATABASE_FILENAME,
+	type SQLiteSessionStoreLease,
+} from "../../src/core/session-store/index.ts";
 import { createHarness } from "../suite/harness.ts";
 
 const roots: string[] = [];
@@ -53,6 +58,40 @@ describe("SQLite-backed SessionManager", () => {
 
 		const reopened = await own(SessionManager.open(ref!));
 		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "hello sqlite" }]);
+	});
+
+	it("lists valid sessions without auditing unrelated foreign-key violations", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		manager.appendMessage({ role: "user", content: "valid session", timestamp: Date.now() });
+		await manager.flush();
+		const sessionId = manager.getSessionId();
+		await manager.closePersistence();
+
+		const db = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME));
+		try {
+			db.exec("PRAGMA foreign_keys = OFF");
+			db.prepare(
+				`INSERT INTO entries (
+					session_id, entry_id, ordinal, parent_entry_id, entry_type, timestamp, is_host_only, payload_json
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run("missing-session", "orphan-entry", 1, null, "message", "2026-09-02T00:00:00.000Z", 0, "{}");
+		} finally {
+			db.close();
+		}
+
+		expect((await SessionManager.list(cwd, sessionDir)).map((session) => session.id)).toEqual([sessionId]);
+		const auditLease = await acquireSharedSQLiteSessionStore(sessionDir);
+		storeLeases.push(auditLease);
+		const audit = await auditLease.client.verifyForeignKeys();
+		expect(audit).toMatchObject({
+			status: "violation",
+			table: "entries",
+			rowId: null,
+			parentTable: "sessions",
+		});
+		if (audit.status !== "violation") throw new Error("Expected a foreign-key violation");
+		expect(Number.isSafeInteger(audit.constraintIndex)).toBe(true);
 	});
 
 	it("searches indexed history beyond the first message without loading transcript payloads", async () => {

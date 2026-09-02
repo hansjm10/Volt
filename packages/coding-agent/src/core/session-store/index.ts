@@ -15,6 +15,7 @@ export type {
 	SessionStoreEntry,
 	SessionStoreEntryWrite,
 	SessionStoreErrorCode,
+	SessionStoreForeignKeyVerificationResult,
 	SessionStoreInfo,
 	SessionStoreJsonPrimitive,
 	SessionStoreJsonValue,

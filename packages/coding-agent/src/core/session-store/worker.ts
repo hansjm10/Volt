@@ -41,6 +41,7 @@ import {
 	type SessionStoreDeleteSessionResult,
 	type SessionStoreEntry,
 	SessionStoreError,
+	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
 	type SessionStoreLabel,
 	type SessionStoreSearchChunk,
@@ -98,6 +99,13 @@ function sqlNullableString(row: Record<string, unknown>, key: string): string | 
 
 function sqlInteger(row: Record<string, unknown>, key: string): number {
 	const value = row[key];
+	if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new Error(`Invalid SQLite ${key} column`);
+	return value;
+}
+
+function sqlNullableInteger(row: Record<string, unknown>, key: string): number | null {
+	const value = row[key];
+	if (value === null) return null;
 	if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new Error(`Invalid SQLite ${key} column`);
 	return value;
 }
@@ -247,10 +255,6 @@ function validateSchema(db: DatabaseSync): void {
 		throw new SessionStoreError("store_schema_mismatch", "Every session store table must use SQLite STRICT mode");
 	}
 
-	if (db.prepare("PRAGMA foreign_key_check").all().length > 0) {
-		throw new SessionStoreError("store_schema_mismatch", "Session store contains foreign key violations");
-	}
-
 	const metadataRows = db.prepare("SELECT key, value_json FROM store_metadata ORDER BY key").all();
 	const metadata = new Map(
 		metadataRows.map((row) => [
@@ -347,6 +351,18 @@ function requireDatabase(): DatabaseSync {
 	if (!database) throw new SessionStoreError("store_initialization_failed", "Session store did not initialize");
 	hardenStoreArtifacts();
 	return database;
+}
+
+function verifyForeignKeys(): SessionStoreForeignKeyVerificationResult {
+	const row = requireDatabase().prepare("PRAGMA foreign_key_check").get();
+	if (!row) return { status: "valid" };
+	return {
+		status: "violation",
+		table: sqlString(row, "table"),
+		rowId: sqlNullableInteger(row, "rowid"),
+		parentTable: sqlString(row, "parent"),
+		constraintIndex: sqlInteger(row, "fkid"),
+	};
 }
 
 function storeInfo(): SessionStoreInfo {
@@ -1040,6 +1056,8 @@ function execute(operation: SessionStoreWorkerOperation): unknown {
 	switch (operation.kind) {
 		case "initialize":
 			return openDatabase();
+		case "verify_foreign_keys":
+			return verifyForeignKeys();
 		case "create_session":
 			return createSession(operation.input);
 		case "load_session":

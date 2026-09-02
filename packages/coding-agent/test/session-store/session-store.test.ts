@@ -601,6 +601,34 @@ describe("SQLite session store", () => {
 		expect(snapshot?.searchChunks).toEqual([{ chunkIndex: 0, entryId: "message-1", text: "hello sqlite" }]);
 	});
 
+	it("rejects write-time foreign-key violations and rolls back the transaction", async () => {
+		const client = await openStore();
+		await client.createHiddenSession(createInput());
+		const payload: SessionStoreTransactionPayload = {
+			...emptyPayload(),
+			entries: [
+				{
+					id: "orphan-child",
+					parentId: "missing-parent",
+					type: "message",
+					timestamp: UPDATED_AT,
+					isHostOnly: false,
+					payload: { type: "message" },
+				},
+			],
+		};
+
+		await expect(
+			client.applyTransaction(transaction("session-1", 0, "invalid-parent", payload)),
+		).rejects.toMatchObject({ code: "constraint_failed" });
+		expect(await client.findSessionSummary("session-1", generationFor("session-1"))).toMatchObject({
+			revision: 0,
+			leafId: null,
+		});
+		expect((await client.loadSession("session-1", generationFor("session-1")))?.entries).toEqual([]);
+		expect(await client.verifyForeignKeys()).toEqual({ status: "valid" });
+	});
+
 	it("persists cross-store parent identity", async () => {
 		const client = await openStore();
 		const child = await client.createHiddenSession({

@@ -17,6 +17,7 @@ import {
 	type SessionStoreDeleteSessionInput,
 	type SessionStoreDeleteSessionResult,
 	SessionStoreError,
+	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
 	type SessionStoreListOptions,
 	type SessionStoreReconcileCommitInput,
@@ -221,6 +222,10 @@ export class SQLiteSessionStoreClient {
 				this.failBoundary(requestError);
 			}
 		});
+	}
+
+	async verifyForeignKeys(): Promise<SessionStoreForeignKeyVerificationResult> {
+		return (await this.call({ kind: "verify_foreign_keys" })) as SessionStoreForeignKeyVerificationResult;
 	}
 
 	async createHiddenSession(input: SessionStoreCreateSessionInput): Promise<SessionStoreSessionSummary> {
