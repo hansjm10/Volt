@@ -13,6 +13,8 @@ import {
 import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const cliPath = resolve(__dirname, "source-cli-runner.mjs");
+const CLI_TIMEOUT_MS = 50_000;
+const TEST_TIMEOUT_MS = 60_000;
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const tempDirs: string[] = [];
 const managerOwner = createSessionManagerTestOwner();
@@ -70,8 +72,24 @@ async function runCli(
 		child.stderr.on("data", (chunk) => {
 			stderr += chunk.toString();
 		});
-		child.on("error", reject);
-		child.on("close", resolvePromise);
+
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGKILL");
+		}, CLI_TIMEOUT_MS);
+		child.once("error", (error) => {
+			clearTimeout(timeout);
+			reject(error);
+		});
+		child.once("close", (exitCode) => {
+			clearTimeout(timeout);
+			if (timedOut) {
+				reject(new Error(`CLI timed out after ${CLI_TIMEOUT_MS}ms: ${resolvedArgs.join(" ")}`));
+				return;
+			}
+			resolvePromise(exitCode);
+		});
 	});
 
 	return { code, stderr, ...dirs };
@@ -127,7 +145,7 @@ async function listSessionIds(sessionDir: string): Promise<string[]> {
 	return sessions.map((session) => session.id);
 }
 
-describe("--session-id read-only commands", () => {
+describe("--session-id read-only commands", { timeout: TEST_TIMEOUT_MS }, () => {
 	it("does not reserve a session for --help", async () => {
 		const result = await runCli(["--session-id", "read-only-help", "--help"]);
 
@@ -156,7 +174,7 @@ describe("--session-id read-only commands", () => {
 	});
 });
 
-describe("--fork path session identity", () => {
+describe("--fork path session identity", { timeout: TEST_TIMEOUT_MS }, () => {
 	it("generates a fresh session id", async () => {
 		const snapshotId = "snapshot-session-id";
 		const result = await runCli(
@@ -202,7 +220,7 @@ describe("--fork path session identity", () => {
 	});
 });
 
-describe("--session-id validation", () => {
+describe("--session-id validation", { timeout: TEST_TIMEOUT_MS }, () => {
 	it("rejects ids invalid under SessionManager rules without stack traces", async () => {
 		for (const id of ["-bad", "bad id"]) {
 			const result = await runCli(["--session-id", id, "-p", "hi"]);
