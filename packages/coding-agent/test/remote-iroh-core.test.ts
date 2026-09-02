@@ -4600,6 +4600,28 @@ describe("Iroh remote core helpers", () => {
 		});
 	});
 
+	test("omits session directories independently of session reference wrapper keys", () => {
+		const sessionDirectory = "/Users/jordan/.volt/agent/sessions/project";
+		const sessionReference = {
+			sessionDirectory,
+			storeId: "store",
+			sessionId: "session",
+			sessionGeneration: "generation",
+		};
+		const expectedReference = {
+			storeId: "store",
+			sessionId: "session",
+			sessionGeneration: "generation",
+		};
+		const options = { workspacePath: "/Users/jordan/project" };
+
+		expect(sanitizeIrohRemoteOutbound(sessionReference, options)).toEqual(expectedReference);
+		expect(sanitizeIrohRemoteOutbound({ ref: sessionReference }, options)).toEqual({ ref: expectedReference });
+		expect(sanitizeIrohRemoteOutbound({ references: [sessionReference] }, options)).toEqual({
+			references: [expectedReference],
+		});
+	});
+
 	test("sanitizes remote outbound structured paths and preserves free-form text", () => {
 		const workspacePath = "/Users/jordan/project";
 		const sessionFile = "/Users/jordan/.volt/agent/sessions/project/session.jsonl";

@@ -11,6 +11,7 @@ const OMIT_REMOTE_PATH_FIELDS = new Set([
 	"parentSession",
 	"parentSessionRef",
 	"previousSessionRef",
+	"sessionDirectory",
 	"sessionFile",
 	"sessionRef",
 	"targetSessionRef",
