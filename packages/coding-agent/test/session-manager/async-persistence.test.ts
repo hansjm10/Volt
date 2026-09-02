@@ -1,8 +1,9 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { acquireSharedSQLiteSessionStore } from "../../src/core/session-store/index.ts";
 import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 const cleanups: string[] = [];
@@ -73,6 +74,77 @@ describe("SessionManager asynchronous SQLite persistence", () => {
 			data: { durable: true },
 		});
 		expect(await SessionManager.list(root, root)).toEqual([]);
+	});
+
+	it("rejects replacement until queued persistence settles", async () => {
+		const root = createTempDir();
+		const manager = await SessionManager.create(root, root, { id: "queued-source" });
+		const sourceRef = manager.getSessionRef();
+		if (!sourceRef) throw new Error("Expected a persisted source reference");
+
+		manager.appendSessionInfo("queued source write");
+		expect(() => manager.newSession({ id: "queued-replacement" })).toThrow(
+			"Cannot create a new session while persistence is pending; await flush() first",
+		);
+		expect(manager.getSessionRef()).toEqual(sourceRef);
+
+		await manager.flush();
+		const replacementRef = manager.newSession({ id: "queued-replacement" });
+		if (!replacementRef) throw new Error("Expected a persisted replacement reference");
+		await manager.flush();
+
+		expect((await SessionManager.open(sourceRef)).getSessionName()).toBe("queued source write");
+		expect((await SessionManager.open(replacementRef)).getEntries()).toEqual([]);
+	});
+
+	it("rejects replacement until an in-flight commit result settles", async () => {
+		const root = createTempDir();
+		const manager = await SessionManager.create(root, root, { id: "inflight-source" });
+		const sourceRef = manager.getSessionRef();
+		if (!sourceRef) throw new Error("Expected a persisted source reference");
+		const lease = await acquireSharedSQLiteSessionStore(root);
+		const applyTransaction = lease.client.applyTransaction.bind(lease.client);
+		let markCommitReturned!: () => void;
+		const commitReturned = new Promise<void>((resolve) => {
+			markCommitReturned = resolve;
+		});
+		let releaseCommitResult!: () => void;
+		const commitResultGate = new Promise<void>((resolve) => {
+			releaseCommitResult = resolve;
+		});
+		let holdNextResult = true;
+		const applySpy = vi.spyOn(lease.client, "applyTransaction").mockImplementation(async (input) => {
+			const result = await applyTransaction(input);
+			if (holdNextResult) {
+				holdNextResult = false;
+				markCommitReturned();
+				await commitResultGate;
+			}
+			return result;
+		});
+
+		try {
+			manager.appendSessionInfo("in-flight source write");
+			await commitReturned;
+			expect(() => manager.newSession({ id: "inflight-replacement" })).toThrow(
+				"Cannot create a new session while persistence is pending; await flush() first",
+			);
+			expect(manager.getSessionRef()).toEqual(sourceRef);
+
+			releaseCommitResult();
+			await manager.flush();
+			const replacementRef = manager.newSession({ id: "inflight-replacement" });
+			if (!replacementRef) throw new Error("Expected a persisted replacement reference");
+			manager.appendSessionInfo("replacement write");
+			await manager.flush();
+
+			expect((await SessionManager.open(sourceRef)).getSessionName()).toBe("in-flight source write");
+			expect((await SessionManager.open(replacementRef)).getSessionName()).toBe("replacement write");
+		} finally {
+			releaseCommitResult();
+			applySpy.mockRestore();
+			await lease.release();
+		}
 	});
 
 	it("persists separate sessions independently in one store", async () => {

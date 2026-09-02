@@ -1575,6 +1575,8 @@ export class SessionManager {
 	private persistenceQueue: Promise<void> = Promise.resolve();
 	/** Promise for all persistence work accepted through the latest synchronous mutation. */
 	private persistenceWatermark: Promise<void> = Promise.resolve();
+	/** Queue tasks admitted but not fully settled, including reconciliation. */
+	private unsettledPersistenceTasks = 0;
 	private persistenceDrainPromise: Promise<SessionPersistenceDrainResult> | undefined;
 	private readonly entryListeners = new Set<SessionEntryListener>();
 	private readonly branchListeners = new Set<SessionBranchListener>();
@@ -1654,6 +1656,9 @@ export class SessionManager {
 	newSession(options?: NewSessionOptions): SessionReference | undefined {
 		this._assertPersistenceHealthy();
 		if (this.atomicAppendInFlight) throw new Error("Cannot create a new session during an atomic append");
+		if (this.unsettledPersistenceTasks > 0) {
+			throw new Error("Cannot create a new session while persistence is pending; await flush() first");
+		}
 		if (options?.id !== undefined) assertValidSessionId(options.id);
 		this.sessionId = options?.id ?? createSessionId();
 		this.sessionGeneration = randomUUID();
@@ -1776,15 +1781,20 @@ export class SessionManager {
 	}
 
 	private _enqueuePersistence(write: () => Promise<void>): void {
-		const task = this.persistenceQueue.then(async () => {
-			if (this.persistenceError) throw this.persistenceError;
-			try {
-				await write();
-			} catch (error) {
-				this.persistenceError ??= error instanceof Error ? error : new Error(String(error));
-				throw this.persistenceError;
-			}
-		});
+		this.unsettledPersistenceTasks++;
+		const task = this.persistenceQueue
+			.then(async () => {
+				if (this.persistenceError) throw this.persistenceError;
+				try {
+					await write();
+				} catch (error) {
+					this.persistenceError ??= error instanceof Error ? error : new Error(String(error));
+					throw this.persistenceError;
+				}
+			})
+			.finally(() => {
+				this.unsettledPersistenceTasks--;
+			});
 		// Keep the serialization lane fulfilled so later accepted work can observe
 		// the sticky error and stop without touching disk. The public watermark
 		// retains rejection for flush callers.
