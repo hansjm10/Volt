@@ -50,7 +50,11 @@ export interface IrohRemoteAgentRuntimeOptions {
 	) => SubagentRuntimeRegistration | Promise<SubagentRuntimeRegistration> | Promise<void> | void;
 	profile?: string;
 	projectTrusted?: boolean;
-	/** Pre-resolved session target (daemon path); skips internal target resolution. */
+	/**
+	 * Pre-resolved session target (daemon path); skips internal target resolution.
+	 * Ownership transfers here until success: failed created targets are discarded,
+	 * while failed resumed targets are only closed.
+	 */
 	resolvedSessionTarget?: ResolvedSessionTargetWithManager<SessionManager>;
 	resumeSessionId?: string;
 	sessionDir?: string;
@@ -173,7 +177,7 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 	};
 
 	const sessionTarget = await createIrohRemoteSessionManager(options, agentDir);
-	let runtime: AgentSessionRuntime;
+	let runtime: AgentSessionRuntime | undefined;
 	try {
 		await options.validateCwd?.(sessionTarget.sessionManager.getCwd());
 		runtime = await createAgentSessionRuntime(createRuntime, {
@@ -182,27 +186,63 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 			sessionManager: sessionTarget.sessionManager,
 			profile: options.profile,
 		});
-	} catch (error) {
-		try {
-			await sessionTarget.sessionManager.closePersistence();
-		} catch (closeError) {
-			throw new AggregateError(
-				[error, closeError],
-				"Remote runtime creation failed and its session manager could not be closed",
-			);
+		const errors = runtime.diagnostics.filter((diagnostic) => diagnostic.type === "error");
+		if (errors.length > 0) {
+			throw new Error(errors.map((diagnostic) => diagnostic.message).join("\n"));
 		}
-		throw error;
+		if (!runtime.session.model) {
+			throw new Error(formatNoModelsAvailableMessage());
+		}
+		return { runtime, sessionSelection: sessionTarget.selection };
+	} catch (error) {
+		return cleanupFailedIrohRemoteAgentRuntime(error, runtime, sessionTarget.sessionManager, sessionTarget.selection);
 	}
-	const errors = runtime.diagnostics.filter((diagnostic) => diagnostic.type === "error");
-	if (errors.length > 0) {
-		await runtime.dispose();
-		throw new Error(errors.map((diagnostic) => diagnostic.message).join("\n"));
+}
+
+async function cleanupFailedIrohRemoteAgentRuntime(
+	error: unknown,
+	runtime: AgentSessionRuntime | undefined,
+	sessionManager: SessionManager,
+	selection: IrohRemoteAgentRuntimeSessionSelection,
+): Promise<never> {
+	const cleanupErrors: unknown[] = [];
+	if (runtime) {
+		try {
+			await runtime.dispose();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
 	}
-	if (!runtime.session.model) {
-		await runtime.dispose();
-		throw new Error(formatNoModelsAvailableMessage());
+	try {
+		if (selection.kind === "resumed") {
+			await sessionManager.closePersistence();
+		} else {
+			await sessionManager.discardPersistence();
+		}
+	} catch (cleanupError) {
+		if (!cleanupErrors.includes(cleanupError)) cleanupErrors.push(cleanupError);
 	}
-	return { runtime, sessionSelection: sessionTarget.selection };
+	if (cleanupErrors.length === 0) throw error;
+
+	const aggregate = new AggregateError(
+		[error, ...cleanupErrors],
+		error instanceof Error ? error.message : String(error),
+	);
+	if (typeof error === "object" && error !== null) {
+		const metadata = error as {
+			outcome?: unknown;
+			retryAfterMs?: unknown;
+			sessionId?: unknown;
+			workspace?: unknown;
+		};
+		Object.assign(aggregate, {
+			...(typeof metadata.outcome === "string" ? { outcome: metadata.outcome } : {}),
+			...(typeof metadata.retryAfterMs === "number" ? { retryAfterMs: metadata.retryAfterMs } : {}),
+			...(typeof metadata.sessionId === "string" ? { sessionId: metadata.sessionId } : {}),
+			...(typeof metadata.workspace === "string" ? { workspace: metadata.workspace } : {}),
+		});
+	}
+	throw aggregate;
 }
 
 async function createIrohRemoteSessionManager(

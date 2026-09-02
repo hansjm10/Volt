@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
+import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/index.ts";
 import { CURRENT_SESSION_VERSION, SessionManager } from "../src/core/session-manager.ts";
 import { DEFAULT_SUBAGENT_TURN_LIMITS, SubagentManager } from "../src/core/subagents/index.ts";
@@ -118,6 +119,21 @@ export default function (volt) {
 			parameters: Type.Object({}),
 			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 		});
+	});
+}
+`,
+		);
+	}
+
+	function writeBrokenProviderExtension(): void {
+		mkdirSync(join(agentDir, "extensions"), { recursive: true });
+		writeFileSync(
+			join(agentDir, "extensions", "broken-provider.ts"),
+			`export default function (volt) {
+	volt.registerProvider("broken-provider", {
+		streamSimple: () => {
+			throw new Error("should not run");
+		},
 	});
 }
 `,
@@ -396,6 +412,178 @@ export default function (volt) {
 			errorSpy.mockRestore();
 			await runtime?.dispose();
 		}
+	});
+
+	it("discards a newly created remote session when cwd validation fails", async () => {
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const setupError = new Error("injected cwd validation failure");
+
+		await expect(
+			createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				conversationTarget: { target: "new", sessionId: "failed-created" },
+				cwd,
+				sessionDir,
+				validateCwd: () => {
+					throw setupError;
+				},
+			}),
+		).rejects.toBe(setupError);
+
+		expect(await SessionManager.findForResume(sessionDir, "failed-created")).toBeUndefined();
+		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual([]);
+	});
+
+	it("discards a created-after-missing remote session when cwd validation fails", async () => {
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const setupError = new Error("injected cwd validation failure");
+
+		await expect(
+			createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				cwd,
+				resumeSessionId: "missing-session",
+				sessionDir,
+				validateCwd: () => {
+					throw setupError;
+				},
+			}),
+		).rejects.toBe(setupError);
+
+		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual([]);
+	});
+
+	it("preserves a resumed remote session when cwd validation fails", async () => {
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const seededSession = await SessionManager.create(cwd, sessionDir, { id: "failed-resumed" });
+		const seededRef = seededSession.getSessionRef();
+		if (!seededRef) throw new Error("expected a persisted seeded session");
+		await seededSession.closePersistence();
+		const setupError = new Error("injected cwd validation failure");
+
+		try {
+			await expect(
+				createIrohRemoteAgentRuntimeWithSessionSelection({
+					agentDir,
+					conversationTarget: { target: "session", sessionId: "failed-resumed" },
+					cwd,
+					sessionDir,
+					validateCwd: () => {
+						throw setupError;
+					},
+				}),
+			).rejects.toBe(setupError);
+
+			expect(await SessionManager.findForResume(sessionDir, "failed-resumed")).toEqual(seededRef);
+		} finally {
+			await SessionManager.delete(seededRef).catch(() => undefined);
+		}
+	});
+
+	it("discards a newly created remote session after runtime diagnostics fail", async () => {
+		writeRuntimeConfig({});
+		writeBrokenProviderExtension();
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+
+		const error = await createIrohRemoteAgentRuntimeWithSessionSelection({
+			agentDir,
+			conversationTarget: { target: "new", sessionId: "failed-diagnostics" },
+			cwd,
+			sessionDir,
+		}).catch((thrown: unknown) => thrown);
+
+		expect(error).toBeInstanceOf(Error);
+		if (!(error instanceof Error)) throw new Error("expected runtime diagnostics to reject");
+		expect(error.message).toContain("broken-provider");
+		expect(await SessionManager.findForResume(sessionDir, "failed-diagnostics")).toBeUndefined();
+	});
+
+	it("discards a newly created remote session even when runtime disposal fails", async () => {
+		writeRuntimeConfig({});
+		writeBrokenProviderExtension();
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const disposeError = new Error("injected runtime disposal failure");
+		const dispose = AgentSessionRuntime.prototype.dispose;
+		const disposeSpy = vi.spyOn(AgentSessionRuntime.prototype, "dispose").mockImplementationOnce(async function (
+			this: AgentSessionRuntime,
+		): Promise<void> {
+			await dispose.call(this);
+			throw disposeError;
+		});
+
+		let thrown: unknown;
+		try {
+			thrown = await createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				conversationTarget: { target: "new", sessionId: "failed-disposal" },
+				cwd,
+				sessionDir,
+			}).catch((error: unknown) => error);
+		} finally {
+			disposeSpy.mockRestore();
+		}
+
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) throw new Error("expected an aggregate cleanup failure");
+		const errors = thrown.errors as unknown[];
+		expect(errors).toContain(disposeError);
+		const primaryError = errors[0];
+		expect(primaryError).toBeInstanceOf(Error);
+		if (!(primaryError instanceof Error)) throw new Error("expected the primary runtime diagnostics error");
+		expect(primaryError.message).toContain("broken-provider");
+		expect(thrown.message).toBe(primaryError.message);
+		expect(await SessionManager.findForResume(sessionDir, "failed-disposal")).toBeUndefined();
+	});
+
+	it("preserves remote failure metadata when cleanup also fails", async () => {
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const setupError = Object.assign(new Error("stored session working directory is unavailable"), {
+			outcome: "session_unavailable",
+			retryAfterMs: 250,
+			sessionId: "failed-metadata",
+			workspace: "volt",
+		});
+		const cleanupError = new Error("injected discard failure");
+		const discardPersistence = SessionManager.prototype.discardPersistence;
+		const discardSpy = vi
+			.spyOn(SessionManager.prototype, "discardPersistence")
+			.mockImplementationOnce(async function (this: SessionManager): Promise<void> {
+				await discardPersistence.call(this);
+				throw cleanupError;
+			});
+
+		let thrown: unknown;
+		try {
+			thrown = await createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				conversationTarget: { target: "new", sessionId: "failed-metadata" },
+				cwd,
+				sessionDir,
+				validateCwd: () => {
+					throw setupError;
+				},
+			}).catch((error: unknown) => error);
+		} finally {
+			discardSpy.mockRestore();
+		}
+
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) throw new Error("expected an aggregate cleanup failure");
+		expect(thrown.message).toBe(setupError.message);
+		expect(thrown.errors as unknown[]).toEqual([setupError, cleanupError]);
+		expect(thrown).toMatchObject({
+			outcome: "session_unavailable",
+			retryAfterMs: 250,
+			sessionId: "failed-metadata",
+			workspace: "volt",
+		});
+		expect(await SessionManager.findForResume(sessionDir, "failed-metadata")).toBeUndefined();
 	});
 
 	it("loads a requested remote session without dispatching recovery before attach ownership", async () => {
