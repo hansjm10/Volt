@@ -60,6 +60,68 @@ describe("SQLite-backed SessionManager", () => {
 		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "hello sqlite" }]);
 	});
 
+	it("publishes absolute custom session directories that survive caller cwd changes", async () => {
+		const { root, cwd } = fixture();
+		const originalCwd = process.cwd();
+		const creatorCwd = join(root, "caller-a");
+		const consumerCwd = join(root, "caller-b");
+		const relativeSessionDir = "relative-sessions";
+		mkdirSync(creatorCwd, { recursive: true });
+		mkdirSync(consumerCwd, { recursive: true });
+
+		try {
+			process.chdir(creatorCwd);
+			const absoluteSessionDir = join(process.cwd(), relativeSessionDir);
+			const manager = await own(SessionManager.create(cwd, relativeSessionDir, { id: "portable-session" }));
+			manager.appendMessage({ role: "user", content: "portableneedle", timestamp: Date.now() });
+			await manager.flush();
+			const createdRef = manager.getSessionRef();
+			if (!createdRef) throw new Error("Expected a persisted session reference");
+
+			const opened = await own(
+				SessionManager.open({
+					...createdRef,
+					sessionDirectory: relativeSessionDir,
+				}),
+			);
+			const continued = await own(SessionManager.continueRecent(cwd, relativeSessionDir));
+			const listedRef = (await SessionManager.list(cwd, relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const searchedRef = (await SessionManager.search(cwd, "portableneedle", relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const searchedAllRef = (await SessionManager.searchAll("portableneedle", relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const listedAllRef = (await SessionManager.listAll(relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const references = {
+				create: createdRef,
+				open: opened.getSessionRef(),
+				continueRecent: continued.getSessionRef(),
+				findForResume: await SessionManager.findForResume(relativeSessionDir, createdRef.sessionId),
+				list: listedRef,
+				search: searchedRef,
+				searchAll: searchedAllRef,
+				listAll: listedAllRef,
+			};
+			for (const ref of Object.values(references)) {
+				expect(ref).toBeDefined();
+				expect(ref?.sessionDirectory).toBe(absoluteSessionDir);
+			}
+			expect(manager.getSessionDir()).toBe(absoluteSessionDir);
+
+			process.chdir(consumerCwd);
+			const reopened = await own(SessionManager.open(createdRef));
+			expect(reopened.getSessionId()).toBe(createdRef.sessionId);
+			expect(reopened.getSessionDir()).toBe(absoluteSessionDir);
+		} finally {
+			process.chdir(originalCwd);
+		}
+	});
+
 	it("lists valid sessions without auditing unrelated foreign-key violations", async () => {
 		const { cwd, sessionDir } = fixture();
 		const manager = await own(SessionManager.create(cwd, sessionDir));

@@ -1658,7 +1658,7 @@ export class SessionManager {
 		snapshot?: SessionStoreSnapshot,
 	) {
 		this.cwd = resolvePath(cwd);
-		this.sessionDir = normalizePath(sessionDir);
+		this.sessionDir = sessionDir;
 		this.persist = persist;
 		this.sessionStoreLease = sessionStoreLease;
 		this.storeId = sessionStoreLease?.client.info.storeId;
@@ -3729,7 +3729,7 @@ export class SessionManager {
 
 	/** Create and durably reserve a hidden persisted session. */
 	static async create(cwd: string, sessionDir?: string, options?: NewSessionOptions): Promise<SessionManager> {
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
 		const lease = await SessionManager._store(dir);
 		try {
 			const manager = new SessionManager(cwd, dir, true, options, lease);
@@ -3746,7 +3746,7 @@ export class SessionManager {
 
 	/** Open one authoritative SQLite session reference. */
 	static async open(ref: SessionReference, cwdOverride?: string): Promise<SessionManager> {
-		const dir = normalizePath(ref.sessionDirectory);
+		const dir = resolvePath(ref.sessionDirectory);
 		const lease = await SessionManager._store(dir);
 		try {
 			if (lease.client.info.storeId !== ref.storeId) {
@@ -3766,7 +3766,7 @@ export class SessionManager {
 
 	/** Continue the most recent visible session for a cwd, or create one. */
 	static async continueRecent(cwd: string, sessionDir?: string): Promise<SessionManager> {
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
 		const lease = await SessionManager._store(dir);
 		try {
 			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
@@ -3815,7 +3815,7 @@ export class SessionManager {
 	/** Find a generation-pinned reference by exact id; open() performs full snapshot validation. */
 	static async findForResume(sessionDir: string, sessionId: string): Promise<SessionReference | undefined> {
 		assertValidSessionId(sessionId);
-		const dir = normalizePath(sessionDir);
+		const dir = resolvePath(sessionDir);
 		return SessionManager._scopedStore(dir, async (store) => {
 			const summary = await store.findSessionSummaryById(sessionId);
 			if (!summary) return undefined;
@@ -4020,7 +4020,7 @@ export class SessionManager {
 		onProgress?: SessionListProgress,
 		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
 		return SessionManager._scopedStore(dir, async (store) => {
 			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
 			const summaries = await store.listSessionSummaries({
@@ -4038,7 +4038,7 @@ export class SessionManager {
 		sessionDir?: string,
 		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
 		return SessionManager._scopedStore(dir, async (store) => {
 			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
 			const results = await store.searchSessionSummaries(query, {
@@ -4051,7 +4051,7 @@ export class SessionManager {
 
 	static async searchAll(query: string, sessionDir?: string): Promise<SessionInfo[]> {
 		if (sessionDir) {
-			const dir = normalizePath(sessionDir);
+			const dir = resolvePath(sessionDir);
 			return SessionManager._scopedStore(dir, async (store) => {
 				const results = await store.searchSessionSummaries(query);
 				return results.map(({ summary }) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
@@ -4134,7 +4134,10 @@ export class SessionManager {
 		onProgressOrOptions?: SessionListProgress | SessionListOptions,
 		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
-		const customDir = typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
+		const customDir =
+			typeof sessionDirOrOnProgress === "string" && sessionDirOrOnProgress
+				? resolvePath(sessionDirOrOnProgress)
+				: undefined;
 		const progress =
 			typeof sessionDirOrOnProgress === "function"
 				? sessionDirOrOnProgress
