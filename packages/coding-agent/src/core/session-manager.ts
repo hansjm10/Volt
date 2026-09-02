@@ -3284,6 +3284,12 @@ export class SessionManager {
 		return this.sessionStoreProjection.startingGitContext;
 	}
 
+	/** Get the incrementally maintained lifetime message summary for session listing. */
+	getSessionEntrySummary(): SessionEntrySummary {
+		this.assertConversationAuthorityAvailable();
+		return sessionEntrySummaryFromAccumulator(this.sessionStoreProjection.messageSummary);
+	}
+
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
 		this.assertConversationAuthorityAvailable();

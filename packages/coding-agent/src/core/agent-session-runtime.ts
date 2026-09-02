@@ -36,7 +36,6 @@ import {
 	SessionManager,
 	type SessionOrigin,
 	type SessionReference,
-	summarizeSessionEntries,
 } from "./session-manager.ts";
 import type { SubagentDelegationScope } from "./subagents/delegation-scope.ts";
 import type { SubagentRegistry } from "./subagents/registry.ts";
@@ -1015,9 +1014,8 @@ export class AgentSessionRuntime {
 
 	getCurrentSessionSummary(): WorkspaceSessionSummary {
 		const header = this.session.sessionManager.getHeader();
-		const entries = this.session.sessionManager.getEntries();
 		const startingGitContext = this.session.sessionManager.getStartingGitContext();
-		const summary = summarizeSessionEntries(entries);
+		const summary = this.session.sessionManager.getSessionEntrySummary();
 		return {
 			sessionId: this.session.sessionId,
 			sessionName: this.session.sessionName,

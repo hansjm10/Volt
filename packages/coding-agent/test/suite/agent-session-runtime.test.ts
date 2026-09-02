@@ -16,6 +16,7 @@ import {
 	SessionConversationStateUnavailableError,
 	SessionManager,
 	type SessionReference,
+	summarizeSessionEntries,
 } from "../../src/core/session-manager.ts";
 import type {
 	ExtensionAPI,
@@ -457,6 +458,44 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(stored).toBeDefined();
 		expect(live.modifiedAt).toBe(new Date(messageTime).toISOString());
 		expect(live.modifiedAt).toBe(stored?.modified.toISOString());
+	});
+
+	it("builds live summaries from the cached projection without materializing history", async () => {
+		const { runtime } = await createRuntimeForTest(() => {}, { bootstrapModel: false });
+		const manager = runtime.session.sessionManager;
+		const firstMessageTime = Date.now() - 3_000;
+		const lastMessageTime = firstMessageTime + 1_000;
+		manager.appendCustomMessageEntry(
+			"test.displayed",
+			"displayed fallback",
+			true,
+			undefined,
+			firstMessageTime - 1_000,
+		);
+		manager.appendMessage({ role: "user", content: "first user", timestamp: firstMessageTime });
+		manager.appendCustomMessageEntry("test.hidden", "hidden activity", false, undefined, lastMessageTime + 60_000);
+		manager.appendMessage({ role: "user", content: "second user", timestamp: lastMessageTime });
+		const expected = summarizeSessionEntries(manager.getEntries());
+		expect(expected).toEqual({
+			messageCount: 3,
+			firstMessage: "first user",
+			lastActivityTime: lastMessageTime,
+		});
+
+		const getEntries = vi.spyOn(manager, "getEntries").mockImplementation(() => {
+			throw new Error("Live summaries must not materialize session entries");
+		});
+		try {
+			expect(manager.getSessionEntrySummary()).toEqual(expected);
+			expect(runtime.getCurrentSessionSummary()).toMatchObject({
+				messageCount: 3,
+				firstMessage: "first user",
+				modifiedAt: new Date(lastMessageTime).toISOString(),
+			});
+			expect(getEntries).not.toHaveBeenCalled();
+		} finally {
+			getEntries.mockRestore();
+		}
 	});
 
 	it("keeps live planning-only modified time aligned with the stored header fallback", async () => {
