@@ -248,6 +248,29 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	let createdSessionManager: SessionManager | undefined;
+	try {
+		return await createAgentSessionUnchecked(options, (sessionManager) => {
+			createdSessionManager = sessionManager;
+		});
+	} catch (error) {
+		if (!createdSessionManager) throw error;
+		try {
+			await createdSessionManager.discardPersistence();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[error, cleanupError],
+				"Agent session setup failed and its manager persistence could not be discarded",
+			);
+		}
+		throw error;
+	}
+}
+
+async function createAgentSessionUnchecked(
+	options: CreateAgentSessionOptions,
+	onDefaultSessionManagerCreated: (sessionManager: SessionManager) => void,
+): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const lexicalProjectCwd = resolvePath(options.projectCwd ?? cwd);
 	const projectCwd = canonicalizePath(lexicalProjectCwd);
@@ -266,8 +289,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			profile: options.profile,
 			...(options.projectTrusted !== undefined ? { projectTrusted: options.projectTrusted } : {}),
 		});
-	const sessionManager =
-		options.sessionManager ?? (await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir)));
+	let sessionManager = options.sessionManager;
+	if (!sessionManager) {
+		sessionManager = await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+		onDefaultSessionManagerCreated(sessionManager);
+	}
 	await sessionManager.flush();
 
 	if (!resourceLoader) {

@@ -7,8 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
+import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 import { createTestResourceLoader } from "./utilities.ts";
@@ -78,6 +79,73 @@ describe("createAgentSession session manager defaults", () => {
 
 		session.dispose();
 		await session.waitForClosed();
+	});
+
+	it("discards the default persisted manager when setup fails", async () => {
+		const setupError = new Error("injected resource reload failure");
+		let discardedManager: SessionManager | undefined;
+		const discardPersistence = SessionManager.prototype.discardPersistence;
+		vi.spyOn(SessionManager.prototype, "discardPersistence").mockImplementation(function (
+			this: SessionManager,
+		): Promise<void> {
+			discardedManager = this;
+			return discardPersistence.call(this);
+		});
+		vi.spyOn(DefaultResourceLoader.prototype, "reload").mockRejectedValue(setupError);
+
+		await expect(createAgentSession({ cwd, agentDir, disableMcp: true })).rejects.toBe(setupError);
+
+		expect(discardedManager).toBeDefined();
+		const manager = discardedManager;
+		if (!manager) throw new Error("Expected the default session manager to be discarded");
+		const sessionRef = manager.getSessionRef();
+		if (!sessionRef) throw new Error("Expected a persisted session reference");
+		expect(() => manager.appendSessionInfo("late write")).toThrow("Session persistence is closed");
+		await expect(SessionManager.open(sessionRef)).rejects.toThrow(`Session not found: ${sessionRef.sessionId}`);
+		expect(await SessionManager.list(cwd, sessionRef.sessionDirectory)).toEqual([]);
+		expect(
+			await SessionManager.list(cwd, sessionRef.sessionDirectory, undefined, {
+				includeMessageFreeDurable: true,
+			}),
+		).toEqual([]);
+	});
+
+	it("keeps an explicit persisted manager open when setup fails", async () => {
+		const setupError = new Error("injected resource reload failure");
+		const sessionManager = await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+		const sessionRef = sessionManager.getSessionRef();
+		if (!sessionRef) throw new Error("Expected a persisted session reference");
+		vi.spyOn(DefaultResourceLoader.prototype, "reload").mockRejectedValue(setupError);
+
+		await expect(createAgentSession({ cwd, agentDir, sessionManager, disableMcp: true })).rejects.toBe(setupError);
+
+		sessionManager.appendSessionInfo("still writable");
+		await sessionManager.flush();
+		expect(
+			await SessionManager.list(cwd, sessionRef.sessionDirectory, undefined, {
+				includeMessageFreeDurable: true,
+			}),
+		).toEqual([expect.objectContaining({ ref: sessionRef })]);
+	});
+
+	it("preserves setup and cleanup errors when default manager discard fails", async () => {
+		const setupError = new Error("injected resource reload failure");
+		const cleanupError = new Error("injected discard failure");
+		vi.spyOn(DefaultResourceLoader.prototype, "reload").mockRejectedValue(setupError);
+		vi.spyOn(SessionManager.prototype, "discardPersistence").mockRejectedValue(cleanupError);
+
+		let thrown: unknown;
+		try {
+			await createAgentSession({ cwd, agentDir, disableMcp: true });
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(AggregateError);
+		expect((thrown as AggregateError).message).toBe(
+			"Agent session setup failed and its manager persistence could not be discarded",
+		);
+		expect((thrown as AggregateError).errors).toEqual([setupError, cleanupError]);
 	});
 
 	it("uses agentDir and session identity for generated image artifacts", async () => {
