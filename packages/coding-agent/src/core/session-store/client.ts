@@ -236,6 +236,13 @@ export class SQLiteSessionStoreClient {
 		return (await this.call({ kind: "load_session", sessionId, sessionGeneration })) as SessionStoreSnapshot | null;
 	}
 
+	async findContinuationSession(cwd?: string): Promise<SessionStoreSessionSummary | null> {
+		return (await this.call({
+			kind: "find_continuation_session",
+			cwd: cwd ?? null,
+		})) as SessionStoreSessionSummary | null;
+	}
+
 	async listSessionSummaries(options: SessionStoreListOptions = {}): Promise<SessionStoreSessionSummary[]> {
 		return (await this.call({
 			kind: "list_sessions",

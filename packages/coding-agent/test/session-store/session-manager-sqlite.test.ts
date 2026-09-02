@@ -60,6 +60,62 @@ describe("SQLite-backed SessionManager", () => {
 		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "hello sqlite" }]);
 	});
 
+	it("continues a WAL-only accepted receipt for an exact client retry", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir, { id: "accepted-only-continuation" }));
+		manager.reserveClientInput("accepted-retry", "prompt", { message: "retry me" });
+		await manager.flush();
+
+		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+		expect(continued.getSessionRef()).toEqual(manager.getSessionRef());
+		expect(continued.getClientInput("accepted-retry")).toMatchObject({
+			state: "accepted",
+			input: { message: "retry me" },
+		});
+	});
+
+	it("continues newer queued WAL activity ahead of stale message recency", async () => {
+		const { cwd, sessionDir } = fixture();
+		const now = Date.now();
+		const pending = await own(SessionManager.create(cwd, sessionDir, { id: "queued-continuation" }));
+		pending.appendMessage({ role: "user", content: "older conversation", timestamp: now - 120_000 });
+		pending.reserveClientInput("queued-recovery", "steer", { message: "recover me" });
+		pending.markClientInputQueued("queued-recovery", { delivery: "steer", message: "recover me" });
+		await pending.flush();
+
+		const visible = await own(SessionManager.create(cwd, sessionDir, { id: "newer-visible-conversation" }));
+		visible.appendMessage({ role: "user", content: "newer visible", timestamp: now - 60_000 });
+		await visible.flush();
+
+		expect((await SessionManager.list(cwd, sessionDir)).map((session) => session.id)).toEqual([
+			"newer-visible-conversation",
+			"queued-continuation",
+		]);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+		expect(continued.getSessionRef()).toEqual(pending.getSessionRef());
+		expect(continued.getClientInputRecoveryPlan()).toMatchObject({
+			kind: "replay",
+			records: [{ clientMessageId: "queued-recovery", state: "accepted" }],
+		});
+	});
+
+	it("continues a WAL-only started input so its ambiguity fence remains authoritative", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir, { id: "started-continuation" }));
+		manager.reserveClientInput("started-recovery", "prompt", { message: "do not replay" });
+		manager.transitionClientInput("started-recovery", "started");
+		await manager.flush();
+
+		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+		expect(continued.getSessionRef()).toEqual(manager.getSessionRef());
+		expect(continued.getClientInputRecoveryPlan()).toMatchObject({
+			kind: "blocked",
+			blocker: { clientMessageId: "started-recovery", state: "started" },
+		});
+	});
+
 	it("publishes absolute custom session directories that survive caller cwd changes", async () => {
 		const { root, cwd } = fixture();
 		const originalCwd = process.cwd();

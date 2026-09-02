@@ -118,6 +118,85 @@ function transaction(
 	};
 }
 
+interface ContinuationSessionFixture {
+	readonly id: string;
+	readonly updatedAt: string;
+	readonly visible?: boolean;
+	readonly input?: {
+		readonly state: "accepted" | "started" | "completed" | "failed";
+		readonly receiptAt: string;
+		readonly queuedAt?: string;
+		readonly stateAt?: string;
+	};
+}
+
+async function addContinuationSession(
+	client: SQLiteSessionStoreClient,
+	fixture: ContinuationSessionFixture,
+): Promise<void> {
+	await client.createHiddenSession(createInput(fixture.id));
+	const entries: Array<SessionStoreTransactionPayload["entries"][number]> = [];
+	const clientInputs: Array<SessionStoreTransactionPayload["clientInputs"][number]> = [];
+	if (fixture.input) {
+		const clientMessageId = `input-${fixture.id}`;
+		const receiptEntryId = `receipt-${fixture.id}`;
+		entries.push({
+			id: receiptEntryId,
+			parentId: null,
+			type: "client_input_receipt",
+			timestamp: fixture.input.receiptAt,
+			isHostOnly: true,
+			payload: { type: "client_input_receipt", clientMessageId },
+		});
+		const queuedEntryId = fixture.input.queuedAt === undefined ? null : `queued-${fixture.id}`;
+		if (queuedEntryId) {
+			entries.push({
+				id: queuedEntryId,
+				parentId: null,
+				type: "client_input_queued",
+				timestamp: fixture.input.queuedAt!,
+				isHostOnly: true,
+				payload: { type: "client_input_queued", clientMessageId },
+			});
+		}
+		if (fixture.input.state !== "accepted") {
+			if (!fixture.input.stateAt) throw new Error(`Missing state timestamp for ${fixture.id}`);
+			entries.push({
+				id: `state-${fixture.id}`,
+				parentId: null,
+				type: "client_input_state",
+				timestamp: fixture.input.stateAt,
+				isHostOnly: true,
+				payload: { type: "client_input_state", clientMessageId, state: fixture.input.state },
+			});
+		}
+		clientInputs.push({
+			clientMessageId,
+			receiptEntryId,
+			command: "steer",
+			semanticDigest: `semantic:${fixture.id}`,
+			input: { message: fixture.id, images: [] },
+			queuedEntryId,
+			queuedInput: queuedEntryId ? { delivery: "steer", message: fixture.id, images: [] } : null,
+			state: fixture.input.state,
+			error: fixture.input.state === "failed" ? "failed" : null,
+			canonicalEntryId: null,
+		});
+	}
+	const payload: SessionStoreTransactionPayload = {
+		...emptyPayload({
+			updatedAt: fixture.updatedAt,
+			visible: fixture.visible ?? false,
+			messageCount: fixture.visible ? 1 : 0,
+			firstMessage: fixture.visible ? fixture.id : "",
+		}),
+		entries,
+		clientInputs,
+	};
+	const result = await client.applyTransaction(transaction(fixture.id, 0, `commit-${fixture.id}`, payload));
+	if (result.status !== "committed") throw new Error(`Could not seed continuation session ${fixture.id}`);
+}
+
 async function openStore(sessionDirectory = makeSessionDirectory()): Promise<SQLiteSessionStoreClient> {
 	const client = await SQLiteSessionStoreClient.open(sessionDirectory);
 	clients.push(client);
@@ -599,6 +678,89 @@ describe("SQLite session store", () => {
 			childStoreId: "child-store-1",
 		});
 		expect(snapshot?.searchChunks).toEqual([{ chunkIndex: 0, entryId: "message-1", text: "hello sqlite" }]);
+	});
+
+	it("selects visible and nonterminal-input continuation candidates by their latest relevant activity", async () => {
+		const client = await openStore();
+		await addContinuationSession(client, {
+			id: "visible-old",
+			updatedAt: "2026-08-31T12:02:00.000Z",
+			visible: true,
+		});
+		await addContinuationSession(client, {
+			id: "hidden-unrelated",
+			updatedAt: "2026-08-31T12:59:00.000Z",
+		});
+		await addContinuationSession(client, {
+			id: "terminal-completed",
+			updatedAt: CREATED_AT,
+			input: {
+				state: "completed",
+				receiptAt: "2026-08-31T12:01:00.000Z",
+				stateAt: "2026-08-31T12:58:00.000Z",
+			},
+		});
+		await addContinuationSession(client, {
+			id: "terminal-failed",
+			updatedAt: CREATED_AT,
+			input: {
+				state: "failed",
+				receiptAt: "2026-08-31T12:01:00.000Z",
+				stateAt: "2026-08-31T12:57:00.000Z",
+			},
+		});
+
+		expect((await client.listSessionSummaries()).map((session) => session.id)).toEqual(["visible-old"]);
+		expect((await client.findContinuationSession())?.id).toBe("visible-old");
+
+		await addContinuationSession(client, {
+			id: "pending-accepted",
+			updatedAt: CREATED_AT,
+			input: { state: "accepted", receiptAt: "2026-08-31T12:03:00.000Z" },
+		});
+		expect((await client.findContinuationSession())?.id).toBe("pending-accepted");
+
+		await addContinuationSession(client, {
+			id: "pending-queued",
+			updatedAt: CREATED_AT,
+			input: {
+				state: "accepted",
+				receiptAt: "2026-08-31T12:01:00.000Z",
+				queuedAt: "2026-08-31T12:04:00.000Z",
+			},
+		});
+		expect((await client.findContinuationSession())?.id).toBe("pending-queued");
+
+		await addContinuationSession(client, {
+			id: "pending-started",
+			updatedAt: CREATED_AT,
+			input: {
+				state: "started",
+				receiptAt: "2026-08-31T12:01:00.000Z",
+				stateAt: "2026-08-31T12:05:00.000Z",
+			},
+		});
+		expect((await client.findContinuationSession())?.id).toBe("pending-started");
+
+		await addContinuationSession(client, {
+			id: "visible-new",
+			updatedAt: "2026-08-31T12:06:00.000Z",
+			visible: true,
+		});
+		expect((await client.findContinuationSession())?.id).toBe("visible-new");
+
+		for (const id of ["pending-tie-z", "pending-tie-a"]) {
+			await addContinuationSession(client, {
+				id,
+				updatedAt: CREATED_AT,
+				input: { state: "accepted", receiptAt: "2026-08-31T12:07:00.000Z" },
+			});
+		}
+		expect((await client.findContinuationSession())?.id).toBe("pending-tie-a");
+		expect((await client.listSessionSummaries()).map((session) => session.id)).toEqual([
+			"visible-new",
+			"visible-old",
+		]);
 	});
 
 	it("rejects write-time foreign-key violations and rolls back the transaction", async () => {

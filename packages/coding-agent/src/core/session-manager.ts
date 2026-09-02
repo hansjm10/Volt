@@ -3771,14 +3771,13 @@ export class SessionManager {
 		}
 	}
 
-	/** Continue the most recent visible session for a cwd, or create one. */
+	/** Continue the most recent visible or pending-input session for a cwd, or create one. */
 	static async continueRecent(cwd: string, sessionDir?: string): Promise<SessionManager> {
 		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
 		const lease = await SessionManager._store(dir);
 		try {
 			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
-			const summaries = await lease.client.listSessionSummaries(filterCwd ? { cwd: resolvePath(cwd) } : {});
-			const latest = summaries[0];
+			const latest = await lease.client.findContinuationSession(filterCwd ? resolvePath(cwd) : undefined);
 			if (!latest) {
 				const manager = new SessionManager(cwd, dir, true, undefined, lease);
 				await manager.flush();

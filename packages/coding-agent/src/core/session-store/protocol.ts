@@ -42,6 +42,7 @@ export type SessionStoreWorkerOperation =
 	| { readonly kind: "verify_foreign_keys" }
 	| { readonly kind: "create_session"; readonly input: SessionStoreCreateSessionInput }
 	| { readonly kind: "load_session"; readonly sessionId: string; readonly sessionGeneration: string }
+	| { readonly kind: "find_continuation_session"; readonly cwd: string | null }
 	| {
 			readonly kind: "list_sessions";
 			readonly includeHidden: boolean;
@@ -470,6 +471,9 @@ export function parseSessionStoreWorkerOperation(value: unknown): SessionStoreWo
 		case "delete_session":
 			exactKeys(input, "$operation", ["kind", "input"]);
 			return { kind, input: parseDeleteInput(input.input, "$operation.input") };
+		case "find_continuation_session":
+			exactKeys(input, "$operation", ["kind", "cwd"]);
+			return { kind, cwd: nullableString(input.cwd, "$operation.cwd") };
 		case "list_sessions":
 			exactKeys(input, "$operation", ["kind", "includeHidden", "cwd"]);
 			return {
@@ -768,6 +772,7 @@ export function parseSessionStoreOperationResult(
 			return arrayValue(value, "$result", parseSummary);
 		case "search_sessions":
 			return arrayValue(value, "$result", parseSearchResult);
+		case "find_continuation_session":
 		case "find_session":
 		case "find_session_by_id":
 			return value === null ? null : parseSummary(value, "$result");

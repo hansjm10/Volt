@@ -525,6 +525,49 @@ function listSessions(includeHidden: boolean, cwd: string | null): SessionStoreS
 	return rows.map(summaryFromRow);
 }
 
+function findContinuationSession(cwd: string | null): SessionStoreSessionSummary | null {
+	const db = requireDatabase();
+	const cwdClause = cwd === null ? "" : "WHERE cwd = ?";
+	const statement = db.prepare(
+		`WITH continuation_candidates AS (
+			SELECT
+				${SUMMARY_COLUMNS},
+				EXISTS (
+					SELECT 1
+					FROM client_inputs
+					WHERE client_inputs.session_id = sessions.id
+						AND client_inputs.state IN ('accepted', 'started')
+				) AS hasPendingInput,
+				(
+					SELECT entries.timestamp
+					FROM entries
+					WHERE entries.session_id = sessions.id
+						AND entries.entry_type IN (
+							'client_input_receipt',
+							'client_input_queued',
+							'client_input_state'
+						)
+					ORDER BY entries.ordinal DESC
+					LIMIT 1
+				) AS pendingInputAt
+			FROM sessions
+			${cwdClause}
+		)
+		SELECT *
+		FROM continuation_candidates
+		WHERE visible = 1 OR hasPendingInput = 1
+		ORDER BY
+			CASE
+				WHEN hasPendingInput = 1 AND pendingInputAt > updatedAt THEN pendingInputAt
+				ELSE updatedAt
+			END DESC,
+			id
+		LIMIT 1`,
+	);
+	const row = cwd === null ? statement.get() : statement.get(cwd);
+	return row ? summaryFromRow(row) : null;
+}
+
 interface ParsedSearchQuery {
 	readonly mode: "tokens" | "regex";
 	readonly tokens: readonly { readonly kind: "fuzzy" | "phrase"; readonly value: string }[];
@@ -1062,6 +1105,8 @@ function execute(operation: SessionStoreWorkerOperation): unknown {
 			return createSession(operation.input);
 		case "load_session":
 			return loadSession(operation.sessionId, operation.sessionGeneration);
+		case "find_continuation_session":
+			return findContinuationSession(operation.cwd);
 		case "list_sessions":
 			return listSessions(operation.includeHidden, operation.cwd);
 		case "search_sessions":
