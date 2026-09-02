@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansjm10/volt-ai";
@@ -10,7 +10,13 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import { SessionConversationStateUnavailableError, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	CURRENT_SESSION_SNAPSHOT_VERSION,
+	CURRENT_SESSION_VERSION,
+	SessionConversationStateUnavailableError,
+	SessionManager,
+	type SessionReference,
+} from "../../src/core/session-manager.ts";
 import type {
 	ExtensionAPI,
 	ExtensionFactory,
@@ -37,7 +43,12 @@ describe("AgentSessionRuntime characterization", () => {
 
 	async function createRuntimeForTest(
 		extensionFactory: ExtensionFactory,
-		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean },
+		options?: {
+			cwd?: string;
+			bootstrapModel?: boolean;
+			bootstrapThinkingLevel?: boolean;
+			beforeCreateRuntime?: (sessionManager: SessionManager) => Promise<void> | void;
+		},
 	) {
 		const tempDir =
 			options?.cwd ?? join(tmpdir(), `volt-runtime-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -86,6 +97,7 @@ describe("AgentSessionRuntime characterization", () => {
 			},
 		};
 		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+			await options?.beforeCreateRuntime?.(sessionManager);
 			const services = await createAgentSessionServices({
 				...runtimeOptions,
 				cwd,
@@ -118,6 +130,32 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 
 		return { runtime, faux, tempDir };
+	}
+
+	const SNAPSHOT_TIMESTAMP = "2026-09-01T12:00:00.000Z";
+
+	function writeSessionSnapshot(
+		filePath: string,
+		cwd: string,
+		id: string,
+		entries: readonly Record<string, unknown>[] = [],
+	): void {
+		writeFileSync(
+			filePath,
+			`${[
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+					id,
+					timestamp: SNAPSHOT_TIMESTAMP,
+					cwd,
+				},
+				...entries,
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
 	}
 
 	it("persists message_end assistant replacements to the session manager", async () => {
@@ -557,6 +595,113 @@ describe("AgentSessionRuntime characterization", () => {
 		const resumeResult = await runtime.switchSession(otherSessionRef!);
 		expect(resumeResult.cancelled).toBe(true);
 		expect(runtime.session.sessionRef).toEqual(originalSessionRef);
+	});
+
+	it("discards a persisted import when snapshot replay fails", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const importedId = "failed-replay-import";
+		const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const currentSessionRef = runtime.session.sessionRef;
+		writeSessionSnapshot(snapshotPath, tempDir, importedId, [
+			{
+				type: "message",
+				id: "imported-message",
+				parentId: null,
+				ordinal: 1,
+				timestamp: SNAPSHOT_TIMESTAMP,
+				message: {
+					role: "user",
+					content: "partially replayed",
+					timestamp: Date.parse(SNAPSHOT_TIMESTAMP),
+				},
+			},
+			{
+				type: "compaction",
+				id: "bad-compaction",
+				parentId: "imported-message",
+				ordinal: 2,
+				timestamp: SNAPSHOT_TIMESTAMP,
+				summary: "summary",
+				firstKeptEntryId: "missing-entry",
+				tokensBefore: 1,
+			},
+		]);
+
+		await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(
+			"Compaction entry bad-compaction references an unavailable retained entry",
+		);
+
+		expect(runtime.session.sessionRef).toEqual(currentSessionRef);
+		const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+			includeMessageFreeDurable: true,
+		});
+		expect(sessions.some((session) => session.id === importedId)).toBe(false);
+	});
+
+	it("discards a persisted import when replacement creation fails before installation", async () => {
+		const importedId = "failed-preinstall-import";
+		let preparedRef: SessionReference | undefined;
+		const { runtime, tempDir } = await createRuntimeForTest(() => {}, {
+			beforeCreateRuntime: (sessionManager) => {
+				if (sessionManager.getSessionId() !== importedId) return;
+				preparedRef = sessionManager.getSessionRef();
+				throw new Error("injected import replacement creation failure");
+			},
+		});
+		const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const currentSessionRef = runtime.session.sessionRef;
+		writeSessionSnapshot(snapshotPath, tempDir, importedId);
+
+		await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(
+			"injected import replacement creation failure",
+		);
+
+		expect(runtime.session.sessionRef).toEqual(currentSessionRef);
+		if (!preparedRef) throw new Error("Expected the imported manager reference to be captured");
+		await expect(SessionManager.open(preparedRef)).rejects.toThrow(`Session not found: ${importedId}`);
+		const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+			includeMessageFreeDurable: true,
+		});
+		expect(sessions.some((session) => session.id === importedId)).toBe(false);
+	});
+
+	it("preserves a persisted import when replacement fails after installation", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const importedId = "failed-postinstall-import";
+		const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const currentSessionRef = runtime.session.sessionRef;
+		writeSessionSnapshot(snapshotPath, tempDir, importedId);
+		const unsubscribe = runtime.subscribeSessionWillProject((session) => {
+			if (session.sessionId === importedId) {
+				throw new Error("injected installed import projection failure");
+			}
+		});
+
+		try {
+			await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(
+				"injected installed import projection failure",
+			);
+		} finally {
+			unsubscribe();
+		}
+
+		expect(runtime.session.sessionId).toBe(importedId);
+		expect(runtime.session.sessionRef).not.toEqual(currentSessionRef);
+		const importedRef = runtime.session.sessionRef;
+		if (!importedRef) throw new Error("Expected the installed import reference");
+		const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+			includeMessageFreeDurable: true,
+		});
+		expect(sessions.find((session) => session.id === importedId)?.ref).toEqual(importedRef);
+		const reopened = await SessionManager.open(importedRef);
+		try {
+			expect(reopened.getSessionRef()).toEqual(importedRef);
+		} finally {
+			await reopened.closePersistence();
+		}
 	});
 
 	it("emits session_before_fork and session_start and honors cancellation", async () => {

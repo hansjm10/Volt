@@ -1732,17 +1732,11 @@ export class AgentSessionRuntime {
 			assertCurrent();
 			return sessionManager;
 		} catch (error) {
-			if (sessionManager.isPersisted()) {
-				try {
-					await sessionManager.closePersistence();
-				} catch (closeError) {
-					throw new AggregateError(
-						[error, closeError],
-						"Session import failed and its prepared manager could not be closed",
-					);
-				}
-			}
-			throw error;
+			return await discardPreparedSessionManager(
+				sessionManager,
+				error,
+				"Session import failed and its manager persistence could not be discarded",
+			);
 		}
 	}
 
@@ -1788,10 +1782,17 @@ export class AgentSessionRuntime {
 			});
 			return { cancelled: false };
 		} catch (error) {
-			return await closePreparedSessionManager(
+			if (sessionManager === this.session.sessionManager) {
+				return await closePreparedSessionManager(
+					sessionManager,
+					error,
+					"Session import failed and its installed manager could not be closed",
+				);
+			}
+			return await discardPreparedSessionManager(
 				sessionManager,
 				error,
-				"Session import failed and its prepared manager could not be closed",
+				"Session import failed and its manager persistence could not be discarded",
 			);
 		}
 	}
