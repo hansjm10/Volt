@@ -1017,13 +1017,15 @@ export class AgentSessionRuntime {
 		const header = this.session.sessionManager.getHeader();
 		const entries = this.session.sessionManager.getEntries();
 		const startingGitContext = this.session.sessionManager.getStartingGitContext();
-		const lastEntry = entries.at(-1);
 		const summary = summarizeSessionEntries(entries);
 		return {
 			sessionId: this.session.sessionId,
 			sessionName: this.session.sessionName,
 			createdAt: toSessionTimestamp(header?.timestamp),
-			modifiedAt: toSessionTimestamp(lastEntry?.timestamp ?? header?.timestamp),
+			modifiedAt:
+				typeof summary.lastActivityTime === "number" && summary.lastActivityTime > 0
+					? new Date(summary.lastActivityTime).toISOString()
+					: toSessionTimestamp(header?.timestamp),
 			messageCount: summary.messageCount,
 			firstMessage: summary.firstMessage,
 			current: true,

@@ -403,6 +403,51 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.session.fastModeEnabled).toBe(true);
 	});
 
+	it("keeps live modified time aligned with stored message activity after metadata changes", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const manager = runtime.session.sessionManager;
+		const messageTime = Date.now() - 60_000;
+		manager.appendMessage({ role: "user", content: "activity baseline", timestamp: messageTime });
+		runtime.session.setSessionName("renamed after activity");
+		await manager.flush();
+
+		const stored = (await SessionManager.list(runtime.cwd, manager.getSessionDir())).find(
+			(session) => session.id === runtime.session.sessionId,
+		);
+		const live = runtime.getCurrentSessionSummary();
+
+		expect(stored).toBeDefined();
+		expect(live.modifiedAt).toBe(new Date(messageTime).toISOString());
+		expect(live.modifiedAt).toBe(stored?.modified.toISOString());
+	});
+
+	it("keeps live planning-only modified time aligned with the stored header fallback", async () => {
+		const { runtime } = await createRuntimeForTest(() => {}, { bootstrapModel: false });
+		const manager = runtime.session.sessionManager;
+		const header = manager.getHeader();
+		if (!header) throw new Error("Expected current session header");
+		const createdAt = new Date(header.timestamp).toISOString();
+		manager.appendPlanningState({ mode: "plan", plan: null });
+		manager.appendCustomMessageEntry(
+			"test.hidden-after-planning",
+			"hidden activity",
+			false,
+			undefined,
+			new Date(header.timestamp).getTime() + 60_000,
+		);
+		await manager.flush();
+
+		const stored = (await SessionManager.list(runtime.cwd, manager.getSessionDir())).find(
+			(session) => session.id === runtime.session.sessionId,
+		);
+		const live = runtime.getCurrentSessionSummary();
+
+		expect(stored).toBeDefined();
+		expect(stored?.messageCount).toBe(0);
+		expect(live.modifiedAt).toBe(createdAt);
+		expect(live.modifiedAt).toBe(stored?.modified.toISOString());
+	});
+
 	it("lists current-workspace sessions and switches by session id", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
 
