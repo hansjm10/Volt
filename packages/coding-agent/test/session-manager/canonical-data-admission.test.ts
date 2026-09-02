@@ -53,6 +53,65 @@ describe("SessionManager canonical data admission", () => {
 		expect((await SessionManager.open(ref)).getEntries()).toHaveLength(1);
 	});
 
+	it("rejects out-of-range message timestamps before state or persistence changes", async () => {
+		const { manager, ref } = await createManager();
+		const observed: string[] = [];
+		manager.subscribeEntries((entry) => observed.push(entry.id));
+		const before = manager.issueCanonicalProjection();
+
+		expect(() =>
+			manager.appendMessage({
+				role: "user",
+				content: "outside the upper Date boundary",
+				timestamp: Number.MAX_SAFE_INTEGER,
+			}),
+		).toThrow("Session message timestamp must be representable as a Date");
+		expect(() =>
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "invalid-timestamp",
+				toolName: "test",
+				content: [{ type: "text", text: "outside the lower Date boundary" }],
+				isError: false,
+				timestamp: -Number.MAX_SAFE_INTEGER,
+			}),
+		).toThrow("Session message timestamp must be representable as a Date");
+
+		const after = manager.issueCanonicalProjection();
+		expect(after.revision).toBe(before.revision);
+		expect(after.entries).toEqual([]);
+		expect(manager.getEntries()).toEqual([]);
+		expect(manager.getLeafId()).toBeNull();
+		expect(observed).toEqual([]);
+		await manager.flush();
+
+		const persistedBeforeValidAppend = await SessionManager.open(ref);
+		expect(persistedBeforeValidAppend.getEntries()).toEqual([]);
+		expect(persistedBeforeValidAppend.getLeafId()).toBeNull();
+
+		const validUserId = manager.appendMessage({
+			role: "user",
+			content: "exact upper Date boundary",
+			timestamp: 8_640_000_000_000_000,
+		});
+		const validToolResultId = manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "valid-timestamp",
+			toolName: "test",
+			content: [{ type: "text", text: "exact lower Date boundary" }],
+			isError: false,
+			timestamp: -8_640_000_000_000_000,
+		});
+		await manager.flush();
+
+		expect(manager.getEntry(validUserId)?.ordinal).toBe(1);
+		expect(manager.getEntry(validToolResultId)?.ordinal).toBe(2);
+		expect(observed).toEqual([validUserId, validToolResultId]);
+		const persisted = await SessionManager.open(ref);
+		expect(persisted.getEntries().map((entry) => entry.id)).toEqual([validUserId, validToolResultId]);
+		expect(persisted.getLeafId()).toBe(validToolResultId);
+	});
+
 	it("owns valid input and round-trips it exactly through SQLite reopen", async () => {
 		const { manager, ref } = await createManager();
 		const data = { nested: { values: [1, "two", true, null] } };

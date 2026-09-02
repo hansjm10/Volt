@@ -2139,6 +2139,13 @@ export class SessionManager {
 		this._assertPersistenceHealthy();
 		const canonicalEntry = cloneCanonicalData(entry, `Session ${entry.type} entry`);
 		if (
+			canonicalEntry.type === "message" &&
+			typeof canonicalEntry.message.timestamp === "number" &&
+			Number.isNaN(new Date(canonicalEntry.message.timestamp).getTime())
+		) {
+			throw new Error("Session message timestamp must be representable as a Date");
+		}
+		if (
 			canonicalEntry.parentId === canonicalEntry.id ||
 			(canonicalEntry.parentId !== null && !this.byId.has(canonicalEntry.parentId))
 		) {
