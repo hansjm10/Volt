@@ -1472,59 +1472,111 @@ export interface SessionEntrySummary {
 	lastActivityTime?: number;
 }
 
-export function summarizeSessionEntries(entries: Iterable<SessionEntry>): SessionEntrySummary {
-	let messageCount = 0;
-	let firstUserMessage = "";
-	let firstFallbackMessage = "";
-	let lastActivityTime: number | undefined;
+interface SessionMessageSummaryAccumulator {
+	messageCount: number;
+	firstUserMessage: string;
+	firstFallbackMessage: string;
+	lastActivityTime: number | undefined;
+}
 
-	for (const entry of entries) {
-		if (entry.type === "message") {
-			messageCount++;
+interface SessionStoreProjectionAccumulator {
+	messageSummary: SessionMessageSummaryAccumulator;
+	hasPlanningState: boolean;
+	name: string | undefined;
+	startingGitContext: RpcGitContext | null | undefined;
+}
 
-			const activityTime = getMessageActivityTime(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
+function createSessionMessageSummaryAccumulator(): SessionMessageSummaryAccumulator {
+	return {
+		messageCount: 0,
+		firstUserMessage: "",
+		firstFallbackMessage: "",
+		lastActivityTime: undefined,
+	};
+}
 
-			const message = entry.message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
+function createSessionStoreProjectionAccumulator(): SessionStoreProjectionAccumulator {
+	return {
+		messageSummary: createSessionMessageSummaryAccumulator(),
+		hasPlanningState: false,
+		name: undefined,
+		startingGitContext: undefined,
+	};
+}
 
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
+function cloneSessionStoreProjectionAccumulator(
+	accumulator: SessionStoreProjectionAccumulator,
+): SessionStoreProjectionAccumulator {
+	return {
+		messageSummary: { ...accumulator.messageSummary },
+		hasPlanningState: accumulator.hasPlanningState,
+		name: accumulator.name,
+		startingGitContext: accumulator.startingGitContext,
+	};
+}
 
-			if (!firstUserMessage && message.role === "user") {
-				firstUserMessage = textContent;
-			}
-			if (!firstFallbackMessage && message.role === "assistant") {
-				firstFallbackMessage = textContent;
-			}
-			continue;
+function accumulateSessionMessageSummary(accumulator: SessionMessageSummaryAccumulator, entry: SessionEntry): void {
+	if (entry.type === "message") {
+		accumulator.messageCount++;
+
+		const activityTime = getMessageActivityTime(entry);
+		if (typeof activityTime === "number") {
+			accumulator.lastActivityTime = Math.max(accumulator.lastActivityTime ?? 0, activityTime);
 		}
 
-		if (isDisplayedCustomMessage(entry)) {
-			messageCount++;
+		const message = entry.message;
+		if (!isMessageWithContent(message)) return;
+		if (message.role !== "user" && message.role !== "assistant") return;
 
-			const activityTime = getEntryTimestamp(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
+		const textContent = extractTextContent(message);
+		if (!textContent) return;
 
-			const textContent = extractTextContentFromContent(entry.content);
-			if (!textContent) continue;
-
-			if (!firstFallbackMessage) {
-				firstFallbackMessage = textContent;
-			}
+		if (!accumulator.firstUserMessage && message.role === "user") {
+			accumulator.firstUserMessage = textContent;
 		}
+		if (!accumulator.firstFallbackMessage && message.role === "assistant") {
+			accumulator.firstFallbackMessage = textContent;
+		}
+		return;
 	}
 
+	if (!isDisplayedCustomMessage(entry)) return;
+	accumulator.messageCount++;
+
+	const activityTime = getEntryTimestamp(entry);
+	if (typeof activityTime === "number") {
+		accumulator.lastActivityTime = Math.max(accumulator.lastActivityTime ?? 0, activityTime);
+	}
+
+	const textContent = extractTextContentFromContent(entry.content);
+	if (textContent && !accumulator.firstFallbackMessage) {
+		accumulator.firstFallbackMessage = textContent;
+	}
+}
+
+function accumulateSessionStoreProjection(accumulator: SessionStoreProjectionAccumulator, entry: SessionEntry): void {
+	accumulateSessionMessageSummary(accumulator.messageSummary, entry);
+	if (entry.type === "planning_state_change") {
+		accumulator.hasPlanningState = true;
+	} else if (entry.type === "session_info") {
+		accumulator.name = entry.name?.trim() || undefined;
+	} else if (entry.type === "session_start_git_context") {
+		accumulator.startingGitContext = entry.gitContext;
+	}
+}
+
+function sessionEntrySummaryFromAccumulator(accumulator: SessionMessageSummaryAccumulator): SessionEntrySummary {
 	return {
-		messageCount,
-		firstMessage: firstUserMessage || firstFallbackMessage || "(no messages)",
-		lastActivityTime,
+		messageCount: accumulator.messageCount,
+		firstMessage: accumulator.firstUserMessage || accumulator.firstFallbackMessage || "(no messages)",
+		lastActivityTime: accumulator.lastActivityTime,
 	};
+}
+
+export function summarizeSessionEntries(entries: Iterable<SessionEntry>): SessionEntrySummary {
+	const accumulator = createSessionMessageSummaryAccumulator();
+	for (const entry of entries) accumulateSessionMessageSummary(accumulator, entry);
+	return sessionEntrySummaryFromAccumulator(accumulator);
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -1559,6 +1611,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private clientInputsById: Map<string, ClientInputRecord> = new Map();
+	private sessionStoreProjection = createSessionStoreProjectionAccumulator();
 	private leafId: string | null = null;
 	private nextOrdinal = 1;
 	/** Monotonic revision of provider-visible entries and durable leaf movement. */
@@ -1677,6 +1730,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.clientInputsById.clear();
+		this.sessionStoreProjection = createSessionStoreProjectionAccumulator();
 		this.leafId = null;
 		this.nextOrdinal = 1;
 		this.canonicalRevision = 0;
@@ -1713,6 +1767,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.clientInputsById.clear();
+		this.sessionStoreProjection = createSessionStoreProjectionAccumulator();
 		this.leafId = null;
 		this.nextOrdinal = 1;
 		this.canonicalRevision = 0;
@@ -1768,6 +1823,7 @@ export class SessionManager {
 				this.leafId = entry.id;
 			}
 			this._indexClientInputEntry(entry);
+			accumulateSessionStoreProjection(this.sessionStoreProjection, entry);
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1878,22 +1934,20 @@ export class SessionManager {
 	}
 
 	private _storeProjection(): SessionStoreSessionProjection {
-		const entries = this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
 		const header = this.getHeader();
 		if (!header) throw new Error("Session header is unavailable");
-		const summary = summarizeSessionEntries(entries);
-		const startingGitContext = this.getStartingGitContext();
+		const summary = sessionEntrySummaryFromAccumulator(this.sessionStoreProjection.messageSummary);
+		const startingGitContext = this.sessionStoreProjection.startingGitContext;
 		const updatedAt =
 			typeof summary.lastActivityTime === "number" && summary.lastActivityTime > 0
 				? new Date(summary.lastActivityTime).toISOString()
 				: header.timestamp;
-		const visible = summary.messageCount > 0 || entries.some((entry) => entry.type === "planning_state_change");
 		return {
 			updatedAt,
 			startingGitContextRecorded: startingGitContext !== undefined,
 			startingGitContext: (startingGitContext ?? null) as SessionStoreJsonValue,
-			name: this.getSessionName() ?? null,
-			visible,
+			name: this.sessionStoreProjection.name ?? null,
+			visible: summary.messageCount > 0 || this.sessionStoreProjection.hasPlanningState,
 			leafId: this.leafId,
 			messageCount: summary.messageCount,
 			firstMessage: summary.firstMessage === "(no messages)" ? "" : summary.firstMessage,
@@ -2100,6 +2154,7 @@ export class SessionManager {
 			this.leafId = canonicalEntry.id;
 		}
 		this._indexClientInputEntry(canonicalEntry);
+		accumulateSessionStoreProjection(this.sessionStoreProjection, canonicalEntry);
 		if (!this.atomicAppendEntries) this._persist(canonicalEntry);
 		if (this.atomicAppendEntries) {
 			this.atomicAppendEntries.push(canonicalEntry);
@@ -2284,6 +2339,7 @@ export class SessionManager {
 			clientInputsById: new Map(
 				[...this.clientInputsById].map(([id, record]) => [id, cloneClientInputRecord(record)]),
 			),
+			sessionStoreProjection: cloneSessionStoreProjectionAccumulator(this.sessionStoreProjection),
 			leafId: this.leafId,
 			nextOrdinal: this.nextOrdinal,
 			nextSearchChunkIndex: this.nextSearchChunkIndex,
@@ -2295,6 +2351,7 @@ export class SessionManager {
 			this.labelsById = snapshot.labelsById;
 			this.labelTimestampsById = snapshot.labelTimestampsById;
 			this.clientInputsById = snapshot.clientInputsById;
+			this.sessionStoreProjection = snapshot.sessionStoreProjection;
 			this.leafId = snapshot.leafId;
 			this.nextOrdinal = snapshot.nextOrdinal;
 			this.nextSearchChunkIndex = snapshot.nextSearchChunkIndex;
@@ -2335,6 +2392,7 @@ export class SessionManager {
 			labelsById: this.labelsById,
 			labelTimestampsById: this.labelTimestampsById,
 			clientInputsById: this.clientInputsById,
+			sessionStoreProjection: cloneSessionStoreProjectionAccumulator(this.sessionStoreProjection),
 			leafId: this.leafId,
 			nextOrdinal: this.nextOrdinal,
 			nextSearchChunkIndex: this.nextSearchChunkIndex,
@@ -2377,6 +2435,7 @@ export class SessionManager {
 		this.labelsById = staged.labelsById;
 		this.labelTimestampsById = staged.labelTimestampsById;
 		this.clientInputsById = staged.clientInputsById;
+		this.sessionStoreProjection = staged.sessionStoreProjection;
 		this.leafId = staged.leafId;
 		this.nextOrdinal = staged.nextOrdinal;
 		this.nextSearchChunkIndex = staged.nextSearchChunkIndex;
@@ -3199,7 +3258,7 @@ export class SessionManager {
 		if (!this.acceptsStartingGitContext || this.sessionId !== expectedSessionId) {
 			return false;
 		}
-		if (this.fileEntries.some((entry) => entry.type === "session_start_git_context")) {
+		if (this.sessionStoreProjection.startingGitContext !== undefined) {
 			this.acceptsStartingGitContext = false;
 			return false;
 		}
@@ -3215,24 +3274,13 @@ export class SessionManager {
 	}
 
 	getStartingGitContext(): RpcGitContext | null | undefined {
-		const entry = this.fileEntries.find(
-			(candidate): candidate is SessionStartGitContextEntry => candidate.type === "session_start_git_context",
-		);
-		return entry?.gitContext;
+		return this.sessionStoreProjection.startingGitContext;
 	}
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
-		// Walk entries in reverse to find the latest session_info entry.
-		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
-			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
-			}
-		}
-		return undefined;
+		this.assertConversationAuthorityAvailable();
+		return this.sessionStoreProjection.name;
 	}
 
 	/**
