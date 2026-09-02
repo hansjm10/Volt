@@ -6,7 +6,7 @@ import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansj
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/index.ts";
-import { CURRENT_SESSION_VERSION } from "../src/core/session-manager.ts";
+import { CURRENT_SESSION_VERSION, SessionManager } from "../src/core/session-manager.ts";
 import { DEFAULT_SUBAGENT_TURN_LIMITS, SubagentManager } from "../src/core/subagents/index.ts";
 import {
 	createIrohRemoteAgentRuntime,
@@ -402,17 +402,8 @@ export default function (volt) {
 		writeRuntimeConfig({});
 		const sessionDir = join(agentDir, "sessions", "remote-workspace");
 		mkdirSync(sessionDir, { recursive: true });
-		const sessionFile = join(sessionDir, "2026-06-21T00-00-00-000Z_remote-session.jsonl");
-		writeFileSync(
-			sessionFile,
-			`${JSON.stringify({
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: "remote-session",
-				timestamp: "2026-06-21T00:00:00.000Z",
-				cwd,
-			})}\n`,
-		);
+		const seededSession = await SessionManager.create(cwd, sessionDir, { id: "remote-session" });
+		await seededSession.closePersistence();
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const resumeRecoveredInputs = vi.spyOn(AgentSession.prototype, "resumeRecoveredClientInputs").mockResolvedValue();
 
