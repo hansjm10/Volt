@@ -1,7 +1,21 @@
-import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { type ChildProcess, execFileSync, fork } from "node:child_process";
+import {
+	chmodSync,
+	existsSync,
+	linkSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	acquireSharedSQLiteSessionStore,
@@ -11,14 +25,29 @@ import {
 	SESSION_STORE_SCHEMA_VERSION,
 	type SessionStoreApplyTransactionInput,
 	type SessionStoreCreateSessionInput,
+	type SessionStoreInfo,
 	type SessionStoreTransactionPayload,
 	SQLiteSessionStoreClient,
 	type SQLiteSessionStoreLease,
 } from "../../src/core/session-store/index.ts";
 import { SESSION_STORE_SCHEMA_SQL } from "../../src/core/session-store/schema.ts";
+import type { OpenStoreChildRequest, OpenStoreChildResponse } from "./open-store-child.ts";
 
 const CREATED_AT = "2026-08-31T12:00:00.000Z";
 const UPDATED_AT = "2026-08-31T12:01:00.000Z";
+const OPEN_STORE_CHILD_PATH = resolve(__dirname, "open-store-child.ts");
+const OPEN_STORE_CHILD_COUNT = 8;
+const OPEN_STORE_CHILD_TIMEOUT_MS = 10_000;
+
+interface OpenStoreChildHandle {
+	readonly child: ChildProcess;
+	readonly stderr: () => string;
+}
+
+interface StoreSchemaState {
+	readonly userVersion: number;
+	readonly objectNames: readonly string[];
+}
 
 function generationFor(id: string): string {
 	return `generation:${id}:1`;
@@ -27,6 +56,7 @@ function generationFor(id: string): string {
 const roots: string[] = [];
 const clients: SQLiteSessionStoreClient[] = [];
 const leases: SQLiteSessionStoreLease[] = [];
+const openStoreChildren = new Set<OpenStoreChildHandle>();
 
 function makeSessionDirectory(): string {
 	const root = mkdtempSync(join(tmpdir(), "volt-session-store-"));
@@ -114,7 +144,215 @@ function mutateStoreSchema(databasePath: string, sql: string): void {
 	);
 }
 
+function openStoreChildResponseKind(message: unknown): OpenStoreChildResponse["kind"] | undefined {
+	if (!message || typeof message !== "object" || !("kind" in message)) return undefined;
+	const kind = message.kind;
+	if (kind === "ready" || kind === "opening" || kind === "opened" || kind === "error" || kind === "closed") {
+		return kind;
+	}
+	return undefined;
+}
+
+function childFailureMessage(handle: OpenStoreChildHandle, description: string): string {
+	const stderr = handle.stderr().trim();
+	return stderr ? `${description}: ${stderr}` : description;
+}
+
+function waitForOpenStoreChildResponse(
+	handle: OpenStoreChildHandle,
+	acceptedKinds: readonly OpenStoreChildResponse["kind"][],
+	description: string,
+): Promise<OpenStoreChildResponse> {
+	return new Promise((resolveResponse, rejectResponse) => {
+		let timeout: NodeJS.Timeout | undefined;
+		const cleanup = (): void => {
+			if (timeout) clearTimeout(timeout);
+			handle.child.off("message", onMessage);
+			handle.child.off("error", onError);
+			handle.child.off("exit", onExit);
+		};
+		const fail = (message: string): void => {
+			cleanup();
+			rejectResponse(new Error(childFailureMessage(handle, message)));
+		};
+		const onMessage = (message: unknown): void => {
+			const kind = openStoreChildResponseKind(message);
+			if (!kind || !acceptedKinds.includes(kind)) return;
+			cleanup();
+			resolveResponse(message as OpenStoreChildResponse);
+		};
+		const onError = (error: Error): void => fail(`${description} failed: ${error.message}`);
+		const onExit = (code: number | null, signal: NodeJS.Signals | null): void =>
+			fail(`${description} exited early with code ${String(code)} and signal ${String(signal)}`);
+
+		handle.child.on("message", onMessage);
+		handle.child.once("error", onError);
+		handle.child.once("exit", onExit);
+		timeout = setTimeout(
+			() => fail(`${description} exceeded ${OPEN_STORE_CHILD_TIMEOUT_MS}ms`),
+			OPEN_STORE_CHILD_TIMEOUT_MS,
+		);
+	});
+}
+
+function waitForOpenStoreChildExit(
+	handle: OpenStoreChildHandle,
+	timeoutMs = OPEN_STORE_CHILD_TIMEOUT_MS,
+): Promise<void> {
+	if (handle.child.exitCode !== null || handle.child.signalCode !== null) return Promise.resolve();
+	return new Promise((resolveExit, rejectExit) => {
+		const cleanup = (): void => {
+			clearTimeout(timeout);
+			handle.child.off("exit", onExit);
+		};
+		const onExit = (): void => {
+			cleanup();
+			resolveExit();
+		};
+		const timeout = setTimeout(() => {
+			cleanup();
+			rejectExit(new Error(childFailureMessage(handle, `Child exit exceeded ${timeoutMs}ms`)));
+		}, timeoutMs);
+		handle.child.once("exit", onExit);
+	});
+}
+
+function spawnOpenStoreChild(): OpenStoreChildHandle {
+	let stderr = "";
+	const child = fork(OPEN_STORE_CHILD_PATH, [], {
+		cwd: resolve(__dirname, "../.."),
+		execArgv: ["--experimental-strip-types", "--conditions=volt-source", "--disable-warning=ExperimentalWarning"],
+		stdio: ["ignore", "ignore", "pipe", "ipc"],
+	});
+	child.stderr?.on("data", (chunk: Buffer | string) => {
+		stderr += chunk.toString();
+	});
+	const handle: OpenStoreChildHandle = { child, stderr: () => stderr };
+	openStoreChildren.add(handle);
+	child.once("exit", () => openStoreChildren.delete(handle));
+	return handle;
+}
+
+function sendOpenStoreChildRequest(handle: OpenStoreChildHandle, request: OpenStoreChildRequest): void {
+	if (!handle.child.connected) throw new Error("Session store child IPC channel is closed");
+	handle.child.send(request);
+}
+
+function errorFromOpenStoreChild(response: Extract<OpenStoreChildResponse, { kind: "error" }>): Error {
+	return new Error(`${response.code ? `${response.code}: ` : ""}${response.message}`);
+}
+
+async function terminateOpenStoreChild(handle: OpenStoreChildHandle): Promise<void> {
+	if (handle.child.exitCode !== null || handle.child.signalCode !== null) {
+		openStoreChildren.delete(handle);
+		return;
+	}
+	const exited = waitForOpenStoreChildExit(handle, 2_000).catch(() => undefined);
+	handle.child.kill("SIGKILL");
+	await exited;
+	openStoreChildren.delete(handle);
+}
+
+async function closeOpenStoreChild(handle: OpenStoreChildHandle): Promise<void> {
+	if (handle.child.exitCode !== null || handle.child.signalCode !== null) return;
+	const responsePromise = waitForOpenStoreChildResponse(handle, ["closed", "error"], "Session store child close");
+	const exitPromise = waitForOpenStoreChildExit(handle);
+	sendOpenStoreChildRequest(handle, { kind: "close" });
+	const response = await responsePromise;
+	if (response.kind === "error") throw errorFromOpenStoreChild(response);
+	await exitPromise;
+}
+
+async function openStoreInIndependentProcesses(
+	sessionDirectory: string,
+	afterOpening?: () => Promise<void>,
+): Promise<SessionStoreInfo[]> {
+	const handles: OpenStoreChildHandle[] = [];
+	const readyPromises: Promise<OpenStoreChildResponse>[] = [];
+	let closedCleanly = false;
+	try {
+		for (let index = 0; index < OPEN_STORE_CHILD_COUNT; index += 1) {
+			const handle = spawnOpenStoreChild();
+			handles.push(handle);
+			readyPromises.push(waitForOpenStoreChildResponse(handle, ["ready"], "Session store child readiness"));
+		}
+		await Promise.all(readyPromises);
+
+		const openingPromises = handles.map((handle) =>
+			waitForOpenStoreChildResponse(handle, ["opening", "error"], "Session store child open start"),
+		);
+		const resultPromises = handles.map((handle) =>
+			waitForOpenStoreChildResponse(handle, ["opened", "error"], "Session store child open result"),
+		);
+		for (const handle of handles) {
+			sendOpenStoreChildRequest(handle, { kind: "open", sessionDirectory });
+		}
+
+		const openingResponses = await Promise.all(openingPromises);
+		const openingFailure = openingResponses.find(
+			(response): response is Extract<OpenStoreChildResponse, { kind: "error" }> => response.kind === "error",
+		);
+		if (openingFailure) throw errorFromOpenStoreChild(openingFailure);
+		if (afterOpening) await afterOpening();
+
+		const responses = await Promise.all(resultPromises);
+		const failure = responses.find(
+			(response): response is Extract<OpenStoreChildResponse, { kind: "error" }> => response.kind === "error",
+		);
+		if (failure) throw errorFromOpenStoreChild(failure);
+		const infos = responses.map((response) => {
+			if (response.kind !== "opened") throw new Error(`Unexpected child response ${response.kind}`);
+			return response.info;
+		});
+		await Promise.all(handles.map((handle) => closeOpenStoreChild(handle)));
+		closedCleanly = true;
+		return infos;
+	} finally {
+		if (!closedCleanly) await Promise.all(handles.map((handle) => terminateOpenStoreChild(handle)));
+	}
+}
+
+function readStoreSchemaState(databasePath: string): StoreSchemaState {
+	const db = new DatabaseSync(databasePath);
+	try {
+		const version = db.prepare("PRAGMA user_version").get()?.user_version;
+		if (typeof version !== "number") throw new Error("SQLite did not return user_version");
+		const objectNames = db
+			.prepare("SELECT name FROM main.sqlite_schema ORDER BY name")
+			.all()
+			.map((row) => {
+				if (typeof row.name !== "string") throw new Error("SQLite returned an invalid schema object name");
+				return row.name;
+			});
+		return { userVersion: version, objectNames };
+	} finally {
+		db.close();
+	}
+}
+
+function seedUnversionedStore(sessionDirectory: string, sql: string): string {
+	mkdirSync(sessionDirectory, { recursive: true, mode: 0o700 });
+	const databasePath = join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME);
+	const db = new DatabaseSync(databasePath);
+	try {
+		db.exec(sql);
+	} finally {
+		db.close();
+	}
+	return databasePath;
+}
+
+function assertConcurrentStoreInfos(infos: readonly SessionStoreInfo[], sessionDirectory: string): string {
+	expect(infos).toHaveLength(OPEN_STORE_CHILD_COUNT);
+	expect(new Set(infos.map((info) => info.storeId)).size).toBe(1);
+	expect(new Set(infos.map((info) => info.databasePath))).toEqual(
+		new Set([join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME)]),
+	);
+	return infos[0]!.storeId;
+}
+
 afterEach(async () => {
+	await Promise.all([...openStoreChildren].map((handle) => terminateOpenStoreChild(handle)));
 	await Promise.all(leases.splice(0).map((lease) => lease.release()));
 	await Promise.all(clients.splice(0).map((client) => client.close()));
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -144,6 +382,40 @@ describe("SQLite session store", () => {
 		expect(reopened.info.schemaVersion).toBe(SESSION_STORE_SCHEMA_VERSION);
 		expect(await reopened.listSessionSummaries({ includeHidden: true })).toEqual([]);
 	});
+
+	it("initializes one missing database across independent processes", async () => {
+		const sessionDirectory = makeSessionDirectory();
+		mkdirSync(sessionDirectory, { mode: 0o700 });
+		const infos = await openStoreInIndependentProcesses(sessionDirectory);
+		const storeId = assertConcurrentStoreInfos(infos, sessionDirectory);
+
+		const reopened = await openStore(sessionDirectory);
+		expect(reopened.info.storeId).toBe(storeId);
+	}, 30_000);
+
+	it("serializes first schema initialization across independent processes", async () => {
+		const sessionDirectory = makeSessionDirectory();
+		const databasePath = seedUnversionedStore(sessionDirectory, "");
+		const gate = new DatabaseSync(databasePath, { timeout: SESSION_STORE_BUSY_TIMEOUT_MS });
+		let infos: SessionStoreInfo[];
+		try {
+			gate.exec(`PRAGMA busy_timeout = ${SESSION_STORE_BUSY_TIMEOUT_MS}`);
+			const journalMode = gate.prepare("PRAGMA journal_mode = WAL").get()?.journal_mode;
+			expect(journalMode).toBe("wal");
+			gate.exec("BEGIN IMMEDIATE");
+			infos = await openStoreInIndependentProcesses(sessionDirectory, async () => {
+				await delay(750);
+				gate.exec("COMMIT");
+			});
+		} finally {
+			if (gate.isTransaction) gate.exec("ROLLBACK");
+			gate.close();
+		}
+		const storeId = assertConcurrentStoreInfos(infos, sessionDirectory);
+
+		const reopened = await openStore(sessionDirectory);
+		expect(reopened.info.storeId).toBe(storeId);
+	}, 30_000);
 
 	it("starts a store worker when the daemon process has V8 optimization arguments", async () => {
 		const daemonFlag = "--optimize-for-size";
@@ -593,6 +865,49 @@ describe("SQLite session store", () => {
 			}),
 		).toEqual({ status: "not_found" });
 	});
+
+	it.each([
+		["a user table", "CREATE TABLE unexpected_table (id INTEGER PRIMARY KEY);"],
+		["a view-only schema", "CREATE VIEW unexpected_view AS SELECT 1 AS value;"],
+		[
+			"residual internal schema state",
+			"CREATE TABLE discarded_table (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE discarded_table;",
+		],
+	])("rejects an unversioned store with %s without mutating its schema", async (_description, sql) => {
+		const sessionDirectory = makeSessionDirectory();
+		const databasePath = seedUnversionedStore(sessionDirectory, sql);
+		const before = readStoreSchemaState(databasePath);
+		expect(before.userVersion).toBe(0);
+		expect(before.objectNames.length).toBeGreaterThan(0);
+
+		await expect(SQLiteSessionStoreClient.open(sessionDirectory)).rejects.toMatchObject({
+			code: "store_schema_mismatch",
+		});
+
+		expect(readStoreSchemaState(databasePath)).toEqual(before);
+	});
+
+	it.runIf(process.platform !== "win32")(
+		"rejects dangling-symlink and hard-link database paths without replacing their referents",
+		async () => {
+			const sessionDirectory = makeSessionDirectory();
+			mkdirSync(sessionDirectory, { mode: 0o700 });
+			const databasePath = join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME);
+			symlinkSync("missing.sqlite", databasePath);
+
+			await expect(SQLiteSessionStoreClient.open(sessionDirectory)).rejects.toThrow("non-regular private file");
+			expect(lstatSync(databasePath).isSymbolicLink()).toBe(true);
+
+			rmSync(databasePath);
+			const referentPath = join(sessionDirectory, "referent.sqlite");
+			writeFileSync(referentPath, "unchanged", { mode: 0o600 });
+			linkSync(referentPath, databasePath);
+
+			await expect(SQLiteSessionStoreClient.open(sessionDirectory)).rejects.toThrow("multiply-linked private file");
+			expect(readFileSync(referentPath, "utf8")).toBe("unchanged");
+			expect(statSync(referentPath).nlink).toBe(2);
+		},
+	);
 
 	it.each([
 		[

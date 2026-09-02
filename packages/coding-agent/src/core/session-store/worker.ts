@@ -196,14 +196,15 @@ function assertExactNames(actual: readonly string[], expected: readonly string[]
 }
 
 function initializeNewSchema(db: DatabaseSync): void {
-	const existingTables = userSchemaObjects(db, "table");
-	if (existingTables.length > 0) {
-		throw new SessionStoreError(
-			"store_schema_mismatch",
-			"Refusing to initialize an unversioned non-empty session store",
-		);
-	}
 	withTransaction(db, () => {
+		const userVersion = pragmaInteger(db, "PRAGMA user_version", "user_version");
+		if (userVersion !== 0) return;
+		if (db.prepare("SELECT 1 AS present FROM main.sqlite_schema LIMIT 1").get()) {
+			throw new SessionStoreError(
+				"store_schema_mismatch",
+				"Refusing to initialize an unversioned non-empty session store",
+			);
+		}
 		db.exec(SESSION_STORE_SCHEMA_SQL);
 		const insertMetadata = db.prepare("INSERT INTO store_metadata (key, value_json) VALUES (?, ?)");
 		insertMetadata.run("schema_id", stringifyCanonicalSessionStoreJson(SESSION_STORE_SCHEMA_ID, "Schema id"));
@@ -278,10 +279,15 @@ function openDatabase(): SessionStoreInfo {
 	if (database) return storeInfo();
 
 	ensurePrivateDirectorySync(sessionDirectory);
-	for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+	for (const path of [`${databasePath}-wal`, `${databasePath}-shm`]) {
 		if (existsSync(path)) hardenPrivateRegularFileSync(path);
 	}
-	if (!existsSync(databasePath)) writePrivateNewFileSync(databasePath, new Uint8Array());
+	try {
+		writePrivateNewFileSync(databasePath, new Uint8Array());
+	} catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+	}
+	hardenPrivateRegularFileSync(databasePath);
 	const preOpenStat = lstatSync(databasePath);
 	if (preOpenStat.isSymbolicLink() || !preOpenStat.isFile() || preOpenStat.nlink !== 1) {
 		throw new SessionStoreError("store_initialization_failed", "Session store path is not a private regular file");
