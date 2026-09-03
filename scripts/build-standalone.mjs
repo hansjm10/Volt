@@ -550,7 +550,7 @@ async function bundleStandalone(scratchDirectory, stageDirectory) {
 		bundle: true,
 		platform: "node",
 		format: "cjs",
-		target: "node22",
+		target: "node26",
 		metafile: true,
 		logLevel: "info",
 		legalComments: "none",
@@ -639,8 +639,8 @@ async function build() {
 		return;
 	}
 	const runtime = JSON.parse(readFileSync(runtimeConfigPath, "utf8"));
-	if (runtime.runtime !== "node" || runtime.version !== "22.23.1") {
-		throw new Error("Standalone runtime config must pin Node.js 22.23.1");
+	if (runtime.runtime !== "node" || runtime.version !== "26.8.1") {
+		throw new Error("Standalone runtime config must pin Node.js 26.8.1");
 	}
 	const currentTarget = nativeTarget();
 	const target = options.target ?? currentTarget;

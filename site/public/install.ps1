@@ -28,12 +28,12 @@ if ($version -ne "latest" -and $version -notmatch '^v?(0|[1-9][0-9]*)\.(0|[1-9][
 
 function Install-NpmVolt {
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-        Fail "Node.js not found. The full Volt install requires Node.js >= 22.19. Install it from https://nodejs.org. For a local CLI/TUI without daemon or remote/iOS support, set VOLT_INSTALL_METHOD=binary."
+        Fail "Node.js not found. The full Volt install requires Node.js >= 26.0. Install it from https://nodejs.org. For a local CLI/TUI without daemon or remote/iOS support, set VOLT_INSTALL_METHOD=binary."
     }
 
-    $nodeSupported = node -p 'const [major, minor] = process.versions.node.split(".").map(Number); Number(major > 22 || (major === 22 && minor >= 19))'
+    $nodeSupported = node -p 'const [major, minor] = process.versions.node.split(".").map(Number); Number(major > 26 || (major === 26 && minor >= 0))'
     if ($LASTEXITCODE -ne 0 -or $nodeSupported -ne "1") {
-        Fail "Node.js $(node --version) is too old. Volt requires Node.js >= 22.19."
+        Fail "Node.js $(node --version) is too old. Volt requires Node.js >= 26.0."
     }
     if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
         Fail "npm not found. It normally ships with Node.js; install Node.js from https://nodejs.org."
@@ -138,7 +138,7 @@ function Install-BinaryVolt {
             "binary-license-manifest.json",
             "standalone-build-manifest.json",
             "standalone-file-manifest.json",
-            "LICENSES\node-v22.23.1-LICENSE.txt"
+            "LICENSES\node-v26.8.1-LICENSE.txt"
         )
         foreach ($required in $requiredFiles) {
             if (-not (Test-Path -LiteralPath (Join-Path $extractedDirectory $required) -PathType Leaf)) {

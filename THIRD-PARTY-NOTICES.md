@@ -8,10 +8,10 @@ the license files shipped in their own packages.
 ## Standalone binary inventory
 
 Standalone releases are built as Node.js Single Executable Applications
-(SEA), using the official Node.js 22.23.1 runtime archive pinned for each
+(SEA), using the official Node.js 26.8.1 runtime archive pinned for each
 target in `compliance/standalone-runtime.json`. Every standalone archive
 includes the exact consolidated Node.js license and third-party notices as
-`LICENSES/node-v22.23.1-LICENSE.txt`. The committed source copy and SHA-256
+`LICENSES/node-v26.8.1-LICENSE.txt`. The committed source copy and SHA-256
 checksum are recorded in the runtime configuration.
 
 The JavaScript bundle has a separate, build-derived inventory:

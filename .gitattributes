@@ -23,5 +23,5 @@
 *.woff2 binary
 
 # Preserve exact vendored/generated text whose format intentionally includes trailing whitespace.
-compliance/node-v22.23.1/LICENSE -whitespace
+compliance/node-v26.8.1/LICENSE -whitespace
 services/relay-credential-broker/relay-patch/*.patch -whitespace

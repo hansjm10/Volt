@@ -17,14 +17,14 @@ completed.
   the beta as `latest` and do not substitute a long-lived npm token for trusted
   publishing.
 - [x] **Approve standalone-binary license compliance.** Standalone artifacts
-  use the official Node.js 22.23.1 runtime as a Single Executable Application,
+  use the official Node.js 26.8.1 runtime as a Single Executable Application,
   replacing the previous standalone runtime design. The runtime version,
   per-platform archive checksums, exact consolidated Node license, and license
   checksum are pinned in `compliance/standalone-runtime.json`.
 
   For the exact release commit, confirm that every native build verifies its
   pinned runtime archive, includes
-  `LICENSES/node-v22.23.1-LICENSE.txt`, and emits both
+  `LICENSES/node-v26.8.1-LICENSE.txt`, and emits both
   `binary-metafile.json` and `binary-license-manifest.json`. Review the
   manifest's metafile checksum, embedded npm package identities, copied
   license-file checksums, and any checksum-pinned overrides. Verify
