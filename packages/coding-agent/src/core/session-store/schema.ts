@@ -4,9 +4,7 @@ export const SESSION_STORE_TABLE_NAMES = [
 	"store_metadata",
 	"sessions",
 	"entries",
-	"labels",
 	"client_inputs",
-	"subagent_spawns",
 	"search_chunks",
 	"transaction_commits",
 ] as const;
@@ -17,9 +15,7 @@ export const SESSION_STORE_INDEX_NAMES = [
 	"sessions_parent_idx",
 	"entries_parent_idx",
 	"entries_type_idx",
-	"labels_label_idx",
 	"client_inputs_state_idx",
-	"subagent_spawns_child_idx",
 	"search_chunks_entry_idx",
 	"transaction_commits_session_revision_idx",
 ] as const;
@@ -94,19 +90,6 @@ CREATE TABLE entries (
 CREATE INDEX entries_parent_idx ON entries (session_id, parent_entry_id);
 CREATE INDEX entries_type_idx ON entries (session_id, entry_type, ordinal);
 
-CREATE TABLE labels (
-	session_id TEXT NOT NULL,
-	target_entry_id TEXT NOT NULL,
-	label TEXT NOT NULL,
-	timestamp TEXT NOT NULL,
-	PRIMARY KEY (session_id, target_entry_id),
-	FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-	FOREIGN KEY (session_id, target_entry_id) REFERENCES entries(session_id, entry_id)
-		DEFERRABLE INITIALLY DEFERRED
-) STRICT, WITHOUT ROWID;
-
-CREATE INDEX labels_label_idx ON labels (session_id, label);
-
 CREATE TABLE client_inputs (
 	session_id TEXT NOT NULL,
 	client_message_id TEXT NOT NULL CHECK (length(client_message_id) BETWEEN 1 AND 512),
@@ -131,24 +114,6 @@ CREATE TABLE client_inputs (
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX client_inputs_state_idx ON client_inputs (session_id, state, client_message_id);
-
-CREATE TABLE subagent_spawns (
-	session_id TEXT NOT NULL,
-	entry_id TEXT NOT NULL,
-	tool_call_id TEXT NOT NULL,
-	subagent_id TEXT NOT NULL,
-	agent TEXT NOT NULL,
-	child_session_id TEXT NOT NULL,
-	child_store_id TEXT,
-	request_key TEXT NOT NULL,
-	PRIMARY KEY (session_id, entry_id),
-	FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-	FOREIGN KEY (session_id, entry_id) REFERENCES entries(session_id, entry_id)
-		DEFERRABLE INITIALLY DEFERRED
-) STRICT, WITHOUT ROWID;
-
-CREATE INDEX subagent_spawns_child_idx
-	ON subagent_spawns (child_store_id, child_session_id, session_id);
 
 CREATE TABLE search_chunks (
 	session_id TEXT NOT NULL,

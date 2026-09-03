@@ -87,18 +87,6 @@ export interface SessionStoreEntry {
 	readonly payload: SessionStoreJsonValue;
 }
 
-export interface SessionStoreLabelWrite {
-	readonly targetEntryId: string;
-	readonly label: string | null;
-	readonly timestamp: string;
-}
-
-export interface SessionStoreLabel {
-	readonly targetEntryId: string;
-	readonly label: string;
-	readonly timestamp: string;
-}
-
 export interface SessionStoreClientInputWrite {
 	readonly clientMessageId: string;
 	readonly receiptEntryId: string;
@@ -113,18 +101,6 @@ export interface SessionStoreClientInputWrite {
 }
 
 export interface SessionStoreClientInput extends SessionStoreClientInputWrite {}
-
-export interface SessionStoreSubagentSpawnWrite {
-	readonly entryId: string;
-	readonly toolCallId: string;
-	readonly subagentId: string;
-	readonly agent: string;
-	readonly childSessionId: string;
-	readonly childStoreId: string | null;
-	readonly requestKey: string;
-}
-
-export interface SessionStoreSubagentSpawn extends SessionStoreSubagentSpawnWrite {}
 
 export interface SessionStoreSearchChunkWrite {
 	readonly chunkIndex: number;
@@ -150,9 +126,7 @@ export interface SessionStoreSessionProjection {
 export interface SessionStoreTransactionPayload {
 	readonly session: SessionStoreSessionProjection;
 	readonly entries: readonly SessionStoreEntryWrite[];
-	readonly labels: readonly SessionStoreLabelWrite[];
 	readonly clientInputs: readonly SessionStoreClientInputWrite[];
-	readonly subagentSpawns: readonly SessionStoreSubagentSpawnWrite[];
 	readonly searchChunks: readonly SessionStoreSearchChunkWrite[];
 }
 
@@ -211,9 +185,7 @@ export type SessionStoreDeleteSessionResult =
 export interface SessionStoreSnapshot {
 	readonly session: SessionStoreSessionSummary;
 	readonly entries: readonly SessionStoreEntry[];
-	readonly labels: readonly SessionStoreLabel[];
 	readonly clientInputs: readonly SessionStoreClientInput[];
-	readonly subagentSpawns: readonly SessionStoreSubagentSpawn[];
 	readonly searchChunks: readonly SessionStoreSearchChunk[];
 }
 

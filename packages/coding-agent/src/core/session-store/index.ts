@@ -19,8 +19,6 @@ export type {
 	SessionStoreInfo,
 	SessionStoreJsonPrimitive,
 	SessionStoreJsonValue,
-	SessionStoreLabel,
-	SessionStoreLabelWrite,
 	SessionStoreListOptions,
 	SessionStoreOrigin,
 	SessionStoreReconcileCommitInput,
@@ -30,8 +28,6 @@ export type {
 	SessionStoreSessionProjection,
 	SessionStoreSessionSummary,
 	SessionStoreSnapshot,
-	SessionStoreSubagentSpawn,
-	SessionStoreSubagentSpawnWrite,
 	SessionStoreTransactionPayload,
 	SessionStoreTransactionResult,
 } from "./types.ts";

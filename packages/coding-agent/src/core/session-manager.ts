@@ -27,11 +27,10 @@ import {
 import { clonePlanningState, DEFAULT_PLANNING_STATE, type PlanningState, parsePlanningState } from "./planning.ts";
 import { RpcGitContextSchema } from "./rpc/schema/git-context.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
-import { RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX, RPC_SESSION_QUEUE_MAX_ITEMS } from "./rpc/wire-limits.ts";
+import { RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX } from "./rpc/wire-limits.ts";
 import {
 	assertClientMessageId,
 	boundClientInputError,
-	CLIENT_INPUT_ERROR_MAX_SCALARS,
 	decodeStoredSessionEntry,
 	digestClientInputPayload,
 	isHostOnlySessionEntryType,
@@ -50,19 +49,34 @@ import {
 	digestSessionStoreTransactionPayload,
 	SESSION_STORE_DATABASE_FILENAME,
 	type SessionStoreApplyTransactionInput,
-	type SessionStoreClientInputWrite,
 	type SessionStoreEntryWrite,
 	type SessionStoreJsonValue,
-	type SessionStoreLabelWrite,
-	type SessionStoreSearchChunkWrite,
 	type SessionStoreSessionProjection,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
-	type SessionStoreSubagentSpawnWrite,
 	type SessionStoreTransactionPayload,
 	type SQLiteSessionStoreClient,
 	type SQLiteSessionStoreLease,
 } from "./session-store/index.ts";
+import {
+	applySessionEntry,
+	CLIENT_INPUT_MAX_OUTSTANDING_BYTES,
+	CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES,
+	CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES,
+	cloneClientInputRecord,
+	cloneSessionDerivedState,
+	createSessionDerivedState,
+	expectedClientInputQueuedDelivery,
+	summarizeSessionEntries as reduceSessionEntries,
+	replaySessionEntries,
+	requireStartedClientInputReceipt,
+	type SessionDerivedState,
+	sessionEntrySummary,
+	sessionStoreClientInputsForEntries,
+	sessionStoreProjection,
+	sessionStoreSearchChunksForEntries,
+	verifySessionStoreProjections,
+} from "./session-store/projection.ts";
 
 function deepFreezeCanonicalData<T>(value: T): T {
 	if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -585,11 +599,13 @@ export function isHostOnlySessionEntry(entry: FileEntry): boolean {
 	return isHostOnlySessionEntryType(entry.type);
 }
 
-export { isValidClientMessageId };
+export {
+	CLIENT_INPUT_MAX_OUTSTANDING_BYTES,
+	CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES,
+	CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES,
+	isValidClientMessageId,
+};
 export const RUNTIME_QUEUE_ENTRY_ID_PREFIX = RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX;
-export const CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES = RPC_SESSION_QUEUE_MAX_ITEMS;
-export const CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES = CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES;
-export const CLIENT_INPUT_MAX_OUTSTANDING_BYTES = 16 * 1024 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -600,98 +616,8 @@ export function isRuntimeQueueEntryId(value: unknown): value is string {
 	return typeof value === "string" && value.startsWith(RUNTIME_QUEUE_ENTRY_ID_PREFIX) && value.length <= 64;
 }
 
-function measureClientInputPayloadBytes(value: ClientInputPayload | ClientInputQueuedPayload): number {
-	return Buffer.byteLength(JSON.stringify(value), "utf8");
-}
-
-function getOutstandingClientInputBytes(records: Iterable<ClientInputRecord>): number {
-	let total = 0;
-	for (const record of records) {
-		if (record.state === "completed" || record.state === "failed") continue;
-		total += measureClientInputPayloadBytes(record.input);
-		if (record.queuedInput) {
-			total += measureClientInputPayloadBytes(record.queuedInput);
-		}
-	}
-	return total;
-}
-
-function getOutstandingClientInputCount(records: Iterable<ClientInputRecord>): number {
-	let total = 0;
-	for (const record of records) {
-		if (record.state !== "completed" && record.state !== "failed") {
-			total++;
-		}
-	}
-	return total;
-}
-
-function getRecoverableQueuedClientInputCount(records: Iterable<ClientInputRecord>): number {
-	let total = 0;
-	for (const record of records) {
-		if (record.state === "accepted" && record.queuedInput !== undefined) {
-			total++;
-		}
-	}
-	return total;
-}
-
-function assertClientInputOutstandingCount(records: Iterable<ClientInputRecord>, additionalEntries: number): void {
-	if (getOutstandingClientInputCount(records) + additionalEntries > CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES) {
-		throw new Error(`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES}-entry limit`);
-	}
-}
-
-function assertClientInputOutstandingBudget(records: Iterable<ClientInputRecord>, additionalBytes: number): void {
-	if (getOutstandingClientInputBytes(records) + additionalBytes > CLIENT_INPUT_MAX_OUTSTANDING_BYTES) {
-		throw new Error(
-			`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_BYTES}-byte aggregate limit`,
-		);
-	}
-}
-
 export function createClientInputSemanticDigest(command: ClientInputCommand, input: ClientInputPayloadInput): string {
 	return digestClientInputPayload(command, normalizeClientInputPayload(command, input));
-}
-
-function cloneClientInputRecord(record: ClientInputRecord): ClientInputRecord {
-	return {
-		...record,
-		input: { ...record.input, images: record.input.images.map((image) => ({ ...image })) },
-		...(record.queuedInput === undefined
-			? {}
-			: {
-					queuedInput: {
-						...record.queuedInput,
-						images: record.queuedInput.images.map((image) => ({ ...image })),
-					},
-				}),
-	};
-}
-
-function requireStartedClientInputReceipt(
-	records: ReadonlyMap<string, ClientInputRecord>,
-	clientMessageId: string,
-): ClientInputRecord {
-	assertClientMessageId(clientMessageId);
-	const record = records.get(clientMessageId);
-	if (!record) {
-		throw new Error(`Canonical client input ${JSON.stringify(clientMessageId)} has no matching durable receipt`);
-	}
-	if (record.state !== "started") {
-		throw new Error(
-			`Canonical client input ${JSON.stringify(clientMessageId)} requires a started receipt; found ${record.state}`,
-		);
-	}
-	return record;
-}
-
-function getExpectedClientInputQueuedDelivery(record: ClientInputRecord): ClientInputQueuedDelivery | undefined {
-	if (record.command === "steer") return "steer";
-	if (record.command === "follow_up") return "follow_up";
-	if (record.input.streamingBehavior === "steer") return "steer";
-	if (record.input.streamingBehavior === "followUp") return "follow_up";
-	return undefined;
 }
 
 export type SessionEntryListener = (entry: SessionEntry) => void;
@@ -1234,159 +1160,14 @@ export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnaps
 	return header;
 }
 
-function isMessageWithContent(message: AgentMessage): message is Message {
-	return typeof (message as Message).role === "string" && "content" in message;
-}
-
-function extractTextContentFromContent(content: string | Array<{ type: string; text?: string }>): string {
-	if (typeof content === "string") {
-		return content;
-	}
-	return content
-		.filter(
-			(block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string",
-		)
-		.map((block) => block.text)
-		.join(" ");
-}
-
-function extractTextContent(message: Message): string {
-	return extractTextContentFromContent(message.content);
-}
-
-function getEntryTimestamp(entry: Pick<SessionEntryBase, "timestamp">): number | undefined {
-	const t = new Date(entry.timestamp).getTime();
-	return Number.isNaN(t) ? undefined : t;
-}
-
-function getMessageActivityTime(entry: SessionMessageEntry): number | undefined {
-	const message = entry.message;
-	if (!isMessageWithContent(message)) return undefined;
-	if (message.role !== "user" && message.role !== "assistant") return undefined;
-
-	const msgTimestamp = (message as { timestamp?: number }).timestamp;
-	if (typeof msgTimestamp === "number") {
-		return msgTimestamp;
-	}
-
-	return getEntryTimestamp(entry);
-}
-
-function isDisplayedCustomMessage(entry: SessionEntry): entry is CustomMessageEntry {
-	return entry.type === "custom_message" && entry.display;
-}
-
 export interface SessionEntrySummary {
 	messageCount: number;
 	firstMessage: string;
 	lastActivityTime?: number;
 }
 
-interface SessionMessageSummaryAccumulator {
-	messageCount: number;
-	firstUserMessage: string;
-	firstFallbackMessage: string;
-	lastActivityTime: number | undefined;
-}
-
-interface SessionStoreProjectionAccumulator {
-	messageSummary: SessionMessageSummaryAccumulator;
-	hasPlanningState: boolean;
-	name: string | undefined;
-	startingGitContext: RpcGitContext | null | undefined;
-}
-
-function createSessionMessageSummaryAccumulator(): SessionMessageSummaryAccumulator {
-	return {
-		messageCount: 0,
-		firstUserMessage: "",
-		firstFallbackMessage: "",
-		lastActivityTime: undefined,
-	};
-}
-
-function createSessionStoreProjectionAccumulator(): SessionStoreProjectionAccumulator {
-	return {
-		messageSummary: createSessionMessageSummaryAccumulator(),
-		hasPlanningState: false,
-		name: undefined,
-		startingGitContext: undefined,
-	};
-}
-
-function cloneSessionStoreProjectionAccumulator(
-	accumulator: SessionStoreProjectionAccumulator,
-): SessionStoreProjectionAccumulator {
-	return {
-		messageSummary: { ...accumulator.messageSummary },
-		hasPlanningState: accumulator.hasPlanningState,
-		name: accumulator.name,
-		startingGitContext: accumulator.startingGitContext,
-	};
-}
-
-function accumulateSessionMessageSummary(accumulator: SessionMessageSummaryAccumulator, entry: SessionEntry): void {
-	if (entry.type === "message") {
-		accumulator.messageCount++;
-
-		const activityTime = getMessageActivityTime(entry);
-		if (typeof activityTime === "number") {
-			accumulator.lastActivityTime = Math.max(accumulator.lastActivityTime ?? 0, activityTime);
-		}
-
-		const message = entry.message;
-		if (!isMessageWithContent(message)) return;
-		if (message.role !== "user" && message.role !== "assistant") return;
-
-		const textContent = extractTextContent(message);
-		if (!textContent) return;
-
-		if (!accumulator.firstUserMessage && message.role === "user") {
-			accumulator.firstUserMessage = textContent;
-		}
-		if (!accumulator.firstFallbackMessage && message.role === "assistant") {
-			accumulator.firstFallbackMessage = textContent;
-		}
-		return;
-	}
-
-	if (!isDisplayedCustomMessage(entry)) return;
-	accumulator.messageCount++;
-
-	const activityTime = getEntryTimestamp(entry);
-	if (typeof activityTime === "number") {
-		accumulator.lastActivityTime = Math.max(accumulator.lastActivityTime ?? 0, activityTime);
-	}
-
-	const textContent = extractTextContentFromContent(entry.content);
-	if (textContent && !accumulator.firstFallbackMessage) {
-		accumulator.firstFallbackMessage = textContent;
-	}
-}
-
-function accumulateSessionStoreProjection(accumulator: SessionStoreProjectionAccumulator, entry: SessionEntry): void {
-	accumulateSessionMessageSummary(accumulator.messageSummary, entry);
-	if (entry.type === "planning_state_change") {
-		accumulator.hasPlanningState = true;
-	} else if (entry.type === "session_info") {
-		accumulator.name = entry.name?.trim() || undefined;
-	} else if (entry.type === "session_start_git_context") {
-		accumulator.startingGitContext = entry.gitContext;
-	}
-}
-
-function sessionEntrySummaryFromAccumulator(accumulator: SessionMessageSummaryAccumulator): SessionEntrySummary {
-	return {
-		messageCount: accumulator.messageCount,
-		firstMessage: accumulator.firstUserMessage || accumulator.firstFallbackMessage || "(no messages)",
-		lastActivityTime: accumulator.lastActivityTime,
-	};
-}
-
 export function summarizeSessionEntries(entries: Iterable<SessionEntry>): SessionEntrySummary {
-	const accumulator = createSessionMessageSummaryAccumulator();
-	for (const entry of entries) accumulateSessionMessageSummary(accumulator, entry);
-	return sessionEntrySummaryFromAccumulator(accumulator);
+	return reduceSessionEntries(entries);
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -1415,17 +1196,27 @@ export class SessionManager {
 	private sessionStoreLease: SQLiteSessionStoreLease | undefined;
 	private storeId: string | undefined;
 	private storeRevision = 0;
-	private nextSearchChunkIndex = 0;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
-	private labelsById: Map<string, string> = new Map();
-	private labelTimestampsById: Map<string, string> = new Map();
-	private clientInputsById: Map<string, ClientInputRecord> = new Map();
-	private sessionStoreProjection = createSessionStoreProjectionAccumulator();
-	private leafId: string | null = null;
-	private nextOrdinal = 1;
-	/** Monotonic revision of provider-visible entries and durable leaf movement. */
-	private canonicalRevision = 0;
+	private derivedState!: SessionDerivedState;
+	private get labelsById(): Map<string, string> {
+		return this.derivedState.labelsById;
+	}
+	private get labelTimestampsById(): Map<string, string> {
+		return this.derivedState.labelTimestampsById;
+	}
+	private get clientInputsById(): Map<string, ClientInputRecord> {
+		return this.derivedState.clientInputsById;
+	}
+	private get leafId(): string | null {
+		return this.derivedState.leafId;
+	}
+	private get nextOrdinal(): number {
+		return this.derivedState.nextOrdinal;
+	}
+	private get canonicalRevision(): number {
+		return this.derivedState.canonicalRevision;
+	}
 	/** First uncertain persistence failure. This manager remains fail-stopped until reloaded. */
 	private persistenceError: Error | undefined;
 	/** Sticky authority state carrying the first unresolved atomic-replacement cause. */
@@ -1508,12 +1299,9 @@ export class SessionManager {
 		this.sessionGeneration = summary.sessionGeneration;
 		this.storeRevision = summary.revision;
 		this.fileEntries = [header, ...snapshot.entries.map(storedEntryToSessionEntry)];
-		this.nextSearchChunkIndex = snapshot.searchChunks.reduce(
-			(maximum, chunk) => Math.max(maximum, chunk.chunkIndex + 1),
-			0,
-		);
 		this.acceptsStartingGitContext = false;
 		this._buildIndex();
+		this._verifyStoreProjections(snapshot);
 	}
 
 	newSession(options?: NewSessionOptions): SessionReference | undefined {
@@ -1544,15 +1332,8 @@ export class SessionManager {
 		};
 		this.fileEntries = [header];
 		this.byId.clear();
-		this.labelsById.clear();
-		this.labelTimestampsById.clear();
-		this.clientInputsById.clear();
-		this.sessionStoreProjection = createSessionStoreProjectionAccumulator();
-		this.leafId = null;
-		this.nextOrdinal = 1;
-		this.canonicalRevision = 0;
+		this.derivedState = createSessionDerivedState(header);
 		this.storeRevision = 0;
-		this.nextSearchChunkIndex = 0;
 		this.acceptsStartingGitContext = true;
 
 		if (this.persist) {
@@ -1579,42 +1360,17 @@ export class SessionManager {
 		return this.getSessionRef();
 	}
 
+	private _verifyStoreProjections(snapshot: SessionStoreSnapshot): void {
+		verifySessionStoreProjections(this.derivedState, snapshot);
+	}
+
 	private _buildIndex(): void {
 		const header = this.fileEntries[0];
 		if (!header || header.type !== "session") throw new Error("Current session header is unavailable");
 		const validatedEntries = validatePersistedSessionEntrySequence(this.fileEntries.slice(1));
 		this.fileEntries = [header, ...validatedEntries];
-		this.byId.clear();
-		this.labelsById.clear();
-		this.labelTimestampsById.clear();
-		this.clientInputsById.clear();
-		this.sessionStoreProjection = createSessionStoreProjectionAccumulator();
-		this.leafId = null;
-		this.nextOrdinal = 1;
-		this.canonicalRevision = 0;
-		for (const entry of validatedEntries) {
-			this.nextOrdinal = entry.ordinal + 1;
-			if (entry.type === "leaf") this.leafId = entry.targetId;
-			if (entry.type === "leaf" || !isHostOnlySessionEntry(entry)) this.canonicalRevision++;
-			this.byId.set(entry.id, entry);
-			if (!isHostOnlySessionEntry(entry)) {
-				this.leafId = entry.id;
-			}
-			this._indexClientInputEntry(entry);
-			this._indexLabelEntry(entry);
-			accumulateSessionStoreProjection(this.sessionStoreProjection, entry);
-		}
-	}
-
-	private _indexLabelEntry(entry: SessionEntry): void {
-		if (entry.type !== "label") return;
-		if (entry.label) {
-			this.labelsById.set(entry.targetId, entry.label);
-			this.labelTimestampsById.set(entry.targetId, entry.timestamp);
-		} else {
-			this.labelsById.delete(entry.targetId);
-			this.labelTimestampsById.delete(entry.targetId);
-		}
+		this.derivedState = replaySessionEntries(header, validatedEntries);
+		this.byId = new Map(validatedEntries.map((entry) => [entry.id, entry]));
 	}
 
 	private _enqueuePersistence(
@@ -1720,92 +1476,18 @@ export class SessionManager {
 	}
 
 	private _storeProjection(): SessionStoreSessionProjection {
-		const header = this.getHeader();
-		if (!header) throw new Error("Session header is unavailable");
-		const summary = sessionEntrySummaryFromAccumulator(this.sessionStoreProjection.messageSummary);
-		const startingGitContext = this.sessionStoreProjection.startingGitContext;
-		const updatedAt =
-			typeof summary.lastActivityTime === "number" && summary.lastActivityTime > 0
-				? new Date(summary.lastActivityTime).toISOString()
-				: header.timestamp;
-		return {
-			updatedAt,
-			startingGitContextRecorded: startingGitContext !== undefined,
-			startingGitContext: (startingGitContext ?? null) as SessionStoreJsonValue,
-			name: this.sessionStoreProjection.name ?? null,
-			visible: summary.messageCount > 0 || this.sessionStoreProjection.hasPlanningState,
-			leafId: this.leafId,
-			messageCount: summary.messageCount,
-			firstMessage: summary.firstMessage === "(no messages)" ? "" : summary.firstMessage,
-		};
-	}
-
-	private _storeClientInputs(entries: readonly SessionEntry[]): SessionStoreClientInputWrite[] {
-		const affectedIds = new Set<string>();
-		for (const entry of entries) {
-			if (isClientInputWalEntry(entry)) affectedIds.add(entry.clientMessageId);
-			if (entry.type === "message" && entry.message.role === "user" && entry.message.clientMessageId) {
-				affectedIds.add(entry.message.clientMessageId);
-			}
-		}
-		return [...affectedIds]
-			.map((clientMessageId) => this.clientInputsById.get(clientMessageId))
-			.filter((record): record is ClientInputRecord => record !== undefined)
-			.map((record) => ({
-				clientMessageId: record.clientMessageId,
-				receiptEntryId: record.receiptId,
-				command: record.command,
-				semanticDigest: record.semanticDigest,
-				input: record.input as unknown as SessionStoreJsonValue,
-				queuedEntryId: record.queuedEntryId ?? null,
-				queuedInput: (record.queuedInput ?? null) as unknown as SessionStoreJsonValue | null,
-				state: record.state,
-				error: record.error ?? null,
-				canonicalEntryId: record.canonicalEntryId ?? null,
-			}));
+		return sessionStoreProjection(this.derivedState);
 	}
 
 	private _storePayload(entries: readonly SessionEntry[]): SessionStoreTransactionPayload {
-		const labels: SessionStoreLabelWrite[] = [];
-		const subagentSpawns: SessionStoreSubagentSpawnWrite[] = [];
-		const searchChunks: SessionStoreSearchChunkWrite[] = [];
-		for (const entry of entries) {
-			if (entry.type === "label") {
-				labels.push({ targetEntryId: entry.targetId, label: entry.label ?? null, timestamp: entry.timestamp });
-			}
-			if (entry.type === "subagent_spawn") {
-				subagentSpawns.push({
-					entryId: entry.id,
-					toolCallId: entry.toolCallId,
-					subagentId: entry.subagentId,
-					agent: entry.agent,
-					childSessionId: entry.childSessionId,
-					childStoreId: entry.childSessionRef?.storeId ?? null,
-					requestKey: entry.requestKey,
-				});
-			}
-			let text = "";
-			if (entry.type === "message" && isMessageWithContent(entry.message)) {
-				if (entry.message.role === "user" || entry.message.role === "assistant") {
-					text = extractTextContent(entry.message);
-				}
-			} else if (isDisplayedCustomMessage(entry)) {
-				text = extractTextContentFromContent(entry.content);
-			}
-			if (text) {
-				searchChunks.push({ chunkIndex: this.nextSearchChunkIndex++, entryId: entry.id, text });
-			}
-		}
 		const storedEntries: SessionStoreEntryWrite[] = entries.map((entry) => ({
 			entry: parsePersistedSessionEntry(entry) as unknown as SessionStoreJsonValue,
 		}));
 		return {
 			session: this._storeProjection(),
 			entries: storedEntries,
-			labels,
-			clientInputs: this._storeClientInputs(entries),
-			subagentSpawns,
-			searchChunks,
+			clientInputs: sessionStoreClientInputsForEntries(this.derivedState, entries),
+			searchChunks: sessionStoreSearchChunksForEntries(this.derivedState, entries),
 		};
 	}
 
@@ -1919,28 +1601,10 @@ export class SessionManager {
 		this._assertPersistenceHealthy();
 		const canonicalEntry = parseSessionEntryForAdmission(entry, `Session ${entry.type} entry`);
 		validateSessionEntryAdmissionReferences(canonicalEntry, this.byId, this.nextOrdinal);
-		if (
-			canonicalEntry.type === "session_start_git_context" &&
-			this.sessionStoreProjection.startingGitContext !== undefined
-		) {
-			throw new Error("Session contains more than one starting Git context entry");
-		}
-		const stagedClientInputs = new Map(
-			[...this.clientInputsById].map(([id, record]) => [id, cloneClientInputRecord(record)]),
-		);
-		this._indexClientInputEntry(canonicalEntry, stagedClientInputs);
-		canonicalEntry.ordinal = this.nextOrdinal++;
+		canonicalEntry.ordinal = this.nextOrdinal;
+		applySessionEntry(this.derivedState, canonicalEntry as SessionEntry & { ordinal: number });
 		this.fileEntries.push(canonicalEntry);
 		this.byId.set(canonicalEntry.id, canonicalEntry);
-		if (canonicalEntry.type === "leaf" || !isHostOnlySessionEntry(canonicalEntry)) this.canonicalRevision++;
-		if (canonicalEntry.type === "leaf") {
-			this.leafId = canonicalEntry.targetId;
-		} else if (!isHostOnlySessionEntry(canonicalEntry)) {
-			this.leafId = canonicalEntry.id;
-		}
-		this._indexClientInputEntry(canonicalEntry);
-		this._indexLabelEntry(canonicalEntry);
-		accumulateSessionStoreProjection(this.sessionStoreProjection, canonicalEntry);
 		if (!this.atomicAppendEntries) this._persist(canonicalEntry);
 		if (this.atomicAppendEntries) {
 			this.atomicAppendEntries.push(canonicalEntry);
@@ -2120,28 +1784,12 @@ export class SessionManager {
 		const snapshot = {
 			fileEntries: [...this.fileEntries],
 			byId: new Map(this.byId),
-			labelsById: new Map(this.labelsById),
-			labelTimestampsById: new Map(this.labelTimestampsById),
-			clientInputsById: new Map(
-				[...this.clientInputsById].map(([id, record]) => [id, cloneClientInputRecord(record)]),
-			),
-			sessionStoreProjection: cloneSessionStoreProjectionAccumulator(this.sessionStoreProjection),
-			leafId: this.leafId,
-			nextOrdinal: this.nextOrdinal,
-			nextSearchChunkIndex: this.nextSearchChunkIndex,
-			canonicalRevision: this.canonicalRevision,
+			derivedState: cloneSessionDerivedState(this.derivedState),
 		};
 		const restore = (): void => {
 			this.fileEntries = snapshot.fileEntries;
 			this.byId = snapshot.byId;
-			this.labelsById = snapshot.labelsById;
-			this.labelTimestampsById = snapshot.labelTimestampsById;
-			this.clientInputsById = snapshot.clientInputsById;
-			this.sessionStoreProjection = snapshot.sessionStoreProjection;
-			this.leafId = snapshot.leafId;
-			this.nextOrdinal = snapshot.nextOrdinal;
-			this.nextSearchChunkIndex = snapshot.nextSearchChunkIndex;
-			this.canonicalRevision = snapshot.canonicalRevision;
+			this.derivedState = snapshot.derivedState;
 		};
 		try {
 			beforeStage();
@@ -2175,19 +1823,11 @@ export class SessionManager {
 		const staged = {
 			fileEntries: this.fileEntries,
 			byId: this.byId,
-			labelsById: this.labelsById,
-			labelTimestampsById: this.labelTimestampsById,
-			clientInputsById: this.clientInputsById,
-			sessionStoreProjection: cloneSessionStoreProjectionAccumulator(this.sessionStoreProjection),
-			leafId: this.leafId,
-			nextOrdinal: this.nextOrdinal,
-			nextSearchChunkIndex: this.nextSearchChunkIndex,
-			canonicalRevision: this.canonicalRevision,
+			derivedState: this.derivedState,
 		};
 		let payload: SessionStoreTransactionPayload | undefined;
 		try {
 			payload = entries.length > 0 && this.persist ? this._storePayload(entries) : undefined;
-			staged.nextSearchChunkIndex = this.nextSearchChunkIndex;
 		} catch (error) {
 			this.atomicAppendEntries = undefined;
 			this.atomicAppendInFlight = false;
@@ -2220,14 +1860,7 @@ export class SessionManager {
 
 		this.fileEntries = staged.fileEntries;
 		this.byId = staged.byId;
-		this.labelsById = staged.labelsById;
-		this.labelTimestampsById = staged.labelTimestampsById;
-		this.clientInputsById = staged.clientInputsById;
-		this.sessionStoreProjection = staged.sessionStoreProjection;
-		this.leafId = staged.leafId;
-		this.nextOrdinal = staged.nextOrdinal;
-		this.nextSearchChunkIndex = staged.nextSearchChunkIndex;
-		this.canonicalRevision = staged.canonicalRevision;
+		this.derivedState = staged.derivedState;
 		try {
 			beforePublish();
 		} catch (error) {
@@ -2240,7 +1873,9 @@ export class SessionManager {
 		} finally {
 			try {
 				for (const entry of entries) this._notifyEntryListeners(entry);
-				if (snapshot.leafId !== staged.leafId) this._notifyBranchListeners(snapshot.leafId, staged.leafId);
+				if (snapshot.derivedState.leafId !== staged.derivedState.leafId) {
+					this._notifyBranchListeners(snapshot.derivedState.leafId, staged.derivedState.leafId);
+				}
 			} finally {
 				this.atomicAppendInFlight = false;
 			}
@@ -2548,127 +2183,6 @@ export class SessionManager {
 		}
 	}
 
-	private _indexClientInputEntry(
-		entry: SessionEntry,
-		records: Map<string, ClientInputRecord> = this.clientInputsById,
-	): void {
-		if (entry.type === "client_input_receipt") {
-			assertClientMessageId(entry.clientMessageId);
-			if (entry.command !== "prompt" && entry.command !== "steer" && entry.command !== "follow_up") {
-				throw new Error(`Client input receipt ${entry.id} has an invalid command`);
-			}
-			const input = normalizeClientInputPayload(entry.command, entry.input);
-			if (entry.semanticDigest !== digestClientInputPayload(entry.command, input)) {
-				throw new Error(`Client input receipt ${entry.id} has a mismatched semantic digest`);
-			}
-			const existing = records.get(entry.clientMessageId);
-			if (!existing) {
-				assertClientInputOutstandingCount(records.values(), 1);
-				assertClientInputOutstandingBudget(records.values(), measureClientInputPayloadBytes(input));
-				records.set(entry.clientMessageId, {
-					receiptId: entry.id,
-					clientMessageId: entry.clientMessageId,
-					command: entry.command,
-					semanticDigest: entry.semanticDigest,
-					input,
-					state: "accepted",
-				});
-			} else if (existing.command !== entry.command || existing.semanticDigest !== entry.semanticDigest) {
-				throw new Error(
-					`Client input id ${JSON.stringify(entry.clientMessageId)} has conflicting durable receipts`,
-				);
-			}
-			return;
-		}
-
-		if (entry.type === "client_input_queued") {
-			assertClientMessageId(entry.clientMessageId);
-			const record = records.get(entry.clientMessageId);
-			if (!record || record.receiptId !== entry.receiptId) {
-				throw new Error(`Queued client input ${entry.id} has no matching receipt`);
-			}
-			if (record.state !== "accepted" && record.state !== "started") {
-				throw new Error(`Queued client input ${entry.id} was persisted after dispatch started`);
-			}
-			const queuedInput = normalizeClientInputQueuedPayload(entry.queuedInput);
-			if (queuedInput.delivery !== getExpectedClientInputQueuedDelivery(record)) {
-				throw new Error(`Queued client input ${entry.id} conflicts with its requested delivery`);
-			}
-			if (record.queuedInput && JSON.stringify(record.queuedInput) !== JSON.stringify(queuedInput)) {
-				throw new Error(`Client input id ${JSON.stringify(entry.clientMessageId)} has conflicting queued payloads`);
-			}
-			if (
-				!record.queuedInput &&
-				getRecoverableQueuedClientInputCount(records.values()) >= CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES
-			) {
-				throw new Error(
-					`Recoverable client input queue exceeds ${CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES} entries`,
-				);
-			}
-			if (!record.queuedInput) {
-				assertClientInputOutstandingBudget(records.values(), measureClientInputPayloadBytes(queuedInput));
-			}
-			record.queuedEntryId ??= entry.id;
-			record.queuedInput = queuedInput;
-			// A queued payload is the durable output of preflight/input hooks. Once it
-			// commits, replay consumes this exact payload without re-running those
-			// side effects, so the receipt is recoverable again.
-			record.state = "accepted";
-			record.error = undefined;
-			return;
-		}
-
-		if (entry.type === "client_input_state") {
-			assertClientMessageId(entry.clientMessageId);
-			if (
-				entry.state !== "accepted" &&
-				entry.state !== "started" &&
-				entry.state !== "completed" &&
-				entry.state !== "failed"
-			) {
-				throw new Error(`Client input state ${entry.id} has an invalid state`);
-			}
-			if (
-				(entry.error !== undefined && typeof entry.error !== "string") ||
-				(entry.state !== "failed" && entry.error !== undefined) ||
-				(typeof entry.error === "string" && Array.from(entry.error).length > CLIENT_INPUT_ERROR_MAX_SCALARS)
-			) {
-				throw new Error(`Client input state ${entry.id} has an invalid error`);
-			}
-			const record = records.get(entry.clientMessageId);
-			if (!record || record.receiptId !== entry.receiptId) {
-				throw new Error(`Client input state ${entry.id} has no matching receipt`);
-			}
-			if (record.state === "completed" || record.state === "failed") {
-				throw new Error(`Client input state ${entry.id} follows a terminal state`);
-			}
-			if (entry.state === "started" && record.state !== "accepted") {
-				throw new Error(`Client input state ${entry.id} repeats the started boundary`);
-			}
-			if (entry.state === "accepted" && record.state !== "started") {
-				throw new Error(`Client input state ${entry.id} cannot roll back from ${record.state}`);
-			}
-			record.state = entry.state;
-			record.error = entry.state === "failed" ? entry.error : undefined;
-			return;
-		}
-
-		if (entry.type !== "message" || entry.message.role !== "user") {
-			return;
-		}
-		const clientMessageId = (entry.message as { clientMessageId?: unknown }).clientMessageId;
-		if (clientMessageId === undefined) {
-			return;
-		}
-		if (typeof clientMessageId !== "string") {
-			throw new Error(`Canonical client input ${entry.id} has an invalid client identity`);
-		}
-		const record = requireStartedClientInputReceipt(records, clientMessageId);
-		record.state = "completed";
-		record.error = undefined;
-		record.canonicalEntryId = entry.id;
-	}
-
 	getClientInput(clientMessageId: string): ClientInputRecord | undefined {
 		this.assertConversationAuthorityAvailable();
 		const record = this.clientInputsById.get(clientMessageId);
@@ -2713,8 +2227,6 @@ export class SessionManager {
 		if (existing) {
 			return { record: cloneClientInputRecord(existing), created: false };
 		}
-		assertClientInputOutstandingCount(this.clientInputsById.values(), 1);
-		assertClientInputOutstandingBudget(this.clientInputsById.values(), measureClientInputPayloadBytes(input));
 		const entry: ClientInputReceiptEntry = {
 			type: "client_input_receipt",
 			id: generateId(this.byId),
@@ -2743,7 +2255,7 @@ export class SessionManager {
 			throw new Error(`Client input ${JSON.stringify(clientMessageId)} cannot be queued from ${record.state}`);
 		}
 		const queuedInput = normalizeClientInputQueuedPayload(queuedInputValue);
-		if (queuedInput.delivery !== getExpectedClientInputQueuedDelivery(record)) {
+		if (queuedInput.delivery !== expectedClientInputQueuedDelivery(record)) {
 			throw new Error(`Client input ${JSON.stringify(clientMessageId)} conflicts with its requested delivery`);
 		}
 		if (record.queuedInput) {
@@ -2751,15 +2263,6 @@ export class SessionManager {
 				throw new Error(`Client input ${JSON.stringify(clientMessageId)} has a conflicting queued payload`);
 			}
 			return cloneClientInputRecord(record);
-		}
-		assertClientInputOutstandingBudget(this.clientInputsById.values(), measureClientInputPayloadBytes(queuedInput));
-		if (
-			getRecoverableQueuedClientInputCount(this.clientInputsById.values()) >=
-			CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES
-		) {
-			throw new Error(
-				`Recoverable client input queue exceeds ${CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES} entries`,
-			);
 		}
 		const entry: ClientInputQueuedEntry = {
 			type: "client_input_queued",
@@ -3019,7 +2522,7 @@ export class SessionManager {
 		if (!this.acceptsStartingGitContext || this.sessionId !== expectedSessionId) {
 			return false;
 		}
-		if (this.sessionStoreProjection.startingGitContext !== undefined) {
+		if (this.derivedState.startingGitContext !== undefined) {
 			this.acceptsStartingGitContext = false;
 			return false;
 		}
@@ -3035,19 +2538,20 @@ export class SessionManager {
 	}
 
 	getStartingGitContext(): RpcGitContext | null | undefined {
-		return this.sessionStoreProjection.startingGitContext;
+		const gitContext = this.derivedState.startingGitContext;
+		return gitContext === undefined ? undefined : cloneCanonicalData(gitContext, "Session starting Git context");
 	}
 
 	/** Get the incrementally maintained lifetime message summary for session listing. */
 	getSessionEntrySummary(): SessionEntrySummary {
 		this.assertConversationAuthorityAvailable();
-		return sessionEntrySummaryFromAccumulator(this.sessionStoreProjection.messageSummary);
+		return sessionEntrySummary(this.derivedState);
 	}
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
 		this.assertConversationAuthorityAvailable();
-		return this.sessionStoreProjection.name;
+		return this.derivedState.name;
 	}
 
 	/**
@@ -3175,7 +2679,7 @@ export class SessionManager {
 	/** All durable spawn edges in file order, including edges recorded on other branches. */
 	getSubagentSpawnEntries(): SubagentSpawnEntry[] {
 		this.assertConversationAuthorityAvailable();
-		return this.fileEntries.filter((entry): entry is SubagentSpawnEntry => entry.type === "subagent_spawn");
+		return [...this.derivedState.subagentSpawns];
 	}
 
 	/**
@@ -3694,6 +3198,7 @@ export class SessionManager {
 		const source = await SessionManager.open(sourceRef);
 		let target: SessionManager | undefined;
 		try {
+			const sourceLeafId = source.getLeafId();
 			target = await SessionManager.create(targetCwd, sessionDir, {
 				...options,
 				parentSession: sourceRef,
@@ -3719,6 +3224,8 @@ export class SessionManager {
 			await target.appendAtomically(
 				() => {
 					for (const entry of entries) target!._appendEntry(entry);
+					if (sourceLeafId === null) target!.resetLeaf();
+					else if (target!.getLeafId() !== sourceLeafId) target!.branch(sourceLeafId);
 				},
 				() => {},
 			);

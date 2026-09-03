@@ -101,6 +101,76 @@ describe("SQLite-backed SessionManager", () => {
 		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "keep me" }]);
 	});
 
+	it.each([
+		{
+			component: "summary",
+			corrupt(database: DatabaseSync, sessionId: string) {
+				database.prepare("UPDATE sessions SET name = 'corrupt' WHERE id = ?").run(sessionId);
+			},
+		},
+		{
+			component: "client_inputs",
+			corrupt(database: DatabaseSync, sessionId: string) {
+				database.prepare("UPDATE client_inputs SET state = 'started' WHERE session_id = ?").run(sessionId);
+			},
+		},
+		{
+			component: "search_chunks",
+			corrupt(database: DatabaseSync, sessionId: string) {
+				database.prepare("UPDATE search_chunks SET text = 'corrupt' WHERE session_id = ?").run(sessionId);
+			},
+		},
+	])("rejects $component projection drift without repairing it", async ({ component, corrupt }) => {
+		const { cwd, sessionDir } = fixture();
+		const corrupted = await own(SessionManager.create(cwd, sessionDir, { id: `drift-${component}` }));
+		corrupted.appendMessage({ role: "user", content: "searchable", timestamp: Date.now() });
+		corrupted.reserveClientInput(`client-${component}`, "prompt", { message: "pending" });
+		await corrupted.flush();
+		const corruptedRef = corrupted.getSessionRef();
+		if (!corruptedRef) throw new Error("Expected a corrupted projection reference");
+		const healthy = await own(SessionManager.create(cwd, sessionDir, { id: `healthy-${component}` }));
+		healthy.appendMessage({ role: "user", content: "healthy", timestamp: Date.now() });
+		await healthy.flush();
+		const healthyRef = healthy.getSessionRef();
+		if (!healthyRef) throw new Error("Expected a healthy projection reference");
+		await Promise.all([corrupted.closePersistence(), healthy.closePersistence()]);
+
+		const database = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME));
+		try {
+			corrupt(database, corruptedRef.sessionId);
+		} finally {
+			database.close();
+		}
+
+		await expect(SessionManager.open(corruptedRef)).rejects.toMatchObject({
+			code: "session_store_projection_integrity",
+			message: `Session store ${component} projection does not match canonical entries`,
+		});
+		const reopenedHealthy = await own(SessionManager.open(healthyRef));
+		expect(reopenedHealthy.getSessionId()).toBe(healthyRef.sessionId);
+
+		const unchanged = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME), { readOnly: true });
+		try {
+			if (component === "summary") {
+				expect(unchanged.prepare("SELECT name FROM sessions WHERE id = ?").get(corruptedRef.sessionId)?.name).toBe(
+					"corrupt",
+				);
+			} else if (component === "client_inputs") {
+				expect(
+					unchanged.prepare("SELECT state FROM client_inputs WHERE session_id = ?").get(corruptedRef.sessionId)
+						?.state,
+				).toBe("started");
+			} else {
+				expect(
+					unchanged.prepare("SELECT text FROM search_chunks WHERE session_id = ?").get(corruptedRef.sessionId)
+						?.text,
+				).toBe("corrupt");
+			}
+		} finally {
+			unchanged.close();
+		}
+	});
+
 	it("continues a WAL-only accepted receipt for an exact client retry", async () => {
 		const { cwd, sessionDir } = fixture();
 		const manager = await own(SessionManager.create(cwd, sessionDir, { id: "accepted-only-continuation" }));

@@ -91,6 +91,29 @@ describe("SessionManager starting Git context", () => {
 		expect(infos[0]?.startingGitContext).toEqual(STARTING_GIT_CONTEXT);
 	});
 
+	it("owns starting Git context across input, getter, and queued projection mutation", async () => {
+		const cwd = makeTempDir();
+		const sessionDir = join(cwd, "sessions");
+		const session = await SessionManager.create(cwd, sessionDir, { id: "starting-git-ownership" });
+		const supplied = structuredClone(STARTING_GIT_CONTEXT);
+
+		expect(session.recordStartingGitContext(session.getSessionId(), supplied)).toBe(true);
+		supplied.repository = "mutated input";
+		const beforeFlush = session.getStartingGitContext();
+		if (!beforeFlush) throw new Error("Expected starting Git context before flush");
+		beforeFlush.repository = "mutated getter before flush";
+		await session.flush();
+
+		const afterFlush = session.getStartingGitContext();
+		if (!afterFlush) throw new Error("Expected starting Git context after flush");
+		afterFlush.repository = "mutated getter after flush";
+		session.appendSessionInfo("trigger another projection write");
+		await session.flush();
+
+		const reopened = await SessionManager.open(session.getSessionRef()!);
+		expect(reopened.getStartingGitContext()).toEqual(STARTING_GIT_CONTEXT);
+	});
+
 	it("rejects a delayed observation for a replaced session id", () => {
 		const session = SessionManager.inMemory(makeTempDir());
 		const replacedSessionId = session.getSessionId();

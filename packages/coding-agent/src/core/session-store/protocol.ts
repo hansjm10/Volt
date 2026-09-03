@@ -22,8 +22,6 @@ import {
 	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
 	type SessionStoreJsonValue,
-	type SessionStoreLabel,
-	type SessionStoreLabelWrite,
 	type SessionStoreOrigin,
 	type SessionStoreReconcileCommitInput,
 	type SessionStoreSearchChunk,
@@ -32,8 +30,6 @@ import {
 	type SessionStoreSessionProjection,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
-	type SessionStoreSubagentSpawn,
-	type SessionStoreSubagentSpawnWrite,
 	type SessionStoreTransactionPayload,
 	type SessionStoreTransactionResult,
 } from "./types.ts";
@@ -313,22 +309,6 @@ function parseEntry(value: unknown, path: string): SessionStoreEntry {
 	return stored;
 }
 
-function parseLabelWrite(value: unknown, path: string): SessionStoreLabelWrite {
-	const input = record(value, path);
-	exactKeys(input, path, ["targetEntryId", "label", "timestamp"]);
-	return {
-		targetEntryId: idValue(input.targetEntryId, `${path}.targetEntryId`),
-		label: nullableString(input.label, `${path}.label`),
-		timestamp: timestampValue(input.timestamp, `${path}.timestamp`),
-	};
-}
-
-function parseLabel(value: unknown, path: string): SessionStoreLabel {
-	const parsed = parseLabelWrite(value, path);
-	if (parsed.label === null) fail(`${path}.label`, "persisted labels cannot be null");
-	return { ...parsed, label: parsed.label };
-}
-
 function parseClientInput(value: unknown, path: string): SessionStoreClientInputWrite {
 	const input = record(value, path);
 	exactKeys(input, path, [
@@ -357,28 +337,6 @@ function parseClientInput(value: unknown, path: string): SessionStoreClientInput
 	};
 }
 
-function parseSpawn(value: unknown, path: string): SessionStoreSubagentSpawnWrite {
-	const input = record(value, path);
-	exactKeys(input, path, [
-		"entryId",
-		"toolCallId",
-		"subagentId",
-		"agent",
-		"childSessionId",
-		"childStoreId",
-		"requestKey",
-	]);
-	return {
-		entryId: idValue(input.entryId, `${path}.entryId`),
-		toolCallId: idValue(input.toolCallId, `${path}.toolCallId`),
-		subagentId: idValue(input.subagentId, `${path}.subagentId`),
-		agent: nonEmptyString(input.agent, `${path}.agent`),
-		childSessionId: idValue(input.childSessionId, `${path}.childSessionId`),
-		childStoreId: nullableId(input.childStoreId, `${path}.childStoreId`),
-		requestKey: idValue(input.requestKey, `${path}.requestKey`),
-	};
-}
-
 function parseSearchChunk(value: unknown, path: string): SessionStoreSearchChunkWrite {
 	const input = record(value, path);
 	exactKeys(input, path, ["chunkIndex", "entryId", "text"]);
@@ -391,13 +349,11 @@ function parseSearchChunk(value: unknown, path: string): SessionStoreSearchChunk
 
 function parseTransactionPayload(value: unknown, path: string): SessionStoreTransactionPayload {
 	const input = record(value, path);
-	exactKeys(input, path, ["session", "entries", "labels", "clientInputs", "subagentSpawns", "searchChunks"]);
+	exactKeys(input, path, ["session", "entries", "clientInputs", "searchChunks"]);
 	return {
 		session: parseSessionProjection(input.session, `${path}.session`),
 		entries: arrayValue(input.entries, `${path}.entries`, parseEntryWrite),
-		labels: arrayValue(input.labels, `${path}.labels`, parseLabelWrite),
 		clientInputs: arrayValue(input.clientInputs, `${path}.clientInputs`, parseClientInput),
-		subagentSpawns: arrayValue(input.subagentSpawns, `${path}.subagentSpawns`, parseSpawn),
 		searchChunks: arrayValue(input.searchChunks, `${path}.searchChunks`, parseSearchChunk),
 	};
 }
@@ -721,23 +677,17 @@ function parseInfo(value: unknown, path: string): SessionStoreInfo {
 
 function parseSnapshot(value: unknown, path: string): SessionStoreSnapshot {
 	const input = record(value, path);
-	exactKeys(input, path, ["session", "entries", "labels", "clientInputs", "subagentSpawns", "searchChunks"]);
+	exactKeys(input, path, ["session", "entries", "clientInputs", "searchChunks"]);
 	const entries = arrayValue(input.entries, `${path}.entries`, parseEntry);
 	validatePersistedSessionEntrySequence(entries.map((entry) => entry.payload));
 	return {
 		session: parseSummary(input.session, `${path}.session`),
 		entries,
-		labels: arrayValue(input.labels, `${path}.labels`, parseLabel),
 		clientInputs: arrayValue(
 			input.clientInputs,
 			`${path}.clientInputs`,
 			parseClientInput,
 		) as SessionStoreClientInput[],
-		subagentSpawns: arrayValue(
-			input.subagentSpawns,
-			`${path}.subagentSpawns`,
-			parseSpawn,
-		) as SessionStoreSubagentSpawn[],
 		searchChunks: arrayValue(
 			input.searchChunks,
 			`${path}.searchChunks`,
@@ -790,10 +740,6 @@ export function parseSessionStoreOperationResult(
 }
 
 export function toClientInput(value: SessionStoreClientInputWrite): SessionStoreClientInput {
-	return value;
-}
-
-export function toSubagentSpawn(value: SessionStoreSubagentSpawnWrite): SessionStoreSubagentSpawn {
 	return value;
 }
 

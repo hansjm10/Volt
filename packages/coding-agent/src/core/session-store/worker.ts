@@ -53,12 +53,10 @@ import {
 	SessionStoreError,
 	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
-	type SessionStoreLabel,
 	type SessionStoreSearchChunk,
 	type SessionStoreSearchResult,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
-	type SessionStoreSubagentSpawn,
 	type SessionStoreTransactionResult,
 } from "./types.ts";
 
@@ -729,14 +727,6 @@ function entryFromRow(row: Record<string, unknown>): SessionStoreEntry {
 	return stored;
 }
 
-function labelFromRow(row: Record<string, unknown>): SessionStoreLabel {
-	return {
-		targetEntryId: sqlString(row, "targetEntryId"),
-		label: sqlString(row, "label"),
-		timestamp: sqlString(row, "timestamp"),
-	};
-}
-
 function clientInputFromRow(row: Record<string, unknown>): SessionStoreClientInput {
 	const command = sqlString(row, "command");
 	if (command !== "prompt" && command !== "steer" && command !== "follow_up") {
@@ -764,18 +754,6 @@ function clientInputFromRow(row: Record<string, unknown>): SessionStoreClientInp
 	};
 }
 
-function spawnFromRow(row: Record<string, unknown>): SessionStoreSubagentSpawn {
-	return {
-		entryId: sqlString(row, "entryId"),
-		toolCallId: sqlString(row, "toolCallId"),
-		subagentId: sqlString(row, "subagentId"),
-		agent: sqlString(row, "agent"),
-		childSessionId: sqlString(row, "childSessionId"),
-		childStoreId: sqlNullableString(row, "childStoreId"),
-		requestKey: sqlString(row, "requestKey"),
-	};
-}
-
 function chunkFromRow(row: Record<string, unknown>): SessionStoreSearchChunk {
 	return {
 		chunkIndex: sqlInteger(row, "chunkIndex"),
@@ -797,13 +775,6 @@ function loadSession(sessionId: string, sessionGeneration: string): SessionStore
 			)
 			.all(sessionId)
 			.map(entryFromRow);
-		const labels = db
-			.prepare(
-				`SELECT target_entry_id AS targetEntryId, label, timestamp
-			FROM labels WHERE session_id = ? ORDER BY target_entry_id`,
-			)
-			.all(sessionId)
-			.map(labelFromRow);
 		const clientInputs = db
 			.prepare(
 				`SELECT client_message_id AS clientMessageId, receipt_entry_id AS receiptEntryId, command,
@@ -813,14 +784,6 @@ function loadSession(sessionId: string, sessionGeneration: string): SessionStore
 			)
 			.all(sessionId)
 			.map(clientInputFromRow);
-		const subagentSpawns = db
-			.prepare(
-				`SELECT entry_id AS entryId, tool_call_id AS toolCallId, subagent_id AS subagentId, agent,
-				child_session_id AS childSessionId, child_store_id AS childStoreId, request_key AS requestKey
-			FROM subagent_spawns WHERE session_id = ? ORDER BY entry_id`,
-			)
-			.all(sessionId)
-			.map(spawnFromRow);
 		const searchChunks = db
 			.prepare(
 				`SELECT chunk_index AS chunkIndex, entry_id AS entryId, text
@@ -828,7 +791,7 @@ function loadSession(sessionId: string, sessionGeneration: string): SessionStore
 			)
 			.all(sessionId)
 			.map(chunkFromRow);
-		return { session, entries, labels, clientInputs, subagentSpawns, searchChunks };
+		return { session, entries, clientInputs, searchChunks };
 	});
 }
 
@@ -1120,16 +1083,6 @@ function applyTransactionInCurrentTransaction(
 		nextOrdinal += 1;
 	}
 
-	const deleteLabel = db.prepare("DELETE FROM labels WHERE session_id = ? AND target_entry_id = ?");
-	const upsertLabel = db.prepare(
-		`INSERT INTO labels (session_id, target_entry_id, label, timestamp) VALUES (?, ?, ?, ?)
-		ON CONFLICT (session_id, target_entry_id) DO UPDATE SET label = excluded.label, timestamp = excluded.timestamp`,
-	);
-	for (const label of input.payload.labels) {
-		if (label.label === null) deleteLabel.run(input.sessionId, label.targetEntryId);
-		else upsertLabel.run(input.sessionId, label.targetEntryId, label.label, label.timestamp);
-	}
-
 	const upsertClientInput = db.prepare(
 		`INSERT INTO client_inputs (
 			session_id, client_message_id, receipt_entry_id, command, semantic_digest, input_json,
@@ -1161,24 +1114,6 @@ function applyTransactionInCurrentTransaction(
 			clientInput.state,
 			clientInput.error,
 			clientInput.canonicalEntryId,
-		);
-	}
-
-	const insertSpawn = db.prepare(
-		`INSERT INTO subagent_spawns (
-			session_id, entry_id, tool_call_id, subagent_id, agent, child_session_id, child_store_id, request_key
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-	for (const spawn of input.payload.subagentSpawns) {
-		insertSpawn.run(
-			input.sessionId,
-			spawn.entryId,
-			spawn.toolCallId,
-			spawn.subagentId,
-			spawn.agent,
-			spawn.childSessionId,
-			spawn.childStoreId,
-			spawn.requestKey,
 		);
 	}
 

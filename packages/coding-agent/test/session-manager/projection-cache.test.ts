@@ -183,6 +183,31 @@ describe("SessionManager projection cache", () => {
 		});
 	});
 
+	it.each([
+		{ name: "an earlier entry", reset: false },
+		{ name: "root", reset: true },
+	])("preserves a source leaf moved to $name when forking", async ({ reset }) => {
+		const { root, cwd, sessionDir } = fixture();
+		const source = await SessionManager.create(cwd, sessionDir, { id: reset ? "reset-source" : "branch-source" });
+		const firstId = source.appendMessage({ role: "user", content: "first", timestamp: BASE_TIME });
+		source.appendMessage({ role: "user", content: "second", timestamp: BASE_TIME + 1_000 });
+		if (reset) source.resetLeaf();
+		else source.branch(firstId);
+		await source.flush();
+
+		const forkCwd = join(root, reset ? "reset-fork" : "branch-fork");
+		mkdirSync(forkCwd, { recursive: true });
+		const forked = await SessionManager.forkFrom(source.getSessionRef()!, forkCwd, join(root, "moved-leaf-forks"));
+		expect(forked.getLeafId()).toBe(reset ? null : firstId);
+		expect(forked.buildSessionContext().messages).toEqual(
+			reset ? [] : [{ role: "user", content: "first", timestamp: BASE_TIME }],
+		);
+
+		const reopened = await SessionManager.open(forked.getSessionRef()!);
+		expect(reopened.getLeafId()).toBe(reset ? null : firstId);
+		expect(reopened.buildSessionContext()).toEqual(forked.buildSessionContext());
+	});
+
 	it("derives forked and imported projections and preserves labels when branching immediately", async () => {
 		const { root, cwd, sessionDir } = fixture();
 		const source = await SessionManager.create(cwd, sessionDir, { id: "projection-source" });
