@@ -1395,22 +1395,33 @@ export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnaps
 	}
 
 	let sawLeaf = false;
+	const seenEntryIds = new Set<string>();
 	for (let index = 1; index < entries.length; index++) {
 		const entry = entries[index]!;
 		if (entry.type === "session") throw new Error("Session snapshot contains more than one header");
+		if (typeof entry.id !== "string" || entry.id.length === 0 || seenEntryIds.has(entry.id)) {
+			throw new Error("Session snapshot contains an invalid or duplicate entry identity");
+		}
+		if (entry.parentId !== null && (typeof entry.parentId !== "string" || !seenEntryIds.has(entry.parentId))) {
+			throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
+		}
 		if (entry.type === "leaf") {
 			if (sawLeaf || index !== entries.length - 1) {
 				throw new Error("Session snapshot leaf must be the final entry");
 			}
+			if (entry.targetId !== null && (typeof entry.targetId !== "string" || !seenEntryIds.has(entry.targetId))) {
+				throw new Error(`Leaf entry ${entry.id} targets an invalid conversation entry`);
+			}
 			sawLeaf = true;
-			continue;
+		} else {
+			if (isHostOnlySessionEntry(entry)) {
+				throw new Error(`Session snapshot contains unsupported host-only entry: ${entry.type}`);
+			}
+			if (entry.type === "message" && entry.message.role === "user" && entry.message.clientMessageId !== undefined) {
+				throw new Error("Session snapshot contains a transport-owned client message identity");
+			}
 		}
-		if (isHostOnlySessionEntry(entry)) {
-			throw new Error(`Session snapshot contains unsupported host-only entry: ${entry.type}`);
-		}
-		if (entry.type === "message" && entry.message.role === "user" && entry.message.clientMessageId !== undefined) {
-			throw new Error("Session snapshot contains a transport-owned client message identity");
-		}
+		seenEntryIds.add(entry.id);
 	}
 	return header as unknown as SessionSnapshotHeader;
 }
@@ -3884,7 +3895,7 @@ export class SessionManager {
 				if (visited.has(currentId)) throw new Error("Imported session contains a host-only parent cycle");
 				visited.add(currentId);
 				const current = sourceById.get(currentId);
-				if (!current) return null;
+				if (!current) throw new Error(`Imported session references an unavailable entry: ${currentId}`);
 				if (!isHostOnlySessionEntry(current)) return current.id;
 				currentId = current.parentId;
 			}

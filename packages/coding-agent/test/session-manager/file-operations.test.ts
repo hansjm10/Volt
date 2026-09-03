@@ -101,6 +101,87 @@ describe("JSONL snapshot import parsing", () => {
 		expect(readFileSync(path, "utf8")).toBe(content);
 	});
 
+	it.each([
+		{
+			name: "entry parent",
+			id: "dangling-parent",
+			entries: [
+				{
+					type: "message",
+					id: "root",
+					parentId: null,
+					ordinal: 1,
+					timestamp: "2025-01-01T00:00:01.000Z",
+					message: { role: "user", content: "root", timestamp: Date.parse("2025-01-01T00:00:01.000Z") },
+				},
+				{
+					type: "message",
+					id: "orphan",
+					parentId: "missing-parent",
+					ordinal: 2,
+					timestamp: "2025-01-01T00:00:02.000Z",
+					message: { role: "user", content: "orphan", timestamp: Date.parse("2025-01-01T00:00:02.000Z") },
+				},
+				{
+					type: "leaf",
+					id: "leaf",
+					parentId: "orphan",
+					ordinal: 3,
+					timestamp: "2025-01-01T00:00:03.000Z",
+					targetId: "orphan",
+				},
+			],
+			error: /invalid or forward parent/,
+		},
+		{
+			name: "leaf target",
+			id: "dangling-leaf",
+			entries: [
+				{
+					type: "message",
+					id: "root",
+					parentId: null,
+					ordinal: 1,
+					timestamp: "2025-01-01T00:00:01.000Z",
+					message: { role: "user", content: "root", timestamp: Date.parse("2025-01-01T00:00:01.000Z") },
+				},
+				{
+					type: "leaf",
+					id: "leaf",
+					parentId: "root",
+					ordinal: 2,
+					timestamp: "2025-01-01T00:00:02.000Z",
+					targetId: "missing-leaf",
+				},
+			],
+			error: /targets an invalid conversation entry/,
+		},
+	])("rejects a snapshot with a dangling $name without retaining a hidden row", async ({ id, entries, error }) => {
+		const path = join(tempDir, `${id}.jsonl`);
+		writeFileSync(
+			path,
+			`${[
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+					id,
+					timestamp: "2025-01-01T00:00:00.000Z",
+					cwd: tempDir,
+				},
+				...entries,
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		const sessionDir = join(tempDir, `${id}-store`);
+
+		await expect(SessionManager.importFromJsonl(path, tempDir, sessionDir)).rejects.toThrow(error);
+		expect(await SessionManager.list(tempDir, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual(
+			[],
+		);
+	});
+
 	it("imports a snapshot into SQLite and never treats the source as live storage", async () => {
 		const path = join(tempDir, "source.jsonl");
 		const sourceBytes = sessionSnapshotJsonl("imported", tempDir, "snapshot message");
