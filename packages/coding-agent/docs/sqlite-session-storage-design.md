@@ -1,1073 +1,770 @@
-# RFC: SQLite Session Storage Ownership and Materialized Projections
+# RFC: SQLite Session Storage Merge Contract
 
-- Status: Proposed; implementation blocked pending review
+- Status: Accepted; implementation not started
 - Date: 2026-09-03
 - Pull request: [#329](https://github.com/volt-hq/Volt/pull/329)
 - Issue: [#328](https://github.com/volt-hq/Volt/issues/328)
 - Package: `packages/coding-agent`
-- Scope: repository design only; this RFC does not authorize implementation
-- Amends: session-storage language and boundaries in the delivery, conversation-bootstrap, live-session, workspace-authority, worktree, and subagent RFCs listed in §5.1
+- Scope: merge-blocking storage work only; deferred designs are explicitly non-normative
 
 Paths are relative to `packages/coding-agent/` unless stated otherwise. Symbol names are durable anchors; line numbers are intentionally omitted.
 
-## 1. Decision summary
+## 1. Decision
 
-Keep the core storage choices already present in #329:
+A successfully committed SQLite session row is immediately **adopted**. No SDK, CLI, runtime-replacement, remote, import, fork, or subagent setup failure automatically deletes that row.
 
-- one authoritative `sessions.sqlite` store per workspace or custom session directory;
-- one shared worker-backed SQLite client per store within a process;
-- stable `SessionReference` identity containing store, session, and immutable session-generation identity;
-- optimistic session revisions, transaction commit identities, payload digests, and reconciliation after uncertain worker outcomes;
-- current-format JSONL only as explicit import/export interchange;
-- unchanged public `SessionManager.create`, `open`, `continueRecent`, `forkFrom`, `importFromJsonl`, list, search, and delete signatures.
+The merge-blocking #329 design is limited to five corrections:
 
-Add four missing contracts in a later, separately approved implementation:
+1. **Single manager finalization.** A high-level session/runtime factory consumes its `SessionManager` at invocation. Before `AgentSession` construction succeeds, the factory closes the manager on failure. After construction, only the `AgentSession`/runtime disposes it. No failure path both disposes a session and separately closes or discards its manager.
+2. **Canonical entry validation.** The full validated `SessionEntry` in `payload_json` is canonical. SQLite envelope columns are derived indexes and must agree exactly on read, including ordinal and deterministic host-only classification. Every entry type is validated exhaustively before state changes.
+3. **One projection reducer.** Incremental append and full replay share the same transition logic for session summaries, labels, client-input state, subagent edges, and search chunks.
+4. **Projection verification.** Opening a session replays canonical entries and compares every retained materialized projection. Mismatch fails closed without automatic repair. Side tables with no indexed reader are removed.
+5. **Bounded deep-search accumulation.** Listing and exact lookup remain summary-only. Deep fuzzy, phrase, and regex search preserves current behavior but processes one session document at a time instead of retaining an entire store's searchable text. Documentation states the real query-dependent cost and does not call this a full-text index.
 
-1. **Preparation ownership and durable adoption.** Every internally acquired manager carries a `SessionManagerPreparation` that records whether the manager was created, opened, or borrowed. Internally created candidates begin as durable `prepared` rows that normal list/find/open paths cannot resolve. One reconciliation-capable SQLite transaction marks the row `adopted` and commits contingent canonical setup before any external publication. Definitive pre-adoption failure discards only the exact preparation; opened managers are closed but never deleted; borrowed managers remain caller-owned after a proven no-effect failure. Published or uncertain candidates are never deleted.
-2. **Incarnation-pinned host ownership.** Once a persisted session ID is resolved, every host-internal runtime, lease, worktree binding, last-session pointer, subagent edge, and delayed callback pins the exact store ID and session generation. ID-only remote requests mean “resolve the current incarnation,” not authority to mutate whichever incarnation later reuses the name.
-3. **One materialized-projection reducer.** Session summaries and side indexes are deterministic derivatives of the canonical session row and ordered entry log. The same reducer drives incremental updates and full replay. Opening a session compares replayed state with persisted projections and fails closed on mismatch.
-4. **An honest search bound.** Listing, exact lookup, continuation lookup, and remote enumeration do not read canonical entry payloads, but their cost includes returned materialized-summary bytes. Deep fuzzy and phrase search is parameterized by query size and extracted text; JavaScript regex has no general asymptotic guarantee. Search accumulates at most one session's searchable document plus query/normalization state in the worker. This RFC does not add FTS or change search semantics.
+The accepted tradeoff is deliberate:
 
-`SessionManagerPreparation` is not a new conversation, runtime, lease, delivery, or workspace owner. It is a short-lived compensation capability that exists only until an already-defined owner publishes or rejects a candidate manager.
+> A failed setup may leave a hidden, or occasionally visible, session row. That is recoverable clutter. Deleting a committed row that another route or caller may already know is a correctness failure.
 
-## 2. Motivation
+If failed-row reclamation later becomes a product requirement, durable preparation state, publication settlement, and crash recovery must be designed together in a separate RFC.
 
-#329 changes more than a file format. It changes persistence latency, manager lifetime, session identity, runtime replacement, remote target creation, subagent startup, catalog projection, and deep search.
+## 2. Why the earlier design was narrowed
 
-The current branch contains correct low-level mechanisms, including revision and generation fences, commit reconciliation, private store files, strict protocol validation, and worker reference counting. Repeated review findings instead cluster at boundaries where those mechanisms are composed:
+The first revision proposed durable prepared/adopted rows, a cross-system publishing state machine, setup overlays, crash-owner recovery, and exact session-generation propagation through daemon/worktree/subagent state.
 
-- created managers require different cleanup from opened or caller-supplied managers;
-- the publication cutoff differs between SDK return, runtime replacement, daemon registry activation, relay handoff, and subagent first-prompt publication;
-- cleanup policy is inferred repeatedly from local booleans, session-selection values, or object identity;
-- session summary and side-index state is updated by several independent mutable indexes;
-- SQLite snapshot side tables are loaded but are not all checked against replayed canonical entries;
-- deep search uses extracted text but not a content index, while current prose implies a stronger asymptotic guarantee.
+Those mechanisms can provide stronger cleanup guarantees, but they materially expand #329 into runtime, daemon, worktree, subagent, and public-construction lifecycle redesigns. Issue #328 requires session discovery to stop parsing cumulative transcript history; it does not require zero abandoned rows after every setup failure.
 
-Adding another local `try`/`catch` around each finding does not establish a durable contract. This RFC defines the contract before further source changes.
+Removing automatic deletion collapses the dangerous lifecycle problem:
+
+- another process opening the same generation without writing can no longer race a creator's cleanup deletion;
+- durable worktree or last-session pointers cannot be left dangling by setup cleanup;
+- a child handle can expose its session identity without later first-prompt failure deleting that identity;
+- cancellation no longer needs a new cross-system publication state merely to decide whether deletion is safe;
+- created and opened managers have the same failure cleanup: close the manager and preserve the row.
+
+The remaining ownership problem is resource finalization, not row adoption. Existing owners should retain their current domains rather than being wrapped by another long-lived owner.
 
 ## 3. Scope
 
 ### 3.1 Goals
 
-1. Define exactly who may close, discard, preserve, or transfer every manager acquired during a higher-level operation.
-2. Define one irreversible adoption cutoff for each creation and replacement flow.
-3. Prevent deletion of a session that may already be externally reachable.
-4. Prevent caught pre-publication failures from retaining newly created hidden rows.
-5. Preserve pre-existing sessions when setup, replacement, transport, or publication fails.
-6. Make every persisted summary and side index reproducible from canonical session data.
-7. Detect projection drift without making routine listing proportional to transcript size.
-8. State search time and memory complexity accurately while preserving current query behavior.
-9. Provide deterministic failure, concurrency, property, and benchmark acceptance criteria for a later implementation plan.
+1. Make listing, exact lookup, continuation lookup, and remote enumeration independent of canonical transcript payload size.
+2. Ensure every manager transferred into high-level construction has one eventual close path.
+3. Preserve every committed session row unless an explicit user/host delete operation targets its exact reference and revision.
+4. Reject malformed or internally contradictory persisted entries before changing live state.
+5. Make retained summary/index state deterministic from canonical entries.
+6. Detect projection drift when opening a selected session without replaying every session during listing.
+7. Preserve current search matching and ranking while bounding worker accumulation to one session document.
+8. Keep JSONL as strict explicit interchange only.
+9. Provide observable acceptance criteria for a separate implementation plan.
 
 ### 3.2 Non-goals
 
-This RFC does not propose:
+This RFC does not add or require:
+
+- durable prepared/adopted row state or preparation IDs;
+- automatic cleanup of failed or crash-left committed sessions;
+- a new publication or rollback state machine spanning SQLite, daemon, relay, worktree, and subagent owners;
+- transactional rollback of arbitrary SDK/runtime construction side effects;
+- a universal canonical setup overlay;
+- host-wide session-generation propagation through every lease, worktree binding, last-session pointer, or subagent record;
+- transaction-local delta staging to remove all history-sized in-memory copies;
+- FTS, changed fuzzy semantics, regex removal, search cancellation, or a separate search worker;
+- changes to remote/mobile wire shapes or iOS code;
+- live JSONL migration or SQLite backward compatibility;
+- replacement of existing delivery, runtime, conversation, lease, workspace, worktree, or subagent ownership;
+- implementation under this document-only revision.
+
+### 3.3 Preserved core design
+
+Keep:
+
+- one `sessions.sqlite` store per workspace or custom session directory;
+- one shared worker-backed client per store within a process;
+- `SessionReference` with session directory, store ID, session ID, and immutable session generation;
+- expected revisions, transaction commit IDs, canonical payload digests, and uncertain-outcome reconciliation;
+- generation-fenced stale writes after delete/recreate;
+- SQLite WAL, foreign keys, strict tables, trusted-schema disabling, and private filesystem permissions;
+- current public `SessionManager` factory signatures;
+- current fuzzy, phrase, regex, score, and modified-time tie-break behavior;
+- session-ID-based remote protocol with existing authorized relative/synthetic path fields.
+
+## 4. Session row adoption and manager ownership
+
+### 4.1 Row adoption
+
+A row becomes adopted when its creation transaction commits. Adoption does not depend on:
 
-- replacing SQLite, the per-directory store layout, or the worker boundary;
-- changing `SessionReference`, session-generation fencing, store identity, or revision reconciliation;
-- changing public `SessionManager` signatures;
-- adding a compatibility path or migrating pre-#329 live JSONL sessions;
-- adding FTS, changing fuzzy matching, removing regex, or changing search result ranking;
-- changing remote/mobile wire shapes or adding iOS work;
-- replacing `AgentDeliveryOwner`, `AgentSessionRuntime`, `ConversationCoordinator`, `LeaseBroker`, `SubagentManager`, or the separately proposed `WorkspaceAuthorityCoordinator` ownership;
-- distributed exactly-once guarantees across provider, tool, extension, audit, or control-plane side effects;
-- age-based or generic automatic deletion of rows left by abrupt process termination; only the owner-proven exact remote retry reclaim in §4.6 is defined;
-- changing the remote session-ID wire shape (host-internal durable bindings may gain store/generation identity);
-- implementing any source, schema, test, user-documentation, or PR-description change under this RFC-writing scope.
-
-### 3.3 Preserved public behavior
-
-Unless a later implementation plan explicitly says otherwise:
-
-- direct owners of a persisted `SessionManager` still await `closePersistence()`;
-- a successfully returned `AgentSession` or `AgentSessionRuntime` owns its manager's eventual close;
-- a caller-supplied manager remains usable when `createAgentSession()` proves that candidate setup had no canonical effect; a committed or uncertain contingent setup transaction retires that manager authority and requires reopen;
-- adopted selector-hidden sessions remain available for durable client-input recovery and exact internal lookup;
-- a session may be adopted while still selector-hidden;
-- prepared rows are not ordinary selector-hidden sessions and cannot be resolved without their process-local preparation capability;
-- JSONL import remains strict, current-version-only interchange;
-- remote requests and responses remain session-ID based; session-store locators never cross remote-safe surfaces, while existing authorized relative/synthetic workspace and worktree path fields remain allowed.
-
-## 4. Vocabulary and authoritative data
-
-### 4.1 Manager acquisition origin
-
-Every higher-level operation classifies its manager acquisition as exactly one of:
-
-- **created**: the operation created the current session row or changed an operation-private manager to a newly created session identity. The row did not predate the operation and may be discarded before adoption.
-- **opened**: the operation opened or continued a pre-existing row into a manager it owns temporarily. Failure closes this manager but never deletes the row.
-- **borrowed**: the manager was supplied by the caller or is an already installed in-memory/current manager. Pre-adoption failure does not close or delete it.
-
-`created_after_missing`, JSONL import, cross-store fork, and a new branched-session identity are `created`. Exact resume is `opened`. `continueRecent` must report whether it opened or created instead of forcing callers to infer that result.
-
-### 4.2 Preparation state
-
-An operation-local preparation has one monotonic state plus a monotonic rollback-request flag:
-
-```text
-prepared -> publishing -> adopted -> settled(transferred)
-    |            |
-    |            `-> settled(rolled_back)  // only proven not published
-    `--------------> settled(rolled_back)
-```
-
-- **prepared**: no publication attempt is in flight and no irreversible publication is known to have occurred. Origin-specific compensation remains permitted.
-- **publishing**: a typed publication attempt owns settlement. Cancellation may set `rollbackRequested`, but no cleanup may start until the attempt is joined and classified.
-- **adopted**: the durable row and a terminal runtime owner are installed, or publication is uncertain. Deletion is permanently forbidden.
-- **settled**: the preparation either completed origin-specific rollback or transferred responsibility to the installed owner. It performs no further cleanup.
-
-The transition into `publishing` and the rollback-request flag update are synchronous. The existing lifecycle actor for the flow owns and joins the publication promise. A `not published` outcome permits rollback; `published` or `uncertain` moves to adopted even when rollback was requested. Shutdown joins the same promise. If bounded process shutdown ends before classification, the case is abrupt process loss: no delete is attempted.
-
-### 4.3 Publication
-
-For this RFC, **publication** means that another durable or live owner may resolve, route to, resume, or act on the candidate session identity. It is not the same as selector visibility.
-
-Examples include:
-
-- resolving `createAgentSession()` or `createAgentSessionRuntime()` to a caller;
-- committing an `AgentSessionRuntime` source rebind;
-- rekeying a daemon runtime/lease registry to the candidate session;
-- handing a newly created target reference to a TUI relay owner;
-- committing child runtime registration, parent spawn linkage, registry, or activity state for a subagent.
-
-The SQLite `sessions.visible` column is a content-derived catalog projection. It is not a lifecycle or publication bit. Setup may make a prepared session visible, and a successfully adopted empty session may remain hidden.
-
-### 4.4 Canonical session data
-
-The authoritative persisted session consists of:
-
-1. **Primary store identity** in `store_metadata`: immutable store ID, schema identity/version, and schema digest.
-2. **Primary session identity/header fields** in `sessions`: session ID, immutable session generation, format version, cwd, creation time, parent reference, origin, durable prepared/adopted publication state, and the preparation ID/owner identity present only while prepared.
-3. **Ordered canonical entries** in `entries`: entry ID, ordinal, parent, type, timestamp, host-only classification, and canonical payload.
-4. **Session revision and transaction evidence**: revision ordering plus `transaction_commits` identity, digest, before/after revisions, and commit time.
-
-The following are materialized projections, not independent truth:
-
-- `sessions.updated_at`, starting Git context fields, `name`, `visible`, `leaf_entry_id`, `message_count`, and `first_message`;
-- `labels`;
-- `client_inputs`;
-- `subagent_spawns`;
-- `search_chunks`.
-
-`transaction_commits` is evidence for transaction outcome reconciliation, not a materialized conversation projection.
-
-### 4.5 Definitive and uncertain outcomes
-
-A publication participant reports one of:
-
-- **not published**: the participant and every earlier durable routing participant prove complete restoration. Prepared rollback is allowed.
-- **published**: the durable adoption transaction or another ownership participant crossed its cutoff. The preparation adopts and deletion is forbidden.
-- **uncertain**: any participant cannot prove that publication or a durable route did not occur. The preparation adopts conservatively and deletion is forbidden.
-
-An untyped exception from an operation that may have crossed publication is `uncertain`, never `not published`.
-
-### 4.6 Durable row publication state
-
-Preparation state is process-local, but a created candidate also carries durable store state. Opened and persisted borrowed managers already reference durable adopted rows; their process-local `prepared` state controls only contingent mutation and close-authority transfer and never grants delete authority.
-
-```text
-prepared(sessionGeneration, preparationId) -> adopted(sessionGeneration, adoptionRevision)
-```
-
-Required rules:
-
-- normal list, search, continuation, `findForResume`, and public `open` exclude prepared rows;
-- only a manager holding the opaque process-local preparation capability may load or append to its prepared row;
-- prepared writes include `preparationId` in the worker request and are rejected after adoption or for another preparation;
-- created rollback uses a dedicated conditional discard requiring store ID, session ID, session generation, preparation ID, prepared state, and expected revision;
-- ordinary `SessionManager.delete` operates only on adopted rows and cannot substitute for prepared discard;
-- adoption is one commit-identified SQLite transaction that applies staged canonical setup, marks the row adopted, clears the preparation ID, advances revision, and records evidence;
-- adoption reconciliation uses the existing commit ID/digest rules: matching evidence proves adoption, absent evidence plus unchanged expected revision proves no publication, and any unreadable/mismatched/advanced state is uncertain;
-- once adopted, the row can be deleted only by the ordinary explicit session-delete contract, never preparation rollback;
-- direct public `SessionManager.create` adopts before returning because its caller immediately owns the manager;
-- a crash-left prepared row remains inaccessible and hidden. This RFC defines no automatic reclamation policy.
-
-The durable state is distinct from `sessions.visible`. A prepared row's content projection may compute either visibility value, but normal catalog queries exclude it by publication state; an adopted row may also have `visible = 0`. The preparation ID is a collision-resistant stale-operation capability, not a security secret against the OS user who owns the database.
-
-A caller-named ID that already has a prepared row is not treated as missing. An internal status lookup may report `preparing` without returning an open capability: the same in-process coordinator joins its exact preparation, while an unrelated live process/request receives a typed `session_preparing`/busy result without an open capability. It cannot create a second incarnation, adopt without the preparation capability, or fall through to ordinary resume. After adoption, an exact retry resolves the adopted incarnation.
-
-Remote caller-named idempotency also needs a stranded-preparation rule. A daemon-owned preparation records the daemon boot/instance authority that created it. After acquiring the daemon's existing exclusive process lock with a fresh boot/instance ID and proving that the recorded owner cannot still hold that lock (socket or pidfile failure alone is insufficient), a later exact `target:"new"` retry may CAS-discard that still-prepared row and create the same requested ID with a fresh session generation. A live current-daemon preparation is joined/retried, never reclaimed. A preparation whose owner death cannot be proven returns stable `session_unavailable` and is preserved. This targeted exact-retry reclaim is not age-based garbage collection and never applies to adopted rows or arbitrary CLI/SDK preparations.
-
-### 4.7 Session incarnation identity
-
-`SessionReference` is the persisted incarnation identity:
-
-```text
-(storeId, sessionId, sessionGeneration)
-```
-
-`sessionDirectory` locates the host store but does not replace store identity. Once an ID-only local or remote request resolves to a reference, every authority-bearing host object pins that reference (or equivalent store ID/generation fields) for its lifetime. Lookup indexes may remain keyed by workspace/session ID, but each record and mutation proves the pinned incarnation.
-
-Deleting and recreating the same session ID is allowed. A stale worktree binding, last-session pointer, lease, coordinator callback, subagent edge, or attach claim for the old generation must fail resolution or be explicitly replaced; it cannot silently bind to the new generation. The remote wire continues to carry session IDs and resolves the current incarnation at each new attach.
-
-## 5. Composition with existing ownership contracts
-
-### 5.1 Normative amendments and prerequisites
-
-This RFC is the session-storage amendment for stale file-era language; it does not reopen the accepted ownership decisions in the linked RFCs.
-
-| Document | Status under this RFC |
-| --- | --- |
-| [Delivery transaction contract](delivery-transaction-contract-design.md) | Remains authoritative for canonical delivery settlement, receipts, reconciliation, and conversation authority. Manager acquisition/adoption happens outside one delivery owner's scope. |
-| [Atomic conversation bootstrap](conversation-bootstrap-design.md) | Its `ConversationCoordinator`, feed, and replacement ownership remain authoritative. References to a recoverable “WAL-only file” mean an adopted selector-hidden SQLite row opened by exact reference. Replacement order is the implemented reservation → candidate construction/durable setup → lease/registry rekey commit → feed source commit → finalization sequence; session preparation wraps that sequence but does not replace its owners. |
-| [Live shared sessions](live-shared-session-daemon-design.md) | References to a session file or JSONL source of truth mean the authoritative SQLite session row plus ordered entries. JSONL is not live handoff storage. |
-| [Workspace authority lifecycle](workspace-authority-lifecycle-design.md) | This remains a Proposed prerequisite, not a current source owner. Until it is implemented, existing Iroh service admission epochs, attach claims, coordinators, and lease capabilities retain their current duties. If accepted later, `WorkspaceAuthorityCoordinator` surrounds but does not replace session preparation. |
-| [Worktree design](worktrees-design.md) | Parent-keyed SQLite storage and worktree cwd remain authoritative. Old path-based `SessionManager.open` examples mean exact `SessionReference` resolution followed by cwd authorization. Durable worktree session bindings must pin the session incarnation under §4.7. |
-| [Subagent design](subagents-design.md) | Registry/activity publication still begins at accepted prompt. Session-row adoption is separate: returning a live handle/reference adopts the row even before registry publication; an internal atomic start-and-prompt flow may remain prepared until prompt acceptance. A registration failure permits row discard only when its typed outcome proves no row/handle/runtime publication. |
-
-A later implementation must update contradictory clauses in those documents in the same source change; implementation may not choose whichever historical wording is most convenient.
-
-### 5.2 Ownership composition
-
-This RFC adds no competing long-lived owner.
-
-| Existing owner | Existing responsibility | Relationship to `SessionManagerPreparation` |
-| --- | --- | --- |
-| `SQLiteSessionStoreLease` | Reference-counts one process-local worker client for a store. | The manager owns/relinquishes the lease. Preparation chooses whether failure asks the manager to close or discard. |
-| `SessionManager` | Owns one live session-generation authority, canonical indexes, persistence queue, and reconciliation state. | Preparation wraps acquisition disposition only; it cannot append, reconcile, or replace manager authority. |
-| `AgentDeliveryOwner` | Settles one logical delivery and supplies verified canonical mutation receipts. | Unchanged. Delivery settlement may use an adopted manager but never adopts or discards a manager. See [delivery transaction contract](delivery-transaction-contract-design.md). |
-| `AgentSession` | Owns active agent/harness resources and, after explicit transfer, closes its manager on disposal. | A prepared candidate initially lacks persistence-close authority; adoption transfers that authority exactly once. |
-| Prepared candidate finalizer | Temporarily disposes candidate harness, extension, MCP, Git, settings, subagent, and other non-persistence resources before adoption. | It is an operation helper, not a long-lived owner. It leaves manager close/discard to the preparation until transfer. |
-| `AgentSessionRuntime` | Serializes current-session structural operations and stages source replacement. | Its lifecycle actor holds and joins preparation publication until the existing replacement cutoff. |
-| `ConversationProjectionFeed` | Owns one materialized live conversation feed and atomic subscriber source rebind. | Its `commitSourceRebind` is one publication boundary, not manager-lifetime ownership. See [atomic conversation bootstrap](conversation-bootstrap-design.md). |
-| `ConversationCoordinator` | Owns daemon runtime/transport retirement for one logical conversation. | Must hold the candidate runtime before adoption and close it on every post-adoption failure. |
-| `LeaseBroker` | Owns process-level conversation lease state and exact owner capabilities. | Lease publication consumes a prepared manager indirectly through the runtime; it does not delete session rows. See [live shared sessions](live-shared-session-daemon-design.md). |
-| Proposed `WorkspaceAuthorityCoordinator` | If separately accepted and implemented, owns workspace-generation admission and retirement. | It may fence a prepared operation, but manager compensation remains origin-specific; current code continues using its existing distributed admission owners until then. |
-| `WorktreeManager` | Owns worktree checkout/binding state. | Worktree cwd and parent-keyed session directory remain inputs to acquisition; preparation never changes path authority. See [worktree design](worktrees-design.md). |
-| `SubagentManager`, handle, and runtime registration | Own child admission, handle lifetime, first-prompt registry/activity publication, and child runtime lifetime. | Returning a public handle adopts the row; only an internal atomic create-and-prompt flow may retain row rollback through prompt acceptance. See [subagent design](subagents-design.md). |
-
-The preparation may retain a reference to an installed owner for ordering, but it never becomes the owner of provider work, tools, streams, leases, registries, or child execution.
-
-## 6. Session manager preparation contract
-
-### 6.1 Proposed internal shape
-
-The eventual implementation may choose different private names, but it must expose equivalent semantics:
-
-```ts
-type SessionManagerAcquisitionOrigin = "created" | "opened" | "borrowed";
-type SessionManagerPreparationState = "prepared" | "publishing" | "adopted" | "settled";
-type SessionManagerPublicationOutcome = "not_published" | "published" | "uncertain";
-
-interface SessionManagerPreparation {
-  readonly manager: SessionManager;
-  readonly origin: SessionManagerAcquisitionOrigin;
-  readonly state: SessionManagerPreparationState;
-  readonly settled: Promise<void>;
-
-  /** Synchronously fences rollback and returns the sole publication attempt. */
-  beginPublication(): SessionManagerPublicationAttempt;
-
-  /** Request origin-specific rollback, joining an in-flight publication first. */
-  rollback(): Promise<void>;
-
-  /** Complete transfer after a published/uncertain outcome; performs no I/O. */
-  settleAdoption(): SessionManager;
-}
-
-interface SessionManagerPublicationAttempt {
-  /** Exactly one terminal classification is required. */
-  finish(outcome: SessionManagerPublicationOutcome): Promise<void>;
-}
-```
-
-Required behavior:
-
-- terminal `settled` state records transfer or rollback; callers never infer disposition from manager state;
-- `beginPublication()` synchronously transitions prepared → publishing and is single-claim;
-- rollback during publishing sets monotonic intent and joins the same publication/settlement promise;
-- `finish("not_published")` performs origin rollback and settles; it is legal only after every publication participant proves restoration;
-- `finish("published")` or `finish("uncertain")` transitions to adopted and permanently disables preparation deletion, even when rollback was requested;
-- an abandoned publication attempt is classified uncertain by its mandatory finalizer;
-- `settleAdoption()` transfers persistence-close authority to the installed terminal owner, transitions adopted → settled, and is idempotent after transfer;
-- repeated rollback returns the same promise and never closes/deletes twice;
-- rollback after adoption or transfer rejects with a preparation-state error and performs no manager I/O;
-- adoption/transfer after completed rollback is a state error and cannot resurrect ownership;
-- cleanup failure preserves the original operation error and every cleanup error in an `AggregateError`;
-- created cleanup uses the durable preparation ID as well as exact store/session/generation/revision identity;
-- the flow's existing lifecycle actor must await `settled` during caught failure and graceful shutdown.
-
-### 6.2 Origin-specific rollback
-
-| Origin | Definitive failure before durable adoption | Success/adoption |
-| --- | --- | --- |
-| `created` | Finalize candidate resources without closing persistence, drain/close the manager, then discard only the exact durable preparation. Attempt close and discard and aggregate failures. A state/revision/preparation conflict preserves the row and reports cleanup failure. | Durable adoption clears preparation identity; transfer normal close responsibility to the installed `AgentSession`/runtime owner. |
-| `opened` | Finalize candidate resources without closing persistence, then close the temporary manager. Never delete. | Transfer normal close responsibility to the installed owner. |
-| `borrowed` | Finalize candidate resources without closing the manager. The original caller/current runtime retains it after a proven no-effect outcome. | Transfer only the responsibility explicitly documented by the successful API, such as a returned `AgentSession` owning eventual close. |
-
-In-memory managers use borrowed manager cleanup semantics. Internal replacement must still use a separate in-memory candidate so failure cannot mutate or dispose the installed conversation.
-
-### 6.3 Prepared candidate finalization
-
-A candidate `AgentSession` currently closes its manager during ordinary disposal. That behavior cannot coexist with preparation rollback: it would close borrowed managers and give created/opened managers two persistence finalizers.
-
-The implementation therefore needs an internal prepared-candidate mode or helper with this contract:
-
-1. construct the candidate without transferring persistence-close authority;
-2. keep it isolated from RPC/relay attachment, provider/tool work, public observers, subagent starts, and extension `session_start` publication while prepared;
-3. permit resource discovery/module validation pre-adoption, but stage any session-bound mutation through the canonical overlay and defer externally observable lifecycle hooks until adoption;
-4. on pre-adoption failure, synchronously fence candidate and delayed Git/resource callbacks;
-5. dispose/join harness, extension-loader, MCP, Git, settings, subagent, staged feed-subscription, and other non-persistence resources without calling manager close;
-6. invoke exactly one origin-specific preparation rollback;
-7. aggregate candidate-finalization and manager-cleanup failures deterministically;
-8. on adoption, transfer the persistence-close capability exactly once to `AgentSession`, publish deferred lifecycle binding, and make normal `AgentSession.dispose()` the sole manager finalizer.
-
-No prepared candidate may expose its session reference through extensions, RPC, registries, or event callbacks. The helper is temporary preparation choreography, not another long-lived owner. `agent-session.ts` and `agent-session-services.ts` are therefore part of the future implementation boundary even though public session/runtime signatures remain unchanged.
-
-### 6.4 Acquisition factories
-
-Internal higher-level paths must receive acquisition disposition from the factory that knows it. They must not infer it from:
-
-- whether the manager currently equals `runtime.session.sessionManager`;
-- whether a `SessionReference` exists;
 - selector visibility;
 - message count;
-- a remote response after several transformations;
-- an unscoped boolean such as `createdRuntime` or `published` detached from the manager capability.
+- successful model/resource/extension setup;
+- `AgentSession` construction;
+- daemon registry activation;
+- first prompt acceptance;
+- worktree or last-session publication.
 
-Required factory classifications:
+Once creation commits:
 
-| Factory/result | Origin |
-| --- | --- |
-| New persisted session | `created` |
-| JSONL import target | `created` |
-| Cross-store/session fork target | `created` |
-| Branched-session target | a separate `created` preparation; the source remains a scoped opened manager |
-| Exact `SessionManager.open` | `opened` |
-| `continueRecent` opening an existing row | `opened` |
-| `continueRecent` creating a row | `created` |
-| Caller-provided manager | `borrowed` |
-| In-memory replacement candidate | separate borrowed/in-memory preparation; never the installed manager object |
+- normal exact lookup may resolve the row according to existing hidden-session rules;
+- setup cleanup may close managers/runtimes but does not delete the row;
+- caller-named retry may resume the same row;
+- explicit deletion remains available through the existing exact-reference/revision contract;
+- stale managers remain unable to write after delete/recreate because store/session generation and revision guards remain mandatory.
 
-One preparation pins one manager object, acquisition origin, and persisted incarnation. Identity-changing methods such as `newSession()` or `createBranchedSession()` are not used on a wrapped source manager. Internal fork/clone opens the source as a scoped reader and creates a separate target preparation. CLI missing-cwd recovery resolves/validates the final cwd before final acquisition, or rolls back/closes the first preparation before opening another; it never overwrites a manager variable while abandoning its lease/origin.
+`SessionManager.discardPersistence()` is not used by construction/setup cleanup. The later implementation should remove it or restrict it away from normal product flows so future callers cannot reintroduce delete-after-publication heuristics.
 
-Public low-level `SessionManager.create/open/...` continue returning `SessionManager`. Internally, the underlying acquisition path produces a preparation first; a direct public create durably adopts and settles before return because the caller becomes the explicit owner. This avoids an exception gap between row creation and preparation.
+### 4.2 Ownership states
 
-The public runtime factory also keeps its current options shape through an explicit split:
+The high-level ownership state is intentionally small:
 
 ```text
-public createAgentSessionRuntime({ sessionManager, ... })
-  -> wrap raw manager as borrowed
-  -> internal createPreparedAgentSessionRuntime({ preparation, ... })
-
-CLI / daemon / replacement / subagent internals
-  -> acquire created|opened|borrowed preparation
-  -> internal createPreparedAgentSessionRuntime({ preparation, ... })
+caller-owned manager
+  -> factory-owned manager
+       -> closed                         // construction failed before AgentSession
+       -> AgentSession-owned manager
+            -> closed                    // normal disposal or later failure
 ```
 
-The internal helper returns the prepared candidate/runtime plus its mandatory finalizer; it does not hide acquisition origin inside the public raw-manager parameter.
+Rules:
 
-### 6.5 Adoption invariants
+1. Passing a manager to `createAgentSession()`, `createAgentSessionRuntime()`, runtime replacement, or subagent runtime creation consumes manager ownership at invocation.
+2. The caller does not reuse that manager after either success or failure; it may reopen the stable reference if needed.
+3. Until `AgentSession` construction returns, the factory owns manager close plus cleanup of every resource it created but has not transferred.
+4. Once an `AgentSession` exists, that session is the sole persistence finalizer. Any still-untransferred service resource remains owned by the factory until attached or cleaned.
+5. Later setup failure disposes the session and separately cleans only resources that were never transferred; it never separately closes the session's manager.
+6. Close is idempotent, but idempotence is not permission to create multiple logical finalizers or discard cleanup errors.
+7. Setup errors and all close/dispose errors are preserved together in `AggregateError`.
+8. No construction finalizer invokes session deletion.
+9. Static/transient readers continue using scoped `try/finally` close and never transfer ownership to a runtime.
 
-1. **Candidate finalizer first.** A candidate session/runtime with a guaranteed non-persistence finalizer exists before publication begins.
-2. **Persistence owner transfers once.** Preparation alone may close/discard before adoption; `AgentSession` alone may close after transfer.
-3. **No avoidable fallible work after the ideal cut.** Validation, service construction, rejecting hooks, path checks, and reversible reservations run while prepared.
-4. **Fence asynchronous publication.** Once publication begins, cancellation cannot run origin rollback until its typed outcome is joined.
-5. **Durable adoption before external reachability.** For created rows, the reconciliation-capable SQLite adoption transaction commits before a runtime, handle, reference, route, binding, or registry entry becomes externally reachable.
-6. **Earliest durable route wins.** If worktree, last-session, parent-edge, lease, or registry state can resolve the candidate, that effect is publication unless a typed receipt proves restoration.
-7. **Uncertainty preserves.** If any participant may have published, adopt/fail-preserve even when the overall operation reports failure.
-8. **Post-adoption failures do not roll back identity.** They retire through the installed owner and preserve the session row.
-9. **Selector visibility is irrelevant.** `visible` never authorizes adoption or deletion.
-10. **Incarnation and preparation fencing are authoritative.** Stale preparation cannot delete an adopted row, another preparation, or a recreated generation.
+This is a deliberate SDK ownership clarification. The public function signatures remain unchanged, but later SDK documentation must state that passing a manager transfers ownership immediately. A caller that needs another live manager opens a separate one.
 
-If an existing publication API can throw after making the candidate reachable without returning typed evidence, it must be split into reversible preparation and a no-throw linearization step or return a typed outcome. Cleanup convenience never justifies delete-after-publication risk.
+### 4.3 Flow-specific ownership
 
-#### Preparation-local canonical view
-
-Manager-row ownership and canonical mutation atomicity are separate concerns.
-
-- Candidate-dependent model, thinking, planning, checkpoint, name, and extension setup is represented as a declarative `SessionCanonicalCommand` overlay against a manager-issued projection guard.
-- Candidate construction reads one effective view: authoritative base projection plus the ordered overlay. It never reads stale base policy while setup writes wait for adoption.
-- The overlay is not visible through the original opened/borrowed manager, observers, list/search, or another process.
-- After all other fallible setup succeeds, `beginPublication()` atomically commits the overlay. For a created row, the same SQLite transaction changes durable publication state to adopted. For opened/borrowed rows, it commits only guarded canonical mutations because the row was already durable/adopted.
-- Proven rollback drops the overlay and leaves opened/borrowed canonical state unchanged. Committed or uncertain outcome moves the preparation to adopted/fail-preserved before external publication continues.
-- The candidate then binds to the committed revision/effective state without replaying hooks or appending the setup twice.
-- A mutation explicitly intended to survive runtime-construction failure is an independent user operation committed before preparation, not candidate setup.
-
-This rule applies to CLI startup options, SDK model/thinking/plan initialization, resumed runtime setup, plan handoff checkpoints, and extension-driven setup. Closing an opened manager is not rollback for already appended canonical entries. A borrowed manager is guaranteed usable only after a proven no-effect failure; committed or uncertain overlay outcomes require a fresh authoritative manager.
-
-### 6.6 Exact adoption boundaries
-
-#### CLI startup
-
-`main.ts` session selection must return a preparation, not a bare manager with lost origin information.
-
-- new, imported, and forked targets are `created`;
-- resumed targets are `opened`;
-- `continueRecent` reports its actual origin;
-- no-session mode is `borrowed`/in-memory.
-
-Synchronous flag/name validation completes before acquisition. Immediately after acquisition, one top-level `try/finally` owns the preparation; no `process.exit()` path may bypass its joined settlement. Missing-cwd prompting completes before final acquisition (or explicitly rolls back/closes the first preparation before reacquiring), and `--name` is part of the startup canonical overlay rather than an immediate append to an opened/imported manager.
-
-`createAgentSessionRuntime()` stages services, the prepared candidate, feed, and startup canonical overlay. Immediately before returning the runtime, its publication attempt commits/reconciles durable adoption and contingent setup, transfers persistence-close authority to `AgentSession`, and settles the preparation. Any proven no-effect failure before that point rolls back by origin. Once returned, runtime disposal owns close and the row is retained even if print, RPC, or interactive mode later fails.
-
-#### SDK `createAgentSession`
-
-- the default internally created manager is `created`;
-- `options.sessionManager` is `borrowed`.
-
-The prepared candidate finalizer exists before publication; `AgentSession` receives persistence-close authority only after durable adoption. Resource loading, model resolution, MCP/LSP setup, extension loading, and startup policy calculation remain pre-publication, while their canonical effects stay in the preparation-local overlay. Immediately before `createAgentSession()` resolves, the publication attempt commits/reconciles that overlay, transfers close authority, and settles. A proven no-effect failure discards only a default-created preparation and leaves a borrowed manager usable. A committed or uncertain overlay fails but preserves the session and retires the borrowed manager authority for reopen. Any error after the promise resolves is ordinary adopted-session lifecycle, never construction rollback.
-
-The lower-level public `createAgentSessionRuntime()` follows the same ownership rule: a raw manager supplied by an SDK caller is borrowed until success, while internal CLI/daemon callers may pass a preparation carrying created/opened origin. On a proven no-effect construction failure, a raw caller manager remains caller-owned; after a committed/uncertain setup outcome the candidate terminalizes that stale authority and the caller reopens, while on success the returned runtime owns eventual close. This intentionally replaces the current ambiguous close-on-failure behavior without changing the function signature and must be called out in the later SDK documentation change.
-
-#### `AgentSessionRuntime` replacement
-
-New, resume, fork, clone, and import all pass a preparation into the serialized lifecycle actor.
-
-Required order:
-
-```text
-acquire preparation
-  -> validate structural operation and durable input gates
-  -> build candidate AgentSession/services
-  -> stage feed source rebind, contingent canonical mutations, and host replacement reservations
-  -> complete reversible/fallible pre-publication work
-  -> commit/classify contingent canonical state under the lifecycle actor
-  -> classify host replacement commit outcome
-  -> adopt no later than the first proven or uncertain durable/source/registry publication cut
-  -> commit feed source and installed runtime generation
-  -> settle adoption
-  -> run post-publication recovery, callbacks, and listeners
-```
-
-For daemon-backed replacement, the preparation publication attempt spans contingent canonical commit, durable created-row adoption, `AgentSessionReplacementTransaction.commit()`, and `ConversationProjectionFeed.commitSourceRebind()`. The lifecycle actor joins that attempt. The implemented order remains reservation → candidate/durable setup → lease/registry rekey commit → feed commit → finalization. Any successful early routing/rekey participant makes the result published unless its typed receipt proves restoration; an untyped throw is uncertain. Persistence-close authority transfers before post-publication callbacks, and the row is preserved thereafter.
-
-`withSession`, rebind callbacks, replacement listeners, recovered-input processing, and UI rendering happen after adoption. Their failure may fail-stop or retire the new runtime, but cannot delete its row.
-
-A same-reference authority refresh is `opened`, not `created`, and never permits deletion.
-
-#### Daemon-owned remote runtime creation
-
-`resolveIrohRemoteSessionTarget()` must preserve acquisition origin through `createIrohRemoteAgentRuntimeWithSessionSelection()` and `IntegratedRuntimeRegistry` preparation.
-
-- `created` and `created_after_missing` selections carry `created` preparation;
-- `resumed` carries `opened` preparation;
-- a pre-resolved target carries the same capability rather than reconstructing policy from selection strings later.
-
-Runtime/service construction, cwd authorization, worktree resolution, tool policy, and audit preparation occur while prepared. Worktree binding, client last-session persistence, registry insertion, lease/coordinator activation, and publication callbacks form a composite publication sequence:
-
-1. prepare each durable participant and retain a typed restoration receipt;
-2. begin and reconcile session-row adoption;
-3. commit durable worktree/last-session routing only after adoption;
-4. publish the exact-incarnation registry/lease/coordinator owner;
-5. transfer persistence-close authority and settle preparation.
-
-`ConversationCoordinator.activateRuntime()` is not the only cutoff. A committed binding, pointer, registry insertion, or throwing post-linearization callback is already published unless all prior receipts restore it. `abortPreparedEntry()` may discard only after the entire sequence proves `not_published`. Stream failure after publication detaches or retires through the coordinator and preserves the row.
-
-A late runtime result that arrives after attach cancellation still carries its preparation. The attach/shutdown owner must join its rollback/publication settlement instead of launching unobserved late cleanup.
-
-#### TUI relay target handoff
-
-If target resolution creates a row for a TUI-owned conversation, closing the temporary manager is not rollback: the TUI/relay is expected to open that reference. The preparation adopts before the resolved target or relay offer becomes available to the TUI owner, then the temporary manager closes while the row remains.
-
-Failure before target handoff discards a created row. Failure after a possibly delivered offer preserves it.
-
-#### Host-internal incarnation propagation
-
-After target resolution, these structures carry the exact persisted incarnation rather than a bare session ID:
-
-| Structure | Required identity |
-| --- | --- |
-| `ResolvedSessionTargetWithManager` / runtime creation result | Full `SessionReference` plus created/opened preparation |
-| `IntegratedRuntimeEntry` and `ConversationCoordinator` | Store ID, session ID, session generation; lookup key may remain workspace/session ID only as an index |
-| Daemon `LeaseRecord`, attach claim, rekey reservation, and delayed stream callback | The coordinator's exact incarnation capability |
-| Persisted client last-session state | Exact store ID, session ID, and session generation; a stale value fails/clears and never binds to a same-ID replacement |
-| Worktree session binding | Parent store ID, session ID, and generation; stale binding fails rather than selecting a same-ID replacement |
-| Parent/child session and `subagent_spawns` index | Child store ID, session ID, and generation matching the canonical spawn entry |
-| Session deletion/recreation callbacks | Exact old capability; an ID-only callback cannot mutate the current record |
-
-An ID-only remote target is resolved once at attach. That attach then remains pinned even if another operation deletes/recreates the name; normal generation/revision authority loss retires the stale runtime. Re-resolution on a later attach may intentionally choose the newer incarnation.
-
-#### Subagent startup
-
-A persisted child created beside a persisted parent is `created`; a resumed child is `opened`; an injected manager is `borrowed`.
-
-Session-row adoption and registry/activity publication are distinct.
-
-- A public `start()`/`startByName()` that returns a live handle, session ID, or session reference adopts and transfers the child row immediately before returning. A later first-prompt failure may keep registry/activity state unpublished, but it cannot delete the already returned session identity.
-- A high-level internal spawn operation may preserve pre-adoption rollback only by keeping the handle/reference private and combining create + prompt acceptance atomically. Prompt rejection before that API returns may then discard a created preparation.
-- Definition application, loopback setup, and reversible runtime registration remain prepared in either form.
-- Daemon subagent registration, worktree binding, durable parent spawn linkage, shared registry insertion, and activity publication require the same typed composite publication outcome as daemon root creation. A callback that throws after registration linearization is published/uncertain unless it proves restoration.
-
-The subagent design's term “unpublished prompt failure” continues to describe registry/activity visibility. It does not authorize deletion of a session row whose handle or reference already escaped.
-
-### 6.7 Failure and concurrency matrix
-
-| Scenario | Preparation classification | Manager/session result | Higher-level owner result |
+| Flow | Manager owner before transfer | Transfer point | Failure behavior |
 | --- | --- | --- | --- |
-| Factory fails before manager exists | none | No manager or row to clean | Original error |
-| Created candidate; setup fails before publication begins | `created`, `prepared` | Finalize candidate resources, close manager, discard exact prepared row/capability | Original error, aggregated with cleanup errors |
-| Opened candidate; proven no-effect setup failure | `opened`, `prepared` | Finalize candidate resources and close temporary manager; preserve row | Original error, aggregated with finalization/close errors |
-| Borrowed candidate; proven no-effect setup failure | `borrowed`, `prepared` | Finalize candidate without manager close; manager stays usable | Original error, aggregated only with candidate-finalization errors |
-| Normal code tries to list/find/open a durable prepared row | durable `prepared` | Reject as unavailable; do not expose a reusable reference | No competing owner can defeat prepared discard CAS |
-| Opened/borrowed setup needs candidate-only canonical writes | any, `prepared` | Read through preparation-local overlay; do not mutate live log | Proven setup failure leaves canonical state unchanged |
-| Contingent/adoption transaction proves rollback | `publishing` → rollback | Drop overlay; origin-specific cleanup | Candidate remains unpublished |
-| Contingent/adoption transaction commits | `publishing` → `adopted` | Preserve committed row/revision and transfer close authority | Later external-publication failure cannot restore old log |
-| Adoption or another publication participant is uncertain | `publishing` → `adopted` | Preserve row; fail-stop uncertain manager and require reconciliation/reopen | Never conditionally delete |
-| Validation/cancellation wins before publication begins | any, `prepared` | Origin-specific rollback | Current owner remains authoritative |
-| Cancellation arrives during publication | `publishing`, rollback requested | Join typed participant outcome | Roll back only on `not_published`; otherwise preserve/adopt |
-| Durable binding/last pointer/registry participant fails with proven restoration | `publishing` | Continue toward `not_published` only after every receipt restores | No dangling external route |
-| Any publication participant cannot prove restoration | `publishing` → `adopted` | Preserve row and exact incarnation | Composite result is uncertain |
-| Public SDK/runtime/handle return succeeds | `adopted` → `settled` | Persistence-close authority transfers once | Returned owner is authoritative |
-| Listener/callback/recovery/stream fails after adoption | `adopted` or transferred | Preserve row; installed owner closes/retires | No construction rollback |
-| Created cleanup close fails | rollback settlement | Still attempt prepared-row discard; aggregate outcomes | No silent cleanup success |
-| Prepared discard sees adopted state, wrong preparation, or newer revision | rollback settlement | Preserve row and report conflict | Never force-delete another owner/write |
-| Session ID is deleted/recreated with another generation | stale capability | Store/generation/preparation guard prevents mutation | Replacement remains authoritative |
-| Old-generation host binding/callback reaches reused ID | stale incarnation | Reject exact-reference/capability mismatch | Never route to replacement incarnation |
-| Two rollback calls race | `prepared` | One settlement promise and one cleanup attempt | Both callers observe same result |
-| Rollback and `beginPublication` race | `prepared` | First synchronous claim wins | Losing path cannot reverse state |
-| Graceful shutdown during publication | `publishing` | Fence new work and join preparation settlement | No unobserved late cleanup/publication |
-| Bounded process termination before join | process loss | Attempt no speculative delete | Durable prepared/adopted row records last proven cutoff |
-| Abrupt process termination while durable prepared | process lost | Inaccessible prepared row may remain | No automatic reclamation or ordinary retry-open |
+| CLI startup | `main.ts` startup scope | Invocation of the runtime factory | Validate flags first; close on pre-transfer exit; after transfer the factory/session owns close |
+| `createAgentSession()` default manager | SDK factory | Successful `AgentSession` construction | Factory closes on early failure; session disposes on later failure; row retained |
+| `createAgentSession()` supplied manager | Caller until invocation, then SDK factory | Successful `AgentSession` construction | Same as default manager; ownership is consumed |
+| Public `createAgentSessionRuntime()` | Caller until invocation, then runtime factory | Successful candidate `AgentSession` construction | Close before construction; dispose session afterward |
+| Runtime new/resume/fork/import | Serialized `AgentSessionRuntime` lifecycle operation | Successful candidate `AgentSession` construction | Candidate manager closes or candidate session disposes; row retained |
+| Remote target/runtime creation | Remote runtime factory/registry preparation | Successful candidate `AgentSession` construction | Selection kind remains response metadata, not delete policy; close/dispose only |
+| TUI relay target inspection | Relay setup scope | None; manager is temporary | Always close after reading target cwd/reference; row retained |
+| Subagent start | `SubagentManager` after invocation | Successful child `AgentSession` construction | Returned handle/runtime later owns disposal; first-prompt failure never deletes the row |
+| Static list/search/export/read helper | Scoped helper | None | `try/finally` close/release |
 
-### 6.8 Abrupt process loss
+### 4.4 CLI acquisition requirements
 
-This RFC guarantees cleanup for caught failure, cancellation, graceful shutdown, and worker failure that the process can still classify. It does not claim automatic crash reclamation.
+`main.ts` currently has exits and manager replacement after acquisition. The implementation must:
 
-A process killed before durable adoption can leave a row explicitly marked prepared with a preparation ID whose process-local capability is lost. Unlike an adopted selector-hidden row, it is distinguishable and normal list/find/open paths cannot resolve it. It cannot be deleted merely because it is old: another live process may own a long-running preparation. Only an exact caller-named remote retry may reclaim a daemon-owned preparation after exclusive daemon authority proves the recorded owner terminal (§4.6).
+1. validate synchronous flags and `--name` syntax before acquiring a manager;
+2. install one top-level finalizer immediately after acquisition;
+3. avoid direct `process.exit()` while that scope owns an unsettled manager;
+4. resolve missing-cwd choice before final runtime transfer;
+5. when reacquisition is unavoidable, close the first manager before assignment of the replacement;
+6. preserve the committed row even when startup is cancelled or runtime creation fails.
 
-A process killed after the adoption transaction but before external runtime publication leaves an adopted selector-hidden row. Preserving it is required because durable adoption is the fail-preserve cutoff. Exact retry may resolve that adopted incarnation normally.
+No created/opened classification is required because both outcomes close and retain the row.
 
-Generic CLI/SDK reclamation still needs durable owner/liveness or explicit operator recovery policy and remains separate from #329's corrective implementation.
+### 4.5 Failure matrix
 
-## 7. Materialized projection contract
+| Scenario | Manager result | Session row result |
+| --- | --- | --- |
+| SQLite creation transaction fails | Factory releases worker lease | No committed row |
+| Creation commits; later setup fails before `AgentSession` exists | Factory closes manager | Row retained |
+| Existing session open; setup fails before `AgentSession` exists | Factory closes manager | Existing row retained |
+| Supplied manager; setup fails before `AgentSession` exists | Factory closes consumed manager | Row retained; caller may reopen reference |
+| `AgentSession` exists; later setup/hook/registration fails | Dispose session only | Row retained |
+| Remote worktree/last-session/registry step commits then later fails | Existing daemon owner compensates or retires its own state; runtime closes | Row retained, so no dangling route points to a deleted identity |
+| Subagent handle returns, then first prompt fails | Handle/runtime disposes according to current subagent contract | Row retained |
+| Persistence transaction is proven rolled back | Manager follows existing authority rules | Prior row state retained |
+| Persistence outcome is uncertain | Manager becomes reconciliation-required and closes/fail-stops | Row retained; fresh manager reopens authoritative state |
+| Explicit user/session-selector delete | Close active manager, export recovery snapshot when applicable, then exact conditional delete | Row deleted only on matching store/generation/revision |
+| Stale manager writes after delete/recreate | Generation/revision check rejects and retires stale authority | Replacement row preserved |
+| Process terminates during setup | OS/worker cleanup eventually releases process resources | Any committed row remains |
 
-### 7.1 Canonical entry envelope
+## 5. Canonical entry contract
 
-SQLite columns are the sole authority for entry envelope identity:
+### 5.1 One canonical representation
+
+The full validated entry object stored in `entries.payload_json` is canonical. It includes its persisted ordinal and all public or host-only type-specific fields.
+
+SQLite envelope columns are derived indexes:
 
 ```text
-(session_id, entry_id, ordinal, parent_entry_id, entry_type, timestamp, is_host_only)
+session_id
+entry_id
+ordinal
+parent_entry_id
+entry_type
+timestamp
+is_host_only
 ```
 
-`payload_json` stores only the exhaustively validated type-specific body. It does not duplicate ID, parent, ordinal, type, timestamp, or host-only classification. `SessionManager` reconstructs the public `SessionEntry` from columns plus body; explicit JSONL export continues writing the full public envelope.
+The write protocol should carry one canonical entry value rather than independently caller-selected envelope fields. The worker derives indexed columns from the validated entry.
 
-Before reduction, every entry type has an exact schema with unknown-field rejection, canonical JSON checks, timestamp/range checks, and cross-reference validation. `is_host_only` must equal the deterministic classification for `entry_type`; callers cannot choose it independently. Parent, compaction boundary, label target, client-input receipt/queue/canonical target, leaf target, and subagent-reference invariants are validated before any derived state changes.
+On load:
 
-Because #329 is unreleased and provides no SQLite compatibility contract, implementation changes the schema/data shape in place rather than retaining a dual full-entry/body payload reader. If physical normalization is deferred in an implementation revision, every duplicated envelope field must compare exactly and the implementation plan must explain why duplication remains; silently overwriting a mismatched payload ordinal or ignoring `is_host_only` is forbidden.
+1. parse canonical JSON;
+2. validate the complete entry schema;
+3. derive the expected envelope;
+4. compare every stored column exactly;
+5. reject any mismatch before reduction.
 
-### 7.2 One reducer
+`session_id` comes from the containing row/transaction. `is_host_only` is deterministic from entry type and cannot be chosen by payload data. A stored ordinal is required and must be a positive contiguous safe integer.
 
-The later implementation introduces one internal session-store projection module. It owns the deterministic functions conceptually equivalent to:
+Keeping the full entry payload avoids an unrelated body-only storage redesign while still establishing one source of truth.
+
+### 5.2 Exhaustive entry validation
+
+One shared codec module is used by `SessionManager`, the store protocol/worker, and JSONL import/export where applicable. It has an admission form that validates a new entry before ordinal assignment and a persisted form that requires the assigned ordinal and exact SQL-envelope parity. Both use the same type-specific body schemas. It validates every current entry type:
+
+- message;
+- client-input receipt, queued payload, and state;
+- thinking, Fast mode, model, and planning state changes;
+- compaction and branch summary;
+- custom and custom-message entries;
+- label and session-info entries;
+- starting Git context;
+- durable leaf;
+- subagent spawn.
+
+Required validation includes:
+
+- exact allowed fields with unknown-field rejection;
+- canonical lossless JSON values;
+- valid IDs and required strings;
+- canonical ISO entry timestamps and representable message timestamps;
+- valid message role/content shape;
+- valid thinking/Fast/planning values;
+- finite numeric fields and bounded persisted error/input values;
+- parent references to an earlier entry in the same session;
+- compaction `firstKeptEntryId` on the compaction's active ancestor path;
+- leaf and label targets that exist and are eligible;
+- client-input receipt/digest/queue/state/canonical-entry consistency;
+- at most one valid starting Git context entry;
+- complete, generation-pinned parent/child session references where present;
+- deterministic host-only classification.
+
+Validation and canonical cloning happen before mutating arrays, maps, ordinals, leaf state, derived projections, persistence queues, or observers.
+
+Unknown future entry types require an explicit schema and reducer update in the same change. Extension-defined payloads remain supported through the known `custom` and `custom_message` entry envelopes.
+
+### 5.3 JSONL snapshots
+
+JSONL remains explicit interchange, not live storage.
+
+Snapshot import:
+
+- requires the current entry and snapshot versions;
+- validates the header and every entry through the same canonical codec;
+- rejects host-only entries and transport-owned client message identities;
+- validates leaf, parent, compaction, label, and branch references before creating/importing durable state where practical;
+- never installs a compatibility reader for old formats.
+
+Snapshot export reconstructs the current full public entry envelope, removes transport-owned identities, excludes host-only state, and appends one final leaf record.
+
+A failed import after a row has committed closes the manager and retains the row. Up-front validation and a single initial transaction should minimize that case; automatic deletion is still forbidden.
+
+## 6. Materialized projection contract
+
+### 6.1 Retained and removed projections
+
+Retain only projections used by indexed operations:
+
+| Projection | Why retained |
+| --- | --- |
+| `sessions.updated_at`, Git-context fields, `name`, `visible`, `leaf_entry_id`, `message_count`, `first_message` | Listing, exact summary, continuation, and remote enumeration |
+| `client_inputs` | Pending/ambiguous input continuation lookup without transcript replay |
+| `search_chunks` | Deep text search without parsing canonical entry JSON |
+| `transaction_commits` | Commit-outcome reconciliation; evidence rather than a conversation projection |
+
+Remove:
+
+- `labels` table and index;
+- `subagent_spawns` table and index.
+
+Current code reads labels and subagent edges from canonical entries after opening a session. No indexed list/search/lookup path consumes their duplicate tables. Removing unused projections is safer than maintaining and verifying redundant state for hypothetical future queries.
+
+If a future feature needs an indexed label or child lookup, it adds the projection with a concrete reader, reducer rule, and verification test in the same change.
+
+The resulting schema contains only `store_metadata`, `sessions`, `entries`, `client_inputs`, `search_chunks`, and `transaction_commits`.
+
+### 6.2 One reducer
+
+The implementation introduces one composed derived-state reducer. Illustrative shape:
 
 ```ts
 interface SessionDerivedState {
   summary: SessionSummaryAccumulator;
   labels: ReadonlyMap<string, SessionLabelState>;
   clientInputs: ReadonlyMap<string, ClientInputRecord>;
-  subagentSpawns: readonly SessionStoreSubagentSpawnWrite[];
+  subagentSpawns: readonly SubagentSpawnEntry[];
   searchChunks: readonly SessionStoreSearchChunkWrite[];
   leafId: string | null;
   nextOrdinal: number;
 }
 
 function createSessionDerivedState(header: SessionHeader): SessionDerivedState;
-function reduceSessionEntry(state: SessionDerivedState, entry: SessionEntry): SessionDerivedState;
+function applySessionEntry(state: SessionDerivedState, entry: SessionEntry): void;
 function replaySessionEntries(header: SessionHeader, entries: readonly SessionEntry[]): SessionDerivedState;
 ```
 
-The concrete implementation may use controlled mutable builders for performance. There must still be one semantic reducer and one canonical comparison representation.
+Controlled mutable builders are acceptable for performance. The semantic transition for one entry must still be shared by:
 
-The reducer receives entries only after canonical JSON cloning, shape validation, ordinal validation, and parent/reference validation. It processes persisted ordinal order. It does not read the filesystem, clock, SQLite, runtime, TUI, or remote state.
+- initial/reopen replay;
+- ordinary append;
+- atomic append staging;
+- import/fork construction;
+- transaction projection generation.
 
-### 7.3 Derived families
+`_storePayload()` must not independently reinterpret labels, client input, subagent edges, or search eligibility.
 
-| Projection family | Canonical source | Required derived semantics |
+### 6.3 Projection semantics
+
+The reducer preserves current intended behavior:
+
+- message count includes persisted message entries and displayed custom messages under current semantics;
+- first message prefers the first user text, otherwise the first eligible assistant/displayed-custom fallback;
+- a later first user can replace a fallback after reopen;
+- modified time derives from existing user/assistant/displayed-custom activity rules and does not change on attach/detach;
+- latest trimmed non-empty session name wins and an empty name clears it;
+- visibility follows existing message/planning policy and is unrelated to setup success;
+- public appends and durable leaf records determine the active leaf;
+- starting Git context is absent versus recorded-null versus recorded-value;
+- label clearing treats empty/absent labels consistently in live and replay state;
+- client-input state preserves receipt limits, semantic digest, queue ordering, terminal states, and ambiguity fences;
+- subagent edges remain canonical host-only entries;
+- search chunks contain only eligible user/assistant text and displayed custom-message text in deterministic entry order.
+
+### 6.4 Transaction behavior
+
+Each session transaction commits together:
+
+- canonical entries;
+- the complete updated session-summary projection;
+- affected `client_inputs` rows;
+- new `search_chunks` rows;
+- session revision increment;
+- commit evidence.
+
+Existing expected-revision, session-generation, commit-ID, digest, and reconciliation behavior remains authoritative.
+
+Incremental projection calculation must not replay full history for every append. This RFC does not require replacing the current full-history array/map snapshots used by some atomic operations; delta/undo staging is deferred until a dedicated benchmark demonstrates that it is necessary.
+
+### 6.5 Open-time verification
+
+`SessionManager.open()` already loads one selected session's row, canonical entries, client-input rows, and search chunks. Before returning a live manager it must:
+
+1. validate and reconstruct every canonical entry;
+2. replay one derived state;
+3. normalize retained persisted projections into deterministic order;
+4. compare every derived summary field, client-input row, and search chunk;
+5. reject with a stable store-integrity error on any mismatch;
+6. release its temporary store lease on failure.
+
+It must not repair automatically.
+
+Reasons:
+
+- mismatch may be canonical corruption rather than stale cache;
+- repair can race another writer and hide revision conflicts;
+- strict failure makes transaction/reducer defects observable;
+- Volt has no released SQLite store requiring compatibility repair.
+
+Routine list, search, exact summary lookup, and continuation candidate selection continue using materialized rows. Replaying every session there would recreate issue #328. A chosen continuation candidate is verified when its snapshot is opened; verification failure does not silently create a replacement idempotency domain.
+
+### 6.6 Incremental/replay property
+
+Normative property:
+
+> For any valid header, valid ordered entry sequence, and partition into legal committed transaction batches, incremental reduction produces exactly the same normalized derived state as replaying the final canonical entry sequence.
+
+Also require:
+
+- a proven rolled-back batch has no effect;
+- reopen after each committed prefix equals live incremental state at that prefix;
+- import/fork rewriting preserves derived behavior for rewritten canonical entries;
+- corrupting any retained projection while foreign keys remain valid makes open fail;
+- one corrupt/unreadable store does not hide healthy sessions in other stores during global enumeration.
+
+## 7. Search contract
+
+### 7.1 Operation classes
+
+Let:
+
+- `S` = candidate/returned session count;
+- `M` = materialized summary bytes;
+- `B` = eligible searchable text examined;
+- `Q` = query bytes/characters processed;
+- `F` = fuzzy-token count.
+
+| Operation | Data read | Contract |
 | --- | --- | --- |
-| Session `updatedAt` | Header creation time plus existing activity-bearing message/custom-message timestamps | Preserve current activity semantics and stable timestamps on attach/detach. Invalid dates reject before state changes. |
-| `messageCount` | Public message entries plus displayed custom messages under current semantics | Lifetime count; branch leaf movement alone does not reduce it. Fork/import replay derives the retained target's count. |
-| `firstMessage` | First user text, else first eligible assistant/displayed-custom fallback | A later first user may replace an earlier fallback after reopen. Reducer state therefore retains user and fallback components, not only final text. |
-| `name` | Ordered `session_info` entries | Latest trimmed non-empty name, with empty name clearing it. |
-| `visible` | Existing message/planning visibility policy | Independent of preparation/adoption state. |
-| `leafId` | Public appends and durable leaf entries | Must resolve to a stored public entry or null. Host-only entries never become the conversation leaf. |
-| Starting Git context | First valid host-only `session_start_git_context` | At most one; recorded null differs from absent. |
-| Labels | Ordered label entries | Latest non-empty label per target; clear removes it; target must exist. |
-| Client input | Ordered host-only receipt, queued, state, and identified canonical user entries | Preserve limits, digest checks, legal transitions, canonical completion, and recovery ambiguity fences. |
-| Subagent spawn index | Ordered host-only `subagent_spawn` entries | Exact tool/request identity plus child store ID, session ID, and session generation; never projected remotely as a host locator. |
-| Search chunks | Eligible user/assistant text and displayed custom-message text | Deterministic contiguous chunk indexes in entry order; no transcript parsing during list/exact lookup. |
+| List one store | Session summary rows | `O(S + M)`; no canonical entry/search text read |
+| List all stores | Directory enumeration and each store's summaries | `O(stores + S + M)`; no canonical entry/search text read |
+| Exact reference/ID lookup | Indexed session identity and one summary | No canonical entry/search text read; `open()` separately loads and verifies one transcript |
+| Continue recent | Summary and indexed pending-input metadata | No canonical transcript payload read before chosen-session open |
+| Remote `list_sessions` | Summaries plus bounded remote-safe projection | No canonical entry/search text read |
+| Fuzzy/phrase search | Metadata plus eligible search chunks | Parsing `O(Q)`; fuzzy scans `O(F × B)`; phrase substring cost also depends on query length |
+| Regex search | Same extracted document | Document/query construction is bounded by `Q + B`; JavaScript RegExp compile/match has no general time bound |
 
-The reducer also produces the complete `SessionStoreSessionProjection` and affected side-table writes for each transaction.
+Summary strings such as `name`, `first_message`, and cwd contribute to `M`. The guarantee is independence from cumulative canonical transcript payload, not zero cost per summary byte.
 
-### 7.4 Incremental application
+### 7.2 One-session accumulation
 
-Incremental append and full replay must call the same entry transition functions. Separate implementations that merely share tests are not sufficient.
+The current worker loads every matching store chunk row with `.all()`, retains a `chunksBySession` map, then joins each session document.
 
-For ordinary queued persistence:
+The target implementation:
 
-1. validate and clone the entry;
-2. apply the reducer once to live derived state;
-3. build the transaction payload from the resulting state plus affected side-index deltas;
-4. enqueue persistence in causal order;
-5. on uncertain failure, fail-stop conversation authority as already specified by the delivery transaction contract.
+1. obtains candidate summaries;
+2. iterates eligible chunks ordered by session and chunk index;
+3. accumulates one session document;
+4. scores and releases that document before continuing;
+5. retains only summaries and scored results needed for final sorting.
 
-No routine append may filter or replay all historical entries to derive a summary.
-
-### 7.5 Atomic staging and rollback
-
-Atomic commands need staged reads of earlier entries in the same command without publishing partial state. The preferred implementation is a transaction-local overlay or undo journal proportional to the staged entries and affected keys:
+Expected worker-owned memory:
 
 ```text
-base canonical/index state
-  + staged entry list
-  + staged by-id/label/client-input/projection deltas
-  -> one SQLite payload
+O(materialized summaries + result summaries + query/parser state
+  + largest one-session searchable document and normalization copies)
 ```
 
-On proven rollback, drop the overlay. On commit, merge it once, then notify observers. This avoids using full-history array/map copies as the semantic rollback mechanism.
+It is not `O(all searchable text in the store)`.
 
-If implementation retains snapshots temporarily, acceptance still requires that projection derivation itself is incremental and that long-session persistence benchmarks do not regress. A future implementation plan must state whether full canonical-index copying is retained or replaced; this RFC recommends delta staging.
+Cross-store search remains sequential. This is a memory guarantee, not a latency guarantee. A large or pathological regex can still block the shared store worker; regex isolation or removal requires a separate search design.
 
-### 7.6 Persisted snapshot verification
+### 7.3 Preserved matching behavior
 
-`SessionManager.open()` already loads the session row, entries, and side tables. After parsing canonical entries, it must:
-
-1. replay one `SessionDerivedState` from the header and ordered entries;
-2. normalize persisted and replayed maps/lists into deterministic order;
-3. compare every derived session-summary field and each labels, client-input, subagent-spawn, and search-chunk record;
-4. reject the open with a dedicated projection-mismatch/store-integrity error when any value differs;
-5. release the temporary store lease on failure.
-
-It must not silently rewrite projections during open.
-
-Reasons to fail closed instead of self-heal:
-
-- mismatch may represent canonical-entry corruption rather than a stale cache;
-- automatic repair can race another manager and hide revision conflicts;
-- a summary may already have influenced continuation/selection;
-- strict failure makes reducer or transaction bugs observable in tests;
-- Volt has no released legacy store requiring compatibility repair.
-
-Routine `list`, `search`, exact summary lookup, and continuation selection continue using materialized rows without loading transcripts. Verifying every session during enumeration would reintroduce the original performance defect. A selected session is verified when opened. A dedicated diagnostic audit may verify all sessions explicitly later, outside routine browsing.
-
-### 7.7 Projection transaction invariants
-
-1. Canonical entries, complete session-summary projection, affected side indexes, publication-state transition when any, revision increment, and commit evidence are one SQLite transaction.
-2. A side-index write never commits at a revision different from its canonical entry.
-3. The worker remains the transaction and reconciliation authority; domain projection semantics remain in the shared SessionManager reducer.
-4. The low-level worker protocol validates exact fields, preparation/adoption capability, body-only canonical JSON, and transaction guards but is not a second independent semantic reducer.
-5. Reconciliation that proves commit adopts the staged derived state exactly once.
-6. Reconciliation that proves rollback leaves live/replayed state exactly at the before snapshot.
-7. Uncertain reconciliation makes current conversation projection unavailable rather than selecting either candidate.
-8. Opening a fresh manager replays and verifies the authoritative committed snapshot before restoring conversation authority.
-
-### 7.8 Incremental/replay property
-
-The normative property is:
-
-> For any valid session header, valid ordered entry sequence, and partition of that sequence into legal transaction batches, incrementally reducing and committing those batches yields exactly the same normalized derived state as replaying the final canonical entry sequence from empty state.
-
-Additional properties:
-
-- inserting proven transaction rollbacks anywhere leaves final state equal to omitting those batches;
-- reopen after each committed prefix equals the live incremental state at that prefix;
-- branch movements affect leaf/context but not lifetime summary fields except when a new session is built from a retained branch;
-- import/fork ID rewriting preserves projection semantics for the rewritten canonical entries;
-- no host-only entry enters provider context or remote transcript projection;
-- no side-table corruption can be accepted by open merely because foreign keys pass.
-
-## 8. Search contract
-
-### 8.1 Operation classes
-
-Let `S` be returned/candidate session count, `M` the materialized-summary bytes read, `B` the eligible searchable text examined, `Q` total query bytes/characters processed, `F` fuzzy-token count, and `P` phrase-token count.
-
-| Operation | Data read | Complexity guarantee |
-| --- | --- | --- |
-| List current/custom store | Adopted `sessions` summary rows only | `O(S + M)`; independent of canonical entry/transcript payload bytes not copied into summaries |
-| List all stores | Directory enumeration plus each store's adopted summary rows | `O(stores + S + M)`; independent of canonical entry payload bytes |
-| Exact ID/reference lookup | Indexed adopted session identity plus one summary | Indexed lookup plus matched summary bytes; no entry/search-chunk read |
-| Continue recent | Adopted summaries plus indexed pending-input metadata | Proportional to materialized candidate/index work; no canonical transcript payload read |
-| Remote `list_sessions` | Adopted summaries plus bounded remote-safe projection | `O(S + M)` before remote projection; no canonical entry payload read |
-| Deep fuzzy/phrase search | Session metadata plus eligible `search_chunks.text` | Parsing `O(Q)`, fuzzy scans `O(F × B)`, and a conservative phrase-search bound `O(B × Q)` including phrase lengths: total `O(Q + B × (F + Q))` |
-| Deep regex search | Same extracted document | Document/query construction is `O(Q + B)`; RegExp compile and match have no general time bound |
-
-SQLite stores extracted text separately so deep search avoids parsing canonical entry JSON and ignores non-searchable payloads such as tool details, images, hidden custom entries, and arbitrary extension data. That is useful but is not a content-index complexity guarantee. Materialized `name`, `first_message`, cwd, and other summary fields still contribute to `M`; documentation and benchmarks must not pretend summary bytes are free.
-
-### 8.2 Preserved query semantics
-
-The search worker preserves:
+Preserve:
 
 - whitespace-separated fuzzy tokens;
-- quoted phrases, including matches spanning adjacent extracted chunks after space joining;
-- `re:` JavaScript regular expressions;
-- current fuzzy scoring and alphanumeric swap behavior;
-- aggregate score ordering with modified-time tie-breaking;
-- session ID, name, cwd, and extracted message text in the searchable document;
+- quoted phrases, including matches spanning adjacent chunks after space joining;
+- `re:` JavaScript regex mode;
+- fuzzy score and alphanumeric-swap behavior;
+- session ID, latest name, cwd, and extracted message text in the document;
+- score ordering and modified-time tie-break;
 - visibility and canonical-cwd filtering;
-- global cross-store score merge behavior.
+- global score merge across stores;
+- selector request sequencing that ignores stale debounced results.
 
-No documentation may say that deep search is independent of transcript or searchable-text size.
+No docs or PR text may claim that deep search is independent of searchable text size or that `search_chunks` is a full-text content index.
 
-### 8.3 Memory bound
+### 7.4 Why not FTS
 
-The current worker materializes an entire store's search rows before scoring. The target implementation iterates chunks ordered by session, builds and scores one session document, releases it, and proceeds to the next session.
-
-Expected worker-owned search memory is therefore:
-
-```text
-O(materialized summaries + result summaries + Q-sized query/parser state
-  + largest single session searchable document and its normalization copies)
-```
-
-not:
-
-```text
-O(all searchable text in the store)
-```
-
-Cross-store search remains sequential so only one store scan is active in the calling operation. Repeated fuzzy tokens currently create repeated lowercase/scan work; the implementation may normalize one session document once only if generated parity tests prove identical scoring.
-
-This is a memory bound, not a CPU-time bound. Token/phrase cost scales with query-token count as well as text, and JavaScript regex has no general asymptotic guarantee. Because search and writes share the store worker, an expensive regex may delay later operations for that store. This limitation must be documented rather than hidden behind the word "indexed."
-
-### 8.4 Why this RFC does not add FTS
-
-[Node 22.16.0 enabled SQLite common flags including FTS5](https://nodejs.org/en/blog/release/v22.16.0), and Volt's supported/CI Node versions are newer. Availability does not solve semantic equivalence:
+[Node 22.16.0 enabled SQLite FTS5](https://nodejs.org/en/blog/release/v22.16.0), and Volt's supported versions are newer. Availability does not make FTS transparent:
 
 - subsequence fuzzy matching does not require contiguous lexical terms;
-- quoted phrases currently span independently stored message chunks;
-- arbitrary JavaScript regex cannot be represented by an FTS query;
-- an FTS candidate fast path would still need a full fallback to avoid false negatives;
-- changing semantics or returning incomplete candidates would remove intentional behavior;
-- FTS virtual/shadow tables would expand schema validation and release testing in an already broad storage change.
+- phrases currently span message chunks;
+- arbitrary JavaScript regex cannot be represented by FTS;
+- preserving exact behavior still requires a complete fallback;
+- FTS virtual/shadow tables add schema and release complexity without changing the worst-case contract.
 
-FTS may be designed later if the product chooses a different default query language or accepts an explicitly incomplete/alternate search mode. It is not a hidden follow-up required to make #329's listing objective true.
+FTS belongs in a later query-language design, not #329.
 
-### 8.5 Benchmark contract
+### 7.5 Benchmark dimensions
 
-The session benchmark must report separate dimensions:
+The repository benchmark should report independently:
 
-1. **Non-searchable payload growth**: grow canonical custom/tool payload while keeping summary/search text fixed. Cold/warm listing and exact lookup should remain insensitive to those bytes.
-2. **Searchable text growth**: grow eligible user/assistant/displayed-custom text. Token/phrase runs report text and query-token scaling, regex runs are observational without a linearity claim, and peak heap should reflect one-session rather than whole-store accumulation.
-3. **Query growth**: vary total query bytes, fuzzy-token count, phrase count/length, and regex pattern bytes independently from searchable text.
-4. **Session/store count growth**: vary sessions per store and number of stores independently.
+1. session count;
+2. store count;
+3. materialized-summary/first-message bytes;
+4. non-searchable canonical payload bytes;
+5. searchable text bytes per session and per store;
+6. query bytes, fuzzy-token count, phrase count/length, and regex pattern size;
+7. cold versus warm list, exact open, and search;
+8. elapsed time and heap delta.
 
-The benchmark is observational unless a later implementation plan defines stable same-host thresholds. It must not use a large unsearched custom payload as evidence that deep search itself is transcript-size-independent.
+The benchmark remains observational unless a later plan establishes reproducible same-host thresholds. Large unsearched custom data is evidence for listing independence, not deep-search independence.
 
-## 9. Path, privacy, and trust boundaries
+## 8. Ownership and protocol composition
 
-1. `SessionReference.sessionDirectory`, store ID, session generation, preparation ID, and parent session directories are host-local capabilities. Local APIs and explicit local JSONL interchange may carry the documented local parent locator, but remote-safe session surfaces never carry store/preparation locators.
-2. Store ID, session ID, session generation, durable publication state, and preparation capability must all match the operation being performed. Path or ID equality alone is insufficient.
-3. Custom session directories are resolved before publishing reusable references.
-4. Equivalent cwd aliases use the existing canonical path comparison for filtering; stored lexical cwd remains available for display and worktree behavior.
-5. Worktree sessions remain in the parent workspace store with their effective worktree cwd, as defined by `worktrees-design.md`.
-6. Search over cwd is local-only. Remote session surfaces may carry existing relative `workingDirectory`, `worktreeId`, and synthetic `/workspace` mappings; they never carry the SQLite directory, parent-session directory, store ID, generation, or preparation ID. Unrelated host paths retain the existing Iroh outbound-filter contract rather than gaining an implicit new guarantee here.
-7. A projection mismatch error must map to a stable remote-safe failure without message payload, storage locators, provider data, raw client-input bodies, or newly exposed host paths.
-8. The preparation capability object is process-local and is never exposed to extensions or application/remote RPC. Its opaque preparation ID is serialized only in the owner-local SQLite row and private worker protocol needed for guarded writes/adoption/discard.
+This RFC preserves existing owners:
 
-## 10. Future implementation map
+| Owner | Responsibility retained |
+| --- | --- |
+| `SessionManager` | Canonical session state, persistence queue, revision/generation authority, and reconciliation |
+| `AgentDeliveryOwner` | One logical delivery's canonical settlement and verified receipt |
+| `AgentSession` / `AgentSessionRuntime` | Active agent resources, structural replacement, and eventual manager close |
+| `ConversationProjectionFeed` | Live materialized conversation projection and atomic source/subscriber cuts |
+| `ConversationCoordinator` | Daemon conversation runtime and transport terminal retirement |
+| `LeaseBroker` | Process-level conversation lease ownership |
+| Existing Iroh admission/attach owners | Current workspace/client authority checks pending any separately accepted workspace-authority RFC |
+| `WorktreeManager` | Worktree checkout and binding state |
+| `SubagentManager` and handle/registration owners | Child admission, registry/activity publication, and runtime lifetime |
 
-This section is a handoff for a later plan, not implementation authorization.
+This document does not introduce `SessionManagerPreparation` or `PreparedConversationActivation` as a merge requirement.
 
-### Phase A: preparation primitive and acquisition metadata
+Storage terminology amendments:
 
-Likely files:
+- references to a live session file in [live shared sessions](live-shared-session-daemon-design.md) mean the authoritative SQLite row plus ordered entries;
+- references to WAL-only session files in [atomic conversation bootstrap](conversation-bootstrap-design.md) mean selector-hidden SQLite rows resolved by ID/reference;
+- worktree sessions remain in the parent workspace store with their effective worktree cwd as described by [worktrees design](worktrees-design.md);
+- the [workspace authority lifecycle](workspace-authority-lifecycle-design.md) remains Proposed and is not a prerequisite for #329;
+- subagent registry/activity publication remains first-prompt-based, while the committed child row itself is retained after any later failure.
 
-- new `src/core/session-manager-preparation.ts`;
-- `src/core/session-manager.ts` internal create/open/continue/import/fork acquisition paths;
-- `src/core/session-store/{schema,types,protocol,client,worker}.ts` for prepared-row capability/owner identity, adoption transaction, and normal-lookup exclusion;
-- focused unit/store tests for preparation and adoption.
+### 8.1 Path and privacy boundary
 
-Exit criteria:
+- SQLite directories, store IDs, session generations, and parent store locators remain host-local.
+- Existing remote session surfaces may carry relative `workingDirectory`, `worktreeId`, and synthetic `/workspace` mappings.
+- No SQLite locator is added to remote responses.
+- Remote errors caused by entry/projection integrity failures expose stable bounded messages, not raw payloads, client input, provider data, or new host paths.
+- Explicit local JSONL interchange may carry the documented local parent locator; this does not widen remote behavior.
 
-- public `SessionManager` signatures remain unchanged;
-- every internal acquisition reports created/opened/borrowed without inference;
-- prepared rows cannot be resolved through normal list/find/open and cannot be mutated/discarded without their preparation capability;
-- adoption and contingent canonical setup share reconciliation-capable commit evidence;
-- publishing, rollback intent, transfer, and cleanup settle exactly once.
+## 9. Implementation phases for a separate plan
 
-### Phase B: local/SDK and runtime replacement adoption
+This section is an implementation handoff, not authorization.
 
-Likely files:
+### Phase 1: manager ownership and fail-preserve cleanup
+
+Primary files:
 
 - `src/main.ts`;
 - `src/core/sdk.ts`;
-- `src/core/agent-session.ts` and `src/core/agent-session-services.ts` for prepared candidate finalization and persistence-close authority transfer;
-- `src/core/agent-session-runtime.ts`, with public raw-manager wrapping and a separate internal preparation-aware factory;
-- existing SDK/runtime replacement tests.
-
-Exit criteria:
-
-- default-created proven pre-publication failures discard the prepared row;
-- borrowed proven no-effect failures leave the manager usable and candidate disposal does not close it;
-- resume failures never delete existing sessions or leave contingent setup entries after a proven no-effect result;
-- post-publication callback failures preserve the adopted row;
-- replacement publication reports definitive versus uncertain outcome.
-
-### Phase C: daemon, relay, and subagent adoption
-
-Likely files:
-
-- `src/daemon/session-target.ts`;
+- `src/core/agent-session-runtime.ts`;
+- `src/core/agent-session.ts` only where needed to enforce one finalizer;
 - `src/modes/rpc/iroh-remote-agent-runtime.ts`;
-- `src/daemon/integrated-runtimes.ts`, `src/daemon/conversation-coordinator.ts`, and `src/daemon/lease-broker.ts`;
-- `src/daemon/iroh-service.ts` where created relay targets are handed off;
-- worktree and daemon state/binding modules that persist session identities;
-- `src/core/subagents/manager.ts` and the subagent-spawn projection/index schema;
-- daemon co-attach, remote runtime, worktree, and subagent integration tests.
+- `src/daemon/integrated-runtimes.ts`;
+- `src/core/subagents/manager.ts`.
 
-Exit criteria:
+Required result:
 
-- `sessionSelection` remains wire metadata, not cleanup authority;
-- same-daemon caller-named retries join/live-retry one preparation, and a restarted exclusive daemon can reclaim only its proven-terminal predecessor's still-prepared row;
-- prepared daemon entries and late canceled runtime results are joined and roll back once only after all participants prove no publication;
-- published daemon entries retire through `ConversationCoordinator` without row deletion;
-- every host-internal runtime, lease, binding, pointer, edge, and callback proves exact session incarnation;
-- public child handles adopt before return, while internal atomic create-and-prompt may discard on proven pre-return prompt failure;
-- uncertain parent-edge/runtime publication preserves the child row.
+- setup cleanup never calls session deletion;
+- factory ownership is explicit from invocation;
+- before session construction, manager and untransferred construction resources close once;
+- after session construction, session disposal is the only manager finalizer and the factory cleans only untransferred resources;
+- CLI reacquisition closes the superseded manager;
+- remote selection kind no longer selects close versus delete;
+- failed created rows remain exact-openable/hidden according to their content;
+- original and cleanup errors remain observable.
 
-### Phase D: projection reducer and integrity verification
+### Phase 2: canonical entry codec
 
-Likely files:
+Primary files:
 
-- new `src/core/session-store/projection.ts`;
-- exhaustive entry-body schemas and column/body reconstruction;
+- new internal session-entry codec/schema module;
 - `src/core/session-manager.ts`;
-- `src/core/session-store/{schema,types,protocol,worker}.ts` for body-only payloads and a dedicated integrity error;
-- projection, session-store, import/fork, and reconciliation tests.
+- `src/core/session-store/{types,protocol,worker}.ts`;
+- JSONL import/export paths.
 
-Exit criteria:
+Required result:
 
-- one semantic reducer serves append and replay;
-- each side projection matches replay after every tested prefix;
-- malformed entry bodies, envelope/classification mismatch, and corrupt summary/label/client-input/spawn/search projection fail open cleanly;
-- routine list/exact lookup still does not load entries;
-- atomic rollback restores before state without projection drift.
+- one full canonical entry drives SQL envelope columns;
+- every entry type rejects malformed and unknown fields;
+- column/payload ordinal, ID, parent, type, timestamp, and host-only classification agree exactly;
+- dangling/invalid references reject before state mutation;
+- the current deterministic compaction CI regression asserts the authoritative validation boundary rather than obsolete later text.
 
-### Phase E: bounded search scan and contract corrections
+### Phase 3: projection reducer and schema simplification
 
-Likely files:
+Primary files:
+
+- new `src/core/session-store/projection.ts` or equivalent;
+- `src/core/session-manager.ts`;
+- `src/core/session-store/{schema,types,protocol,worker}.ts`;
+- projection/store tests.
+
+Required result:
+
+- incremental and replay state use one transition path;
+- `labels` and `subagent_spawns` duplicate tables/indexes are removed;
+- session summary, `client_inputs`, and `search_chunks` commit with canonical entries;
+- open compares replay with every retained projection and fails closed;
+- list/exact lookup remain summary-only;
+- label clearing and imported/forked projection behavior are identical before and after reopen.
+
+### Phase 4: search scan and contract wording
+
+Primary files:
 
 - `src/core/session-store/worker.ts`;
-- `benchmarks/session-listing.ts` or a renamed session-storage benchmark;
-- `README.md`, `docs/usage.md`, `docs/sessions.md`, `docs/session-format.md`, SDK docs, the #329 PR body, and the primary SQLite changeset.
+- session search/selector tests;
+- `benchmarks/session-listing.ts` or a renamed benchmark;
+- README, usage/session/SDK docs, PR description, and primary SQLite changeset.
 
-Exit criteria:
+Required result:
 
-- generated parity tests return identical results/scores before and after scan refactoring;
+- result IDs, order, and scores remain identical;
 - phrase matching across chunks remains intact;
 - worker accumulation is bounded to one session document;
-- prose distinguishes summary indexes from deep-text scan complexity.
+- docs distinguish summary indexes from deep-text scanning;
+- unsupported performance claims are removed.
 
-### Phase F: verification and implementation review
+### Phase 5: integrated acceptance
 
-A later approved implementation plan should run modified focused tests, `./test.sh`, and `npm run check` under repository rules. It should review the resulting diff against this RFC's state and failure matrices before requesting another broad PR review.
+Run modified focused tests, then `./test.sh` and `npm run check` under repository rules. Build/package smoke testing requires separate explicit authorization.
 
-Build/package smoke commands require their own explicit scope under repository rules.
+## 10. Verification contract
 
-## 11. Verification contract
+### 10.1 Ownership tests
 
-### 11.1 Preparation state-machine tests
+Cover:
 
-Exercise every legal and illegal method sequence for each origin:
+- default and supplied SDK manager failure before session construction;
+- failure after session construction, proving only session disposal closes persistence while untransferred services still clean up;
+- direct `createAgentSessionRuntime()` ownership transfer;
+- CLI invalid flag/name before acquisition;
+- CLI missing-cwd cancel and manager replacement;
+- runtime new/resume/fork/import failure at pre- and post-session boundaries;
+- remote created/resumed setup failure without selection-based deletion;
+- late remote cleanup retaining the row;
+- public subagent handle return and first-prompt failure;
+- close/dispose failure aggregation;
+- explicit delete remaining generation/revision conditional.
 
-- rollback from prepared and repeated rollback;
-- single-claim `beginPublication`;
-- rollback requested while publication is blocked;
-- each typed publication outcome and mandatory uncertain finalization;
-- adopted transfer and repeated settlement;
-- conflicting rollback/publication/transfer calls;
-- candidate non-persistence finalization before manager cleanup;
-- close failure, prepared-discard failure, and both failing;
-- wrong preparation ID, adopted-state conflict, revision conflict, and session-generation replacement;
-- borrowed proven-no-effect failure followed by a successful write;
-- committed/uncertain borrowed overlay followed by stale-authority rejection and reopen.
+Observable assertions include manager closed or reopened, row retained or explicitly deleted, and exactly one logical finalizer. Tests do not assert implementation source text.
 
-Assertions target observable manager/store behavior, not source text.
+### 10.2 Canonical entry tests
 
-### 11.2 Lifecycle integration tests
+For every entry type:
 
-Inject failure at every await boundary before, during, and after publication for:
+- valid round trip;
+- unknown and missing fields;
+- noncanonical JSON values;
+- invalid timestamps/numbers/modes;
+- each envelope-column mismatch;
+- wrong host-only classification;
+- duplicate IDs and noncontiguous ordinals;
+- forward/missing/cyclic parents;
+- invalid compaction, leaf, label, client-input, and subagent references;
+- strict JSONL import/export parity.
 
-- default SDK startup, caller-supplied SDK manager, and direct `createAgentSessionRuntime`;
-- CLI new, continue, resume, missing-cwd retry/cancel, import, and fork setup;
-- runtime new/resume/fork/import replacement;
-- daemon runtime creation, same-instance named retry, daemon-restart stranded-preparation retry, unprovable-owner rejection, late canceled result, registry commit, attach cancellation, and post-publication stream failure;
-- TUI relay target creation/handoff;
-- subagent runtime setup, definition application, loopback creation, public handle return, internal atomic start-and-prompt, runtime registration, first prompt, parent spawn linkage, and handle disposal.
+Corruption rejection must release the store lease and leave other sessions/stores usable.
 
-For each injection, assert the matrix result: prepared row absent/inaccessible, adopted row retained, borrowed manager usable or correctly retired for reopen, manager closed exactly once, routing state restored, or fail-preserved uncertainty. Graceful shutdown joins late runtime/preparation cleanup instead of merely scheduling it.
+### 10.3 Projection tests
 
-Delete and recreate the same session ID with a new generation while retaining old last-session, worktree, lease/coordinator, subagent-edge, and delayed-callback fixtures. Every old fixture must fail/clear against the replacement rather than resolving or mutating it.
+Deterministic cases:
 
-### 11.3 Projection deterministic tests
+- summary fallback later replaced by first user text;
+- stable modified time;
+- planning visibility;
+- name set/clear;
+- absent versus recorded-null Git context;
+- branch movement versus retained-branch fork;
+- label set/clear and immediate fork/import;
+- client-input receipt/queue/terminal/ambiguity state;
+- subagent edges from canonical entries;
+- search eligibility and chunk order;
+- proven atomic rollback and uncertain reconciliation.
 
-For canonical envelopes and each derived family:
+Property oracle with deterministic `fast-check` seed:
 
-- exhaustive type-body validation plus column/body reconstruction and JSONL export;
-- rejection of mismatched host-only classification, parent/reference fields, and malformed type-specific bodies;
-- append, flush, list, reopen, and compare;
-- import and fork, including ID rewriting and branch retention;
-- atomic commit and proven rollback;
-- empty/cleared metadata;
-- recorded-null versus absent Git context;
-- legal and illegal client-input transitions;
-- labels before immediate branch/fork;
-- subagent edge and child store/session/generation integrity;
-- search chunk ordering and eligibility.
+> For every generated valid operation sequence and every legal transaction partition, incremental derived state equals replayed state after each committed prefix. Injected proven rollbacks are equivalent to omitting their batches.
 
-Directly corrupt one persisted projection family at a time while retaining valid foreign keys. `SessionManager.open()` must reject it and release the lease. Healthy sessions in another store remain available.
+Directly corrupt each retained summary/client-input/search projection while preserving foreign keys; open must fail closed without repair.
 
-### 11.4 Projection property tests
+### 10.4 Search tests
 
-Use deterministic-seed `fast-check` operation sequences. Generate valid actions rather than malformed source objects:
+- generated parity against the current matcher for fuzzy, phrase, regex, metadata, and score ties;
+- phrases spanning chunk boundaries;
+- cwd alias and visibility filtering;
+- global ranking and unreadable-store isolation;
+- independent growth of summary, non-searchable, and searchable bytes;
+- independent growth of query bytes/token/phrase count;
+- one-session rather than whole-store accumulation;
+- stale selector request suppression.
 
-- public and host-only append types;
-- labels and clears against existing targets;
-- branch/leaf movement;
-- client receipt/queue/state transitions;
-- planning/name/Git-context updates;
-- subagent edges;
-- transaction batch boundaries and injected proven rollbacks.
+Regex tests verify parity and bounded test fixtures, not a false general latency guarantee.
 
-The oracle compares normalized incremental state with replay after every committed prefix, not only at the end.
+### 10.5 Completion definition
 
-### 11.5 Search parity and bounds
+#329's corrective implementation is complete only when:
 
-- generated token, phrase, regex, and fuzzy queries produce identical IDs and scores;
-- phrases spanning chunk boundaries remain matches;
-- canonical cwd aliases retain current filtering;
-- search-all preserves global ranking and isolates unreadable stores;
-- large non-searchable payload does not appear in search work;
-- large searchable text reports token/phrase scaling by query count without whole-store accumulation, while regex is measured separately without a linearity claim;
-- stale debounced selector results remain fenced by existing query sequence handling.
+- no setup cleanup automatically deletes a committed session;
+- each transferred manager has one finalizer;
+- every canonical entry is exhaustively validated and agrees with its SQL envelope;
+- only concretely consumed projections remain;
+- incremental and replay projection state agree;
+- open rejects every retained projection mismatch;
+- list/exact/continuation discovery remains summary-only;
+- deep search retains at most one session document and preserves matching/ranking;
+- docs and PR claims state the real complexity;
+- focused tests, `./test.sh`, and `npm run check` pass or unrelated failures are reported.
 
-### 11.6 Static ownership audit
+## 11. Deferred follow-up designs
 
-The implementation review should classify every internal `SessionManager.create/open/continueRecent/forkFrom/importFromJsonl` handoff. Transient read-only opens with immediate `try/finally close` may remain direct. Any manager passed into runtime/session setup must carry preparation origin through publication settlement.
+These are not merge requirements for #329.
 
-The audit must also classify every identity-changing manager call and every host-internal session binding, pointer, coordinator/lease record, subagent edge, and delayed callback. Wrapped source managers are never mutated into target identities, and resolved persisted targets pin exact incarnation.
+### 11.1 Failed-session reclamation
 
-The audit should find no cleanup decision based solely on `sessionSelection.kind`, manager object equality, selector visibility, an ID-only binding, or a free-floating `published` boolean when the preparation capability is available.
+Only pursue if retained failed rows become a real product problem.
+
+Required dependency order:
+
+1. define which failed rows are safe to remove;
+2. define durable prepared/adopted state;
+3. define typed publication settlement across every route that can expose an ID;
+4. define crash-owner/liveness proof and caller-named retry;
+5. define explicit operator recovery;
+6. then permit conditional prepared-row deletion.
+
+Implementing only the deletion step is unsafe.
+
+### 11.2 Transactional runtime construction
+
+A separate SDK/runtime RFC may define success-only borrowing, candidate views, setup overlays, and rollback of canonical startup mutations. It must acknowledge that arbitrary extension imports, MCP startup, filesystem work, and other external effects cannot be universally rolled back.
+
+### 11.3 Host-wide session incarnation routing
+
+Core SQLite writes already prove store ID and session generation. Propagating incarnation identity through every daemon lease, coordinator, worktree binding, last-session pointer, subagent index, and delayed callback is a broader availability/routing design. Start it only from a concrete stale-routing defect and preserve the ID-based wire contract deliberately.
+
+### 11.4 Long-session mutation staging
+
+Profile `appendAtomically()`, canonical projection receipts, and delivery commits independently. Replace full-history snapshots with delta/undo staging only under a benchmark-backed performance design. Do not conflate this with summary-only discovery.
+
+### 11.5 Search redesign
+
+Regex isolation/cancellation, FTS, a different fuzzy language, result limits, or intentionally incomplete candidate modes require a separate search contract.
+
+### 11.6 Workspace authority and ownership API consolidation
+
+The proposed workspace-authority coordinator and optional `PreparedConversationActivation` remain separate designs. Neither is required to make SQLite session discovery correct.
 
 ## 12. Rejected alternatives
 
-### 12.1 Keep adding local cleanup blocks
+### 12.1 Keep automatic setup deletion with local heuristics
 
-Rejected. It duplicates origin inference, publication timing, aggregation, and idempotence across each caller. The repeated fixes on #329 show that local compensation is not a stable contract.
+Rejected. Generation and revision do not prove that another owner has not opened or learned the same committed row. Selection kind, manager identity, visibility, and free-floating `published` booleans are not safe delete authority.
 
-### 12.2 Make `SessionManager` the runtime/daemon/subagent owner
+### 12.2 Add durable preparation state now
 
-Rejected. `SessionManager` owns persistence authority, not provider work, transports, leases, registries, or child execution. Expanding it would conflict with accepted ownership RFCs and make disposal more coupled.
+Rejected from #329's merge scope. It solves failed-row cleanup but creates schema, cross-process open, caller-named retry, crash recovery, and composite publication requirements disproportionate to issue #328.
 
-### 12.3 Use `sessions.visible` as publication state
+### 12.3 Preserve every duplicate projection table
 
-Rejected. Visibility is derived from content. Prepared setup can create visible planning/message state, and an adopted empty runtime can remain hidden. Conflating these states enables both leaks and unsafe deletion.
+Rejected. A materialized projection needs a concrete indexed reader. Unused label/spawn tables create drift and validation work without serving discovery.
 
-### 12.4 Delete every created row whenever setup returns an error
+### 12.4 Store body-only payload JSON
 
-Rejected. An error can occur after registry, lease, relay, feed, or subagent publication. Deleting by creation origin alone can create a dangling externally published identity.
+Rejected from the merge slice. It is clean but unnecessary. Keeping one exhaustively validated full entry canonical and treating columns as checked indexes resolves the ambiguity with less churn.
 
-### 12.5 Preserve every created row on any error
+### 12.5 Auto-repair projection drift
 
-Rejected. It is safe from delete-after-publication but guarantees abandoned hidden rows for ordinary caught setup failures. Typed preparation and publication outcomes distinguish the cases.
+Rejected. Repair can hide canonical corruption and race another writer. Fail closed; add an explicit repair tool only if released user data later requires one.
 
-### 12.6 Auto-repair projection mismatch on open
+### 12.6 Recompute summaries on every write or list
 
-Rejected. It can hide canonical corruption, race another writer, and make listing decisions depend on unverified repaired state. Fail closed and require an explicit future repair tool if real users ever need one.
+Rejected. It restores history-sized writes or the exact discovery defect #328 is intended to remove.
 
-### 12.7 Recompute summaries by replay on every write or list
+### 12.7 Add FTS transparently
 
-Rejected. It restores `O(history)` saves or the exact discovery defect #328 is intended to remove.
+Rejected. Existing fuzzy, cross-chunk phrase, and regex semantics still require fallback scanning, so FTS does not remove the worst-case contract.
 
-### 12.8 Treat `search_chunks` as a full-text index
+### 12.8 Replace existing lifecycle owners
 
-Rejected as inaccurate. The current index accelerates session/entry lookup, not arbitrary content matching. Fuzzy and regex semantics require scanning extracted text.
+Rejected. The manager ownership rule concerns close responsibility only. Delivery, runtime, conversation, lease, worktree, and subagent owners remain authoritative in their existing domains.
 
-### 12.9 Add FTS as a transparent optimization now
+## 13. Decisions requiring acceptance
 
-Rejected. It cannot safely prefilter every current fuzzy/regex query without a complete fallback and expands schema/release complexity without changing the worst-case contract.
+Before an implementation plan, reviewers should accept or revise these eight decisions:
 
-### 12.10 Reclaim crash-left prepared rows by age
+1. A committed session row is immediately adopted and setup cleanup never deletes it.
+2. Passing a manager to a high-level session/runtime/subagent factory consumes ownership at invocation.
+3. Before `AgentSession` construction the factory closes; afterward only the session/runtime disposes.
+4. Full validated `payload_json` is canonical and every SQL envelope column is derived and checked.
+5. Remove duplicate label and subagent-spawn tables because no indexed reader consumes them.
+6. Use one reducer and fail-closed open verification for retained projections; defer delta staging.
+7. Preserve search semantics, bound accumulation to one session, state query-dependent cost honestly, and do not add FTS.
+8. Defer durable preparation, crash reclaim, universal setup overlays, host-wide incarnation propagation, and new cross-system ownership state machines.
 
-Rejected. Durable prepared state distinguishes them from adopted selector-hidden recovery rows, but age does not prove owner death. The only automatic path is exact remote retry of a daemon-owned preparation after exclusive daemon authority proves the recorded boot/instance terminal; generic CLI/SDK recovery remains explicit future work.
-
-### 12.11 Preserve old live-JSONL or SQLite layouts
-
-Rejected. Volt has no users and #329 explicitly changes the storage/API contract in place. Compatibility machinery would obscure the new invariants.
-
-### 12.12 Use session generation and revision alone as discard proof
-
-Rejected. Another owner can open the same generation without advancing revision. Prepared rows therefore require a distinct durable state and opaque collision-resistant preparation ID, and normal open paths cannot resolve them.
-
-### 12.13 Let ordinary `AgentSession.dispose()` finalize prepared candidates
-
-Rejected. It closes persistence unconditionally, which conflicts with borrowed-manager preservation and duplicates created/opened cleanup. Persistence-close authority transfers only after adoption; prepared candidate finalization excludes manager close.
-
-### 12.14 Treat first-prompt acceptance as session-row adoption after returning a child handle
-
-Rejected. Returning a live handle or reference already exposes an owner that can act on the child. Public handle return adopts the row; only an internal operation that withholds the handle may keep rollback through prompt acceptance.
-
-### 12.15 Keep host authority and durable bindings keyed by session ID alone
-
-Rejected. Session IDs are reusable names. After resolution, host owners and bindings pin store ID/generation so delayed old-incarnation work cannot affect a replacement.
-
-### 12.16 Keep a full duplicated entry envelope in `payload_json`
-
-Rejected. Duplicate identity/classification fields create two possible truths. SQLite columns own the envelope and payload JSON contains only the exhaustively validated type-specific body.
-
-## 13. Risks and mitigations
-
-| Risk | Mitigation in the design |
-| --- | --- |
-| Preparation becomes another lifetime owner | Restrict it to origin-specific compensation; use a prepared candidate finalizer; transfer persistence-close authority once; settle immediately afterward. |
-| Publication is in flight when cancellation/shutdown arrives | Explicit `publishing` state, rollback intent, mandatory typed finalizer, and lifecycle-owner join. |
-| Adoption occurs too early and retains ordinary failed rows | Stage all fallible work and contingent canonical overlays before the cutoff; require typed definitive restoration. |
-| Adoption occurs too late and deletes a published row | Commit durable adopted state before reachability; classify any unproven participant as uncertain/fail-preserve. |
-| Another process opens a prepared row before discard | Normal list/find/open exclude prepared rows; mutation/discard require the preparation capability. |
-| Borrowed manager is closed on SDK failure | Withhold persistence-close authority from the candidate and test post-failure writes. |
-| Failed setup leaves model/planning/name entries in an opened session | Build against a preparation-local overlay and commit it once during adoption; close alone is never called rollback. |
-| Created manager is closed but not deleted | Created rollback uses dedicated prepared-state/preparation-ID discard and verifies absence. |
-| Cleanup deletes another writer's work | Prepared state, preparation ID, exact store/generation, and expected revision all participate in CAS. |
-| Stale ID-only route reaches a recreated session | Pin exact incarnation in every host owner/binding after resolution and reject stale capabilities. |
-| Candidate and manager both close persistence | Prepared candidate finalizer excludes persistence; authority transfers to `AgentSession` once. |
-| Shared reducer becomes a large mutable god object | Keep it pure in semantics, split validation/helpers by projection family, and expose one composed state transition. |
-| Incremental and replay share the same bug | Add explicit behavior examples plus property tests and persisted corruption tests; sharing establishes consistency, not semantic correctness by itself. |
-| Open verification makes listing slow | Verify only the selected/opened session; list and exact summary lookup remain projection-only. |
-| Search wording again overpromises | Put operation complexity in a normative table and benchmark searchable text separately. |
-| Long regex blocks the store worker | Document as an accepted limitation under preserved semantics; revisit query language or worker separation in a separate design. |
-| Process crash leaves a prepared or adopted hidden row | Durable state records the last proven cutoff; normal APIs reject prepared rows and no automatic GC guesses liveness. |
-| Entry columns and payload disagree | Make columns the sole envelope authority, store body-only JSON, and validate every entry type before reduction. |
-| Existing RFCs claim file/JSONL source of truth | This RFC uses current SQLite terms and is the normative session-storage amendment; later documentation work should update stale file-era prose without changing those RFCs' ownership decisions. |
-
-## 14. Decision gates before implementation
-
-The recommendations below require explicit acceptance during RFC review:
-
-1. **Internal capability, unchanged public signatures.** Add `SessionManagerPreparation` to higher-level acquisition paths; direct public factories retain ownership, and a raw manager passed to `createAgentSessionRuntime()` is borrowed on proven no-effect construction failure.
-2. **Durable prepared/adopted state.** Normal APIs cannot resolve a prepared row; adoption and prepared discard require commit evidence and an opaque collision-resistant preparation ID.
-3. **Explicit publishing state and join.** Cancellation/shutdown cannot clean up until the sole publication attempt returns a typed outcome; timeout is process loss, not permission to delete.
-4. **Single persistence finalizer.** Prepared candidate disposal excludes manager close; adoption transfers close authority exactly once to `AgentSession`/runtime.
-5. **Fail-preserve uncertainty.** Any unproven publication or durable-routing outcome forbids deletion, even if that retains a hidden row.
-6. **No age-based crash reclamation.** Permit only owner-proven exact remote retry reclaim for daemon-owned prepared rows; generic CLI/SDK prepared rows require a separate recovery design.
-7. **Exact incarnation after resolution.** Host owners and durable bindings pin store ID/session generation while remote wire identities remain ID-based.
-8. **Stage contingent writes.** Candidate setup uses a local canonical overlay; a proven no-effect failure leaves opened/borrowed state unchanged, while committed/uncertain state requires reopen.
-9. **Column-authoritative entry envelope.** Store type-specific body JSON only and validate every reconstructed entry before reduction.
-10. **Fail-closed projection mismatch.** Opening rejects drift and does not self-heal.
-11. **One reducer, transaction-local staging.** Incremental and replay semantics share code; atomic work should move toward delta overlays rather than full-history projection recomputation.
-12. **Preserve search semantics.** Deep search remains a token-parameterized/regex-unbounded scan with one-session accumulation; no FTS is added.
-13. **No competing long-lived owner.** Existing delivery, runtime, conversation, lease, workspace, worktree, and subagent ownership contracts remain authoritative in their domains.
-
-A reviewer should request changes to this RFC rather than infer a different choice during implementation.
-
-## 15. RFC acceptance criteria
-
-This RFC is ready to become an implementation plan only when reviewers can answer all of the following from the document without reading cleanup code:
-
-- Who owns a newly created, opened, borrowed, imported, forked, continued, or branched manager before and after failure?
-- How do durable prepared/adopted row state and process-local prepared/publishing/adopted/settled state compose?
-- Why can no normal opener acquire a row while prepared discard remains possible?
-- What exact event forbids deletion in CLI, SDK, replacement, daemon, relay, and subagent flows?
-- How is an in-flight publication joined and classified as not published, published, or uncertain?
-- Which finalizer disposes candidate resources before adoption, and which owner alone closes persistence after transfer?
-- How does the preparation-local canonical overlay give candidate construction the intended policy without mutating an opened/borrowed log on a proven no-effect failure?
-- When does returning a subagent handle adopt its row relative to first-prompt registry/activity publication?
-- Which exact session incarnation is pinned by each runtime, lease, worktree/last-session binding, parent edge, and delayed callback?
-- Why is selector visibility not lifecycle state?
-- Which SQLite columns/body fields are canonical and what is derived?
-- How do incremental reduction, atomic rollback, reopen replay, and persisted projection comparison compose?
-- What happens when side indexes drift but foreign keys remain valid?
-- Which operations avoid canonical entry payloads, how do materialized-summary bytes affect listing, and how do token count and regex semantics affect search cost?
-- Which crash, regex CPU, distributed side-effect, and compatibility guarantees are explicitly not made?
-- What tests and benchmarks prove each observable contract?
-
-Until the user accepts these decisions and approves a separate implementation plan, the status remains **Proposed** and no product implementation is authorized.
+These decisions are accepted. Implementation has not started and requires a separate approved plan.
