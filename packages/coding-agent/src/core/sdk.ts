@@ -126,7 +126,10 @@ export interface CreateAgentSessionOptions {
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
 
-	/** Session manager. Default: SessionManager.create(cwd) */
+	/**
+	 * Session manager. Default: SessionManager.create(cwd).
+	 * Ownership transfers to createAgentSession when the call begins.
+	 */
 	sessionManager?: SessionManager;
 	/** Shared cwd-bound Git context provider. A bounded provider is created when omitted. */
 	gitContextProvider?: GitContextProvider;
@@ -248,23 +251,30 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	let createdSessionManager: SessionManager | undefined;
+	let ownedSessionManager = options.sessionManager;
 	try {
 		return await createAgentSessionUnchecked(options, (sessionManager) => {
-			createdSessionManager = sessionManager;
+			ownedSessionManager = sessionManager;
 		});
 	} catch (error) {
-		if (!createdSessionManager) throw error;
+		if (!ownedSessionManager) throw error;
 		try {
-			await createdSessionManager.discardPersistence();
+			await ownedSessionManager.closePersistence();
 		} catch (cleanupError) {
 			throw new AggregateError(
 				[error, cleanupError],
-				"Agent session setup failed and its manager persistence could not be discarded",
+				"Agent session setup failed and its manager could not be closed",
 			);
 		}
 		throw error;
 	}
+}
+
+/** @internal The enclosing AgentSessionRuntime factory owns manager cleanup until this returns. */
+export async function createAgentSessionForRuntime(
+	options: CreateAgentSessionOptions & { sessionManager: SessionManager },
+): Promise<CreateAgentSessionResult> {
+	return createAgentSessionUnchecked(options, () => {});
 }
 
 async function createAgentSessionUnchecked(
@@ -411,6 +421,7 @@ async function createAgentSessionUnchecked(
 		return manager;
 	};
 	const mcpManager = options.disableMcp ? undefined : (options.mcpManager ?? (await createDefaultMcpManager()));
+	const ownsMcpManager = !options.disableMcp && options.mcpManager === undefined && mcpManager !== undefined;
 
 	const defaultActiveToolNames: string[] = [...DEFAULT_ACTIVE_TOOL_NAMES];
 	const isSubagentRuntime = options.subagentToolManager?.isSubagentRuntime?.() === true;
@@ -522,45 +533,63 @@ async function createAgentSessionUnchecked(
 	await sessionManager.flush();
 
 	const gitContextProvider = options.gitContextProvider ?? new GitContextProvider(cwd);
-	if (!options.gitContextProvider) void gitContextProvider.refresh();
-	const session = new AgentSession({
-		sessionManager,
-		...(model === undefined ? {} : { model }),
-		thinkingLevel,
-		streamFn,
-		convertToLlm: convertToLlmWithBlockImages,
-		streamOptions,
-		steeringMode: settingsManager.getSteeringMode(),
-		followUpMode: settingsManager.getFollowUpMode(),
-		settingsManager,
-		gitContextProvider,
-		cwd,
-		projectCwd: lexicalProjectCwd,
-		agentDir,
-		scopedModels: options.scopedModels,
-		resourceLoader,
-		customTools: options.customTools,
-		modelRegistry,
-		initialActiveToolNames,
-		allowedToolNames,
-		allowUnlistedExtensionTools: options.allowUnlistedExtensionTools,
-		excludedToolNames,
-		extensionRunnerRef,
-		sessionStartEvent: options.sessionStartEvent,
-		hostInteraction: options.hostInteraction,
-		subagentToolManager: options.subagentToolManager,
-		mcpManager,
-		mcpManagerFactory: options.disableMcp || options.mcpManager ? undefined : createDefaultMcpManager,
-	});
-	const registeredModel = model ? modelRegistry.find(model.provider, model.id) : undefined;
-	if (registeredModel && registeredModel !== session.model) {
-		await session.setModel(registeredModel, { persistDefault: false });
+	const ownsGitContextProvider = options.gitContextProvider === undefined;
+	if (ownsGitContextProvider) void gitContextProvider.refresh();
+	try {
+		const extensionsResult = resourceLoader.getExtensions();
+		const session = new AgentSession({
+			sessionManager,
+			...(model === undefined ? {} : { model }),
+			thinkingLevel,
+			streamFn,
+			convertToLlm: convertToLlmWithBlockImages,
+			streamOptions,
+			steeringMode: settingsManager.getSteeringMode(),
+			followUpMode: settingsManager.getFollowUpMode(),
+			settingsManager,
+			gitContextProvider,
+			cwd,
+			projectCwd: lexicalProjectCwd,
+			agentDir,
+			scopedModels: options.scopedModels,
+			resourceLoader,
+			customTools: options.customTools,
+			modelRegistry,
+			initialActiveToolNames,
+			allowedToolNames,
+			allowUnlistedExtensionTools: options.allowUnlistedExtensionTools,
+			excludedToolNames,
+			extensionRunnerRef,
+			sessionStartEvent: options.sessionStartEvent,
+			hostInteraction: options.hostInteraction,
+			subagentToolManager: options.subagentToolManager,
+			mcpManager,
+			mcpManagerFactory: options.disableMcp || options.mcpManager ? undefined : createDefaultMcpManager,
+		});
+		return {
+			session,
+			extensionsResult,
+			modelFallbackMessage,
+		};
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
+		if (ownsGitContextProvider) {
+			try {
+				gitContextProvider.dispose();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (ownsMcpManager) {
+			try {
+				await mcpManager.dispose();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError([error, ...cleanupErrors], "Agent session construction cleanup did not complete");
+		}
+		throw error;
 	}
-	const extensionsResult = resourceLoader.getExtensions();
-
-	return {
-		session,
-		extensionsResult,
-		modelFallbackMessage,
-	};
 }

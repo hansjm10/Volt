@@ -1,6 +1,6 @@
 # RFC: SQLite Session Storage Merge Contract
 
-- Status: Accepted; implementation not started
+- Status: Accepted; implementation in progress
 - Date: 2026-09-03
 - Pull request: [#329](https://github.com/volt-hq/Volt/pull/329)
 - Issue: [#328](https://github.com/volt-hq/Volt/issues/328)
@@ -110,7 +110,7 @@ Once creation commits:
 - explicit deletion remains available through the existing exact-reference/revision contract;
 - stale managers remain unable to write after delete/recreate because store/session generation and revision guards remain mandatory.
 
-`SessionManager.discardPersistence()` is not used by construction/setup cleanup. The later implementation should remove it or restrict it away from normal product flows so future callers cannot reintroduce delete-after-publication heuristics.
+`SessionManager.discardPersistence()` is removed from construction/setup cleanup so future callers cannot reintroduce delete-after-publication heuristics.
 
 ### 4.2 Ownership states
 

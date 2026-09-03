@@ -87,11 +87,11 @@ export interface SubagentHandle {
 	id: string;
 	sessionId: string;
 	/**
-	 * Send a message to the child. A rejection before the start is published
+	 * Send a message to the child. A rejection before the run is published
 	 * (prompt preflight, cancellation, or the host's runtime registration commit)
-	 * rolls back the unpublished start (daemon hosts dispose the prepared child
-	 * runtime) and disposes this handle, so it cannot be retried. Cancellation
-	 * remains authoritative when requested before the first prompt.
+	 * rolls back registry/activity publication and disposes this handle. The
+	 * already committed child session row is retained. Cancellation remains
+	 * authoritative when requested before the first prompt.
 	 */
 	prompt(message: string): Promise<void>;
 	abort(source?: AgentAbortSource): Promise<void>;
@@ -273,6 +273,15 @@ interface MutableSubagentActivity {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+async function closeConsumedSessionManager(manager: SessionManager, error: unknown, message: string): Promise<never> {
+	try {
+		await manager.closePersistence();
+	} catch (closeError) {
+		throw new AggregateError([error, closeError], message);
+	}
+	throw error;
 }
 
 function capacityLimitSnapshot(
@@ -616,14 +625,26 @@ class LocalSubagentHandle implements SubagentHandle {
 			// admission is authoritative.
 			if (this.promptSettlementObserved) this.startSettlementWatcher();
 		} catch (error) {
-			await this.onPromptFailed(error).catch(() => undefined);
+			const cleanupErrors: unknown[] = [];
+			try {
+				await this.onPromptFailed(error);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
 			this.settleOwnership();
 			if (!this.promptAccepted) {
 				// An unpublished prompt failure rolled the start back; daemon hosts
 				// dispose the prepared child runtime, so the handle cannot be
 				// retried. Dispose it so later calls fail with a clear
 				// disposed-handle error instead of generic disposed-session errors.
-				await this.dispose().catch(() => undefined);
+				try {
+					await this.dispose();
+				} catch (cleanupError) {
+					if (!cleanupErrors.includes(cleanupError)) cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Subagent prompt failed and cleanup did not complete");
 			}
 			throw error;
 		}
@@ -691,15 +712,23 @@ class LocalSubagentHandle implements SubagentHandle {
 			this.rejectEnd(new Error(`Subagent ${this.id} was disposed before completion`));
 		}
 		this.disposePromise = Promise.resolve().then(async () => {
+			const cleanupErrors: unknown[] = [];
 			try {
 				await this.client.stop();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				await this.onDispose();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
 			} finally {
-				try {
-					await this.onDispose();
-				} finally {
-					this.eventListeners.clear();
-					this.removeFromManager(this.id);
-				}
+				this.eventListeners.clear();
+				this.removeFromManager(this.id);
+			}
+			if (cleanupErrors.length === 1) throw cleanupErrors[0];
+			if (cleanupErrors.length > 1) {
+				throw new AggregateError(cleanupErrors, `Subagent ${this.id} cleanup did not complete`);
 			}
 		});
 		return this.disposePromise;
@@ -988,31 +1017,20 @@ export class SubagentManager {
 			);
 		}
 		let handle: SubagentHandle;
-		let preparedManager: SessionManager | undefined;
 		try {
+			let resumedManager: SessionManager;
 			try {
-				preparedManager = await SessionManager.open(claim.childSessionRef);
+				resumedManager = await SessionManager.open(claim.childSessionRef);
 			} catch {
 				throw new Error("The interrupted run's transcript no longer exists; it cannot be resumed.");
 			}
 			handle = await this.startByName(claim.agentName, {
-				sessionManager: preparedManager,
+				sessionManager: resumedManager,
 				resumeSubagentId: subagentId,
 				...(claim.task !== undefined ? { resumeTaskLabel: claim.task } : {}),
 				...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
 			});
 		} catch (error) {
-			if (preparedManager) {
-				try {
-					await preparedManager.closePersistence();
-				} catch (closeError) {
-					claim.rollback();
-					throw new AggregateError(
-						[error, closeError],
-						"Subagent resume failed and its prepared manager could not be closed",
-					);
-				}
-			}
 			claim.rollback();
 			throw error;
 		}
@@ -1058,10 +1076,12 @@ export class SubagentManager {
 		let releaseReservation = (): void => undefined;
 		let scopeLease: SubagentDelegationScopeLease | undefined;
 		let treeReservation: SubagentDelegationReservation | undefined;
+		let managerTransferred = false;
 		try {
 			releaseReservation = this.reserveChildStart(undefined);
 			scopeLease = this.resolveDelegationScope(options.delegationScope);
 			treeReservation = scopeLease.scope.reserve("subagent", (this.subagentContext?.depth ?? 0) + 1);
+			managerTransferred = true;
 			return await this.startRuntime(options, undefined, {
 				scopeLease,
 				reservation: treeReservation,
@@ -1070,6 +1090,13 @@ export class SubagentManager {
 			releaseReservation();
 			treeReservation?.rollback();
 			if (scopeLease?.owned) scopeLease.scope.dispose();
+			if (options.sessionManager && !managerTransferred) {
+				return await closeConsumedSessionManager(
+					options.sessionManager,
+					error,
+					"Subagent start failed and its consumed manager could not be closed",
+				);
+			}
 			throw error;
 		} finally {
 			finishStart();
@@ -1138,6 +1165,7 @@ export class SubagentManager {
 		let releaseReservation = (): void => undefined;
 		let scopeLease: SubagentDelegationScopeLease | undefined;
 		let treeReservation: SubagentDelegationReservation | undefined;
+		let managerTransferred = false;
 		try {
 			const definition = this.getDefinition(agentName, { resourceLoader: options.resourceLoader });
 			if (options.spawnBatchLease) {
@@ -1153,6 +1181,7 @@ export class SubagentManager {
 				scopeLease = this.resolveDelegationScope(options.delegationScope);
 				treeReservation = scopeLease.scope.reserve(definition.name, (this.subagentContext?.depth ?? 0) + 1);
 			}
+			managerTransferred = true;
 			return await this.startRuntime(
 				options,
 				{
@@ -1168,6 +1197,13 @@ export class SubagentManager {
 			releaseReservation();
 			treeReservation?.rollback();
 			if (scopeLease?.owned) scopeLease.scope.dispose();
+			if (options.sessionManager && !managerTransferred) {
+				return await closeConsumedSessionManager(
+					options.sessionManager,
+					error,
+					"Named subagent start failed and its consumed manager could not be closed",
+				);
+			}
 			throw error;
 		} finally {
 			finishStart();
@@ -1413,43 +1449,32 @@ export class SubagentManager {
 		if (!delegation) {
 			throw new Error("Subagent delegation scope is required");
 		}
-		let createdSessionManager: SessionManager | undefined;
-		let sessionManager: SessionManager;
-		if (options.sessionManager) {
-			sessionManager = options.sessionManager;
-		} else {
-			createdSessionManager = await this.createDefaultChildSessionManager(cwd);
-			sessionManager = createdSessionManager;
-		}
-		let published = false;
-		const discardUnpublishedCreatedSessionManager = async (): Promise<void> => {
-			const manager = createdSessionManager;
-			if (published || !manager?.isPersisted()) return;
-			await manager.discardPersistence();
-		};
-		const rethrowAfterDiscard = async (error: unknown): Promise<never> => {
-			try {
-				await discardUnpublishedCreatedSessionManager();
-			} catch (cleanupError) {
-				throw new AggregateError(
-					[error, cleanupError],
-					"Subagent startup failed and its newly created session persistence could not be discarded",
+		let sessionManager = options.sessionManager;
+		let managerTransferred = false;
+		let id: string;
+		let subagentContext: SubagentRuntimeContext;
+		let runtime: AgentSessionRuntime;
+		try {
+			id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
+			subagentContext = this.createChildSubagentContext(
+				id,
+				definitionOptions?.definition,
+				delegation.scopeLease.scope,
+			);
+			sessionManager ??= await this.createDefaultChildSessionManager(cwd);
+			managerTransferred = true;
+			runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
+		} catch (error) {
+			if (sessionManager && !managerTransferred) {
+				return await closeConsumedSessionManager(
+					sessionManager,
+					error,
+					"Subagent runtime preparation failed and its manager could not be closed",
 				);
 			}
 			throw error;
-		};
-		const id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
-		const subagentContext = this.createChildSubagentContext(
-			id,
-			definitionOptions?.definition,
-			delegation.scopeLease.scope,
-		);
-		let runtime: AgentSessionRuntime;
-		try {
-			runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
-		} catch (error) {
-			return await rethrowAfterDiscard(error);
 		}
+		let published = false;
 		let abortRequested = false;
 		const markRunAbortRequested = (): void => {
 			if (abortRequested) return;
@@ -1565,14 +1590,23 @@ export class SubagentManager {
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;
-		const rollbackRuntimeRegistration = (): Promise<void> => {
-			if (published) return Promise.resolve();
+		let rollbackRuntimeRegistrationErrorReported = false;
+		const rollbackRuntimeRegistration = async (): Promise<void> => {
+			if (published) return;
 			if (!rollbackRuntimeRegistrationPromise) {
 				const registration = runtimeRegistration;
 				runtimeRegistration = undefined;
-				rollbackRuntimeRegistrationPromise = registration?.rollback().catch(() => undefined) ?? Promise.resolve();
+				rollbackRuntimeRegistrationPromise = Promise.resolve().then(async () => {
+					await registration?.rollback();
+				});
 			}
-			return rollbackRuntimeRegistrationPromise;
+			try {
+				await rollbackRuntimeRegistrationPromise;
+			} catch (error) {
+				if (rollbackRuntimeRegistrationErrorReported) return;
+				rollbackRuntimeRegistrationErrorReported = true;
+				throw error;
+			}
 		};
 		try {
 			if (definitionOptions) {
@@ -1650,7 +1684,6 @@ export class SubagentManager {
 				onDispose: async () => {
 					teardownBudgetWiring();
 					await rollbackRuntimeRegistration();
-					await discardUnpublishedCreatedSessionManager();
 				},
 				waitForIdle: async () => {
 					await runtime.session.waitForIdle();
@@ -1680,11 +1713,35 @@ export class SubagentManager {
 			);
 			return handle;
 		} catch (error) {
-			teardownBudgetWiring();
-			await client?.stop().catch(() => undefined);
-			await rollbackRuntimeRegistration();
-			await runtime.dispose().catch(() => undefined);
-			return await rethrowAfterDiscard(error);
+			const cleanupErrors: unknown[] = [];
+			try {
+				teardownBudgetWiring();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (client) {
+				try {
+					await client.stop();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			try {
+				await rollbackRuntimeRegistration();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (!client || this.retainRuntimeOnDispose) {
+				try {
+					await runtime.dispose();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Subagent startup failed and cleanup did not complete");
+			}
+			throw error;
 		}
 	}
 

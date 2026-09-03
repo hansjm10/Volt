@@ -732,7 +732,7 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(sessions.some((session) => session.id === importedId)).toBe(false);
 	});
 
-	it("discards a persisted import when replacement creation fails before installation", async () => {
+	it("retains a persisted import when replacement creation fails before installation", async () => {
 		const importedId = "failed-preinstall-import";
 		let preparedRef: SessionReference | undefined;
 		const { runtime, tempDir } = await createRuntimeForTest(() => {}, {
@@ -753,11 +753,16 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(runtime.session.sessionRef).toEqual(currentSessionRef);
 		if (!preparedRef) throw new Error("Expected the imported manager reference to be captured");
-		await expect(SessionManager.open(preparedRef)).rejects.toThrow(`Session not found: ${importedId}`);
+		const reopened = await SessionManager.open(preparedRef);
+		try {
+			expect(reopened.getSessionRef()).toEqual(preparedRef);
+		} finally {
+			await reopened.closePersistence();
+		}
 		const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
 			includeMessageFreeDurable: true,
 		});
-		expect(sessions.some((session) => session.id === importedId)).toBe(false);
+		expect(sessions.find((session) => session.id === importedId)?.ref).toEqual(preparedRef);
 	});
 
 	it("preserves a persisted import when replacement fails after installation", async () => {

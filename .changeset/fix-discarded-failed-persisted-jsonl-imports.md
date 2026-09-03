@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(sessions): Discarded failed persisted JSONL imports before they become active.
+fix(sessions): Retained committed JSONL imports when later runtime setup fails.

@@ -24,7 +24,7 @@ import {
 } from "../core/remote/iroh/protocol.ts";
 import type { IrohRemoteWorkspace, IrohRemoteWorkspaceWorktree } from "../core/remote/iroh/state.ts";
 import type { IrohRemoteHostStateManager } from "../core/remote/iroh/state-manager.ts";
-import { getDefaultSessionDir, SessionManager } from "../core/session-manager.ts";
+import { getDefaultSessionDir } from "../core/session-manager.ts";
 import type { SubagentRuntimeRegistration } from "../core/subagents/index.ts";
 import {
 	createIrohRemoteAgentRuntimeWithSessionSelection,
@@ -606,7 +606,7 @@ export class IntegratedRuntimeRegistry {
 				projectTrusted,
 			});
 			const runtimeResult = await waitForAttachAdmission(runtimeOperation, options.signal, async (lateResult) => {
-				await cleanupUncommittedRuntime(lateResult.runtime, lateResult.sessionSelection);
+				await cleanupUncommittedRuntime(lateResult.runtime);
 			});
 			runtime = runtimeResult.runtime;
 			sessionSelection = runtimeResult.sessionSelection;
@@ -643,13 +643,26 @@ export class IntegratedRuntimeRegistry {
 				this.getRegistryKey(authorization.workspace.name, sessionId),
 			);
 			if (reservedOwner) {
-				await cleanupUncommittedRuntime(runtime, sessionSelection);
+				const retryError = this.createAttachRetryError(
+					reservedOwner,
+					"conversation runtime replacement is still publishing",
+				);
+				const runtimeToDispose = runtime;
 				runtime = undefined;
-				throw this.createAttachRetryError(reservedOwner, "conversation runtime replacement is still publishing");
+				try {
+					await cleanupUncommittedRuntime(runtimeToDispose);
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[retryError, cleanupError],
+						"Conversation attach retry cleanup did not complete",
+					);
+				}
+				throw retryError;
 			}
 			if (owner) {
-				await cleanupUncommittedRuntime(runtime, sessionSelection);
+				const runtimeToDispose = runtime;
 				runtime = undefined;
+				await cleanupUncommittedRuntime(runtimeToDispose);
 				assertAttachAdmissionOpen(options.signal);
 				if (owner.lifecycle !== "active") {
 					throw this.createAttachRetryError(owner, "conversation runtime is retiring");
@@ -712,9 +725,26 @@ export class IntegratedRuntimeRegistry {
 				sessionSelection,
 			};
 		} catch (error) {
-			await worktreePreparation?.release().catch(() => undefined);
+			const cleanupErrors: unknown[] = [];
+			try {
+				await worktreePreparation?.release();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
 			if (runtime) {
-				await cleanupUncommittedRuntime(runtime, sessionSelection);
+				const runtimeToDispose = runtime;
+				runtime = undefined;
+				try {
+					await cleanupUncommittedRuntime(runtimeToDispose);
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError(
+					[error, ...cleanupErrors],
+					"Conversation runtime creation failed and cleanup did not complete",
+				);
 			}
 			throw error;
 		}
@@ -873,9 +903,8 @@ export class IntegratedRuntimeRegistry {
 					return;
 				}
 				state = "rolled-back";
-				await entry.coordinator
-					.beginRuntimeRetirement("subagent_start_rolled_back", () => event.runtime.dispose())
-					.settled.catch(() => undefined);
+				await entry.coordinator.beginRuntimeRetirement("subagent_start_rolled_back", () => event.runtime.dispose())
+					.settled;
 			},
 		};
 	}
@@ -1012,15 +1041,27 @@ export class IntegratedRuntimeRegistry {
 
 	private async finishPreparedEntryAbort(
 		entry: IntegratedRuntimeEntry,
-		sessionSelection: IntegratedConversationSessionSelection | undefined,
+		_sessionSelection: IntegratedConversationSessionSelection | undefined,
 	): Promise<void> {
 		if (entry.subscribers.size !== 0) {
 			throw new Error("Cannot abort a prepared conversation runtime with attached subscribers");
 		}
 		this.cancelRetention(entry);
-		await entry.worktreePreparation?.release().catch(() => undefined);
+		const cleanupErrors: unknown[] = [];
+		try {
+			await entry.worktreePreparation?.release();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
 		delete entry.worktreePreparation;
-		await cleanupUncommittedRuntime(entry.runtime, sessionSelection);
+		try {
+			await cleanupUncommittedRuntime(entry.runtime);
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError(cleanupErrors, "Prepared conversation runtime cleanup did not complete");
+		}
 		const namedCreation = this.namedSessionCreations.get(entry.key);
 		if (namedCreation?.entry === entry) {
 			this.namedSessionCreations.delete(entry.key);
@@ -1529,7 +1570,11 @@ export class IntegratedRuntimeRegistry {
 			try {
 				await this.rekeyEntry(entry, activeStreamEntry, session.sessionId);
 			} catch (error: unknown) {
-				await this.stopEntry(entry, "session_rekey_failed").catch(() => {});
+				try {
+					await this.stopEntry(entry, "session_rekey_failed");
+				} catch (cleanupError) {
+					throw new AggregateError([error, cleanupError], error instanceof Error ? error.message : String(error));
+				}
 				throw error;
 			}
 		}
@@ -1542,7 +1587,11 @@ export class IntegratedRuntimeRegistry {
 				await this.recordSessionChange(entry, session.sessionId, clientNodeId);
 				entry.recordedSessionIdsByClient.set(clientNodeId, session.sessionId);
 			} catch (error: unknown) {
-				await this.stopEntry(entry, "session_rekey_persistence_failed").catch(() => {});
+				try {
+					await this.stopEntry(entry, "session_rekey_persistence_failed");
+				} catch (cleanupError) {
+					throw new AggregateError([error, cleanupError], error instanceof Error ? error.message : String(error));
+				}
 				throw error;
 			}
 		}
@@ -1830,14 +1879,6 @@ export class IntegratedRuntimeRegistry {
 	}
 }
 
-async function cleanupUncommittedRuntime(
-	runtime: AgentSessionRuntime,
-	sessionSelection: IntegratedConversationSessionSelection | undefined,
-): Promise<void> {
-	const sessionRef = runtime.session.sessionRef;
-	await runtime.dispose().catch(() => {});
-	if (sessionSelection?.kind === "resumed" || sessionRef === undefined) {
-		return;
-	}
-	await SessionManager.delete(sessionRef).catch(() => {});
+async function cleanupUncommittedRuntime(runtime: AgentSessionRuntime): Promise<void> {
+	await runtime.dispose();
 }

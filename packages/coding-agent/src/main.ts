@@ -17,7 +17,11 @@ import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
 import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, isStandaloneBinary, VERSION } from "./config.ts";
-import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
+import {
+	type AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionRuntime,
+} from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
 	createAgentSessionFromServices,
@@ -501,6 +505,52 @@ async function promptForMissingSessionCwd(
 	]);
 }
 
+async function throwAfterClosingSessionManager(
+	manager: SessionManager,
+	error: unknown,
+	message: string,
+): Promise<never> {
+	try {
+		await manager.closePersistence();
+	} catch (closeError) {
+		throw new AggregateError([error, closeError], message);
+	}
+	throw error;
+}
+
+async function runWithOwnedAgentSessionRuntime(
+	runtime: AgentSessionRuntime,
+	operation: (transferRuntime: () => void) => Promise<void>,
+): Promise<void> {
+	let runtimeOwned = true;
+	let operationError: unknown;
+	let operationFailed = false;
+	try {
+		await operation(() => {
+			runtimeOwned = false;
+		});
+	} catch (error) {
+		operationFailed = true;
+		operationError = error;
+	}
+
+	let cleanupError: unknown;
+	let cleanupFailed = false;
+	if (runtimeOwned) {
+		try {
+			await runtime.dispose();
+		} catch (error) {
+			cleanupFailed = true;
+			cleanupError = error;
+		}
+	}
+	if (operationFailed && cleanupFailed) {
+		throw new AggregateError([operationError, cleanupError], "CLI runtime setup failed and cleanup did not complete");
+	}
+	if (operationFailed) throw operationError;
+	if (cleanupFailed) throw cleanupError;
+}
+
 export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
 }
@@ -618,6 +668,11 @@ export async function main(args: string[], options?: MainOptions) {
 
 	validateForkFlags(parsed);
 	validateSessionIdFlags(parsed);
+	const requestedSessionName = parsed.name?.trim();
+	if (parsed.name !== undefined && !requestedSessionName) {
+		console.error(chalk.red("Error: --name requires a non-empty value"));
+		process.exit(1);
+	}
 
 	// Run migrations (pass cwd for project-local migrations)
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
@@ -644,44 +699,109 @@ export async function main(args: string[], options?: MainOptions) {
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
-	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
+	let missingSessionCwdIssue: SessionCwdIssue | undefined;
+	try {
+		missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
+	} catch (error) {
+		return await throwAfterClosingSessionManager(
+			sessionManager,
+			error,
+			"Session cwd validation failed and its manager could not be closed",
+		);
+	}
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
-			const selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
-			if (!selectedCwd) {
-				process.exit(0);
+			let selectedCwd: string | undefined;
+			try {
+				selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
+			} catch (error) {
+				return await throwAfterClosingSessionManager(
+					sessionManager,
+					error,
+					"Session cwd selection failed and its manager could not be closed",
+				);
 			}
-			sessionManager = await SessionManager.open(missingSessionCwdIssue.sessionRef!, selectedCwd);
+			if (!selectedCwd) {
+				await sessionManager.closePersistence();
+				process.exitCode = 0;
+				return;
+			}
+			let replacementManager: SessionManager;
+			try {
+				replacementManager = await SessionManager.open(missingSessionCwdIssue.sessionRef!, selectedCwd);
+			} catch (error) {
+				return await throwAfterClosingSessionManager(
+					sessionManager,
+					error,
+					"Session cwd replacement failed and its original manager could not be closed",
+				);
+			}
+			try {
+				await sessionManager.closePersistence();
+			} catch (error) {
+				return await throwAfterClosingSessionManager(
+					replacementManager,
+					error,
+					"Session cwd replacement failed and neither manager could be closed cleanly",
+				);
+			}
+			sessionManager = replacementManager;
 		} else {
-			console.error(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message));
-			process.exit(1);
+			const error = new MissingSessionCwdError(missingSessionCwdIssue);
+			try {
+				await sessionManager.closePersistence();
+			} catch (closeError) {
+				throw new AggregateError([error, closeError], "Invalid session cwd and manager close both failed");
+			}
+			console.error(chalk.red(error.message));
+			process.exitCode = 1;
+			return;
 		}
 	}
-	if (parsed.name !== undefined) {
-		const name = parsed.name.trim();
-		if (!name) {
-			console.error(chalk.red("Error: --name requires a non-empty value"));
-			process.exit(1);
+	if (requestedSessionName) {
+		try {
+			sessionManager.appendSessionInfo(requestedSessionName);
+			await sessionManager.flush();
+		} catch (error) {
+			return await throwAfterClosingSessionManager(
+				sessionManager,
+				error,
+				"Session naming failed and its manager could not be closed",
+			);
 		}
-		sessionManager.appendSessionInfo(name);
-		await sessionManager.flush();
 	}
 	time("createSessionManager");
 
-	const trustStore = new ProjectTrustStore(agentDir);
-	const sessionCwd = sessionManager.getCwd();
-	const autoTrustOnReloadCwd =
-		parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
-			? sessionCwd
-			: undefined;
-	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
+	let trustStore: ProjectTrustStore;
+	let sessionCwd: string;
+	let autoTrustOnReloadCwd: string | undefined;
+	let trustPromptMode: AppMode;
+	let resolvedExtensionPaths: string[] | undefined;
+	let resolvedSkillPaths: string[] | undefined;
+	let resolvedPromptTemplatePaths: string[] | undefined;
+	let resolvedThemePaths: string[] | undefined;
+	let authStorage: AuthStorage;
+	try {
+		trustStore = new ProjectTrustStore(agentDir);
+		sessionCwd = sessionManager.getCwd();
+		autoTrustOnReloadCwd =
+			parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
+				? sessionCwd
+				: undefined;
+		trustPromptMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
+		resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
+		resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
+		resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
+		resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+		authStorage = AuthStorage.create();
+	} catch (error) {
+		return await throwAfterClosingSessionManager(
+			sessionManager,
+			error,
+			"Session startup preparation failed and its manager could not be closed",
+		);
+	}
 	const projectTrustByCwd = new Map<string, boolean>();
-
-	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
-	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
-	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
-	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
-	const authStorage = AuthStorage.create();
 	const createRuntime: CreateAgentSessionRuntimeFactory = async (runtimeOptions) => {
 		const { cwd, agentDir, sessionManager, sessionStartEvent, projectTrustContext, subagentContext } = runtimeOptions;
 		const runtimeProfile = Object.hasOwn(runtimeOptions, "profile") ? runtimeOptions.profile : requestedProfile;
@@ -806,148 +926,165 @@ export async function main(args: string[], options?: MainOptions) {
 			parentSessionManager: sessionManager,
 			...(subagentContext ? { subagentContext } : {}),
 		});
-		const created = await createAgentSessionFromServices({
-			services,
-			sessionManager,
-			sessionStartEvent,
-			model: sessionOptions.model,
-			thinkingLevel: sessionOptions.thinkingLevel,
-			agentMode: sessionStartEvent ? undefined : sessionOptions.agentMode,
-			scopedModels: sessionOptions.scopedModels,
-			tools: sessionOptions.tools,
-			allowUnlistedExtensionTools: sessionOptions.allowUnlistedExtensionTools,
-			excludeTools: sessionOptions.excludeTools,
-			noTools: sessionOptions.noTools,
-			customTools: sessionOptions.customTools,
-			subagentToolManager: subagentManager,
-		});
-		if (hasExistingSession && parsed.models !== undefined && sessionOptions.scopedModels !== undefined) {
-			created.session.setScopedModels(sessionOptions.scopedModels);
-		}
+		try {
+			const created = await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				sessionStartEvent,
+				model: sessionOptions.model,
+				thinkingLevel: sessionOptions.thinkingLevel,
+				agentMode: sessionStartEvent ? undefined : sessionOptions.agentMode,
+				scopedModels: sessionOptions.scopedModels,
+				tools: sessionOptions.tools,
+				allowUnlistedExtensionTools: sessionOptions.allowUnlistedExtensionTools,
+				excludeTools: sessionOptions.excludeTools,
+				noTools: sessionOptions.noTools,
+				customTools: sessionOptions.customTools,
+				subagentToolManager: subagentManager,
+			});
 
-		return {
-			...created,
-			services,
-			diagnostics,
-		};
+			return {
+				...created,
+				services,
+				diagnostics,
+			};
+		} catch (error) {
+			try {
+				await subagentManager.dispose();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"Agent session creation failed and its untransferred subagent manager could not be disposed",
+				);
+			}
+			throw error;
+		}
 	};
 	time("createRuntime");
 	const runtime = await createAgentSessionRuntime(createRuntime, {
-		cwd: sessionManager.getCwd(),
+		cwd: sessionCwd,
 		agentDir,
 		sessionManager,
 	});
 	time("createAgentSessionRuntime");
-	const { services, session, modelFallbackMessage } = runtime;
-	const { settingsManager, modelRegistry, resourceLoader } = services;
-	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
-	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+	await runWithOwnedAgentSessionRuntime(runtime, async (transferRuntime) => {
+		const { services, session, modelFallbackMessage } = runtime;
+		const { settingsManager, modelRegistry, resourceLoader } = services;
+		applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+		configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
 
-	if (parsed.help) {
-		const extensionFlags = resourceLoader
-			.getExtensions()
-			.extensions.flatMap((extension) => Array.from(extension.flags.values()));
-		printHelp(extensionFlags);
-		process.exit(0);
-	}
-
-	if (parsed.listModels !== undefined) {
-		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
-		await listModels(modelRegistry, searchPattern);
-		process.exit(0);
-	}
-
-	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
-	let stdinContent: string | undefined;
-	if (appMode !== "rpc") {
-		stdinContent = await readPipedStdin();
-		if (stdinContent !== undefined && appMode === "interactive") {
-			appMode = "print";
-		}
-	}
-	time("readPipedStdin");
-
-	const { initialMessage, initialImages } = await prepareInitialMessage(
-		parsed,
-		settingsManager.getImageAutoResize(),
-		stdinContent,
-	);
-	time("prepareInitialMessage");
-	initTheme(settingsManager.getTheme(), appMode === "interactive");
-	time("initTheme");
-
-	// Show deprecation warnings in interactive mode
-	if (appMode === "interactive" && deprecationWarnings.length > 0) {
-		await showDeprecationWarnings(deprecationWarnings);
-	}
-
-	time("resolveModelScope");
-	reportDiagnostics(runtime.diagnostics);
-	if (runtime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
-		process.exit(1);
-	}
-	time("createAgentSession");
-
-	if (appMode !== "interactive" && !session.model) {
-		console.error(chalk.red(formatNoModelsAvailableMessage()));
-		process.exit(1);
-	}
-
-	const startupBenchmark = isTruthyEnvFlag(process.env.VOLT_STARTUP_BENCHMARK);
-	if (startupBenchmark && appMode !== "interactive") {
-		console.error(chalk.red("Error: VOLT_STARTUP_BENCHMARK only supports interactive mode"));
-		process.exit(1);
-	}
-
-	if (appMode === "rpc") {
-		printTimings();
-		await runRpcMode(runtime, {
-			onReady: () => {
-				void runtime.startRecoveredClientInputs().catch(() => undefined);
-			},
-		});
-	} else if (appMode === "interactive") {
-		const interactiveMode = new InteractiveMode(runtime, {
-			migratedProviders,
-			modelFallbackMessage,
-			modelScopePatterns: parsed.models,
-			autoTrustOnReloadCwd,
-			initialMessage,
-			initialImages,
-			initialMessages: parsed.messages,
-			verbose: parsed.verbose,
-			...(parsed.tuiMode !== undefined ? { tuiMode: parsed.tuiMode } : {}),
-		});
-		if (startupBenchmark) {
-			await interactiveMode.init();
-			time("interactiveMode.init");
-			printTimings();
-			interactiveMode.stop();
-			stopThemeWatcher();
-			if (process.stdout.writableLength > 0) {
-				await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
-			}
-			if (process.stderr.writableLength > 0) {
-				await new Promise<void>((resolve) => process.stderr.once("drain", resolve));
-			}
+		if (parsed.help) {
+			const extensionFlags = resourceLoader
+				.getExtensions()
+				.extensions.flatMap((extension) => Array.from(extension.flags.values()));
+			printHelp(extensionFlags);
 			return;
 		}
 
-		printTimings();
-		await interactiveMode.run();
-	} else {
-		printTimings();
-		const exitCode = await runPrintMode(runtime, {
-			mode: toPrintOutputMode(appMode),
-			messages: parsed.messages,
-			initialMessage,
-			initialImages,
-		});
-		stopThemeWatcher();
-		restoreStdout();
-		if (exitCode !== 0) {
-			process.exitCode = exitCode;
+		if (parsed.listModels !== undefined) {
+			const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
+			await listModels(modelRegistry, searchPattern);
+			return;
 		}
-		return;
-	}
+
+		// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
+		let stdinContent: string | undefined;
+		if (appMode !== "rpc") {
+			stdinContent = await readPipedStdin();
+			if (stdinContent !== undefined && appMode === "interactive") {
+				appMode = "print";
+			}
+		}
+		time("readPipedStdin");
+
+		const { initialMessage, initialImages } = await prepareInitialMessage(
+			parsed,
+			settingsManager.getImageAutoResize(),
+			stdinContent,
+		);
+		time("prepareInitialMessage");
+		initTheme(settingsManager.getTheme(), appMode === "interactive");
+		time("initTheme");
+
+		// Show deprecation warnings in interactive mode
+		if (appMode === "interactive" && deprecationWarnings.length > 0) {
+			await showDeprecationWarnings(deprecationWarnings);
+		}
+
+		time("resolveModelScope");
+		reportDiagnostics(runtime.diagnostics);
+		if (runtime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+			process.exitCode = 1;
+			return;
+		}
+		time("createAgentSession");
+
+		if (appMode !== "interactive" && !session.model) {
+			console.error(chalk.red(formatNoModelsAvailableMessage()));
+			process.exitCode = 1;
+			return;
+		}
+
+		const startupBenchmark = isTruthyEnvFlag(process.env.VOLT_STARTUP_BENCHMARK);
+		if (startupBenchmark && appMode !== "interactive") {
+			console.error(chalk.red("Error: VOLT_STARTUP_BENCHMARK only supports interactive mode"));
+			process.exitCode = 1;
+			return;
+		}
+
+		if (appMode === "rpc") {
+			printTimings();
+			transferRuntime();
+			await runRpcMode(runtime, {
+				onReady: () => {
+					void runtime.startRecoveredClientInputs().catch(() => undefined);
+				},
+			});
+		} else if (appMode === "interactive") {
+			const interactiveMode = new InteractiveMode(runtime, {
+				migratedProviders,
+				modelFallbackMessage,
+				modelScopePatterns: parsed.models,
+				autoTrustOnReloadCwd,
+				initialMessage,
+				initialImages,
+				initialMessages: parsed.messages,
+				verbose: parsed.verbose,
+				...(parsed.tuiMode !== undefined ? { tuiMode: parsed.tuiMode } : {}),
+			});
+			if (startupBenchmark) {
+				await interactiveMode.init();
+				time("interactiveMode.init");
+				printTimings();
+				interactiveMode.stop();
+				stopThemeWatcher();
+				if (process.stdout.writableLength > 0) {
+					await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
+				}
+				if (process.stderr.writableLength > 0) {
+					await new Promise<void>((resolve) => process.stderr.once("drain", resolve));
+				}
+				return;
+			}
+
+			printTimings();
+			transferRuntime();
+			await interactiveMode.run();
+		} else {
+			printTimings();
+			transferRuntime();
+			const exitCode = await runPrintMode(runtime, {
+				mode: toPrintOutputMode(appMode),
+				messages: parsed.messages,
+				initialMessage,
+				initialImages,
+			});
+			stopThemeWatcher();
+			restoreStdout();
+			if (exitCode !== 0) {
+				process.exitCode = exitCode;
+			}
+			return;
+		}
+	});
 }

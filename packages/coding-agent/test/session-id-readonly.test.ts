@@ -160,6 +160,14 @@ describe("--session-id read-only commands", { timeout: TEST_TIMEOUT_MS }, () => 
 		expect(await hasSessionWithId(result, "read-only-models")).toBe(false);
 	});
 
+	it("rejects an empty session name before reserving a session", async () => {
+		const result = await runCli(["--session-id", "empty-name", "--name", "   ", "-p", "hi"]);
+
+		expect(result.code).toBe(1);
+		expect(result.stderr).toContain("--name requires a non-empty value");
+		expect(await hasSessionWithId(result, "empty-name")).toBe(false);
+	});
+
 	it("rejects an existing fork target session id", async () => {
 		const result = await runCli(
 			(dirs) => ["--session-dir", dirs.sessionDir, "--fork", "source-id", "--session-id", "existing-id", "-p", "hi"],

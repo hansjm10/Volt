@@ -6,6 +6,7 @@ import { type FauxProviderRegistration, getModel, registerFauxProvider } from "@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { GitContextProvider } from "../src/core/git-context-provider.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -81,36 +82,37 @@ describe("createAgentSession session manager defaults", () => {
 		await session.waitForClosed();
 	});
 
-	it("discards the default persisted manager when setup fails", async () => {
+	it("closes the default persisted manager and retains its row when setup fails", async () => {
 		const setupError = new Error("injected resource reload failure");
-		let discardedManager: SessionManager | undefined;
-		const discardPersistence = SessionManager.prototype.discardPersistence;
-		vi.spyOn(SessionManager.prototype, "discardPersistence").mockImplementation(function (
+		let closedManager: SessionManager | undefined;
+		const closePersistence = SessionManager.prototype.closePersistence;
+		vi.spyOn(SessionManager.prototype, "closePersistence").mockImplementation(function (
 			this: SessionManager,
 		): Promise<void> {
-			discardedManager = this;
-			return discardPersistence.call(this);
+			closedManager = this;
+			return closePersistence.call(this);
 		});
 		vi.spyOn(DefaultResourceLoader.prototype, "reload").mockRejectedValue(setupError);
 
 		await expect(createAgentSession({ cwd, agentDir, disableMcp: true })).rejects.toBe(setupError);
 
-		expect(discardedManager).toBeDefined();
-		const manager = discardedManager;
-		if (!manager) throw new Error("Expected the default session manager to be discarded");
+		expect(closedManager).toBeDefined();
+		const manager = closedManager;
+		if (!manager) throw new Error("Expected the default session manager to be closed");
 		const sessionRef = manager.getSessionRef();
 		if (!sessionRef) throw new Error("Expected a persisted session reference");
 		expect(() => manager.appendSessionInfo("late write")).toThrow("Session persistence is closed");
-		await expect(SessionManager.open(sessionRef)).rejects.toThrow(`Session not found: ${sessionRef.sessionId}`);
+		const reopened = await SessionManager.open(sessionRef);
+		await reopened.closePersistence();
 		expect(await SessionManager.list(cwd, sessionRef.sessionDirectory)).toEqual([]);
 		expect(
 			await SessionManager.list(cwd, sessionRef.sessionDirectory, undefined, {
 				includeMessageFreeDurable: true,
 			}),
-		).toEqual([]);
+		).toEqual([expect.objectContaining({ ref: sessionRef })]);
 	});
 
-	it("keeps an explicit persisted manager open when setup fails", async () => {
+	it("consumes and closes an explicit persisted manager when setup fails", async () => {
 		const setupError = new Error("injected resource reload failure");
 		const sessionManager = await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 		const sessionRef = sessionManager.getSessionRef();
@@ -119,20 +121,38 @@ describe("createAgentSession session manager defaults", () => {
 
 		await expect(createAgentSession({ cwd, agentDir, sessionManager, disableMcp: true })).rejects.toBe(setupError);
 
-		sessionManager.appendSessionInfo("still writable");
-		await sessionManager.flush();
+		expect(() => sessionManager.appendSessionInfo("late write")).toThrow("Session persistence is closed");
+		const reopened = await SessionManager.open(sessionRef);
+		reopened.appendSessionInfo("reopened after failed setup");
+		await reopened.flush();
+		await reopened.closePersistence();
 		expect(
 			await SessionManager.list(cwd, sessionRef.sessionDirectory, undefined, {
 				includeMessageFreeDurable: true,
 			}),
-		).toEqual([expect.objectContaining({ ref: sessionRef })]);
+		).toEqual([expect.objectContaining({ ref: sessionRef, name: "reopened after failed setup" })]);
 	});
 
-	it("preserves setup and cleanup errors when default manager discard fails", async () => {
+	it("disposes factory-created resources when construction fails before session transfer", async () => {
+		const setupError = new Error("injected extension result failure");
+		const resourceLoader = createTestResourceLoader();
+		vi.spyOn(resourceLoader, "getExtensions").mockImplementation(() => {
+			throw setupError;
+		});
+		const disposeGitContext = vi.spyOn(GitContextProvider.prototype, "dispose");
+
+		await expect(
+			createAgentSession({ cwd, agentDir, resourceLoader, disableMcp: true, noTools: "all" }),
+		).rejects.toBe(setupError);
+
+		expect(disposeGitContext).toHaveBeenCalledOnce();
+	});
+
+	it("preserves setup and cleanup errors when default manager close fails", async () => {
 		const setupError = new Error("injected resource reload failure");
-		const cleanupError = new Error("injected discard failure");
+		const cleanupError = new Error("injected close failure");
 		vi.spyOn(DefaultResourceLoader.prototype, "reload").mockRejectedValue(setupError);
-		vi.spyOn(SessionManager.prototype, "discardPersistence").mockRejectedValue(cleanupError);
+		vi.spyOn(SessionManager.prototype, "closePersistence").mockRejectedValue(cleanupError);
 
 		let thrown: unknown;
 		try {
@@ -142,9 +162,7 @@ describe("createAgentSession session manager defaults", () => {
 		}
 
 		expect(thrown).toBeInstanceOf(AggregateError);
-		expect((thrown as AggregateError).message).toBe(
-			"Agent session setup failed and its manager persistence could not be discarded",
-		);
+		expect((thrown as AggregateError).message).toBe("Agent session setup failed and its manager could not be closed");
 		expect((thrown as AggregateError).errors).toEqual([setupError, cleanupError]);
 	});
 

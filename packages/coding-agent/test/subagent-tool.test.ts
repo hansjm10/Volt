@@ -914,6 +914,43 @@ describe("subagent tool", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	it("does not dispose the subagent manager twice after replacement teardown", async () => {
+		const dispose = vi.fn(async () => undefined);
+		const manager = {
+			getDefinition: () => createDefinition("scout"),
+			startByName: async () => createCompletedHandle("unused"),
+			dispose,
+		} satisfies SubagentToolManager;
+		const session = await createSession({ manager });
+
+		await session.disposeSubagentToolManager();
+		session.dispose();
+		await session.waitForClosed();
+
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	it("reports every session cleanup failure", async () => {
+		const subagentError = new Error("injected subagent cleanup failure");
+		const persistenceError = new Error("injected persistence cleanup failure");
+		const manager = {
+			getDefinition: () => createDefinition("scout"),
+			startByName: async () => createCompletedHandle("unused"),
+			dispose: async () => {
+				throw subagentError;
+			},
+		} satisfies SubagentToolManager;
+		const session = await createSession({ manager });
+		vi.spyOn(session.sessionManager, "closePersistence").mockRejectedValue(persistenceError);
+
+		session.dispose();
+		const error = await session.waitForClosed().catch((thrown: unknown) => thrown);
+
+		expect(error).toBeInstanceOf(AggregateError);
+		expect((error as AggregateError).message).toBe("Agent session cleanup did not complete");
+		expect((error as AggregateError).errors).toEqual([persistenceError, subagentError]);
+	});
+
 	it("delegates a single task and returns the child final text", async () => {
 		const manager = await createRealManager({
 			definitions: [createDefinition("scout", { source: "project" })],

@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { getMissingSessionCwdIssue, MissingSessionCwdError } from "../src/core/session-cwd.ts";
 import { SessionManager, type SessionReference } from "../src/core/session-manager.ts";
@@ -28,6 +28,7 @@ describe("session cwd handling", () => {
 
 	afterEach(async () => {
 		await managerOwner.drain();
+		vi.restoreAllMocks();
 		for (const path of cleanupPaths.splice(0)) rmSync(path, { recursive: true, force: true });
 	});
 
@@ -58,6 +59,48 @@ describe("session cwd handling", () => {
 		expect(getMissingSessionCwdIssue(sessionManager, fallbackCwd)).toBeUndefined();
 	});
 
+	it("closes a consumed manager and retains its row when the runtime factory fails", async () => {
+		const cwd = createTempDir("volt-session-runtime-factory");
+		const sessionDir = createTempDir("volt-session-runtime-factory-store");
+		cleanupPaths.push(cwd, sessionDir);
+		const sessionManager = await SessionManager.create(cwd, sessionDir, { id: "failed-runtime-factory" });
+		const ref = sessionManager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const setupError = new Error("injected runtime factory failure");
+		const closePersistence = vi.spyOn(sessionManager, "closePersistence");
+		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
+			throw setupError;
+		};
+
+		await expect(createAgentSessionRuntime(createRuntime, { cwd, agentDir: cwd, sessionManager })).rejects.toBe(
+			setupError,
+		);
+		expect(closePersistence).toHaveBeenCalledOnce();
+		expect(() => sessionManager.appendSessionInfo("late write")).toThrow("Session persistence is closed");
+		expect(await SessionManager.findForResume(sessionDir, ref.sessionId)).toEqual(ref);
+	});
+
+	it("preserves runtime factory and manager close failures", async () => {
+		const cwd = createTempDir("volt-session-runtime-close-failure");
+		cleanupPaths.push(cwd);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const setupError = new Error("injected runtime factory failure");
+		const closeError = new Error("injected manager close failure");
+		vi.spyOn(sessionManager, "closePersistence").mockRejectedValue(closeError);
+		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
+			throw setupError;
+		};
+
+		const error = await createAgentSessionRuntime(createRuntime, {
+			cwd,
+			agentDir: cwd,
+			sessionManager,
+		}).catch((thrown: unknown) => thrown);
+
+		expect(error).toBeInstanceOf(AggregateError);
+		expect((error as AggregateError).errors).toEqual([setupError, closeError]);
+	});
+
 	it("throws a controlled error before runtime creation when the stored cwd is missing", async () => {
 		const fallbackCwd = createTempDir("volt-session-cwd-runtime");
 		const missingCwd = join(fallbackCwd, "does-not-exist");
@@ -79,5 +122,7 @@ describe("session cwd handling", () => {
 			}),
 		).rejects.toBeInstanceOf(MissingSessionCwdError);
 		expect(createRuntimeCalled).toBe(false);
+		expect(() => sessionManager.appendSessionInfo("late write")).toThrow("Session persistence is closed");
+		expect(await SessionManager.findForResume(sessionDir, ref.sessionId)).toEqual(ref);
 	});
 });

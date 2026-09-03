@@ -105,6 +105,37 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		return { runtimeHost, faux };
 	}
 
+	it("uses only session disposal after runtime construction fails", async () => {
+		const tempDir = join(tmpdir(), `volt-runtime-construction-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		tempDirs.push(tempDir);
+		const sessionManager = await SessionManager.create(tempDir, tempDir, { id: "failed-runtime-construction" });
+		const sessionRef = sessionManager.getSessionRef();
+		if (!sessionRef) throw new Error("Expected a persisted session reference");
+		const closePersistence = vi.spyOn(sessionManager, "closePersistence");
+		const constructionError = new Error("injected runtime transcript subscription failure");
+		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager }) => {
+			const services = await createAgentSessionServices({ cwd, agentDir: tempDir });
+			const created = await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				noTools: "all",
+			});
+			vi.spyOn(sessionManager, "subscribeEntries").mockImplementation(() => {
+				throw constructionError;
+			});
+			return { ...created, services, diagnostics: services.diagnostics };
+		};
+
+		await expect(
+			createAgentSessionRuntime(createRuntime, { cwd: tempDir, agentDir: tempDir, sessionManager }),
+		).rejects.toBe(constructionError);
+
+		expect(closePersistence).toHaveBeenCalledOnce();
+		expect(() => sessionManager.appendSessionInfo("late write")).toThrow("Session persistence is closed");
+		expect(await SessionManager.findForResume(tempDir, sessionRef.sessionId)).toEqual(sessionRef);
+	});
+
 	it("bridges Git replacements while retaining the session's first Git observation", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => undefined);
 		const events: AgentSessionEvent[] = [];
@@ -845,7 +876,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		expect(phases).toEqual(["prepare", "session_shutdown", "commit", "publish", "finalize", "rebind"]);
 	});
 
-	it("leaves the old runtime live when replacement ownership preflight rejects", async () => {
+	it("leaves the old runtime live and retains the candidate row when replacement ownership preflight rejects", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => {});
 		const originalSession = runtimeHost.session;
 		const originalSessionId = originalSession.sessionId;
@@ -868,12 +899,14 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await expect(runtimeHost.session.prompt("still alive")).resolves.toBeUndefined();
 
 		const failedRef = preparedRef!;
-		await expect(SessionManager.open(failedRef)).rejects.toThrow(`Session not found: ${failedRef.sessionId}`);
+		const reopened = await SessionManager.open(failedRef);
+		expect(reopened.getSessionRef()).toEqual(failedRef);
+		await reopened.closePersistence();
 		expect(
 			await SessionManager.list(runtimeHost.cwd, failedRef.sessionDirectory, undefined, {
 				includeMessageFreeDurable: true,
 			}),
-		).not.toEqual(expect.arrayContaining([expect.objectContaining({ ref: failedRef })]));
+		).toEqual(expect.arrayContaining([expect.objectContaining({ ref: failedRef })]));
 	});
 
 	it("serializes complete structural operations and rejects a queued stale derivation", async () => {

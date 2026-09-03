@@ -52,8 +52,7 @@ export interface IrohRemoteAgentRuntimeOptions {
 	projectTrusted?: boolean;
 	/**
 	 * Pre-resolved session target (daemon path); skips internal target resolution.
-	 * Ownership transfers here until success: failed created targets are discarded,
-	 * while failed resumed targets are only closed.
+	 * The runtime factory consumes its manager and preserves every committed row on failure.
 	 */
 	resolvedSessionTarget?: ResolvedSessionTargetWithManager<SessionManager>;
 	resumeSessionId?: string;
@@ -114,14 +113,31 @@ export async function createIrohRemoteAgentRuntime(
 export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 	options: IrohRemoteAgentRuntimeOptions,
 ): Promise<IrohRemoteAgentRuntimeResult> {
-	const agentDir = resolvePath(options.agentDir ?? getAgentDir());
-	const projectCwd = resolvePath(options.projectCwd ?? options.cwd);
-	runIrohRemoteStartupMigrations(projectCwd, agentDir);
-	const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-	const tools = options.toolPolicy ? [...options.toolPolicy.tools] : parseIrohRemoteAllowTools(options.allowTools);
-	const allowUnlistedExtensionTools =
-		options.toolPolicy?.allowUnlistedExtensionTools ?? usesDefaultIrohRemoteAllowTools(options.allowTools);
-	const projectTrusted = options.projectTrusted ?? false;
+	const suppliedSessionManager = options.resolvedSessionTarget?.sessionManager;
+	const { agentDir, projectCwd, authStorage, tools, allowUnlistedExtensionTools, projectTrusted } =
+		await (async () => {
+			try {
+				const agentDir = resolvePath(options.agentDir ?? getAgentDir());
+				const projectCwd = resolvePath(options.projectCwd ?? options.cwd);
+				runIrohRemoteStartupMigrations(projectCwd, agentDir);
+				const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+				const tools = options.toolPolicy
+					? [...options.toolPolicy.tools]
+					: parseIrohRemoteAllowTools(options.allowTools);
+				const allowUnlistedExtensionTools =
+					options.toolPolicy?.allowUnlistedExtensionTools ?? usesDefaultIrohRemoteAllowTools(options.allowTools);
+				return {
+					agentDir,
+					projectCwd,
+					authStorage,
+					tools,
+					allowUnlistedExtensionTools,
+					projectTrusted: options.projectTrusted ?? false,
+				};
+			} catch (error) {
+				return cleanupFailedIrohRemoteAgentRuntime(error, undefined, suppliedSessionManager);
+			}
+		})();
 
 	const createRuntime: CreateAgentSessionRuntimeFactory = async (runtimeOptions) => {
 		const profile = Object.hasOwn(runtimeOptions, "profile") ? runtimeOptions.profile : options.profile;
@@ -161,27 +177,47 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 						})
 				: undefined,
 		});
-		const created = await createAgentSessionFromServices({
-			services,
-			sessionManager: runtimeOptions.sessionManager,
-			sessionStartEvent: runtimeOptions.sessionStartEvent,
-			tools,
-			allowUnlistedExtensionTools,
-			subagentToolManager: subagentManager,
-		});
-		return {
-			...created,
-			services,
-			diagnostics: services.diagnostics,
-		};
+		try {
+			const created = await createAgentSessionFromServices({
+				services,
+				sessionManager: runtimeOptions.sessionManager,
+				sessionStartEvent: runtimeOptions.sessionStartEvent,
+				tools,
+				allowUnlistedExtensionTools,
+				subagentToolManager: subagentManager,
+			});
+			return {
+				...created,
+				services,
+				diagnostics: services.diagnostics,
+			};
+		} catch (error) {
+			try {
+				await subagentManager.dispose();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"Remote agent session creation failed and its untransferred subagent manager could not be disposed",
+				);
+			}
+			throw error;
+		}
 	};
 
-	const sessionTarget = await createIrohRemoteSessionManager(options, agentDir);
-	let runtime: AgentSessionRuntime | undefined;
+	let sessionTarget: Awaited<ReturnType<typeof createIrohRemoteSessionManager>>;
 	try {
-		await options.validateCwd?.(sessionTarget.sessionManager.getCwd());
+		sessionTarget = await createIrohRemoteSessionManager(options, agentDir);
+	} catch (error) {
+		return cleanupFailedIrohRemoteAgentRuntime(error, undefined, suppliedSessionManager);
+	}
+	let runtime: AgentSessionRuntime | undefined;
+	let managerTransferred = false;
+	try {
+		const runtimeCwd = sessionTarget.sessionManager.getCwd();
+		await options.validateCwd?.(runtimeCwd);
+		managerTransferred = true;
 		runtime = await createAgentSessionRuntime(createRuntime, {
-			cwd: sessionTarget.sessionManager.getCwd(),
+			cwd: runtimeCwd,
 			agentDir,
 			sessionManager: sessionTarget.sessionManager,
 			profile: options.profile,
@@ -195,15 +231,18 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 		}
 		return { runtime, sessionSelection: sessionTarget.selection };
 	} catch (error) {
-		return cleanupFailedIrohRemoteAgentRuntime(error, runtime, sessionTarget.sessionManager, sessionTarget.selection);
+		return cleanupFailedIrohRemoteAgentRuntime(
+			error,
+			runtime,
+			managerTransferred ? undefined : sessionTarget.sessionManager,
+		);
 	}
 }
 
 async function cleanupFailedIrohRemoteAgentRuntime(
 	error: unknown,
 	runtime: AgentSessionRuntime | undefined,
-	sessionManager: SessionManager,
-	selection: IrohRemoteAgentRuntimeSessionSelection,
+	ownedSessionManager: SessionManager | undefined,
 ): Promise<never> {
 	const cleanupErrors: unknown[] = [];
 	if (runtime) {
@@ -212,15 +251,12 @@ async function cleanupFailedIrohRemoteAgentRuntime(
 		} catch (cleanupError) {
 			cleanupErrors.push(cleanupError);
 		}
-	}
-	try {
-		if (selection.kind === "resumed") {
-			await sessionManager.closePersistence();
-		} else {
-			await sessionManager.discardPersistence();
+	} else if (ownedSessionManager) {
+		try {
+			await ownedSessionManager.closePersistence();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
 		}
-	} catch (cleanupError) {
-		if (!cleanupErrors.includes(cleanupError)) cleanupErrors.push(cleanupError);
 	}
 	if (cleanupErrors.length === 0) throw error;
 

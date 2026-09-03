@@ -70,6 +70,8 @@ const { session } = await createAgentSession({
 
 `agentMode` defaults to `"build"`. A new Plan-mode session exposes only read-only exploration and native checklist tools; persisted branches restore their own planning state.
 
+Passing `sessionManager` transfers its ownership to `createAgentSession()` immediately. On success, dispose the returned session and await `session.waitForClosed()`. If setup fails, the factory closes the consumed manager but retains any committed session row; do not reuse the manager object. Open its `SessionReference` again when another live manager is needed.
+
 ### AgentSession
 
 The session manages agent lifecycle, message history, model state, compaction, and event streaming.
@@ -146,7 +148,7 @@ All user plan actions are fenced by the exact plan ID and revision. Repeating an
 Use the runtime API when you need to replace the active session and rebuild cwd-bound runtime state.
 This is the same layer used by the built-in interactive, print, and RPC modes.
 
-`createAgentSessionRuntime()` takes a runtime factory plus the initial cwd/session target. The factory closes over process-global fixed inputs, recreates cwd-bound services for the effective cwd, resolves session options against those services, and returns a full runtime result.
+`createAgentSessionRuntime()` takes a runtime factory plus the initial cwd/session target. Passing the manager consumes it immediately. The factory closes over process-global fixed inputs, recreates cwd-bound services for the effective cwd, resolves session options against those services, and returns a full runtime result. A `CreateAgentSessionRuntimeFactory` callback borrows cleanup ownership from its enclosing runtime operation until it returns an `AgentSession`; construct and return the session as its final ownership-transferring step.
 
 ```typescript
 import {
@@ -275,7 +277,7 @@ interface SubagentResult {
 
 `status` is the authoritative terminal outcome, and `error` supplies terminal failure detail when available. Do not infer the outcome from `event` or its assistant stop reasons: the latest low-level `agent_end` retains attempt history and can contain an error from a retry that was subsequently aborted.
 
-Cancellation remains authoritative while a child is prepared but not yet published. If `handle.abort()` is called or the delegation scope aborts before the first prompt is accepted, a later `handle.prompt()` rejects, rolls back the prepared runtime registration, disposes the handle, and leaves no activity or registry record.
+Cancellation remains authoritative while a child is prepared but not yet published. If `handle.abort()` is called or the delegation scope aborts before the first prompt is accepted, a later `handle.prompt()` rejects, rolls back the prepared runtime registration, disposes the handle, and leaves no activity or registry record. Any already committed child session row is retained and remains addressable by its session identity.
 
 Definition-less `start()` children join the session tree exactly like definition-backed ones — they share the session-wide registry, the delegation scope's ceilings, and depth accounting — but they are fail-closed for nested delegation: only a definition can declare an `allowedSubagents` policy, so an unnamed child cannot spawn further subagents.
 

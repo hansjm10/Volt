@@ -158,7 +158,10 @@ export function isConversationTranscriptCommittedEvent(value: object): value is 
  *
  * The factory closes over process-global fixed inputs, recreates cwd-bound
  * services for the effective cwd, resolves session options against those
- * services, and finally creates the AgentSession.
+ * services, and finally creates the AgentSession. Its enclosing runtime
+ * operation retains manager-close ownership until this callback returns a
+ * session; callbacks should use createAgentSessionFromServices, which borrows
+ * that ownership rather than closing the manager independently.
  */
 export type CreateAgentSessionRuntimeFactory = (options: {
 	cwd: string;
@@ -213,20 +216,11 @@ function sessionRefsEqual(left: SessionReference, right: SessionReference): bool
 	);
 }
 
-async function closePreparedSessionManager(manager: SessionManager, error: unknown, message: string): Promise<never> {
+async function closeOwnedSessionManager(manager: SessionManager, error: unknown, message: string): Promise<never> {
 	try {
 		await manager.closePersistence();
 	} catch (closeError) {
 		throw new AggregateError([error, closeError], message);
-	}
-	throw error;
-}
-
-async function discardPreparedSessionManager(manager: SessionManager, error: unknown, message: string): Promise<never> {
-	try {
-		await manager.discardPersistence();
-	} catch (cleanupError) {
-		throw new AggregateError([error, cleanupError], message);
 	}
 	throw error;
 }
@@ -750,7 +744,8 @@ export class AgentSessionRuntime {
 		/** RPC request correlated with the replacement bootstrap, when any. */
 		rebindRequestId?: string;
 	}): Promise<{ seeded: boolean }> {
-		const releasePreparedManagerOnFailure = options.sessionManager !== this.session.sessionManager;
+		const ownsCandidateManager = options.sessionManager !== this.session.sessionManager;
+		let candidateSessionOwnsManager = false;
 		try {
 			// The entire public operation runs in the lifecycle actor. Re-check at the
 			// ownership boundary so a queued command can never prepare against the
@@ -816,6 +811,7 @@ export class AgentSessionRuntime {
 						this.lifecycleRevision++;
 					});
 					created = await options.create();
+					candidateSessionOwnsManager = true;
 					await created.session.sessionManager.flush();
 					this.applyReplacement(created);
 					applied = true;
@@ -831,12 +827,21 @@ export class AgentSessionRuntime {
 					return await this.finishSessionReplacement(options.withSession, transaction, options.rebindRequestId);
 				} catch (error: unknown) {
 					const replacementError = error instanceof Error ? error : new Error(String(error));
+					const cleanupErrors: unknown[] = [];
 					if (applied) {
 						this.conversationProjectionFeed.failSourceRebind(replacementError);
-						await this.disposeReplacementSession(this.session).catch(() => {});
+						try {
+							await this.disposeReplacementSession(this.session);
+						} catch (cleanupError) {
+							cleanupErrors.push(cleanupError);
+						}
 						this.sessionInvalidated = true;
 					} else if (created) {
-						await this.disposeReplacementSession(created.session).catch(() => {});
+						try {
+							await this.disposeReplacementSession(created.session);
+						} catch (cleanupError) {
+							cleanupErrors.push(cleanupError);
+						}
 					}
 					if (invalidated) {
 						this.acceptingStructuralOperations = false;
@@ -852,9 +857,15 @@ export class AgentSessionRuntime {
 							} else {
 								await transaction.rollback();
 							}
-						} catch {
-							// The ownership service must also clear transactions on disconnect.
+						} catch (cleanupError) {
+							cleanupErrors.push(cleanupError);
 						}
+					}
+					if (cleanupErrors.length > 0) {
+						throw new AggregateError(
+							[replacementError, ...cleanupErrors],
+							"Session replacement failed and cleanup did not complete",
+						);
 					}
 					throw replacementError;
 				}
@@ -862,15 +873,12 @@ export class AgentSessionRuntime {
 				this.sessionReplacementInProgress = false;
 			}
 		} catch (error) {
-			if (releasePreparedManagerOnFailure) {
-				try {
-					await options.sessionManager.closePersistence();
-				} catch (closeError) {
-					throw new AggregateError(
-						[error, closeError],
-						"Session replacement failed and its prepared manager could not be closed",
-					);
-				}
+			if (ownsCandidateManager && !candidateSessionOwnsManager) {
+				return await closeOwnedSessionManager(
+					options.sessionManager,
+					error,
+					"Session replacement failed and its owned manager could not be closed",
+				);
 			}
 			throw error;
 		}
@@ -1120,9 +1128,11 @@ export class AgentSessionRuntime {
 
 		const previousSessionRef = this.session.sessionRef;
 		const sessionManager = await SessionManager.open(sessionRef, options?.cwdOverride);
+		let managerTransferred = false;
 		try {
 			this.assertStructuralOperationCurrent(operation);
 			assertSessionCwdExists(sessionManager, this.cwd);
+			managerTransferred = true;
 			const replacement = await this.replaceCurrentSession({
 				operation,
 				reason: "resume",
@@ -1143,10 +1153,11 @@ export class AgentSessionRuntime {
 			});
 			return { cancelled: false, seeded: replacement.seeded };
 		} catch (error) {
-			return await closePreparedSessionManager(
+			if (managerTransferred) throw error;
+			return await closeOwnedSessionManager(
 				sessionManager,
 				error,
-				"Session switch failed and its prepared manager could not be closed",
+				"Session switch failed and its owned manager could not be closed",
 			);
 		}
 	}
@@ -1371,6 +1382,8 @@ export class AgentSessionRuntime {
 				sessionManager.newSession({ parentSession: options.parentSessionRef });
 			}
 		}
+		const ownsSessionManager = sessionManager !== this.session.sessionManager;
+		let managerTransferred = false;
 		try {
 			this.assertStructuralOperationCurrent(operation);
 			if (options?.setup) {
@@ -1379,6 +1392,7 @@ export class AgentSessionRuntime {
 			}
 			await sessionManager.flush();
 
+			managerTransferred = true;
 			const replacement = await this.replaceCurrentSession({
 				operation,
 				reason: "new",
@@ -1400,17 +1414,11 @@ export class AgentSessionRuntime {
 			});
 			return { cancelled: false, seeded: replacement.seeded };
 		} catch (error) {
-			if (sessionManager === this.session.sessionManager) {
-				return await closePreparedSessionManager(
-					sessionManager,
-					error,
-					"New session preparation failed and its installed manager could not be closed",
-				);
-			}
-			return await discardPreparedSessionManager(
+			if (managerTransferred || !ownsSessionManager) throw error;
+			return await closeOwnedSessionManager(
 				sessionManager,
 				error,
-				"New session preparation failed and its manager persistence could not be discarded",
+				"New session preparation failed and its owned manager could not be closed",
 			);
 		}
 	}
@@ -1464,8 +1472,10 @@ export class AgentSessionRuntime {
 				const sessionManager = await SessionManager.create(this.cwd, sessionDir, {
 					parentSession: currentSessionRef,
 				});
+				let managerTransferred = false;
 				try {
 					this.assertStructuralOperationCurrent(operation);
+					managerTransferred = true;
 					const replacement = await this.replaceCurrentSession({
 						operation,
 						reason: "fork",
@@ -1485,10 +1495,11 @@ export class AgentSessionRuntime {
 					});
 					return { cancelled: false, seeded: replacement.seeded, selectedText };
 				} catch (error) {
-					return await closePreparedSessionManager(
+					if (managerTransferred) throw error;
+					return await closeOwnedSessionManager(
 						sessionManager,
 						error,
-						"Session fork failed and its prepared manager could not be closed",
+						"Session fork failed and its owned manager could not be closed",
 					);
 				}
 			}
@@ -1496,6 +1507,7 @@ export class AgentSessionRuntime {
 			await this.session.sessionManager.flush();
 			this.assertStructuralOperationCurrent(operation);
 			const sessionManager = await SessionManager.open(currentSessionRef);
+			let managerTransferred = false;
 			try {
 				this.assertStructuralOperationCurrent(operation);
 				const forkedSessionRef = await sessionManager.createBranchedSession(targetLeafId);
@@ -1504,6 +1516,7 @@ export class AgentSessionRuntime {
 					throw new Error("Failed to create forked session");
 				}
 				await sessionManager.flush();
+				managerTransferred = true;
 				const replacement = await this.replaceCurrentSession({
 					operation,
 					reason: "fork",
@@ -1523,10 +1536,11 @@ export class AgentSessionRuntime {
 				});
 				return { cancelled: false, seeded: replacement.seeded, selectedText };
 			} catch (error) {
-				return await closePreparedSessionManager(
+				if (managerTransferred) throw error;
+				return await closeOwnedSessionManager(
 					sessionManager,
 					error,
-					"Session fork failed and its prepared manager could not be closed",
+					"Session fork failed and its owned manager could not be closed",
 				);
 			}
 		}
@@ -1730,10 +1744,10 @@ export class AgentSessionRuntime {
 			assertCurrent();
 			return sessionManager;
 		} catch (error) {
-			return await discardPreparedSessionManager(
+			return await closeOwnedSessionManager(
 				sessionManager,
 				error,
-				"Session import failed and its manager persistence could not be discarded",
+				"Session import failed and its owned manager could not be closed",
 			);
 		}
 	}
@@ -1761,8 +1775,11 @@ export class AgentSessionRuntime {
 		const sessionManager = await this.createImportedSessionManager(resolvedPath, cwdOverride, () =>
 			this.assertStructuralOperationCurrent(operation),
 		);
+		const ownsSessionManager = sessionManager !== this.session.sessionManager;
+		let managerTransferred = false;
 		try {
 			assertSessionCwdExists(sessionManager, this.cwd);
+			managerTransferred = true;
 			await this.replaceCurrentSession({
 				operation,
 				reason: "resume",
@@ -1780,17 +1797,11 @@ export class AgentSessionRuntime {
 			});
 			return { cancelled: false };
 		} catch (error) {
-			if (sessionManager === this.session.sessionManager) {
-				return await closePreparedSessionManager(
-					sessionManager,
-					error,
-					"Session import failed and its installed manager could not be closed",
-				);
-			}
-			return await discardPreparedSessionManager(
+			if (managerTransferred || !ownsSessionManager) throw error;
+			return await closeOwnedSessionManager(
 				sessionManager,
 				error,
-				"Session import failed and its manager persistence could not be discarded",
+				"Session import failed and its owned manager could not be closed",
 			);
 		}
 	}
@@ -1872,24 +1883,42 @@ export async function createAgentSessionRuntime(
 		assertSessionCwdExists(options.sessionManager, options.cwd);
 		result = await createRuntime(options);
 	} catch (error) {
+		return await closeOwnedSessionManager(
+			options.sessionManager,
+			error,
+			"Agent session runtime creation failed and its manager could not be closed",
+		);
+	}
+	try {
+		return new AgentSessionRuntime(
+			result.session,
+			result.services,
+			createRuntime,
+			result.diagnostics,
+			result.modelFallbackMessage,
+			options.subagentContext,
+		);
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
 		try {
-			await options.sessionManager.closePersistence();
-		} catch (closeError) {
+			await result.session.disposeSubagentToolManager();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
+		try {
+			result.session.dispose("disposal");
+			await result.session.waitForClosed();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
+		if (cleanupErrors.length > 0) {
 			throw new AggregateError(
-				[error, closeError],
-				"Agent session runtime creation failed and its manager could not be closed",
+				[error, ...cleanupErrors],
+				"Agent session runtime construction failed and its session could not be disposed",
 			);
 		}
 		throw error;
 	}
-	return new AgentSessionRuntime(
-		result.session,
-		result.services,
-		createRuntime,
-		result.diagnostics,
-		result.modelFallbackMessage,
-		options.subagentContext,
-	);
 }
 
 export {

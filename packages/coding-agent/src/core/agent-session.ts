@@ -2163,7 +2163,7 @@ export class AgentSession {
 		let subagentDrain: Promise<void>;
 		let mcpDrain: Promise<void>;
 		try {
-			subagentDrain = this._subagentToolManager?.dispose?.() ?? Promise.resolve();
+			subagentDrain = this.disposeSubagentToolManager();
 		} catch (error) {
 			subagentDrain = Promise.reject(error);
 		}
@@ -2223,8 +2223,14 @@ export class AgentSession {
 		cleanupSessionResources(this.sessionId);
 
 		const results = await Promise.allSettled([persistenceDrain, subagentDrain, mcpDrain, settingsDrain]);
-		const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-		if (rejected) throw rejected.reason;
+		const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+		if (rejected.length === 1) throw rejected[0].reason;
+		if (rejected.length > 1) {
+			throw new AggregateError(
+				rejected.map((result) => result.reason),
+				"Agent session cleanup did not complete",
+			);
+		}
 	}
 
 	private _fenceExtensionGeneration(): void {
@@ -2622,7 +2628,9 @@ export class AgentSession {
 	}
 
 	async disposeSubagentToolManager(): Promise<void> {
-		await this._subagentToolManager?.dispose?.();
+		const manager = this._subagentToolManager;
+		this._subagentToolManager = undefined;
+		await manager?.dispose?.();
 	}
 
 	getMcpManager(): McpManager | undefined {

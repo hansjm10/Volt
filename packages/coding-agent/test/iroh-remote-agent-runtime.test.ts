@@ -414,7 +414,7 @@ export default function (volt) {
 		}
 	});
 
-	it("discards a newly created remote session when cwd validation fails", async () => {
+	it("retains a newly created remote session when cwd validation fails", async () => {
 		const sessionDir = join(agentDir, "sessions", "remote-workspace");
 		mkdirSync(sessionDir, { recursive: true });
 		const setupError = new Error("injected cwd validation failure");
@@ -431,11 +431,14 @@ export default function (volt) {
 			}),
 		).rejects.toBe(setupError);
 
-		expect(await SessionManager.findForResume(sessionDir, "failed-created")).toBeUndefined();
-		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual([]);
+		const failedRef = await SessionManager.findForResume(sessionDir, "failed-created");
+		expect(failedRef).toBeDefined();
+		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual([
+			expect.objectContaining({ id: "failed-created", ref: failedRef }),
+		]);
 	});
 
-	it("discards a created-after-missing remote session when cwd validation fails", async () => {
+	it("retains a created-after-missing remote session when cwd validation fails", async () => {
 		const sessionDir = join(agentDir, "sessions", "remote-workspace");
 		mkdirSync(sessionDir, { recursive: true });
 		const setupError = new Error("injected cwd validation failure");
@@ -452,7 +455,10 @@ export default function (volt) {
 			}),
 		).rejects.toBe(setupError);
 
-		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual([]);
+		const retained = await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true });
+		expect(retained).toHaveLength(1);
+		expect(retained[0]?.id).not.toBe("missing-session");
+		expect(retained[0]?.ref.sessionId).toBe(retained[0]?.id);
 	});
 
 	it("preserves a resumed remote session when cwd validation fails", async () => {
@@ -483,7 +489,7 @@ export default function (volt) {
 		}
 	});
 
-	it("discards a newly created remote session after runtime diagnostics fail", async () => {
+	it("retains a newly created remote session after runtime diagnostics fail", async () => {
 		writeRuntimeConfig({});
 		writeBrokenProviderExtension();
 		const sessionDir = join(agentDir, "sessions", "remote-workspace");
@@ -499,10 +505,10 @@ export default function (volt) {
 		expect(error).toBeInstanceOf(Error);
 		if (!(error instanceof Error)) throw new Error("expected runtime diagnostics to reject");
 		expect(error.message).toContain("broken-provider");
-		expect(await SessionManager.findForResume(sessionDir, "failed-diagnostics")).toBeUndefined();
+		expect(await SessionManager.findForResume(sessionDir, "failed-diagnostics")).toBeDefined();
 	});
 
-	it("discards a newly created remote session even when runtime disposal fails", async () => {
+	it("retains a newly created remote session even when runtime disposal fails", async () => {
 		writeRuntimeConfig({});
 		writeBrokenProviderExtension();
 		const sessionDir = join(agentDir, "sessions", "remote-workspace");
@@ -537,10 +543,10 @@ export default function (volt) {
 		if (!(primaryError instanceof Error)) throw new Error("expected the primary runtime diagnostics error");
 		expect(primaryError.message).toContain("broken-provider");
 		expect(thrown.message).toBe(primaryError.message);
-		expect(await SessionManager.findForResume(sessionDir, "failed-disposal")).toBeUndefined();
+		expect(await SessionManager.findForResume(sessionDir, "failed-disposal")).toBeDefined();
 	});
 
-	it("preserves remote failure metadata when cleanup also fails", async () => {
+	it("preserves remote failure metadata when manager close also fails", async () => {
 		const sessionDir = join(agentDir, "sessions", "remote-workspace");
 		mkdirSync(sessionDir, { recursive: true });
 		const setupError = Object.assign(new Error("stored session working directory is unavailable"), {
@@ -549,14 +555,14 @@ export default function (volt) {
 			sessionId: "failed-metadata",
 			workspace: "volt",
 		});
-		const cleanupError = new Error("injected discard failure");
-		const discardPersistence = SessionManager.prototype.discardPersistence;
-		const discardSpy = vi
-			.spyOn(SessionManager.prototype, "discardPersistence")
-			.mockImplementationOnce(async function (this: SessionManager): Promise<void> {
-				await discardPersistence.call(this);
-				throw cleanupError;
-			});
+		const cleanupError = new Error("injected close failure");
+		const closePersistence = SessionManager.prototype.closePersistence;
+		const closeSpy = vi.spyOn(SessionManager.prototype, "closePersistence").mockImplementationOnce(async function (
+			this: SessionManager,
+		): Promise<void> {
+			await closePersistence.call(this);
+			throw cleanupError;
+		});
 
 		let thrown: unknown;
 		try {
@@ -570,7 +576,7 @@ export default function (volt) {
 				},
 			}).catch((error: unknown) => error);
 		} finally {
-			discardSpy.mockRestore();
+			closeSpy.mockRestore();
 		}
 
 		expect(thrown).toBeInstanceOf(AggregateError);
@@ -583,7 +589,7 @@ export default function (volt) {
 			sessionId: "failed-metadata",
 			workspace: "volt",
 		});
-		expect(await SessionManager.findForResume(sessionDir, "failed-metadata")).toBeUndefined();
+		expect(await SessionManager.findForResume(sessionDir, "failed-metadata")).toBeDefined();
 	});
 
 	it("loads a requested remote session without dispatching recovery before attach ownership", async () => {
