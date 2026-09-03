@@ -16,8 +16,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
+import * as fc from "fast-check";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createClientInputSemanticDigest } from "../../src/core/session-manager.ts";
+import { createClientInputSemanticDigest, type SessionInfo } from "../../src/core/session-manager.ts";
 import {
 	acquireSharedSQLiteSessionStore,
 	digestSessionStoreTransactionPayload,
@@ -33,6 +34,7 @@ import {
 	type SQLiteSessionStoreLease,
 } from "../../src/core/session-store/index.ts";
 import { SESSION_STORE_SCHEMA_SQL } from "../../src/core/session-store/schema.ts";
+import { matchSession, parseSearchQuery } from "../../src/modes/interactive/components/session-selector-search.ts";
 import type { OpenStoreChildRequest, OpenStoreChildResponse } from "./open-store-child.ts";
 
 const CREATED_AT = "2026-08-31T12:00:00.000Z";
@@ -1015,6 +1017,67 @@ describe("SQLite session store", () => {
 		expect(await ids("re:hello\\s+sqlite")).toEqual(["matching"]);
 		expect(await ids("hello absent")).toEqual([]);
 		expect(await ids("re:[")).toEqual([]);
+	});
+
+	it("matches generated deep-search queries with the established matcher and ranking", async () => {
+		const client = await openStore();
+		const documents = [
+			{ id: "alpha", name: "First", chunks: ["hello", "sqlite world"], updatedAt: "2026-08-31T12:01:00.000Z" },
+			{ id: "beta", name: "Second", chunks: ["fuzzy matching", "node cve"], updatedAt: "2026-08-31T12:02:00.000Z" },
+			{ id: "gamma", name: undefined, chunks: ["HELLO", "other text"], updatedAt: "2026-08-31T12:03:00.000Z" },
+		];
+		for (const document of documents) {
+			await client.createHiddenSession(createInput(document.id));
+			const payload = {
+				...emptyPayload({
+					updatedAt: document.updatedAt,
+					visible: true,
+					name: document.name ?? null,
+				}),
+				searchChunks: document.chunks.map((text, chunkIndex) => ({ chunkIndex, entryId: null, text })),
+			};
+			await client.applyTransaction(transaction(document.id, 0, `commit-${document.id}`, payload));
+		}
+		const sessions: SessionInfo[] = documents.map((document) => ({
+			ref: {
+				sessionDirectory: "/sessions",
+				storeId: "store",
+				sessionId: document.id,
+				sessionGeneration: generationFor(document.id),
+			},
+			id: document.id,
+			cwd: "/workspace/project",
+			...(document.name === undefined ? {} : { name: document.name }),
+			created: new Date(CREATED_AT),
+			modified: new Date(document.updatedAt),
+			messageCount: 0,
+			firstMessage: document.chunks.join(" "),
+		}));
+		const queryCharacters = fc.constantFrom(...'abcdefghijklmnopqrstuvwxyz0123456789 "[]()+*?.^-$\\'.split(""));
+		const query = fc.oneof(
+			fc.array(queryCharacters, { maxLength: 24 }).map((characters) => characters.join("")),
+			fc.array(queryCharacters, { maxLength: 18 }).map((characters) => `re:${characters.join("")}`),
+			fc.constantFrom('"hello sqlite"', "hellosqlite", "node cve", "re:hello\\s+sqlite", '"node cve"'),
+		);
+
+		await fc.assert(
+			fc.asyncProperty(query, async (value) => {
+				const parsed = parseSearchQuery(value);
+				const expected = sessions
+					.map((session) => ({ session, match: matchSession(session, parsed) }))
+					.filter(({ match }) => match.matches)
+					.sort((left, right) =>
+						left.match.score !== right.match.score
+							? left.match.score - right.match.score
+							: right.session.modified.getTime() - left.session.modified.getTime(),
+					);
+				const actual = await client.searchSessionSummaries(value);
+				expect(actual.map(({ summary, score }) => ({ id: summary.id, score }))).toEqual(
+					expected.map(({ session, match }) => ({ id: session.id, score: match.score })),
+				);
+			}),
+			{ seed: 329_004, numRuns: 50 },
+		);
 	});
 
 	it("ranks deep-text matches by score and modified-date ties", async () => {

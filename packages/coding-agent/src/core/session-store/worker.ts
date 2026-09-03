@@ -665,6 +665,11 @@ function matchSearchText(text: string, parsed: ParsedSearchQuery): { matches: bo
 	return { matches: true, score };
 }
 
+/**
+ * Deep search preserves the established matcher while retaining chunks for at
+ * most one session document. Latency still scales with searchable bytes and
+ * query complexity; JavaScript RegExp execution has no general time bound.
+ */
 function searchSessions(query: string, includeHidden: boolean, cwd: string | null): SessionStoreSearchResult[] {
 	const db = requireDatabase();
 	return withDeferredReadTransaction(db, () => {
@@ -672,36 +677,16 @@ function searchSessions(query: string, includeHidden: boolean, cwd: string | nul
 		const parsed = parseSearchQuery(query);
 		if (parsed.invalid || sessions.length === 0) return [];
 
-		let chunkRows: Record<string, unknown>[];
-		if (cwd === null) {
-			chunkRows = db
-				.prepare(
-					`SELECT search_chunks.session_id AS sessionId, search_chunks.text
-				FROM search_chunks
-				JOIN sessions ON sessions.id = search_chunks.session_id
-				WHERE (? = 1 OR sessions.visible = 1)
-				ORDER BY search_chunks.session_id, search_chunks.chunk_index`,
-				)
-				.all(includeHidden ? 1 : 0);
-		} else {
-			const statement = db.prepare(
-				`SELECT session_id AS sessionId, text
-				FROM search_chunks
-				WHERE session_id = ?
-				ORDER BY chunk_index`,
-			);
-			chunkRows = sessions.flatMap((session) => statement.all(session.id));
-		}
-		const chunksBySession = new Map<string, string[]>();
-		for (const row of chunkRows) {
-			const sessionId = sqlString(row, "sessionId");
-			const chunks = chunksBySession.get(sessionId) ?? [];
-			chunks.push(sqlString(row, "text"));
-			chunksBySession.set(sessionId, chunks);
-		}
+		const chunksForSession = db.prepare(
+			`SELECT text FROM search_chunks
+			WHERE session_id = ?
+			ORDER BY chunk_index`,
+		);
 		const results: SessionStoreSearchResult[] = [];
 		for (const session of sessions) {
-			const extractedText = (chunksBySession.get(session.id) ?? []).join(" ");
+			const chunks: string[] = [];
+			for (const row of chunksForSession.iterate(session.id)) chunks.push(sqlString(row, "text"));
+			const extractedText = chunks.join(" ");
 			const match = matchSearchText(`${session.id} ${session.name ?? ""} ${extractedText} ${session.cwd}`, parsed);
 			if (match.matches) results.push({ summary: session, score: match.score });
 		}

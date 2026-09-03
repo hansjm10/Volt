@@ -311,6 +311,19 @@ async function createAgentSessionUnchecked(
 		await resourceLoader.reload();
 		time("resourceLoader.reload");
 	}
+	const extensionsResult = resourceLoader.getExtensions();
+	const pendingProviderRegistrations = extensionsResult.runtime.pendingProviderRegistrations;
+	extensionsResult.runtime.pendingProviderRegistrations = [];
+	for (const { name, config, extensionPath } of pendingProviderRegistrations) {
+		try {
+			modelRegistry.registerProvider(name, config);
+		} catch (error) {
+			extensionsResult.errors.push({
+				path: extensionPath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
 
 	// Check if session has existing branch state to restore, including message-free durable policy.
 	let existingSession = sessionManager.buildSessionContext();
@@ -536,7 +549,6 @@ async function createAgentSessionUnchecked(
 	const ownsGitContextProvider = options.gitContextProvider === undefined;
 	if (ownsGitContextProvider) void gitContextProvider.refresh();
 	try {
-		const extensionsResult = resourceLoader.getExtensions();
 		const session = new AgentSession({
 			sessionManager,
 			...(model === undefined ? {} : { model }),

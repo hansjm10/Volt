@@ -79,7 +79,7 @@ Configure delivery in [Settings](settings.md) with `steeringMode` and `followUpM
 
 ## Sessions
 
-Sessions are saved automatically in a per-workspace `sessions.sqlite` database under `~/.volt/agent/sessions/`. A custom session directory contains its own authoritative database. Live sessions are addressed by stable IDs, and listing, search, resume, and RPC discovery use SQLite indexes.
+Sessions are saved automatically in a per-workspace `sessions.sqlite` database under `~/.volt/agent/sessions/`. A custom session directory contains its own authoritative database. Live sessions are addressed by stable IDs. Listing, exact-ID resolution, continuation candidate selection, and RPC discovery use materialized SQLite summaries without reading transcript payloads. Deep search scans extracted searchable text one session at a time, so its cost still grows with searchable history and query complexity.
 
 ```bash
 volt -c                  # Continue most recent session

@@ -1,6 +1,6 @@
 # RFC: SQLite Session Storage Merge Contract
 
-- Status: Accepted; implementation in progress
+- Status: Accepted; implemented
 - Date: 2026-09-03
 - Pull request: [#329](https://github.com/volt-hq/Volt/pull/329)
 - Issue: [#328](https://github.com/volt-hq/Volt/issues/328)

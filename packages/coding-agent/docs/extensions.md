@@ -1174,7 +1174,7 @@ if (result.cancelled) {
 Options:
 - `withSession`: run post-switch work against a fresh replacement-session context. Do not use captured old `volt` / command `ctx`; see [Session replacement lifecycle and footguns](#session-replacement-lifecycle-and-footguns).
 
-`SessionManager.list()`, `search()`, and `listAll()` query SQLite indexes and return `SessionInfo` objects whose `ref` field can be passed directly to `ctx.switchSession()`:
+`SessionManager.list()` and `listAll()` read materialized SQLite summaries; `search()` scans extracted searchable text one session at a time. All return `SessionInfo` objects whose `ref` field can be passed directly to `ctx.switchSession()`:
 
 ```typescript
 import { SessionManager } from "@hansjm10/volt-coding-agent";

@@ -133,7 +133,7 @@ describe("createAgentSession session manager defaults", () => {
 		).toEqual([expect.objectContaining({ ref: sessionRef, name: "reopened after failed setup" })]);
 	});
 
-	it("disposes factory-created resources when construction fails before session transfer", async () => {
+	it("does not create later construction resources when extension setup fails", async () => {
 		const setupError = new Error("injected extension result failure");
 		const resourceLoader = createTestResourceLoader();
 		vi.spyOn(resourceLoader, "getExtensions").mockImplementation(() => {
@@ -145,7 +145,7 @@ describe("createAgentSession session manager defaults", () => {
 			createAgentSession({ cwd, agentDir, resourceLoader, disableMcp: true, noTools: "all" }),
 		).rejects.toBe(setupError);
 
-		expect(disposeGitContext).toHaveBeenCalledOnce();
+		expect(disposeGitContext).not.toHaveBeenCalled();
 	});
 
 	it("preserves setup and cleanup errors when default manager close fails", async () => {

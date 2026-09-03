@@ -22,7 +22,7 @@ Default storage is organized by workspace:
 
 A directory passed through `--session-dir`, `VOLT_CODING_AGENT_SESSION_DIR`, or the SDK instead contains its own `sessions.sqlite`. SQLite may keep active `sessions.sqlite-wal` and `sessions.sqlite-shm` sidecars beside it. The directory is owner-only (`0700`), and the database and sidecars are owner-readable/writable only (`0600`). Treat all three SQLite files as one live store.
 
-Listing, search, resume, tree loading, and RPC session discovery use SQLite indexes rather than scanning live JSONL files.
+Listing, exact-ID resolution, continuation candidate selection, and RPC session discovery use materialized SQLite summaries rather than scanning canonical entries or JSONL. Tree loading opens and verifies one selected session. Deep search scans extracted searchable chunks one session at a time; those chunks are not a full-text index.
 
 ## JSONL Snapshots
 
@@ -436,12 +436,12 @@ Use references returned by `getSessionRef()`, `SessionInfo.ref`, or another `Ses
 - `await SessionManager.exportJsonlSnapshot(ref, outputPath)` - Export one JSONL snapshot.
 - `await SessionManager.delete(ref)` - Delete a persisted session.
 
-### Indexed Discovery
+### Summary Discovery and Deep Search
 
-- `await SessionManager.list(cwd, sessionDir?, onProgress?, options?)` - List sessions for a workspace or custom store.
-- `await SessionManager.search(cwd, query, sessionDir?, options?)` - Search indexed session text for a workspace or custom store.
-- `await SessionManager.listAll(...)` - List sessions across known workspace stores, or within one custom store.
-- `await SessionManager.searchAll(query, sessionDir?)` - Search across known workspace stores, or within one custom store.
+- `await SessionManager.list(cwd, sessionDir?, onProgress?, options?)` - List materialized session summaries for a workspace or custom store.
+- `await SessionManager.search(cwd, query, sessionDir?, options?)` - Scan extracted searchable text for a workspace or custom store.
+- `await SessionManager.listAll(...)` - List summaries across known workspace stores, or within one custom store.
+- `await SessionManager.searchAll(query, sessionDir?)` - Scan extracted searchable text across known workspace stores, or within one custom store.
 - `await SessionManager.findForResume(sessionDir, sessionId)` - Resolve an exact ID to a checked reference.
 
 `SessionInfo` includes `ref`, `id`, `cwd`, timestamps, message count, first message, optional name, and optional `parentSessionRef`.

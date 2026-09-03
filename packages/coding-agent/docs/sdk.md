@@ -875,7 +875,8 @@ if (modelFallbackMessage) {
   console.log("Note:", modelFallbackMessage);
 }
 
-// Indexed listing and search return SessionInfo objects with stable refs
+// Summary-only listing and deep search return SessionInfo objects with stable refs.
+// Search scans extracted searchable text one session at a time.
 const currentProjectSessions = await SessionManager.list(process.cwd());
 const matchingSessions = await SessionManager.search(process.cwd(), "authentication");
 const allSessions = await SessionManager.listAll();

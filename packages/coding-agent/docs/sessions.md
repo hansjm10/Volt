@@ -19,6 +19,8 @@ Use `/session` in interactive mode to see the current store directory, session I
 
 JSONL is not live storage. It is used only for explicit snapshot import and export; passing a path to `--session` or `--fork` imports a current `snapshotVersion: 1` snapshot into SQLite.
 
+Session listing, exact-ID resolution, continuation candidate selection, and remote discovery read materialized summaries without loading transcript entries. Picker search is a deep scan over extracted user, assistant, and displayed custom-message text. It processes one session document at a time, but latency still grows with searchable history and query complexity; JavaScript regex searches have no general runtime bound.
+
 For storage, snapshots, and the `SessionManager` API, see [Session Format](session-format.md).
 
 ## Session Commands

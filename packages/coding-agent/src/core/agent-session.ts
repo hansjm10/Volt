@@ -5204,9 +5204,9 @@ export class AgentSession {
 	 * and assemble the CompactionResult.
 	 *
 	 * When continuation context is requested, auto-compaction supplies the rebuilt
-	 * projection to Harness. Overflow recovery also removes its trailing assistant
-	 * error message before the retry so it is
-	 * excluded from both the retained context and estimatedTokensAfter.
+	 * projection to Harness. Overflow recovery removes its trailing assistant
+	 * error before retry, and length continuation removes the tool-free truncated
+	 * assistant turn, so neither stale terminal is replayed into the next request.
 	 */
 	private async _finalizeCompaction(
 		summary: string,
@@ -5214,7 +5214,7 @@ export class AgentSession {
 		tokensBefore: number,
 		details: JsonValue | undefined,
 		fromExtension: boolean,
-		continuation?: { dropTrailingErrorMessage: boolean },
+		continuation?: { dropTrailingErrorMessage: boolean; dropTrailingLengthMessage?: boolean },
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<CompactionResult> {
 		assertConversationGenerationCurrent?.();
@@ -5222,16 +5222,19 @@ export class AgentSession {
 		const sessionContext = this.sessionManager.buildSessionContext();
 		const projectMessages = (source: readonly AgentMessage[]): AgentMessage[] => {
 			const messages = [...source];
-			if (!continuation?.dropTrailingErrorMessage) return messages;
+			if (!continuation?.dropTrailingErrorMessage && continuation?.dropTrailingLengthMessage !== true)
+				return messages;
 			const lastIndex =
 				messages.at(-1)?.role === "custom" &&
 				(messages.at(-1) as CustomMessage).customType === PLAN_CHECKPOINT_CUSTOM_TYPE
 					? messages.length - 2
 					: messages.length - 1;
 			const candidate = messages[lastIndex];
-			return candidate?.role === "assistant" && (candidate as AssistantMessage).stopReason === "error"
-				? [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)]
-				: messages;
+			const stopReason = candidate?.role === "assistant" ? (candidate as AssistantMessage).stopReason : undefined;
+			const shouldDrop =
+				(continuation.dropTrailingErrorMessage && stopReason === "error") ||
+				(continuation.dropTrailingLengthMessage === true && stopReason === "length");
+			return shouldDrop ? [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)] : messages;
 		};
 		const messages = projectMessages(sessionContext.messages);
 		if (continuation || this._harness.hasQueuedMessages()) {
@@ -5787,7 +5790,12 @@ export class AgentSession {
 				tokensBefore,
 				details,
 				fromExtension,
-				willRetry || continueAfterCompaction ? { dropTrailingErrorMessage: willRetry } : undefined,
+				willRetry || continueAfterCompaction
+					? {
+							dropTrailingErrorMessage: willRetry,
+							dropTrailingLengthMessage: continueAfterCompaction,
+						}
+					: undefined,
 				assertConversationCurrent,
 			);
 			this._emit({
