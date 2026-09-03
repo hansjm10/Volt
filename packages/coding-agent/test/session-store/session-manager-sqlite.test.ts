@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,6 +11,7 @@ import {
 	type SQLiteSessionStoreLease,
 } from "../../src/core/session-store/index.ts";
 import { createHarness } from "../suite/harness.ts";
+import { createDirectorySymlinkSync } from "../symlink-utils.ts";
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -125,6 +126,39 @@ describe("SQLite-backed SessionManager", () => {
 			kind: "blocked",
 			blocker: { clientMessageId: "started-recovery", state: "started" },
 		});
+	});
+
+	it("matches custom-store sessions across equivalent cwd symlink or junction aliases", async (context) => {
+		const { root, cwd, sessionDir } = fixture();
+		const cwdAlias = join(root, "workspace-alias");
+		try {
+			createDirectorySymlinkSync(cwd, cwdAlias);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EPERM") {
+				context.skip("directory symlink or junction creation is not permitted");
+				return;
+			}
+			throw error;
+		}
+		expect(realpathSync(cwdAlias)).toBe(realpathSync(cwd));
+
+		const manager = await own(SessionManager.create(cwdAlias, sessionDir, { id: "filesystem-alias" }));
+		manager.appendMessage({ role: "user", content: "filesystem-alias-needle", timestamp: Date.now() });
+		await manager.flush();
+		expect(manager.getCwd()).toBe(cwdAlias);
+
+		const listed = await SessionManager.list(cwd, sessionDir);
+		const searched = await SessionManager.search(cwd, "filesystem-alias-needle", sessionDir);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+
+		expect(listed).toMatchObject([{ id: "filesystem-alias", cwd: cwdAlias }]);
+		expect(searched).toMatchObject([{ id: "filesystem-alias", cwd: cwdAlias }]);
+		expect(continued.getSessionRef()).toEqual(manager.getSessionRef());
+		expect(
+			(await SessionManager.listAll(sessionDir, undefined, { includeMessageFreeDurable: true })).map(
+				(session) => session.id,
+			),
+		).toEqual(["filesystem-alias"]);
 	});
 
 	it("publishes absolute custom session directories that survive caller cwd changes", async () => {

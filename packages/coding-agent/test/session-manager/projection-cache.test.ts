@@ -183,14 +183,31 @@ describe("SessionManager projection cache", () => {
 		});
 	});
 
-	it("derives forked and imported projections from their copied entries", async () => {
+	it("derives forked and imported projections and preserves labels when branching immediately", async () => {
 		const { root, cwd, sessionDir } = fixture();
 		const source = await SessionManager.create(cwd, sessionDir, { id: "projection-source" });
 		source.appendMessage(assistantMessage("fallback", BASE_TIME + 2_000));
-		source.appendMessage({ role: "user", content: "first user", timestamp: BASE_TIME + 1_000 });
+		const labeledMessageId = source.appendMessage({
+			role: "user",
+			content: "first user",
+			timestamp: BASE_TIME + 1_000,
+		});
+		const labelEntryId = source.appendLabelChange(labeledMessageId, "checkpoint");
+		const labelTimestamp = source.getEntry(labelEntryId)?.timestamp;
+		if (!labelTimestamp) throw new Error("Expected source label timestamp");
 		await source.flush();
 		const sourceRef = source.getSessionRef();
 		if (!sourceRef) throw new Error("Expected source session reference");
+		const expectProjectedLabel = (manager: SessionManager): void => {
+			expect(manager.getLabel(labeledMessageId)).toBe("checkpoint");
+			const pending = [...manager.getTree()];
+			let node = pending.shift();
+			while (node && node.entry.id !== labeledMessageId) {
+				pending.push(...node.children);
+				node = pending.shift();
+			}
+			expect(node).toMatchObject({ label: "checkpoint", labelTimestamp });
+		};
 
 		const forkCwd = join(root, "fork-workspace");
 		const forkSessionDir = join(root, "fork-sessions");
@@ -203,6 +220,11 @@ describe("SessionManager projection cache", () => {
 			messageCount: 2,
 			modified: new Date(BASE_TIME + 2_000),
 		});
+		expectProjectedLabel(forked);
+		const forkBranchRef = await forked.createBranchedSession(labeledMessageId);
+		if (!forkBranchRef) throw new Error("Expected fork branch session reference");
+		expectProjectedLabel(forked);
+		expectProjectedLabel(await SessionManager.open(forkBranchRef));
 
 		const snapshotPath = join(root, "projection-source.jsonl");
 		await SessionManager.exportJsonlSnapshot(sourceRef, snapshotPath);
@@ -217,6 +239,11 @@ describe("SessionManager projection cache", () => {
 			messageCount: 2,
 			modified: new Date(BASE_TIME + 2_000),
 		});
+		expectProjectedLabel(imported);
+		const importBranchRef = await imported.createBranchedSession(labeledMessageId);
+		if (!importBranchRef) throw new Error("Expected import branch session reference");
+		expectProjectedLabel(imported);
+		expectProjectedLabel(await SessionManager.open(importBranchRef));
 	});
 
 	it("does not filter historical file entries for direct or canonical transaction payloads", async () => {
@@ -251,7 +278,10 @@ describe("SessionManager projection cache", () => {
 	it("restores cached projection metadata after a proven atomic rollback", async () => {
 		const { cwd, sessionDir } = fixture();
 		const manager = await SessionManager.create(cwd, sessionDir, { id: "projection-rollback" });
-		manager.appendCustomMessageEntry("baseline", "baseline fallback", true, undefined, BASE_TIME);
+		const baselineId = manager.appendCustomMessageEntry("baseline", "baseline fallback", true, undefined, BASE_TIME);
+		const baselineLabelId = manager.appendLabelChange(baselineId, "baseline label");
+		const baselineLabelTimestamp = manager.getEntry(baselineLabelId)?.timestamp;
+		if (!baselineLabelTimestamp) throw new Error("Expected baseline label timestamp");
 		await manager.flush();
 
 		const faultLease = await acquireSharedSQLiteSessionStore(sessionDir);
@@ -273,6 +303,7 @@ describe("SessionManager projection cache", () => {
 					},
 					{ kind: "append", entry: { type: "planning_state_change", planning: { mode: "plan", plan: null } } },
 					{ kind: "append", entry: { type: "session_info", name: "Rolled back" } },
+					{ kind: "append", entry: { type: "label", targetId: baselineId, label: "rolled back" } },
 				],
 			}),
 		).rejects.toMatchObject({ effect: "rolled_back", authority: "available" });
@@ -287,6 +318,11 @@ describe("SessionManager projection cache", () => {
 		});
 		expect(manager.getSessionName()).toBeUndefined();
 		expect(manager.buildSessionContext().planning).toEqual({ mode: "build", plan: null });
+		expect(manager.getLabel(baselineId)).toBe("baseline label");
+		expect(manager.getTree()[0]).toMatchObject({
+			label: "baseline label",
+			labelTimestamp: baselineLabelTimestamp,
+		});
 
 		const committedProjection = manager.issueCanonicalProjection();
 		await manager.commitCanonicalCommand({

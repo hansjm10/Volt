@@ -636,6 +636,60 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.session.sessionRef).toEqual(originalSessionRef);
 	});
 
+	it.each([
+		{
+			name: "Fast mode",
+			importedId: "invalid-fast-mode-import",
+			entry: { type: "fast_mode_change", id: "invalid-fast", enabled: "yes" },
+			error: "Fast mode entry invalid-fast has an invalid enabled state",
+		},
+		{
+			name: "thinking-level",
+			importedId: "invalid-thinking-level-import",
+			entry: { type: "thinking_level_change", id: "invalid-thinking", thinkingLevel: "turbo" },
+			error: "Thinking level entry invalid-thinking has an invalid thinking level",
+		},
+	])(
+		"rejects a malformed $name import without replacing or poisoning the current session",
+		async ({ importedId, entry, error }) => {
+			const { runtime, tempDir } = await createRuntimeForTest(() => {});
+			runtime.session.setThinkingLevel("high", { persistDefault: false });
+			runtime.session.setFastModeEnabled(true);
+			await runtime.session.sessionManager.flush();
+			const currentSessionRef = runtime.session.sessionRef;
+			if (!currentSessionRef) throw new Error("Expected current persisted session reference");
+			const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+			const sessionDir = runtime.session.sessionManager.getSessionDir();
+			writeSessionSnapshot(snapshotPath, tempDir, importedId, [
+				{
+					...entry,
+					parentId: null,
+					ordinal: 1,
+					timestamp: SNAPSHOT_TIMESTAMP,
+				},
+			]);
+
+			await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(error);
+
+			expect(runtime.session.sessionRef).toEqual(currentSessionRef);
+			expect(runtime.session.thinkingLevel).toBe("high");
+			expect(runtime.session.fastModeEnabled).toBe(true);
+			const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+				includeMessageFreeDurable: true,
+			});
+			expect(sessions.some((session) => session.id === importedId)).toBe(false);
+			const reopened = await SessionManager.open(currentSessionRef);
+			try {
+				expect(reopened.buildSessionContext()).toMatchObject({
+					thinkingLevel: "high",
+					fastMode: { enabled: true },
+				});
+			} finally {
+				await reopened.closePersistence();
+			}
+		},
+	);
+
 	it("discards a persisted import when snapshot replay fails", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
 		const importedId = "failed-replay-import";

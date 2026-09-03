@@ -365,6 +365,64 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		});
 	});
 
+	it("keeps flush and drain pending until an atomic transaction settles", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "volt-issue-217-atomic-drain-"));
+		tempDirs.push(tempDir);
+		const manager = await own(SessionManager.create(tempDir, join(tempDir, "sessions")));
+		const store = await trackedStore(manager.getSessionDir());
+		const applyTransaction = store.applyTransaction.bind(store);
+		const transactionStarted = deferred();
+		const releaseTransaction = deferred();
+		let intercepted = false;
+		vi.spyOn(store, "applyTransaction").mockImplementation(async (input) => {
+			if (intercepted || !input.payload.entries.some((entry) => entry.type === "planning_state_change")) {
+				return applyTransaction(input);
+			}
+			intercepted = true;
+			transactionStarted.resolve();
+			await releaseTransaction.promise;
+			return applyTransaction(input);
+		});
+
+		const committing = commitPlanningState(manager, "plan");
+		await transactionStarted.promise;
+		const flushing = manager.flush();
+		const draining = manager.drainPersistence();
+		let flushSettled = false;
+		let drainSettled = false;
+		void flushing.then(
+			() => {
+				flushSettled = true;
+			},
+			() => {
+				flushSettled = true;
+			},
+		);
+		void draining.then(
+			() => {
+				drainSettled = true;
+			},
+			() => {
+				drainSettled = true;
+			},
+		);
+
+		try {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(flushSettled).toBe(false);
+			expect(drainSettled).toBe(false);
+			releaseTransaction.resolve();
+			await expect(Promise.all([committing, flushing, draining])).resolves.toEqual([
+				undefined,
+				undefined,
+				{ status: "closed" },
+			]);
+		} finally {
+			releaseTransaction.resolve();
+			await Promise.allSettled([committing, flushing, draining]);
+		}
+	});
+
 	it("retains delivery and client-input ownership when the transaction is proven rolled back", async () => {
 		const { harness, sessionRef, baseline } = await setup();
 		harness.setResponses([fauxAssistantMessage("must remain unused")]);

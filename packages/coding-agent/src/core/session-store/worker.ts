@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
 import { resolve } from "node:path";
-import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
+import { canonicalizePath, resolvePath } from "../../utils/paths.ts";
 import {
 	ensurePrivateDirectorySync,
 	hardenPrivateRegularFileSync,
@@ -507,27 +508,25 @@ function createSession(input: SessionStoreCreateSessionInput): SessionStoreSessi
 	});
 }
 
+function canonicalCwdIdentity(cwd: string): string {
+	return canonicalizePath(resolvePath(cwd));
+}
+
+function sessionCwdMatches(summary: SessionStoreSessionSummary, canonicalCwd: string | null): boolean {
+	return canonicalCwd === null || canonicalCwdIdentity(summary.cwd) === canonicalCwd;
+}
+
 function listSessions(includeHidden: boolean, cwd: string | null): SessionStoreSessionSummary[] {
-	const db = requireDatabase();
-	let statement: StatementSync;
-	let rows: Record<string, unknown>[];
-	if (cwd === null) {
-		statement = db.prepare(
-			`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE (? = 1 OR visible = 1) ORDER BY updated_at DESC, id`,
-		);
-		rows = statement.all(includeHidden ? 1 : 0);
-	} else {
-		statement = db.prepare(
-			`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE cwd = ? AND (? = 1 OR visible = 1) ORDER BY updated_at DESC, id`,
-		);
-		rows = statement.all(cwd, includeHidden ? 1 : 0);
-	}
-	return rows.map(summaryFromRow);
+	const rows = requireDatabase()
+		.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE (? = 1 OR visible = 1) ORDER BY updated_at DESC, id`)
+		.all(includeHidden ? 1 : 0);
+	const canonicalCwd = cwd === null ? null : canonicalCwdIdentity(cwd);
+	return rows.map(summaryFromRow).filter((summary) => sessionCwdMatches(summary, canonicalCwd));
 }
 
 function findContinuationSession(cwd: string | null): SessionStoreSessionSummary | null {
 	const db = requireDatabase();
-	const cwdClause = cwd === null ? "" : "WHERE cwd = ?";
+	const limitClause = cwd === null ? "LIMIT 1" : "";
 	const statement = db.prepare(
 		`WITH continuation_candidates AS (
 			SELECT
@@ -551,7 +550,6 @@ function findContinuationSession(cwd: string | null): SessionStoreSessionSummary
 					LIMIT 1
 				) AS pendingInputAt
 			FROM sessions
-			${cwdClause}
 		)
 		SELECT *
 		FROM continuation_candidates
@@ -562,10 +560,14 @@ function findContinuationSession(cwd: string | null): SessionStoreSessionSummary
 				ELSE updatedAt
 			END DESC,
 			id
-		LIMIT 1`,
+		${limitClause}`,
 	);
-	const row = cwd === null ? statement.get() : statement.get(cwd);
-	return row ? summaryFromRow(row) : null;
+	const canonicalCwd = cwd === null ? null : canonicalCwdIdentity(cwd);
+	for (const row of statement.iterate()) {
+		const summary = summaryFromRow(row);
+		if (sessionCwdMatches(summary, canonicalCwd)) return summary;
+	}
+	return null;
 }
 
 interface ParsedSearchQuery {
@@ -669,15 +671,13 @@ function searchSessions(query: string, includeHidden: boolean, cwd: string | nul
 				)
 				.all(includeHidden ? 1 : 0);
 		} else {
-			chunkRows = db
-				.prepare(
-					`SELECT search_chunks.session_id AS sessionId, search_chunks.text
+			const statement = db.prepare(
+				`SELECT session_id AS sessionId, text
 				FROM search_chunks
-				JOIN sessions ON sessions.id = search_chunks.session_id
-				WHERE sessions.cwd = ? AND (? = 1 OR sessions.visible = 1)
-				ORDER BY search_chunks.session_id, search_chunks.chunk_index`,
-				)
-				.all(cwd, includeHidden ? 1 : 0);
+				WHERE session_id = ?
+				ORDER BY chunk_index`,
+			);
+			chunkRows = sessions.flatMap((session) => statement.all(session.id));
 		}
 		const chunksBySession = new Map<string, string[]>();
 		for (const row of chunkRows) {

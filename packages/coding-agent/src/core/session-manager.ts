@@ -26,6 +26,7 @@ import {
 } from "./messages.ts";
 import { clonePlanningState, DEFAULT_PLANNING_STATE, type PlanningState, parsePlanningState } from "./planning.ts";
 import { RpcGitContextSchema } from "./rpc/schema/git-context.ts";
+import { RpcThinkingLevelSchema } from "./rpc/schema/primitives.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
 import {
 	RPC_CLIENT_MESSAGE_ID_MAX_CHARS,
@@ -859,6 +860,15 @@ export type SessionBranchListener = (change: SessionBranchChange) => void;
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
 
+function assertValidSessionModeEntry(entry: FileEntry): void {
+	if (entry.type === "thinking_level_change" && !Check(RpcThinkingLevelSchema, entry.thinkingLevel)) {
+		throw new Error(`Thinking level entry ${entry.id} has an invalid thinking level`);
+	}
+	if (entry.type === "fast_mode_change" && typeof entry.enabled !== "boolean") {
+		throw new Error(`Fast mode entry ${entry.id} has an invalid enabled state`);
+	}
+}
+
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeNode {
 	entry: SessionEntry;
@@ -1405,6 +1415,7 @@ export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnaps
 		if (entry.parentId !== null && (typeof entry.parentId !== "string" || !seenEntryIds.has(entry.parentId))) {
 			throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
 		}
+		assertValidSessionModeEntry(entry);
 		if (entry.type === "leaf") {
 			if (sawLeaf || index !== entries.length - 1) {
 				throw new Error("Session snapshot leaf must be the final entry");
@@ -1800,9 +1811,7 @@ export class SessionManager {
 				throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
 			}
 			seenEntryIds.add(entry.id);
-			if (entry.type === "fast_mode_change" && typeof entry.enabled !== "boolean") {
-				throw new Error(`Fast mode entry ${entry.id} has an invalid enabled state`);
-			}
+			assertValidSessionModeEntry(entry);
 			if (isClientInputWalEntry(entry)) {
 				if (!Number.isSafeInteger(entry.ordinal) || (entry.ordinal ?? 0) <= lastWalOrdinal) {
 					throw new Error(`Client input WAL entry ${entry.id} has an invalid commit ordinal`);
@@ -1834,20 +1843,26 @@ export class SessionManager {
 				this.leafId = entry.id;
 			}
 			this._indexClientInputEntry(entry);
+			this._indexLabelEntry(entry);
 			accumulateSessionStoreProjection(this.sessionStoreProjection, entry);
-			if (entry.type === "label") {
-				if (entry.label) {
-					this.labelsById.set(entry.targetId, entry.label);
-					this.labelTimestampsById.set(entry.targetId, entry.timestamp);
-				} else {
-					this.labelsById.delete(entry.targetId);
-					this.labelTimestampsById.delete(entry.targetId);
-				}
-			}
 		}
 	}
 
-	private _enqueuePersistence(write: () => Promise<void>): void {
+	private _indexLabelEntry(entry: SessionEntry): void {
+		if (entry.type !== "label") return;
+		if (entry.label) {
+			this.labelsById.set(entry.targetId, entry.label);
+			this.labelTimestampsById.set(entry.targetId, entry.timestamp);
+		} else {
+			this.labelsById.delete(entry.targetId);
+			this.labelTimestampsById.delete(entry.targetId);
+		}
+	}
+
+	private _enqueuePersistence(
+		write: () => Promise<void>,
+		failureHandling: "fail_stop" | "propagate" = "fail_stop",
+	): Promise<void> {
 		this.unsettledPersistenceTasks++;
 		const task = this.persistenceQueue
 			.then(async () => {
@@ -1855,6 +1870,7 @@ export class SessionManager {
 				try {
 					await write();
 				} catch (error) {
+					if (failureHandling === "propagate") throw error;
 					this.persistenceError ??= error instanceof Error ? error : new Error(String(error));
 					throw this.persistenceError;
 				}
@@ -1868,6 +1884,7 @@ export class SessionManager {
 		this.persistenceQueue = task.catch(() => {});
 		this.persistenceWatermark = task;
 		void task.catch(() => {});
+		return task;
 	}
 
 	isPersisted(): boolean {
@@ -2172,6 +2189,7 @@ export class SessionManager {
 			this.leafId = canonicalEntry.id;
 		}
 		this._indexClientInputEntry(canonicalEntry);
+		this._indexLabelEntry(canonicalEntry);
 		accumulateSessionStoreProjection(this.sessionStoreProjection, canonicalEntry);
 		if (!this.atomicAppendEntries) this._persist(canonicalEntry);
 		if (this.atomicAppendEntries) {
@@ -2430,7 +2448,9 @@ export class SessionManager {
 		restore();
 
 		try {
-			if (payload) await this._commitStorePayload(payload);
+			if (payload) {
+				await this._enqueuePersistence(() => this._commitStorePayload(payload), "propagate");
+			}
 		} catch (error) {
 			this.atomicAppendInFlight = false;
 			const failure =
@@ -3395,13 +3415,6 @@ export class SessionManager {
 			...(label === undefined ? {} : { label }),
 		};
 		this._appendEntry(entry);
-		if (label) {
-			this.labelsById.set(targetId, label);
-			this.labelTimestampsById.set(targetId, entry.timestamp);
-		} else {
-			this.labelsById.delete(targetId);
-			this.labelTimestampsById.delete(targetId);
-		}
 		return entry.id;
 	}
 
@@ -3701,8 +3714,6 @@ export class SessionManager {
 						label,
 					};
 					this._appendEntry(labelEntry);
-					this.labelsById.set(targetId, label);
-					this.labelTimestampsById.set(targetId, timestamp);
 					labelParentId = labelEntry.id;
 				}
 			},

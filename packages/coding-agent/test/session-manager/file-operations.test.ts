@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ThinkingLevel } from "@hansjm10/volt-agent-core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	CURRENT_SESSION_SNAPSHOT_VERSION,
@@ -180,6 +181,97 @@ describe("JSONL snapshot import parsing", () => {
 		expect(await SessionManager.list(tempDir, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual(
 			[],
 		);
+	});
+
+	it.each([
+		{
+			name: "Fast mode",
+			id: "invalid-fast-mode",
+			entry: { type: "fast_mode_change", id: "invalid-fast", enabled: "yes" },
+			error: "Fast mode entry invalid-fast has an invalid enabled state",
+		},
+		{
+			name: "thinking-level",
+			id: "invalid-thinking-level",
+			entry: { type: "thinking_level_change", id: "invalid-thinking", thinkingLevel: "turbo" },
+			error: "Thinking level entry invalid-thinking has an invalid thinking level",
+		},
+	])("rejects a malformed $name import without retaining a hidden row", async ({ id, entry, error }) => {
+		const path = join(tempDir, `${id}.jsonl`);
+		writeFileSync(
+			path,
+			`${[
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+					id,
+					timestamp: "2025-01-01T00:00:00.000Z",
+					cwd: tempDir,
+				},
+				{
+					...entry,
+					parentId: null,
+					ordinal: 1,
+					timestamp: "2025-01-01T00:00:01.000Z",
+				},
+			]
+				.map((snapshotEntry) => JSON.stringify(snapshotEntry))
+				.join("\n")}\n`,
+		);
+		const sessionDir = join(tempDir, `${id}-store`);
+
+		await expect(SessionManager.importFromJsonl(path, tempDir, sessionDir)).rejects.toThrow(error);
+		expect(await SessionManager.list(tempDir, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual(
+			[],
+		);
+	});
+
+	it("imports and reopens every valid thinking level with valid Fast mode state", async () => {
+		const path = join(tempDir, "valid-modes.jsonl");
+		const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] satisfies ThinkingLevel[];
+		const modeEntries: Record<string, unknown>[] = thinkingLevels.map((thinkingLevel, index) => ({
+			type: "thinking_level_change",
+			id: `thinking-${index}`,
+			parentId: index === 0 ? null : `thinking-${index - 1}`,
+			ordinal: index + 1,
+			timestamp: "2025-01-01T00:00:01.000Z",
+			thinkingLevel,
+		}));
+		modeEntries.push({
+			type: "fast_mode_change",
+			id: "fast-enabled",
+			parentId: `thinking-${thinkingLevels.length - 1}`,
+			ordinal: thinkingLevels.length + 1,
+			timestamp: "2025-01-01T00:00:02.000Z",
+			enabled: true,
+		});
+		writeFileSync(
+			path,
+			`${[
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+					id: "valid-modes",
+					timestamp: "2025-01-01T00:00:00.000Z",
+					cwd: tempDir,
+				},
+				...modeEntries,
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		const sessionDir = join(tempDir, "valid-modes-store");
+
+		const imported = await SessionManager.importFromJsonl(path, tempDir, sessionDir);
+		expect(imported.buildSessionContext()).toMatchObject({ thinkingLevel: "max", fastMode: { enabled: true } });
+		const ref = imported.getSessionRef();
+		if (!ref) throw new Error("Expected imported session reference");
+		expect((await SessionManager.open(ref)).buildSessionContext()).toMatchObject({
+			thinkingLevel: "max",
+			fastMode: { enabled: true },
+		});
 	});
 
 	it("imports a snapshot into SQLite and never treats the source as live storage", async () => {
