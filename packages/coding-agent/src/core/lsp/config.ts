@@ -12,7 +12,7 @@ export type LspSeverity = "error" | "warning" | "information" | "hint";
 
 /** One language server definition. User entries merge over built-in defaults by name. */
 export interface LspServerSettings {
-	/** Server launch command, argv-style (e.g. ["typescript-language-server", "--stdio"]) */
+	/** Server launch command, argv-style (e.g. ["tsc", "--lsp", "--stdio"]) */
 	command?: string[];
 	/** File extensions routed to this server (e.g. [".ts", ".tsx"]) */
 	fileExtensions?: string[];
@@ -90,7 +90,7 @@ const DEFAULT_LSP_SERVERS: Record<
 	Required<Pick<LspServerSettings, "command" | "fileExtensions" | "rootMarkers">>
 > = {
 	typescript: {
-		command: ["typescript-language-server", "--stdio"],
+		command: ["tsc", "--lsp", "--stdio"],
 		fileExtensions: [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
 		rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json"],
 	},
@@ -137,10 +137,10 @@ const DEFAULT_LSP_SERVERS: Record<
  * matching built-in server entries, not arbitrary custom server definitions.
  */
 const INSTALL_RECIPES: Record<string, Omit<LspInstallRecipe, "binary">> = {
-	"typescript-language-server": {
-		command: ["npm", "install", "-g", "typescript-language-server", "typescript"],
-		displayCommand: "npm install -g typescript-language-server typescript",
-		installHint: "Install with: npm install -g typescript-language-server typescript",
+	tsc: {
+		command: ["npm", "install", "-g", "typescript@7.0.2"],
+		displayCommand: "npm install -g typescript@7.0.2",
+		installHint: "Install with: npm install -g typescript@7.0.2",
 	},
 	"pyright-langserver": {
 		command: ["npm", "install", "-g", "pyright"],
