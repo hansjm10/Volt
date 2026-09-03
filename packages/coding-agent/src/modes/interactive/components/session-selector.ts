@@ -364,6 +364,11 @@ class SessionList implements Component, Focusable {
 		this.filterSessions(this.searchInput.getValue());
 	}
 
+	removeSession(sessionRef: SessionReference): void {
+		this.allSessions = this.allSessions.filter((session) => !sessionRefsEqual(session.ref, sessionRef));
+		this.filterSessions(this.searchInput.getValue());
+	}
+
 	private filterSessions(query: string): void {
 		const trimmed = query.trim();
 		const nameFiltered =
@@ -674,6 +679,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	private renameSession?: (sessionRef: SessionReference, currentName: string | undefined) => Promise<void>;
 	private currentLoading = false;
 	private allLoading = false;
+	private currentLoadSeq = 0;
 	private allLoadSeq = 0;
 	private searchLoadSeq = 0;
 	private searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -814,7 +820,11 @@ export class SessionSelectorComponent extends Container implements Focusable {
 					this.allSessions = this.allSessions.filter((session) => !sessionRefsEqual(session.ref, sessionRef));
 				}
 				const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
-				this.sessionList.setSessions(sessions, this.scope === "all");
+				if (this.sessionList.getSearchQuery().trim()) {
+					this.sessionList.removeSession(sessionRef);
+				} else {
+					this.sessionList.setSessions(sessions, this.scope === "all");
+				}
 				this.header.setStatusMessage(
 					{ type: "info", message: movedToTrash ? "Session snapshot moved to trash" : "Session deleted" },
 					2000,
@@ -938,14 +948,14 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.allLoading = true;
 		}
 
-		const seq = scope === "all" ? ++this.allLoadSeq : undefined;
+		const seq = scope === "all" ? ++this.allLoadSeq : ++this.currentLoadSeq;
+		const isLatestLoad = () => (scope === "all" ? seq === this.allLoadSeq : seq === this.currentLoadSeq);
 		this.header.setScope(scope);
 		this.header.setLoading(true);
 		this.requestRender();
 
 		const onProgress = (loaded: number, total: number) => {
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
+			if (scope !== this.scope || !isLatestLoad()) return;
 			this.header.setProgress(loaded, total);
 			this.requestRender();
 		};
@@ -955,6 +965,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				? this.currentSessionsLoader(onProgress)
 				: this.allSessionsLoader(onProgress));
 
+			if (!isLatestLoad()) return;
 			if (scope === "current") {
 				this.currentSessions = sessions;
 				this.currentLoading = false;
@@ -963,21 +974,20 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				this.allLoading = false;
 			}
 
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
+			if (scope !== this.scope || this.sessionList.getSearchQuery().trim()) return;
 
 			this.header.setLoading(false);
 			this.sessionList.setSessions(sessions, showCwd);
 			this.requestRender();
 		} catch (err) {
+			if (!isLatestLoad()) return;
 			if (scope === "current") {
 				this.currentLoading = false;
 			} else {
 				this.allLoading = false;
 			}
 
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
+			if (scope !== this.scope || this.sessionList.getSearchQuery().trim()) return;
 
 			const message = err instanceof Error ? err.message : String(err);
 			this.header.setLoading(false);
@@ -1007,6 +1017,15 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 	private async refreshSessionsAfterMutation(): Promise<void> {
 		await this.loadScope(this.scope, "refresh");
+
+		const query = this.sessionList.getSearchQuery();
+		if (!query.trim()) return;
+		if (this.searchTimer) {
+			clearTimeout(this.searchTimer);
+			this.searchTimer = undefined;
+		}
+		const seq = ++this.searchLoadSeq;
+		await this.loadSearch(query, seq);
 	}
 
 	private toggleScope(): void {

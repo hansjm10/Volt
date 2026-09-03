@@ -2,9 +2,9 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@hansjm10/volt-tui";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
-import type { SessionInfo, SessionReference } from "../src/core/session-manager.ts";
+import { type SessionInfo, SessionManager, type SessionReference } from "../src/core/session-manager.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
 import { createDirectorySymlinkSync } from "./symlink-utils.ts";
@@ -29,6 +29,13 @@ async function flushPromises(): Promise<void> {
 	await new Promise<void>((resolve) => {
 		setImmediate(resolve);
 	});
+}
+
+async function waitForDebouncedSearch(): Promise<void> {
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 175);
+	});
+	await flushPromises();
 }
 
 function stripAnsi(text: string): string {
@@ -180,6 +187,104 @@ describe("session selector path/delete interactions", () => {
 		list.handleInput("\r");
 		expect(confirmationChanges).toEqual([refKey(sessions[0]!), null]);
 		expect(deletedRef).toEqual(sessions[0]!.ref);
+	});
+
+	it("preserves and refreshes active deep-search results while deleting", async () => {
+		const sessionDirectory = mkdtempSync(join(tmpdir(), "volt-session-selector-delete-"));
+		tempDirs.push(sessionDirectory);
+		const target = makeSession({
+			id: "target",
+			name: "Delete Me",
+			ref: {
+				sessionDirectory,
+				storeId: "store",
+				sessionGeneration: "generation-target",
+				sessionId: "target",
+			},
+			modified: new Date("2026-01-01T00:00:00.000Z"),
+			firstMessage: "summary without the query",
+		});
+		const remaining = makeSession({
+			id: "remaining",
+			name: "Remaining Deep Match",
+			ref: {
+				sessionDirectory,
+				storeId: "store",
+				sessionGeneration: "generation-remaining",
+				sessionId: "remaining",
+			},
+			modified: new Date("2026-01-02T00:00:00.000Z"),
+			firstMessage: "another summary without the query",
+		});
+		const shallow = makeSession({
+			id: "shallow",
+			name: "Shallow Summary Match",
+			ref: {
+				sessionDirectory,
+				storeId: "store",
+				sessionGeneration: "generation-shallow",
+				sessionId: "shallow",
+			},
+			modified: new Date("2026-01-03T00:00:00.000Z"),
+			firstMessage: "deepterm",
+		});
+		const refreshLoad = createDeferred<SessionInfo[]>();
+		let unqueriedLoadCalls = 0;
+		let searchCalls = 0;
+		let deleted = false;
+		const selector = new SessionSelectorComponent(
+			async (_onProgress, query) => {
+				if (query) {
+					searchCalls++;
+					return deleted ? [remaining] : [target, remaining];
+				}
+				unqueriedLoadCalls++;
+				return unqueriedLoadCalls === 1 ? [target, remaining, shallow] : refreshLoad.promise;
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		for (const character of "deepterm") list.handleInput(character);
+		await waitForDebouncedSearch();
+		expect(searchCalls).toBe(1);
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("target");
+
+		const exportSnapshot = vi.spyOn(SessionManager, "exportJsonlSnapshot").mockResolvedValue({ revision: 1 });
+		const deleteSession = vi.spyOn(SessionManager, "delete").mockImplementation(async () => {
+			deleted = true;
+			return true;
+		});
+		try {
+			const deleteSelected = list.onDeleteSession;
+			expect(deleteSelected).toBeDefined();
+			const deletion = deleteSelected!(target.ref);
+			await flushPromises();
+
+			let output = selector.render(120).lines.join("\n");
+			expect(output).not.toContain("Delete Me");
+			expect(output).toContain("Remaining Deep Match");
+			expect(output).not.toContain("Shallow Summary Match");
+
+			refreshLoad.resolve([remaining, shallow]);
+			await deletion;
+
+			expect(searchCalls).toBe(2);
+			expect(list.getSearchQuery()).toBe("deepterm");
+			expect(list.getSelectedSessionRef()?.sessionId).toBe("remaining");
+			output = selector.render(120).lines.join("\n");
+			expect(output).toContain("Remaining Deep Match");
+			expect(output).not.toContain("Shallow Summary Match");
+		} finally {
+			exportSnapshot.mockRestore();
+			deleteSession.mockRestore();
+		}
 	});
 
 	it("does not switch scope back to All when All load resolves after toggling back to Current", async () => {

@@ -1410,17 +1410,46 @@ export class SubagentManager {
 	): Promise<SubagentHandle> {
 		const cwd = options.cwd ?? this.cwd;
 		const agentDir = options.agentDir ?? this.agentDir;
-		const sessionManager = options.sessionManager ?? (await this.createDefaultChildSessionManager(cwd));
-		const id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
 		if (!delegation) {
 			throw new Error("Subagent delegation scope is required");
 		}
+		let createdSessionManager: SessionManager | undefined;
+		let sessionManager: SessionManager;
+		if (options.sessionManager) {
+			sessionManager = options.sessionManager;
+		} else {
+			createdSessionManager = await this.createDefaultChildSessionManager(cwd);
+			sessionManager = createdSessionManager;
+		}
+		let published = false;
+		const discardUnpublishedCreatedSessionManager = async (): Promise<void> => {
+			const manager = createdSessionManager;
+			if (published || !manager?.isPersisted()) return;
+			await manager.discardPersistence();
+		};
+		const rethrowAfterDiscard = async (error: unknown): Promise<never> => {
+			try {
+				await discardUnpublishedCreatedSessionManager();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"Subagent startup failed and its newly created session persistence could not be discarded",
+				);
+			}
+			throw error;
+		};
+		const id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
 		const subagentContext = this.createChildSubagentContext(
 			id,
 			definitionOptions?.definition,
 			delegation.scopeLease.scope,
 		);
-		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
+		let runtime: AgentSessionRuntime;
+		try {
+			runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
+		} catch (error) {
+			return await rethrowAfterDiscard(error);
+		}
 		let abortRequested = false;
 		const markRunAbortRequested = (): void => {
 			if (abortRequested) return;
@@ -1536,7 +1565,6 @@ export class SubagentManager {
 		let client: InProcessRpcClient | undefined;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;
-		let published = false;
 		const rollbackRuntimeRegistration = (): Promise<void> => {
 			if (published) return Promise.resolve();
 			if (!rollbackRuntimeRegistrationPromise) {
@@ -1622,6 +1650,7 @@ export class SubagentManager {
 				onDispose: async () => {
 					teardownBudgetWiring();
 					await rollbackRuntimeRegistration();
+					await discardUnpublishedCreatedSessionManager();
 				},
 				waitForIdle: async () => {
 					await runtime.session.waitForIdle();
@@ -1655,7 +1684,7 @@ export class SubagentManager {
 			await client?.stop().catch(() => undefined);
 			await rollbackRuntimeRegistration();
 			await runtime.dispose().catch(() => undefined);
-			throw error;
+			return await rethrowAfterDiscard(error);
 		}
 	}
 

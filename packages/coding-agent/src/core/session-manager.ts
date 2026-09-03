@@ -1406,6 +1406,7 @@ export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnaps
 
 	let sawLeaf = false;
 	const seenEntryIds = new Set<string>();
+	const parentIdsByEntryId = new Map<string, string | null>();
 	for (let index = 1; index < entries.length; index++) {
 		const entry = entries[index]!;
 		if (entry.type === "session") throw new Error("Session snapshot contains more than one header");
@@ -1416,6 +1417,15 @@ export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnaps
 			throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
 		}
 		assertValidSessionModeEntry(entry);
+		if (entry.type === "compaction") {
+			let branchEntryId = entry.parentId;
+			while (branchEntryId !== null && branchEntryId !== entry.firstKeptEntryId) {
+				branchEntryId = parentIdsByEntryId.get(branchEntryId) ?? null;
+			}
+			if (typeof entry.firstKeptEntryId !== "string" || branchEntryId !== entry.firstKeptEntryId) {
+				throw new Error(`Compaction entry ${entry.id} has an invalid first-kept boundary`);
+			}
+		}
 		if (entry.type === "leaf") {
 			if (sawLeaf || index !== entries.length - 1) {
 				throw new Error("Session snapshot leaf must be the final entry");
@@ -1433,6 +1443,7 @@ export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnaps
 			}
 		}
 		seenEntryIds.add(entry.id);
+		parentIdsByEntryId.set(entry.id, entry.parentId);
 	}
 	return header as unknown as SessionSnapshotHeader;
 }

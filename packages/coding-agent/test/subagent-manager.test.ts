@@ -305,6 +305,44 @@ describe("SubagentManager", () => {
 		);
 	});
 
+	it("discards an unpublished persisted child when startup fails after creation", async () => {
+		const parentRoot = join(
+			tmpdir(),
+			`subagent-manager-failed-start-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(parentRoot, { recursive: true });
+		cleanups.push(() => {
+			if (existsSync(parentRoot)) {
+				rmSync(parentRoot, { recursive: true, force: true });
+			}
+		});
+		const parentSessionManager = await SessionManager.create(parentRoot, join(parentRoot, "sessions"));
+		cleanups.push(() => parentSessionManager.closePersistence());
+		const startupError = new Error("injected post-creation startup failure");
+		let childSessionRef: SubagentRuntimeCreatedEvent["parentSessionRef"];
+		let childCwd: string | undefined;
+		const { manager } = await createTestManager({
+			parentSessionManager,
+			onRuntimeCreated: (event) => {
+				childSessionRef = event.runtime.session.sessionManager.getSessionRef();
+				childCwd = event.runtime.session.sessionManager.getCwd();
+				throw startupError;
+			},
+		});
+
+		await expect(manager.start()).rejects.toBe(startupError);
+		if (!childSessionRef || !childCwd) throw new Error("expected the failed child session identity");
+
+		await expect(SessionManager.open(childSessionRef)).rejects.toThrow(
+			`Session not found: ${childSessionRef.sessionId}`,
+		);
+		expect(
+			await SessionManager.list(childCwd, childSessionRef.sessionDirectory, undefined, {
+				includeMessageFreeDurable: true,
+			}),
+		).toEqual([]);
+	});
+
 	it("emits runtime-created metadata and can retain child runtimes after loopback dispose", async () => {
 		const events: SubagentRuntimeCreatedEvent[] = [];
 		const { manager, getDisposedSessionCount } = await createTestManager({

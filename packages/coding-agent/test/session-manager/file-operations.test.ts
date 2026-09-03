@@ -185,6 +185,86 @@ describe("JSONL snapshot import parsing", () => {
 
 	it.each([
 		{
+			name: "missing",
+			id: "missing-compaction-boundary",
+			firstKeptEntryId: "missing",
+		},
+		{
+			name: "outside the active branch",
+			id: "branched-compaction-boundary",
+			firstKeptEntryId: "sibling",
+		},
+	])("rejects a compaction boundary that is $name during direct JSONL import", async ({ id, firstKeptEntryId }) => {
+		const path = join(tempDir, `${id}.jsonl`);
+		writeFileSync(
+			path,
+			`${[
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+					id,
+					timestamp: "2025-01-01T00:00:00.000Z",
+					cwd: tempDir,
+				},
+				{
+					type: "message",
+					id: "root",
+					parentId: null,
+					ordinal: 1,
+					timestamp: "2025-01-01T00:00:01.000Z",
+					message: { role: "user", content: "root", timestamp: Date.parse("2025-01-01T00:00:01.000Z") },
+				},
+				{
+					type: "message",
+					id: "active",
+					parentId: "root",
+					ordinal: 2,
+					timestamp: "2025-01-01T00:00:02.000Z",
+					message: { role: "user", content: "active", timestamp: Date.parse("2025-01-01T00:00:02.000Z") },
+				},
+				{
+					type: "message",
+					id: "sibling",
+					parentId: "root",
+					ordinal: 3,
+					timestamp: "2025-01-01T00:00:03.000Z",
+					message: { role: "user", content: "sibling", timestamp: Date.parse("2025-01-01T00:00:03.000Z") },
+				},
+				{
+					type: "compaction",
+					id: "compaction",
+					parentId: "active",
+					ordinal: 4,
+					timestamp: "2025-01-01T00:00:04.000Z",
+					summary: "summary",
+					firstKeptEntryId,
+					tokensBefore: 100,
+				},
+				{
+					type: "leaf",
+					id: "leaf",
+					parentId: "compaction",
+					ordinal: 5,
+					timestamp: "2025-01-01T00:00:05.000Z",
+					targetId: "compaction",
+				},
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		const sessionDir = join(tempDir, `${id}-store`);
+
+		await expect(SessionManager.importFromJsonl(path, tempDir, sessionDir)).rejects.toThrow(
+			"Compaction entry compaction has an invalid first-kept boundary",
+		);
+		expect(await SessionManager.list(tempDir, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual(
+			[],
+		);
+	});
+
+	it.each([
+		{
 			name: "Fast mode",
 			id: "invalid-fast-mode",
 			entry: { type: "fast_mode_change", id: "invalid-fast", enabled: "yes" },

@@ -11,6 +11,13 @@ async function flushPromises(): Promise<void> {
 	});
 }
 
+async function waitForDebouncedSearch(): Promise<void> {
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 175);
+	});
+	await flushPromises();
+}
+
 function makeSession(overrides: Partial<SessionInfo> & { id: string }): SessionInfo {
 	return {
 		ref: overrides.ref ?? {
@@ -78,6 +85,63 @@ describe("session selector rename", () => {
 		const output = selector.render(120).lines.join("\n");
 		expect(output).not.toContain("ctrl+r");
 		expect(output).not.toContain("rename");
+	});
+
+	it("reruns an active deep search after rename refresh", async () => {
+		const target = makeSession({
+			id: "target",
+			name: "Old",
+			modified: new Date("2026-01-01T00:00:00.000Z"),
+			firstMessage: "summary without the query",
+		});
+		const second = makeSession({
+			id: "second",
+			name: "Second Deep Match",
+			modified: new Date("2026-01-02T00:00:00.000Z"),
+			firstMessage: "another summary without the query",
+		});
+		let renamedName = target.name;
+		let searchCalls = 0;
+		const renameSession = vi.fn(async (_sessionRef: SessionInfo["ref"], nextName: string | undefined) => {
+			renamedName = nextName;
+		});
+		const keybindings = new KeybindingsManager();
+		const selector = new SessionSelectorComponent(
+			async (_onProgress, query) => {
+				if (query) {
+					searchCalls++;
+					return [{ ...target, name: renamedName }, second];
+				}
+				return [{ ...target, name: renamedName }, second];
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ renameSession, showRenameHint: true, keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		for (const character of "deepterm") list.handleInput(character);
+		await waitForDebouncedSearch();
+		expect(searchCalls).toBe(1);
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("target");
+
+		list.handleInput(CTRL_R);
+		selector.handleInput("X");
+		selector.handleInput("\r");
+		await flushPromises();
+
+		expect(renameSession).toHaveBeenCalledWith(target.ref, "XOld");
+		expect(searchCalls).toBe(2);
+		expect(list.getSearchQuery()).toBe("deepterm");
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("target");
+		const output = selector.render(120).lines.join("\n");
+		expect(output).toContain("XOld");
+		expect(output).toContain("Second Deep Match");
+		expect(output.indexOf("XOld")).toBeLessThan(output.indexOf("Second Deep Match"));
 	});
 
 	it("enters rename mode on Ctrl+R and submits with Enter", async () => {

@@ -12,6 +12,13 @@ async function flushPromises(): Promise<void> {
 	});
 }
 
+async function waitForDebouncedSearch(): Promise<void> {
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 175);
+	});
+	await flushPromises();
+}
+
 function makeSession(overrides: Partial<SessionInfo> & { id: string; modified: Date }): SessionInfo {
 	return {
 		ref: overrides.ref ?? {
@@ -112,6 +119,69 @@ describe("session selector search", () => {
 			makeSession({ id: "a", modified: new Date("2026-01-01T00:00:00.000Z"), firstMessage: "brave" }),
 		];
 		expect(filterAndSortSessions(sessions, "re:(", "recent")).toEqual([]);
+	});
+
+	it("does not let the initial unqueried load overwrite active deep-search results", async () => {
+		let resolveInitialLoad: (sessions: SessionInfo[]) => void = () => {};
+		const initialLoad = new Promise<SessionInfo[]>((resolve) => {
+			resolveInitialLoad = resolve;
+		});
+		const rankedSearchResults = [
+			makeSession({
+				id: "best",
+				name: "Best Deep Match",
+				modified: new Date("2026-01-01T00:00:00.000Z"),
+				firstMessage: "summary without the query",
+			}),
+			makeSession({
+				id: "second",
+				name: "Second Deep Match",
+				modified: new Date("2026-01-02T00:00:00.000Z"),
+				firstMessage: "another summary without the query",
+			}),
+		];
+		let searchCalls = 0;
+		const keybindings = new KeybindingsManager();
+		setKeybindings(keybindings);
+		const selector = new SessionSelectorComponent(
+			async (_onProgress, query) => {
+				if (query) {
+					searchCalls++;
+					return rankedSearchResults;
+				}
+				return initialLoad;
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+
+		const list = selector.getSessionList();
+		for (const character of "deepterm") list.handleInput(character);
+		await waitForDebouncedSearch();
+
+		expect(searchCalls).toBe(1);
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("best");
+
+		resolveInitialLoad([
+			makeSession({
+				id: "shallow",
+				name: "Shallow Summary Match",
+				modified: new Date("2026-01-03T00:00:00.000Z"),
+				firstMessage: "deepterm",
+			}),
+		]);
+		await flushPromises();
+
+		const rendered = selector.render(120).lines.join("\n");
+		expect(list.getSelectedSessionRef()?.sessionId).toBe("best");
+		expect(rendered).toContain("Best Deep Match");
+		expect(rendered).toContain("Second Deep Match");
+		expect(rendered).not.toContain("Shallow Summary Match");
+		expect(rendered.indexOf("Best Deep Match")).toBeLessThan(rendered.indexOf("Second Deep Match"));
 	});
 
 	it("preserves worker relevance while toggling Recent without dropping deep matches", async () => {
