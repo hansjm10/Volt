@@ -4075,17 +4075,28 @@ export class SessionManager {
 			.filter((entry) => entry.isDirectory())
 			.map((entry) => join(sessionsRoot, entry.name));
 		const result: { session: SessionInfo; score: number }[] = [];
+		const storeFailures: unknown[] = [];
+		let successfulStores = 0;
 		for (const directory of directories) {
 			if (!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) continue;
-			result.push(
-				...(await SessionManager._scopedStore(directory, async (store) => {
+			let storeResults: { session: SessionInfo; score: number }[];
+			try {
+				storeResults = await SessionManager._scopedStore(directory, async (store) => {
 					const results = await store.searchSessionSummaries(query);
 					return results.map(({ summary, score }) => ({
 						session: sessionInfoFromStoreSummary(directory, store.info.storeId, summary),
 						score,
 					}));
-				})),
-			);
+				});
+			} catch (error) {
+				storeFailures.push(error);
+				continue;
+			}
+			successfulStores += 1;
+			result.push(...storeResults);
+		}
+		if (successfulStores === 0 && storeFailures.length > 0) {
+			throw new AggregateError(storeFailures, "Could not search sessions in any project store");
 		}
 		result.sort((left, right) => {
 			if (left.score !== right.score) return left.score - right.score;
@@ -4178,23 +4189,34 @@ export class SessionManager {
 			.filter((entry) => entry.isDirectory())
 			.map((entry) => join(sessionsRoot, entry.name));
 		const result: SessionInfo[] = [];
+		const storeFailures: unknown[] = [];
+		let successfulStores = 0;
 		let loaded = 0;
 		for (const directory of directories) {
-			if (!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) {
-				loaded += 1;
-				progress?.(loaded, directories.length);
-				continue;
-			}
-			result.push(
-				...(await SessionManager._scopedStore(directory, async (store) => {
-					const summaries = await store.listSessionSummaries({
-						includeHidden: listOptions?.includeMessageFreeDurable,
+			if (existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) {
+				let storeResults: SessionInfo[] | undefined;
+				try {
+					storeResults = await SessionManager._scopedStore(directory, async (store) => {
+						const summaries = await store.listSessionSummaries({
+							includeHidden: listOptions?.includeMessageFreeDurable,
+						});
+						return summaries.map((summary) =>
+							sessionInfoFromStoreSummary(directory, store.info.storeId, summary),
+						);
 					});
-					return summaries.map((summary) => sessionInfoFromStoreSummary(directory, store.info.storeId, summary));
-				})),
-			);
+				} catch (error) {
+					storeFailures.push(error);
+				}
+				if (storeResults) {
+					successfulStores += 1;
+					result.push(...storeResults);
+				}
+			}
 			loaded += 1;
 			progress?.(loaded, directories.length);
+		}
+		if (successfulStores === 0 && storeFailures.length > 0) {
+			throw new AggregateError(storeFailures, "Could not list sessions from any project store");
 		}
 		return result.sort((left, right) => right.modified.getTime() - left.modified.getTime());
 	}

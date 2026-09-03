@@ -7,6 +7,7 @@ import { CURRENT_SESSION_VERSION, SessionManager } from "../../src/core/session-
 import {
 	acquireSharedSQLiteSessionStore,
 	SESSION_STORE_DATABASE_FILENAME,
+	SESSION_STORE_SCHEMA_VERSION,
 	type SQLiteSessionStoreLease,
 } from "../../src/core/session-store/index.ts";
 import { createHarness } from "../suite/harness.ts";
@@ -28,6 +29,16 @@ function fixture(): { root: string; cwd: string; sessionDir: string } {
 	const sessionDir = join(root, "sessions");
 	mkdirSync(cwd, { recursive: true });
 	return { root, cwd, sessionDir };
+}
+
+function seedIncompatibleStore(sessionDirectory: string): void {
+	mkdirSync(sessionDirectory, { recursive: true });
+	const database = new DatabaseSync(join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME));
+	try {
+		database.exec(`PRAGMA user_version = ${SESSION_STORE_SCHEMA_VERSION + 1}`);
+	} finally {
+		database.close();
+	}
 }
 
 afterEach(async () => {
@@ -246,6 +257,62 @@ describe("SQLite-backed SessionManager", () => {
 		const matches = await SessionManager.searchAll('"rankneedle"');
 		expect(matches.map((session) => session.id)).toEqual(["rank-old", "rank-new"]);
 		expect(matches.map((session) => session.firstMessage)).toEqual(["summary a", "summary b"]);
+	});
+
+	it("isolates an incompatible store while preserving global list and search results", async () => {
+		const { root } = fixture();
+		const agentDir = join(root, "agent");
+		const olderCwd = join(root, "work-a");
+		const newerCwd = join(root, "work-b");
+		mkdirSync(olderCwd, { recursive: true });
+		mkdirSync(newerCwd, { recursive: true });
+		vi.stubEnv("VOLT_CODING_AGENT_DIR", agentDir);
+
+		const older = await own(SessionManager.create(olderCwd, undefined, { id: "isolation-old" }));
+		older.appendMessage({ role: "user", content: "summary a", timestamp: 1_700_000_000_000 });
+		older.appendMessage({ role: "user", content: "isolationneedle tail", timestamp: 1_700_000_000_001 });
+		await older.flush();
+
+		const newer = await own(SessionManager.create(newerCwd, undefined, { id: "isolation-new" }));
+		newer.appendMessage({ role: "user", content: "summary b", timestamp: 1_700_000_001_000 });
+		newer.appendMessage({ role: "user", content: "xxxx isolationneedle", timestamp: 1_700_000_001_001 });
+		await newer.flush();
+
+		const incompatibleStore = join(agentDir, "sessions", "incompatible");
+		seedIncompatibleStore(incompatibleStore);
+
+		const progress = vi.fn();
+		const listed = await SessionManager.listAll(progress);
+		expect(listed.map((session) => session.id)).toEqual(["isolation-new", "isolation-old"]);
+		expect(progress.mock.calls).toEqual([
+			[1, 3],
+			[2, 3],
+			[3, 3],
+		]);
+
+		const matches = await SessionManager.searchAll('"isolationneedle"');
+		expect(matches.map((session) => session.id)).toEqual(["isolation-old", "isolation-new"]);
+
+		await expect(SessionManager.listAll(incompatibleStore)).rejects.toMatchObject({
+			code: "store_schema_mismatch",
+		});
+		await expect(SessionManager.searchAll("isolationneedle", incompatibleStore)).rejects.toMatchObject({
+			code: "store_schema_mismatch",
+		});
+	});
+
+	it("rejects global enumeration when every database-bearing store fails", async () => {
+		const { root } = fixture();
+		const agentDir = join(root, "agent");
+		const sessionsRoot = join(agentDir, "sessions");
+		vi.stubEnv("VOLT_CODING_AGENT_DIR", agentDir);
+		seedIncompatibleStore(join(sessionsRoot, "incompatible"));
+		mkdirSync(join(sessionsRoot, "no-database"));
+
+		await expect(SessionManager.listAll()).rejects.toThrow("Could not list sessions from any project store");
+		await expect(SessionManager.searchAll("needle")).rejects.toThrow(
+			"Could not search sessions in any project store",
+		);
 	});
 
 	it("fails stale managers closed after delete and same-id recreation", async () => {
