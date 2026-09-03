@@ -23,6 +23,7 @@
 		"build": "cd packages/tui && npm run build && cd ../ai && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build",
 		"benchmark:streaming-markdown": "node --experimental-strip-types --conditions volt-source packages/coding-agent/benchmarks/streaming-markdown.ts",
 		"benchmark:memory": "node scripts/benchmark-coding-agent-memory.mjs",
+		"benchmark:node-runtime": "node scripts/benchmark-node-runtime.mjs",
 		"benchmark:swebench": "node scripts/benchmark-swebench.mjs",
 		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:changesets && npm run check:ts-imports && npm run check:coding-agent-source-exports && npm run check:source-launchers && npm run check:shrinkwrap && npm run check:rpc-contract && npm run check:release-security && tsc --noEmit && tsc --noEmit -p packages/tui/tsconfig.json && tsc --noEmit -p packages/agent/tsconfig.json && npm run check:browser-smoke",
 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
@@ -86,7 +87,7 @@
 		"typescript": "npm:@typescript/typescript6@6.0.2"
 	},
 	"engines": {
-		"node": ">=22.19.0"
+		"node": ">=26.0.0"
 	},
 	"version": "0.1.0",
 	"overrides": {

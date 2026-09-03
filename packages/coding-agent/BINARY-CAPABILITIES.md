@@ -1,7 +1,7 @@
 # Standalone Binary Capabilities
 
 The prebuilt executable is a local Volt CLI/TUI distribution built as a
-Node.js 22.23.1 Single Executable Application. It supports local interactive
+Node.js 26.8.1 Single Executable Application. It supports local interactive
 and print-mode agent sessions.
 
 It does **not** include the required `@hansjm10/volt-iroh` wrapper or any native

@@ -42,7 +42,7 @@
 				"volt": "dist/core/npm/cli.js"
 			},
 			"engines": {
-				"node": ">=22.19.0"
+				"node": ">=26.0.0"
 			}
 		},
 		"node_modules/@anthropic-ai/sdk": {
@@ -525,7 +525,7 @@
 				"yaml": "2.9.0"
 			},
 			"engines": {
-				"node": ">=22.19.0"
+				"node": ">=26.0.0"
 			}
 		},
 		"node_modules/@hansjm10/volt-ai": {
@@ -548,7 +548,7 @@
 				"volt-ai": "./dist/cli.js"
 			},
 			"engines": {
-				"node": ">=22.19.0"
+				"node": ">=26.0.0"
 			}
 		},
 		"node_modules/@hansjm10/volt-iroh": {
@@ -777,7 +777,7 @@
 				"marked": "18.0.5"
 			},
 			"engines": {
-				"node": ">=22.19.0"
+				"node": ">=26.0.0"
 			}
 		},
 		"node_modules/@hono/node-server": {

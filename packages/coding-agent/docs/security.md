@@ -40,7 +40,7 @@ Project trust is only an input-loading guard. It prevents a repository from sile
 
 ## Standalone Release Integrity
 
-Prebuilt Volt executables are Node.js 22.23.1 Single Executable Applications.
+Prebuilt Volt executables are Node.js 26.8.1 Single Executable Applications.
 Release builds verify a pinned official Node runtime archive, bundle Volt's
 JavaScript, and generate an exact esbuild metafile plus a checksum-linked npm
 license manifest. Each archive includes Volt's license, the consolidated Node

@@ -96,7 +96,7 @@ async function build() {
 		splitting: true,
 		platform: "node",
 		format: "esm",
-		target: "node22",
+		target: "node26",
 		tsconfigRaw: { compilerOptions: {} },
 		metafile: true,
 		logLevel: "info",

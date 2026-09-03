@@ -16,8 +16,8 @@ set -eu
 
 PACKAGE="@hansjm10/volt-coding-agent"
 REPO="volt-hq/Volt"
-MIN_NODE_MAJOR=22
-MIN_NODE_MINOR=19
+MIN_NODE_MAJOR=26
+MIN_NODE_MINOR=0
 METHOD="${VOLT_INSTALL_METHOD:-npm}"
 VERSION="${VOLT_VERSION:-latest}"
 
@@ -32,13 +32,13 @@ validate_version() {
 }
 
 install_npm() {
-    have node || fail "Node.js not found. The full Volt install requires Node.js >= 22.19.
+    have node || fail "Node.js not found. The full Volt install requires Node.js >= 26.0.
 Install it from https://nodejs.org, then re-run this installer.
 For a local CLI/TUI without daemon or remote/iOS support:
   curl -fsSL https://volt-cli.dev/install.sh | VOLT_INSTALL_METHOD=binary sh"
 
     node_supported=$(node -p "const [major, minor] = process.versions.node.split('.').map(Number); Number(major > $MIN_NODE_MAJOR || (major === $MIN_NODE_MAJOR && minor >= $MIN_NODE_MINOR))")
-    [ "$node_supported" = "1" ] || fail "Node.js $(node --version) is too old. Volt requires Node.js >= 22.19."
+    [ "$node_supported" = "1" ] || fail "Node.js $(node --version) is too old. Volt requires Node.js >= 26.0."
     have npm || fail "npm not found. It normally ships with Node.js; install Node.js from https://nodejs.org."
 
     npm_spec="$PACKAGE@beta"
@@ -151,7 +151,7 @@ install_binary() {
     for required in \
         volt package.json image-resize-worker.cjs binary-metafile.json \
         binary-license-manifest.json standalone-build-manifest.json \
-        standalone-file-manifest.json LICENSES/node-v22.23.1-LICENSE.txt; do
+        standalone-file-manifest.json LICENSES/node-v26.8.1-LICENSE.txt; do
         [ -f "$release_dir/$required" ] || fail "release archive is missing volt/$required"
     done
     [ -d "$release_dir/theme" ] || fail "release archive is missing volt/theme"

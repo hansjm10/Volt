@@ -1174,16 +1174,16 @@ test("standalone runtime archives and the consolidated Node license are checksum
 	const runtime = JSON.parse(readFileSync("compliance/standalone-runtime.json", "utf8"));
 	assert.equal(runtime.schemaVersion, 1);
 	assert.equal(runtime.runtime, "node");
-	assert.equal(runtime.version, "22.23.1");
-	assert.equal(runtime.releaseBaseUrl, "https://nodejs.org/download/release/v22.23.1");
+	assert.equal(runtime.version, "26.8.1");
+	assert.equal(runtime.releaseBaseUrl, "https://nodejs.org/download/release/v26.8.1");
 	assert.equal(
 		runtime.seaDocumentation,
-		"https://nodejs.org/download/release/v22.23.1/docs/api/single-executable-applications.html",
+		"https://nodejs.org/download/release/v26.8.1/docs/api/single-executable-applications.html",
 	);
 	assert.deepEqual(runtime.license, {
-		source: "https://raw.githubusercontent.com/nodejs/node/v22.23.1/LICENSE",
+		source: "https://raw.githubusercontent.com/nodejs/node/v26.8.1/LICENSE",
 		sha256: "c738ae413cf561f174e34f6961f8ca458aae2369a73640dda6234c629b98bcc4",
-		path: "compliance/node-v22.23.1/LICENSE",
+		path: "compliance/node-v26.8.1/LICENSE",
 	});
 	assert.equal(
 		createHash("sha256").update(readFileSync(runtime.license.path)).digest("hex"),
@@ -1193,33 +1193,33 @@ test("standalone runtime archives and the consolidated Node license are checksum
 	const expectedTargets = {
 		"darwin-arm64": {
 			runner: "macos-15",
-			archive: "node-v22.23.1-darwin-arm64.tar.gz",
-			sha256: "ef28d8fab2c0e4314522d4bb1b7173270aa3937e93b92cb7de79c112ac1fa953",
+			archive: "node-v26.8.1-darwin-arm64.tar.gz",
+			sha256: "6e577fd0d9db776db82306629e441a9dace416702622aebdd171c9dfaa41f4d2",
 		},
 		"darwin-x64": {
 			runner: "macos-15-intel",
-			archive: "node-v22.23.1-darwin-x64.tar.gz",
-			sha256: "b8da981b8a0b1241b70249204916da76c63573ddf5814dbd2d1e41069105cb81",
+			archive: "node-v26.8.1-darwin-x64.tar.gz",
+			sha256: "fe9c6dbf9c8e1b4443803d75e2a20366e420dae650c747dbb116b22975751baf",
 		},
 		"linux-arm64": {
 			runner: "ubuntu-24.04-arm",
-			archive: "node-v22.23.1-linux-arm64.tar.xz",
-			sha256: "0294e8b915ab75f92c7513d2fcb830ae06e10684e6c603e99a87dbf8835389c1",
+			archive: "node-v26.8.1-linux-arm64.tar.xz",
+			sha256: "23c1b4d19e2f12a7d06fe8aa3d6e0e4923cf77a47e13c5ccdf32fadaa33960f2",
 		},
 		"linux-x64": {
 			runner: "ubuntu-24.04",
-			archive: "node-v22.23.1-linux-x64.tar.xz",
-			sha256: "9749e988f437343b7fa832c69ded82a312e41a03116d766797ac14f6f9eee578",
+			archive: "node-v26.8.1-linux-x64.tar.xz",
+			sha256: "3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d",
 		},
 		"windows-arm64": {
 			runner: "windows-11-arm",
-			archive: "node-v22.23.1-win-arm64.zip",
-			sha256: "b470fdfe3502c05151656e06d495e3f47544f2ee8b1d9c8705090f2dd5996bd0",
+			archive: "node-v26.8.1-win-arm64.zip",
+			sha256: "09d62005aa9dca8fcd9bdce8196f5aa783eee3818d5af74089eb7297103c02d4",
 		},
 		"windows-x64": {
 			runner: "windows-2025",
-			archive: "node-v22.23.1-win-x64.zip",
-			sha256: "7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29",
+			archive: "node-v26.8.1-win-x64.zip",
+			sha256: "57693d8e93d1b04e7b7de46aca53ecd63e97564e73de36a68428d7ff08d83587",
 		},
 	};
 	assert.deepEqual(runtime.targets, expectedTargets);
@@ -1565,7 +1565,7 @@ test("publisher is dispatch-only, tag-bound, approval-bound, and cannot replace 
 	assert.equal(workflow.match(/"\$\{GITHUB_SHA\}" != "\$\{tag_commit\}"/g)?.length, 4);
 	assert.equal(workflow.match(/"\$\{checkout_commit\}" != "\$\{tag_commit\}"/g)?.length, 4);
 	assert.equal(workflow.match(/actions\/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6\.4\.0/g)?.length, 3);
-	assert.equal(workflow.match(/node-version: '22\.23\.1'/g)?.length, 3);
+	assert.equal(workflow.match(/node-version: '26\.8\.1'/g)?.length, 3);
 	assert.equal(workflow.match(/package-manager-cache: false/g)?.length, 3);
 	assert.match(workflow, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
 	assert.match(workflow, /actions\/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3/);
@@ -1969,7 +1969,7 @@ test("published packages and binary build include the repository license and not
 	assert.match(betaReadiness, /not ready for public beta\s+distribution/i);
 	assert.match(betaReadiness, /Do not run Approve Release until/i);
 	assert.match(betaReadiness, /Prove the npm daemon distribution/);
-	assert.match(betaReadiness, /Node\.js 22\.23\.1/);
+	assert.match(betaReadiness, /Node\.js 26\.8\.1/);
 	assert.match(betaReadiness, /glibc 2\.28/);
 	assert.match(betaReadiness, /Windows executables are not\s+Authenticode-signed/);
 	assert.match(betaReadiness, /Resolve Doom source-archive provenance/);
@@ -2157,7 +2157,7 @@ test("Unix binary installer verifies a pinned archive before installing its exac
 		]) {
 			writeFileSync(join(payload, file), `${file}\n`);
 		}
-		writeFileSync(join(payload, "LICENSES", "node-v22.23.1-LICENSE.txt"), "node license\n");
+		writeFileSync(join(payload, "LICENSES", "node-v26.8.1-LICENSE.txt"), "node license\n");
 		writeFileSync(join(payload, "theme", "dark.json"), "{}\n");
 		writeFileSync(join(payload, "export-html", "template.html"), "<html></html>\n");
 		const asset = "volt-linux-x64.tar.gz";
@@ -2220,8 +2220,8 @@ uname() {
 			readFileSync(join(payload, "image-resize-worker.cjs")),
 		);
 		assert.deepEqual(
-			readFileSync(join(home, ".volt", "bin", "LICENSES", "node-v22.23.1-LICENSE.txt")),
-			readFileSync(join(payload, "LICENSES", "node-v22.23.1-LICENSE.txt")),
+			readFileSync(join(home, ".volt", "bin", "LICENSES", "node-v26.8.1-LICENSE.txt")),
+			readFileSync(join(payload, "LICENSES", "node-v26.8.1-LICENSE.txt")),
 		);
 		assert.match(installed.stdout, /Installed verified standalone release/);
 		assert.match(readFileSync(env.VOLT_INSTALL_URL_LOG, "utf8"), /\/releases\/download\/v1\.2\.3\/volt-linux-x64\.tar\.gz/);
