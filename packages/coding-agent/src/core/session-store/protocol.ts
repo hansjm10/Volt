@@ -1,3 +1,8 @@
+import {
+	decodeStoredSessionEntry,
+	parsePersistedSessionEntry,
+	validatePersistedSessionEntrySequence,
+} from "../session-entry-codec.ts";
 import { cloneCanonicalSessionStoreJson, isSessionStoreCommitDigest } from "./canonical-json.ts";
 import {
 	SESSION_STORE_SCHEMA_VERSION,
@@ -287,23 +292,15 @@ function parseSessionProjection(value: unknown, path: string): SessionStoreSessi
 
 function parseEntryWrite(value: unknown, path: string): SessionStoreEntryWrite {
 	const input = record(value, path);
-	exactKeys(input, path, ["id", "parentId", "type", "timestamp", "isHostOnly", "payload"], ["ordinal"]);
-	const ordinal = Object.hasOwn(input, "ordinal") ? safeInteger(input.ordinal, `${path}.ordinal`, 1) : undefined;
-	return {
-		id: idValue(input.id, `${path}.id`),
-		parentId: nullableId(input.parentId, `${path}.parentId`),
-		type: nonEmptyString(input.type, `${path}.type`),
-		timestamp: timestampValue(input.timestamp, `${path}.timestamp`),
-		...(ordinal === undefined ? {} : { ordinal }),
-		isHostOnly: booleanValue(input.isHostOnly, `${path}.isHostOnly`),
-		payload: jsonValue(input.payload, `${path}.payload`),
-	};
+	exactKeys(input, path, ["entry"]);
+	const entry = parsePersistedSessionEntry(input.entry);
+	return { entry: entry as unknown as SessionStoreJsonValue };
 }
 
 function parseEntry(value: unknown, path: string): SessionStoreEntry {
 	const input = record(value, path);
 	exactKeys(input, path, ["id", "parentId", "type", "timestamp", "ordinal", "isHostOnly", "payload"]);
-	return {
+	const stored: SessionStoreEntry = {
 		id: idValue(input.id, `${path}.id`),
 		parentId: nullableId(input.parentId, `${path}.parentId`),
 		type: nonEmptyString(input.type, `${path}.type`),
@@ -312,6 +309,8 @@ function parseEntry(value: unknown, path: string): SessionStoreEntry {
 		isHostOnly: booleanValue(input.isHostOnly, `${path}.isHostOnly`),
 		payload: jsonValue(input.payload, `${path}.payload`),
 	};
+	decodeStoredSessionEntry(stored);
+	return stored;
 }
 
 function parseLabelWrite(value: unknown, path: string): SessionStoreLabelWrite {
@@ -723,9 +722,11 @@ function parseInfo(value: unknown, path: string): SessionStoreInfo {
 function parseSnapshot(value: unknown, path: string): SessionStoreSnapshot {
 	const input = record(value, path);
 	exactKeys(input, path, ["session", "entries", "labels", "clientInputs", "subagentSpawns", "searchChunks"]);
+	const entries = arrayValue(input.entries, `${path}.entries`, parseEntry);
+	validatePersistedSessionEntrySequence(entries.map((entry) => entry.payload));
 	return {
 		session: parseSummary(input.session, `${path}.session`),
-		entries: arrayValue(input.entries, `${path}.entries`, parseEntry),
+		entries,
 		labels: arrayValue(input.labels, `${path}.labels`, parseLabel),
 		clientInputs: arrayValue(
 			input.clientInputs,

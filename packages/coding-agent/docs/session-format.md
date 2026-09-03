@@ -36,7 +36,7 @@ Delete sessions through `/resume` or `SessionManager.delete(ref)`. When the `tra
 
 ## Snapshot Version
 
-The current header has `version: 5` for session entries and `snapshotVersion: 1` for the interchange envelope. Import requires both exact values and rejects unmarked or older JSONL. Snapshots contain public session entries plus one final active-leaf record; client-input recovery state, starting Git context, subagent links, and transport-owned message identities are never accepted as interchange data.
+The current header has `version: 5` for session entries and `snapshotVersion: 1` for the interchange envelope. Import requires both exact values and rejects unmarked or older JSONL. Snapshots contain public session entries plus exactly one final active-leaf record; malformed or truncated final lines are rejected. Client-input recovery state, starting Git context, subagent links, and transport-owned message identities are never accepted as interchange data.
 
 ## Source Files
 

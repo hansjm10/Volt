@@ -11,6 +11,7 @@ import {
 	createAgentSessionServices,
 } from "../../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../../src/core/auth-storage.ts";
+import { parsePersistedSessionEntry } from "../../../src/core/session-entry-codec.ts";
 import {
 	SessionConversationStateUnavailableError,
 	type SessionEntry,
@@ -133,7 +134,12 @@ async function faultNextPlanningTransaction(
 	let intercepted = false;
 
 	vi.spyOn(store, "applyTransaction").mockImplementation(async (input) => {
-		if (intercepted || !input.payload.entries.some((entry) => entry.type === "planning_state_change")) {
+		if (
+			intercepted ||
+			!input.payload.entries.some(
+				(entry) => parsePersistedSessionEntry(entry.entry).type === "planning_state_change",
+			)
+		) {
 			return applyTransaction(input);
 		}
 		intercepted = true;
@@ -375,7 +381,12 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		const releaseTransaction = deferred();
 		let intercepted = false;
 		vi.spyOn(store, "applyTransaction").mockImplementation(async (input) => {
-			if (intercepted || !input.payload.entries.some((entry) => entry.type === "planning_state_change")) {
+			if (
+				intercepted ||
+				!input.payload.entries.some(
+					(entry) => parsePersistedSessionEntry(entry.entry).type === "planning_state_change",
+				)
+			) {
 				return applyTransaction(input);
 			}
 			intercepted = true;

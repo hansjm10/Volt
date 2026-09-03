@@ -73,17 +73,18 @@ export interface SessionStoreSearchResult {
 }
 
 export interface SessionStoreEntryWrite {
+	/** Full canonical persisted SessionEntry. Indexed columns are derived from this value. */
+	readonly entry: SessionStoreJsonValue;
+}
+
+export interface SessionStoreEntry {
 	readonly id: string;
 	readonly parentId: string | null;
 	readonly type: string;
 	readonly timestamp: string;
-	readonly ordinal?: number;
+	readonly ordinal: number;
 	readonly isHostOnly: boolean;
 	readonly payload: SessionStoreJsonValue;
-}
-
-export interface SessionStoreEntry extends Omit<SessionStoreEntryWrite, "ordinal"> {
-	readonly ordinal: number;
 }
 
 export interface SessionStoreLabelWrite {
@@ -145,10 +146,7 @@ export interface SessionStoreSessionProjection {
 	readonly firstMessage: string;
 }
 
-/**
- * Serializable mutations applied under one session revision guard. Entry payloads
- * intentionally remain generic JSON until SessionManager integration owns their shape.
- */
+/** Serializable mutations applied under one session revision guard. */
 export interface SessionStoreTransactionPayload {
 	readonly session: SessionStoreSessionProjection;
 	readonly entries: readonly SessionStoreEntryWrite[];

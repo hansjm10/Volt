@@ -112,6 +112,62 @@ describe("SessionManager canonical data admission", () => {
 		expect(persisted.getLeafId()).toBe(validToolResultId);
 	});
 
+	it("rejects malformed entry bodies before assigning ordinals or notifying observers", async () => {
+		const { manager } = await createManager();
+		const observed: string[] = [];
+		manager.subscribeEntries((entry) => observed.push(entry.id));
+
+		expect(() =>
+			manager.appendMessage({
+				role: "user",
+				content: "unknown field",
+				timestamp: Date.now(),
+				unexpected: true,
+			} as never),
+		).toThrow("unknown property");
+		expect(() => manager.appendThinkingLevelChange("turbo")).toThrow("invalid thinking level");
+		expect(() => manager.appendFastModeChange("yes" as never)).toThrow("invalid enabled state");
+		expect(() => manager.appendModelChange("", "model")).toThrow("must not be empty");
+		expect(() =>
+			manager.appendCustomMessageEntry("custom", [{ type: "video", data: "nope" }] as never, true),
+		).toThrow("unsupported user content type");
+		expect(() =>
+			manager.appendSubagentSpawn({
+				toolCallId: "call-1",
+				subagentId: "sa_child",
+				agent: "researcher",
+				childSessionId: "child-session",
+				childSessionRef: {
+					sessionDirectory: "/sessions",
+					storeId: "store",
+					sessionId: "other-child",
+					sessionGeneration: "generation",
+				},
+				requestKey: "request-1",
+			}),
+		).toThrow("must match childSessionId");
+
+		expect(manager.getEntries()).toEqual([]);
+		expect(manager.getSubagentSpawnEntries()).toEqual([]);
+		expect(manager.getLeafId()).toBeNull();
+		expect(observed).toEqual([]);
+		const validId = manager.appendSessionInfo("valid");
+		expect(manager.getEntry(validId)?.ordinal).toBe(1);
+	});
+
+	it("bounds client input errors to a codec-valid terminal entry", async () => {
+		const { manager, ref } = await createManager();
+		manager.reserveClientInput("long-error", "prompt", { message: "fail" });
+
+		const failed = manager.transitionClientInput("long-error", "failed", "x".repeat(2_001));
+		expect(Array.from(failed.error ?? "")).toHaveLength(2_000);
+		expect(failed.error?.endsWith("…")).toBe(true);
+		await manager.flush();
+
+		const reopened = await SessionManager.open(ref);
+		expect(reopened.getClientInput("long-error")?.error).toBe(failed.error);
+	});
+
 	it("owns valid input and round-trips it exactly through SQLite reopen", async () => {
 		const { manager, ref } = await createManager();
 		const data = { nested: { values: [1, "two", true, null] } };

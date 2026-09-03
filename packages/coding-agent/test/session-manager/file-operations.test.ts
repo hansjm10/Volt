@@ -37,6 +37,14 @@ function sessionSnapshotJsonl(id: string, cwd: string, message = "hello"): strin
 			timestamp: "2025-01-01T00:00:01.000Z",
 			message: { role: "user", content: message, timestamp: Date.parse("2025-01-01T00:00:01.000Z") },
 		}),
+		JSON.stringify({
+			type: "leaf",
+			id: `${id}-leaf`,
+			parentId: `${id}-message`,
+			ordinal: 2,
+			timestamp: "2025-01-01T00:00:02.000Z",
+			targetId: `${id}-message`,
+		}),
 	].join("\n")}\n`;
 }
 
@@ -70,10 +78,20 @@ describe("JSONL snapshot import parsing", () => {
 		writeFileSync(path, sessionSnapshotJsonl("snapshot", tempDir));
 
 		const entries = loadEntriesFromFile(path);
-		expect(entries.map((entry) => entry.type)).toEqual(["session", "message"]);
+		expect(entries.map((entry) => entry.type)).toEqual(["session", "message", "leaf"]);
 	});
 
-	it("rejects malformed committed current-format records but ignores a torn final fragment", () => {
+	it("rejects a snapshot whose final leaf record is missing", async () => {
+		const path = join(tempDir, "leafless.jsonl");
+		const lines = sessionSnapshotJsonl("leafless", tempDir).trimEnd().split("\n");
+		writeFileSync(path, `${lines.slice(0, -1).join("\n")}\n`);
+
+		await expect(SessionManager.importFromJsonl(path, tempDir, join(tempDir, "leafless-store"))).rejects.toThrow(
+			"Session snapshot must contain exactly one final leaf entry",
+		);
+	});
+
+	it("rejects malformed committed records and truncated final fragments", () => {
 		const malformed = join(tempDir, "malformed.jsonl");
 		writeFileSync(
 			malformed,
@@ -87,7 +105,7 @@ describe("JSONL snapshot import parsing", () => {
 			'{"type":"session","version":5,"id":"torn","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' +
 				'{"type":"client_input_sta',
 		);
-		expect(loadEntriesFromFile(torn)).toHaveLength(1);
+		expect(() => loadEntriesFromFile(torn)).toThrow("malformed at committed line 2");
 	});
 
 	it("rejects unsupported imports without mutating their bytes", async () => {
@@ -318,14 +336,24 @@ describe("JSONL snapshot import parsing", () => {
 			timestamp: "2025-01-01T00:00:01.000Z",
 			thinkingLevel,
 		}));
-		modeEntries.push({
-			type: "fast_mode_change",
-			id: "fast-enabled",
-			parentId: `thinking-${thinkingLevels.length - 1}`,
-			ordinal: thinkingLevels.length + 1,
-			timestamp: "2025-01-01T00:00:02.000Z",
-			enabled: true,
-		});
+		modeEntries.push(
+			{
+				type: "fast_mode_change",
+				id: "fast-enabled",
+				parentId: `thinking-${thinkingLevels.length - 1}`,
+				ordinal: thinkingLevels.length + 1,
+				timestamp: "2025-01-01T00:00:02.000Z",
+				enabled: true,
+			},
+			{
+				type: "leaf",
+				id: "valid-modes-leaf",
+				parentId: "fast-enabled",
+				ordinal: thinkingLevels.length + 2,
+				timestamp: "2025-01-01T00:00:03.000Z",
+				targetId: "fast-enabled",
+			},
+		);
 		writeFileSync(
 			path,
 			`${[

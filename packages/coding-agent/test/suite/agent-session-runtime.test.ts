@@ -141,6 +141,8 @@ describe("AgentSessionRuntime characterization", () => {
 		id: string,
 		entries: readonly Record<string, unknown>[] = [],
 	): void {
+		const lastEntryId = entries.at(-1)?.id;
+		const targetId = typeof lastEntryId === "string" ? lastEntryId : null;
 		writeFileSync(
 			filePath,
 			`${[
@@ -153,6 +155,14 @@ describe("AgentSessionRuntime characterization", () => {
 					cwd,
 				},
 				...entries,
+				{
+					type: "leaf",
+					id: `${id}-leaf`,
+					parentId: targetId,
+					ordinal: entries.length + 1,
+					timestamp: SNAPSHOT_TIMESTAMP,
+					targetId,
+				},
 			]
 				.map((entry) => JSON.stringify(entry))
 				.join("\n")}\n`,
@@ -690,7 +700,7 @@ describe("AgentSessionRuntime characterization", () => {
 		},
 	);
 
-	it("discards a persisted import when snapshot replay fails", async () => {
+	it("rejects an invalid compaction boundary before creating an imported row", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
 		const importedId = "failed-replay-import";
 		const snapshotPath = join(tempDir, `${importedId}.jsonl`);
@@ -722,7 +732,7 @@ describe("AgentSessionRuntime characterization", () => {
 		]);
 
 		await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(
-			"Compaction entry bad-compaction references an unavailable retained entry",
+			"Compaction entry bad-compaction has an invalid first-kept boundary",
 		);
 
 		expect(runtime.session.sessionRef).toEqual(currentSessionRef);

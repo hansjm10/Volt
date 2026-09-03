@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import { parentPort, workerData } from "node:worker_threads";
 import { canonicalizePath, resolvePath } from "../../utils/paths.ts";
 import {
@@ -9,6 +10,14 @@ import {
 	hardenPrivateRegularFileSync,
 	writePrivateNewFileSync,
 } from "../../utils/private-files.ts";
+import {
+	type ClientInputSequenceSeed,
+	createClientInputSequenceValidator,
+	decodeStoredSessionEntry,
+	parsePersistedSessionEntry,
+	sessionEntryEnvelope,
+} from "../session-entry-codec.ts";
+import type { SessionEntry } from "../session-manager.ts";
 import { fuzzyMatchSessionText } from "../session-search.ts";
 import {
 	digestSessionStoreTransactionPayload,
@@ -109,6 +118,12 @@ function sqlNullableInteger(row: Record<string, unknown>, key: string): number |
 	if (value === null) return null;
 	if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new Error(`Invalid SQLite ${key} column`);
 	return value;
+}
+
+function sqlBoolean(row: Record<string, unknown>, key: string): boolean {
+	const value = sqlInteger(row, key);
+	if (value !== 0 && value !== 1) throw new Error(`Invalid SQLite ${key} boolean column`);
+	return value === 1;
 }
 
 function hardenStoreArtifacts(): void {
@@ -439,13 +454,13 @@ function summaryFromRow(row: Record<string, unknown>): SessionStoreSessionSummar
 		parentSessionId: sqlNullableString(row, "parentSessionId"),
 		parentSessionGeneration: sqlNullableString(row, "parentSessionGeneration"),
 		origin,
-		startingGitContextRecorded: startingGitContextRecorded === 1,
+		startingGitContextRecorded: sqlBoolean(row, "startingGitContextRecorded"),
 		startingGitContext:
 			startingGitContextJson === null
 				? null
 				: parseCanonicalSessionStoreJson(startingGitContextJson, "Stored starting Git context"),
 		name: sqlNullableString(row, "name"),
-		visible: visible === 1,
+		visible: sqlBoolean(row, "visible"),
 		revision: sqlInteger(row, "revision"),
 		leafId: sqlNullableString(row, "leafId"),
 		messageCount: sqlInteger(row, "messageCount"),
@@ -701,15 +716,17 @@ function searchSessions(query: string, includeHidden: boolean, cwd: string | nul
 }
 
 function entryFromRow(row: Record<string, unknown>): SessionStoreEntry {
-	return {
+	const stored: SessionStoreEntry = {
 		id: sqlString(row, "id"),
 		parentId: sqlNullableString(row, "parentId"),
 		type: sqlString(row, "type"),
 		timestamp: sqlString(row, "timestamp"),
 		ordinal: sqlInteger(row, "ordinal"),
-		isHostOnly: sqlInteger(row, "isHostOnly") === 1,
+		isHostOnly: sqlBoolean(row, "isHostOnly"),
 		payload: parseCanonicalSessionStoreJson(sqlString(row, "payloadJson"), "Stored session entry payload"),
 	};
+	decodeStoredSessionEntry(stored);
+	return stored;
 }
 
 function labelFromRow(row: Record<string, unknown>): SessionStoreLabel {
@@ -866,6 +883,184 @@ function assertMatchingDigest(input: SessionStoreApplyTransactionInput): void {
 	}
 }
 
+interface StoredEntryRelation {
+	readonly parentId: string | null;
+	readonly isHostOnly: boolean;
+}
+
+function validateTransactionEntryReferences(
+	db: DatabaseSync,
+	sessionId: string,
+	entries: SessionStoreApplyTransactionInput["payload"]["entries"],
+): Array<SessionEntry & { ordinal: number }> {
+	const validatedEntries: Array<SessionEntry & { ordinal: number }> = [];
+	const relations = new Map<string, StoredEntryRelation>();
+	const findStored = db.prepare(
+		`SELECT parent_entry_id AS parentId, entry_type AS type, is_host_only AS isHostOnly
+		FROM entries WHERE session_id = ? AND entry_id = ?`,
+	);
+	const relationFor = (entryId: string): StoredEntryRelation | undefined => {
+		const pending = relations.get(entryId);
+		if (pending) return pending;
+		const row = findStored.get(sessionId, entryId);
+		if (!row) return undefined;
+		const relation = {
+			parentId: sqlNullableString(row, "parentId"),
+			isHostOnly: sqlBoolean(row, "isHostOnly"),
+		};
+		relations.set(entryId, relation);
+		return relation;
+	};
+	let sawStartingGitContext =
+		db
+			.prepare("SELECT 1 AS present FROM entries WHERE session_id = ? AND entry_type = ? LIMIT 1")
+			.get(sessionId, "session_start_git_context") !== undefined;
+
+	for (const write of entries) {
+		const entry = parsePersistedSessionEntry(write.entry);
+		const envelope = sessionEntryEnvelope(entry);
+		if (relationFor(envelope.id)) {
+			throw new SessionStoreError("constraint_failed", `Entry ${JSON.stringify(envelope.id)} already exists`);
+		}
+		if (envelope.parentId !== null && !relationFor(envelope.parentId)) {
+			throw new SessionStoreError(
+				"constraint_failed",
+				`Entry ${JSON.stringify(envelope.id)} has an invalid or forward parent`,
+			);
+		}
+		if (entry.type === "compaction") {
+			let currentId = entry.parentId;
+			const visited = new Set<string>();
+			while (currentId !== null && currentId !== entry.firstKeptEntryId) {
+				if (visited.has(currentId)) {
+					throw new SessionStoreError("constraint_failed", "Session entry parent chain contains a cycle");
+				}
+				visited.add(currentId);
+				currentId = relationFor(currentId)?.parentId ?? null;
+			}
+			if (currentId !== entry.firstKeptEntryId) {
+				throw new SessionStoreError(
+					"constraint_failed",
+					`Compaction entry ${JSON.stringify(entry.id)} has an invalid first-kept boundary`,
+				);
+			}
+		}
+		if (entry.type === "leaf" || entry.type === "label") {
+			const targetId = entry.targetId;
+			if (targetId !== null) {
+				const target = relationFor(targetId);
+				if (!target || target.isHostOnly) {
+					throw new SessionStoreError(
+						"constraint_failed",
+						`${entry.type === "leaf" ? "Leaf" : "Label"} entry ${JSON.stringify(entry.id)} has an invalid target`,
+					);
+				}
+			}
+		}
+		if (entry.type === "branch_summary" && entry.fromId !== (entry.parentId ?? "root")) {
+			throw new SessionStoreError(
+				"constraint_failed",
+				`Branch summary entry ${JSON.stringify(entry.id)} has an invalid source`,
+			);
+		}
+		if (entry.type === "session_start_git_context") {
+			if (sawStartingGitContext) {
+				throw new SessionStoreError("constraint_failed", "Session has more than one starting Git context entry");
+			}
+			sawStartingGitContext = true;
+		}
+		relations.set(envelope.id, {
+			parentId: envelope.parentId,
+			isHostOnly: envelope.isHostOnly,
+		});
+		validatedEntries.push(entry);
+	}
+	return validatedEntries;
+}
+
+function clientMessageIdForEntry(entry: SessionEntry): string | undefined {
+	if (
+		entry.type === "client_input_receipt" ||
+		entry.type === "client_input_queued" ||
+		entry.type === "client_input_state"
+	) {
+		return entry.clientMessageId;
+	}
+	return entry.type === "message" && entry.message.role === "user" ? entry.message.clientMessageId : undefined;
+}
+
+function validateTransactionClientInputs(
+	db: DatabaseSync,
+	input: SessionStoreApplyTransactionInput,
+	entries: readonly SessionEntry[],
+): void {
+	const affectedClientIds = new Set(entries.map(clientMessageIdForEntry).filter((id) => id !== undefined));
+	const findStored = db.prepare(
+		`SELECT client_message_id AS clientMessageId, receipt_entry_id AS receiptEntryId, command,
+			semantic_digest AS semanticDigest, input_json AS inputJson, queued_entry_id AS queuedEntryId,
+			queued_input_json AS queuedInputJson, state, error, canonical_entry_id AS canonicalEntryId
+		FROM client_inputs WHERE session_id = ? AND client_message_id = ?`,
+	);
+	const seeds: ClientInputSequenceSeed[] = [];
+	for (const clientMessageId of affectedClientIds) {
+		const row = findStored.get(input.sessionId, clientMessageId);
+		if (!row) continue;
+		const stored = clientInputFromRow(row);
+		seeds.push({
+			receiptId: stored.receiptEntryId,
+			clientMessageId: stored.clientMessageId,
+			command: stored.command,
+			semanticDigest: stored.semanticDigest,
+			input: stored.input,
+			state: stored.state,
+			...(stored.queuedEntryId === null ? {} : { queuedEntryId: stored.queuedEntryId }),
+			...(stored.queuedInput === null ? {} : { queuedInput: stored.queuedInput }),
+			...(stored.error === null ? {} : { error: stored.error }),
+			...(stored.canonicalEntryId === null ? {} : { canonicalEntryId: stored.canonicalEntryId }),
+		});
+	}
+	const validator = createClientInputSequenceValidator(seeds);
+	for (const entry of entries) validator.apply(entry);
+
+	const writes = new Map(input.payload.clientInputs.map((write) => [write.clientMessageId, write]));
+	if (writes.size !== input.payload.clientInputs.length) {
+		throw new SessionStoreError("constraint_failed", "Session transaction contains duplicate client input writes");
+	}
+	for (const clientMessageId of writes.keys()) {
+		if (!affectedClientIds.has(clientMessageId)) {
+			throw new SessionStoreError(
+				"constraint_failed",
+				"Session transaction contains a client input write without a canonical entry",
+			);
+		}
+	}
+	for (const clientMessageId of affectedClientIds) {
+		const record = validator.get(clientMessageId);
+		const write = writes.get(clientMessageId);
+		if (!record || !write) {
+			throw new SessionStoreError("constraint_failed", "Session transaction omits canonical client input state");
+		}
+		const expected = {
+			clientMessageId: record.clientMessageId,
+			receiptEntryId: record.receiptId,
+			command: record.command,
+			semanticDigest: record.semanticDigest,
+			input: record.input,
+			queuedEntryId: record.queuedEntryId ?? null,
+			queuedInput: record.queuedInput ?? null,
+			state: record.state,
+			error: record.error ?? null,
+			canonicalEntryId: record.canonicalEntryId ?? null,
+		};
+		if (!isDeepStrictEqual(write, expected)) {
+			throw new SessionStoreError(
+				"constraint_failed",
+				`Client input ${JSON.stringify(clientMessageId)} does not match its canonical entries`,
+			);
+		}
+	}
+}
+
 function applyTransactionInCurrentTransaction(
 	db: DatabaseSync,
 	input: SessionStoreApplyTransactionInput,
@@ -892,6 +1087,8 @@ function applyTransactionInCurrentTransaction(
 	if (summary.revision !== input.expectedRevision) {
 		return { status: "conflict", actualRevision: summary.revision };
 	}
+	const canonicalEntries = validateTransactionEntryReferences(db, input.sessionId, input.payload.entries);
+	validateTransactionClientInputs(db, input, canonicalEntries);
 	const maxOrdinalRow = db
 		.prepare("SELECT COALESCE(MAX(ordinal), 0) AS maxOrdinal FROM entries WHERE session_id = ?")
 		.get(input.sessionId);
@@ -902,23 +1099,23 @@ function applyTransactionInCurrentTransaction(
 			session_id, entry_id, ordinal, parent_entry_id, entry_type, timestamp, is_host_only, payload_json
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
-	for (const entry of input.payload.entries) {
-		const ordinal = entry.ordinal ?? nextOrdinal;
-		if (ordinal !== nextOrdinal) {
+	for (const entry of canonicalEntries) {
+		const envelope = sessionEntryEnvelope(entry);
+		if (envelope.ordinal !== nextOrdinal) {
 			throw new SessionStoreError(
 				"constraint_failed",
-				`Entry ${JSON.stringify(entry.id)} has a non-contiguous ordinal`,
+				`Entry ${JSON.stringify(envelope.id)} has a non-contiguous ordinal`,
 			);
 		}
 		insertEntry.run(
 			input.sessionId,
-			entry.id,
-			ordinal,
-			entry.parentId,
-			entry.type,
-			entry.timestamp,
-			entry.isHostOnly ? 1 : 0,
-			stringifyCanonicalSessionStoreJson(entry.payload, `Entry ${entry.id} payload`),
+			envelope.id,
+			envelope.ordinal,
+			envelope.parentId,
+			envelope.type,
+			envelope.timestamp,
+			envelope.isHostOnly ? 1 : 0,
+			stringifyCanonicalSessionStoreJson(entry, `Entry ${envelope.id} payload`),
 		);
 		nextOrdinal += 1;
 	}

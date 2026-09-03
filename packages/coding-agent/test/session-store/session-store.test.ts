@@ -17,6 +17,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createClientInputSemanticDigest } from "../../src/core/session-manager.ts";
 import {
 	acquireSharedSQLiteSessionStore,
 	digestSessionStoreTransactionPayload,
@@ -26,6 +27,7 @@ import {
 	type SessionStoreApplyTransactionInput,
 	type SessionStoreCreateSessionInput,
 	type SessionStoreInfo,
+	type SessionStoreJsonValue,
 	type SessionStoreTransactionPayload,
 	SQLiteSessionStoreClient,
 	type SQLiteSessionStoreLease,
@@ -102,6 +104,27 @@ function emptyPayload(
 	};
 }
 
+function entryWrite(entry: SessionStoreJsonValue): SessionStoreTransactionPayload["entries"][number] {
+	return { entry };
+}
+
+function userMessageEntry(
+	id: string,
+	ordinal: number,
+	timestamp: string,
+	content: string,
+	parentId: string | null = null,
+): SessionStoreTransactionPayload["entries"][number] {
+	return entryWrite({
+		type: "message",
+		id,
+		parentId,
+		timestamp,
+		ordinal,
+		message: { role: "user", content, timestamp: Date.parse(timestamp) },
+	});
+}
+
 function transaction(
 	sessionId: string,
 	expectedRevision: number,
@@ -140,42 +163,58 @@ async function addContinuationSession(
 	if (fixture.input) {
 		const clientMessageId = `input-${fixture.id}`;
 		const receiptEntryId = `receipt-${fixture.id}`;
-		entries.push({
-			id: receiptEntryId,
-			parentId: null,
-			type: "client_input_receipt",
-			timestamp: fixture.input.receiptAt,
-			isHostOnly: true,
-			payload: { type: "client_input_receipt", clientMessageId },
-		});
+		const input = { message: fixture.id, images: [] };
+		const semanticDigest = createClientInputSemanticDigest("steer", input);
+		entries.push(
+			entryWrite({
+				type: "client_input_receipt",
+				id: receiptEntryId,
+				parentId: null,
+				timestamp: fixture.input.receiptAt,
+				ordinal: entries.length + 1,
+				clientMessageId,
+				command: "steer",
+				semanticDigest,
+				input,
+			}),
+		);
 		const queuedEntryId = fixture.input.queuedAt === undefined ? null : `queued-${fixture.id}`;
 		if (queuedEntryId) {
-			entries.push({
-				id: queuedEntryId,
-				parentId: null,
-				type: "client_input_queued",
-				timestamp: fixture.input.queuedAt!,
-				isHostOnly: true,
-				payload: { type: "client_input_queued", clientMessageId },
-			});
+			entries.push(
+				entryWrite({
+					type: "client_input_queued",
+					id: queuedEntryId,
+					parentId: null,
+					timestamp: fixture.input.queuedAt!,
+					ordinal: entries.length + 1,
+					receiptId: receiptEntryId,
+					clientMessageId,
+					queuedInput: { delivery: "steer", message: fixture.id, images: [] },
+				}),
+			);
 		}
 		if (fixture.input.state !== "accepted") {
 			if (!fixture.input.stateAt) throw new Error(`Missing state timestamp for ${fixture.id}`);
-			entries.push({
-				id: `state-${fixture.id}`,
-				parentId: null,
-				type: "client_input_state",
-				timestamp: fixture.input.stateAt,
-				isHostOnly: true,
-				payload: { type: "client_input_state", clientMessageId, state: fixture.input.state },
-			});
+			entries.push(
+				entryWrite({
+					type: "client_input_state",
+					id: `state-${fixture.id}`,
+					parentId: null,
+					timestamp: fixture.input.stateAt,
+					ordinal: entries.length + 1,
+					receiptId: receiptEntryId,
+					clientMessageId,
+					state: fixture.input.state,
+					...(fixture.input.state === "failed" ? { error: "failed" } : {}),
+				}),
+			);
 		}
 		clientInputs.push({
 			clientMessageId,
 			receiptEntryId,
 			command: "steer",
-			semanticDigest: `semantic:${fixture.id}`,
-			input: { message: fixture.id, images: [] },
+			semanticDigest,
+			input,
 			queuedEntryId,
 			queuedInput: queuedEntryId ? { delivery: "steer", message: fixture.id, images: [] } : null,
 			state: fixture.input.state,
@@ -582,11 +621,13 @@ describe("SQLite session store", () => {
 			"session-1",
 		]);
 
+		const clientInput = { message: "hello sqlite", images: [] };
+		const semanticDigest = createClientInputSemanticDigest("prompt", clientInput);
 		const payload: SessionStoreTransactionPayload = {
 			session: {
 				updatedAt: UPDATED_AT,
 				startingGitContextRecorded: true,
-				startingGitContext: { branch: "main", commit: "abcdef", isDirty: false },
+				startingGitContext: null,
 				name: "Foundation",
 				visible: true,
 				leafId: "message-1",
@@ -594,30 +635,58 @@ describe("SQLite session store", () => {
 				firstMessage: "hello sqlite",
 			},
 			entries: [
-				{
+				entryWrite({
+					type: "client_input_receipt",
 					id: "receipt-1",
 					parentId: null,
-					type: "client_input_receipt",
 					timestamp: CREATED_AT,
-					isHostOnly: true,
-					payload: { input: { message: "hello sqlite" }, command: "prompt" },
-				},
-				{
+					ordinal: 1,
+					clientMessageId: "client-1",
+					command: "prompt",
+					semanticDigest,
+					input: clientInput,
+				}),
+				entryWrite({
+					type: "client_input_state",
+					id: "state-1",
+					parentId: null,
+					timestamp: CREATED_AT,
+					ordinal: 2,
+					receiptId: "receipt-1",
+					clientMessageId: "client-1",
+					state: "started",
+				}),
+				entryWrite({
+					type: "message",
 					id: "message-1",
 					parentId: null,
-					type: "message",
 					timestamp: UPDATED_AT,
-					isHostOnly: false,
-					payload: { message: { role: "user", content: "hello sqlite" } },
-				},
-				{
+					ordinal: 3,
+					message: {
+						role: "user",
+						content: "hello sqlite",
+						clientMessageId: "client-1",
+						timestamp: Date.parse(UPDATED_AT),
+					},
+				}),
+				entryWrite({
+					type: "subagent_spawn",
 					id: "spawn-1",
 					parentId: null,
-					type: "subagent_spawn",
 					timestamp: UPDATED_AT,
-					isHostOnly: true,
-					payload: { agent: "general-purpose" },
-				},
+					ordinal: 4,
+					toolCallId: "tool-1",
+					subagentId: "subagent-1",
+					agent: "general-purpose",
+					childSessionId: "child-1",
+					childSessionRef: {
+						sessionDirectory: "/sessions/child",
+						storeId: "child-store-1",
+						sessionId: "child-1",
+						sessionGeneration: "child-generation-1",
+					},
+					requestKey: "request-1",
+				}),
 			],
 			labels: [{ targetEntryId: "message-1", label: "start", timestamp: UPDATED_AT }],
 			clientInputs: [
@@ -625,8 +694,8 @@ describe("SQLite session store", () => {
 					clientMessageId: "client-1",
 					receiptEntryId: "receipt-1",
 					command: "prompt",
-					semanticDigest: "semantic:1",
-					input: { message: "hello sqlite", images: [] },
+					semanticDigest,
+					input: clientInput,
 					queuedEntryId: null,
 					queuedInput: null,
 					state: "completed",
@@ -658,7 +727,7 @@ describe("SQLite session store", () => {
 			revision: 1,
 			messageCount: 1,
 			startingGitContextRecorded: true,
-			startingGitContext: { branch: "main", commit: "abcdef", isDirty: false },
+			startingGitContext: null,
 		});
 		expect(listed[0]).not.toHaveProperty("allMessagesText");
 		expect(await client.findSessionSummary("session-1", generationFor("session-1"))).toEqual(listed[0]);
@@ -666,10 +735,23 @@ describe("SQLite session store", () => {
 		const snapshot = await client.loadSession("session-1", generationFor("session-1"));
 		expect(snapshot?.entries.map((entry) => [entry.id, entry.ordinal])).toEqual([
 			["receipt-1", 1],
-			["message-1", 2],
-			["spawn-1", 3],
+			["state-1", 2],
+			["message-1", 3],
+			["spawn-1", 4],
 		]);
-		expect(snapshot?.entries[1]?.payload).toEqual({ message: { content: "hello sqlite", role: "user" } });
+		expect(snapshot?.entries[2]?.payload).toEqual({
+			type: "message",
+			id: "message-1",
+			parentId: null,
+			timestamp: UPDATED_AT,
+			ordinal: 3,
+			message: {
+				role: "user",
+				content: "hello sqlite",
+				clientMessageId: "client-1",
+				timestamp: Date.parse(UPDATED_AT),
+			},
+		});
 		expect(snapshot?.labels).toEqual([{ targetEntryId: "message-1", label: "start", timestamp: UPDATED_AT }]);
 		expect(snapshot?.clientInputs[0]).toMatchObject({ clientMessageId: "client-1", state: "completed" });
 		expect(snapshot?.subagentSpawns[0]).toMatchObject({
@@ -768,16 +850,7 @@ describe("SQLite session store", () => {
 		await client.createHiddenSession(createInput());
 		const payload: SessionStoreTransactionPayload = {
 			...emptyPayload(),
-			entries: [
-				{
-					id: "orphan-child",
-					parentId: "missing-parent",
-					type: "message",
-					timestamp: UPDATED_AT,
-					isHostOnly: false,
-					payload: { type: "message" },
-				},
-			],
+			entries: [userMessageEntry("orphan-child", 1, UPDATED_AT, "orphan", "missing-parent")],
 		};
 
 		await expect(
@@ -789,6 +862,112 @@ describe("SQLite session store", () => {
 		});
 		expect((await client.loadSession("session-1", generationFor("session-1")))?.entries).toEqual([]);
 		expect(await client.verifyForeignKeys()).toEqual({ status: "valid" });
+	});
+
+	it("rejects forward parent references before mutating SQLite", async () => {
+		const client = await openStore();
+		await client.createHiddenSession(createInput());
+		const payload: SessionStoreTransactionPayload = {
+			...emptyPayload(),
+			entries: [
+				userMessageEntry("child", 1, UPDATED_AT, "child", "future-parent"),
+				userMessageEntry("future-parent", 2, UPDATED_AT, "parent"),
+			],
+		};
+
+		await expect(
+			client.applyTransaction(transaction("session-1", 0, "forward-parent", payload)),
+		).rejects.toMatchObject({ code: "constraint_failed" });
+		expect((await client.loadSession("session-1", generationFor("session-1")))?.entries).toEqual([]);
+	});
+
+	it("rejects invalid client-input histories before mutating SQLite", async () => {
+		const client = await openStore();
+		await client.createHiddenSession(createInput());
+		const input = { message: "retry", images: [] };
+		const semanticDigest = createClientInputSemanticDigest("steer", input);
+		const receipt = entryWrite({
+			type: "client_input_receipt",
+			id: "receipt",
+			parentId: null,
+			timestamp: CREATED_AT,
+			ordinal: 1,
+			clientMessageId: "client-retry",
+			command: "steer",
+			semanticDigest,
+			input,
+		});
+		const acceptedProjection = {
+			clientMessageId: "client-retry",
+			receiptEntryId: "receipt",
+			command: "steer" as const,
+			semanticDigest,
+			input,
+			queuedEntryId: null,
+			queuedInput: null,
+			state: "accepted" as const,
+			error: null,
+			canonicalEntryId: null,
+		};
+		const firstPayload = {
+			...emptyPayload(),
+			entries: [receipt],
+			clientInputs: [acceptedProjection],
+		};
+		expect(await client.applyTransaction(transaction("session-1", 0, "client-receipt", firstPayload))).toMatchObject({
+			status: "committed",
+		});
+
+		const invalidTransition = {
+			...emptyPayload(),
+			entries: [
+				entryWrite({
+					type: "client_input_state",
+					id: "invalid-rollback",
+					parentId: null,
+					timestamp: UPDATED_AT,
+					ordinal: 2,
+					receiptId: "receipt",
+					clientMessageId: "client-retry",
+					state: "accepted",
+				}),
+			],
+			clientInputs: [acceptedProjection],
+		};
+		await expect(
+			client.applyTransaction(transaction("session-1", 1, "invalid-client-transition", invalidTransition)),
+		).rejects.toMatchObject({ code: "constraint_failed" });
+		const snapshot = await client.loadSession("session-1", generationFor("session-1"));
+		expect(snapshot?.session.revision).toBe(1);
+		expect(snapshot?.entries.map((entry) => entry.id)).toEqual(["receipt"]);
+	});
+
+	it("rejects client-input projection writes without canonical entries", async () => {
+		const client = await openStore();
+		await client.createHiddenSession(createInput());
+		const input = { message: "orphan", images: [] };
+		const payload = {
+			...emptyPayload(),
+			clientInputs: [
+				{
+					clientMessageId: "client-orphan",
+					receiptEntryId: "missing-receipt",
+					command: "steer" as const,
+					semanticDigest: createClientInputSemanticDigest("steer", input),
+					input,
+					queuedEntryId: null,
+					queuedInput: null,
+					state: "accepted" as const,
+					error: null,
+					canonicalEntryId: null,
+				},
+			],
+		};
+
+		await expect(
+			client.applyTransaction(transaction("session-1", 0, "orphan-client-projection", payload)),
+		).rejects.toMatchObject({ code: "constraint_failed" });
+		expect(await client.findSessionSummary("session-1", generationFor("session-1"))).toMatchObject({ revision: 0 });
 	});
 
 	it("persists cross-store parent identity", async () => {
@@ -959,16 +1138,7 @@ describe("SQLite session store", () => {
 							messageCount: revision + 1,
 							firstMessage: "snapshot",
 						}),
-						entries: [
-							{
-								id: entryId,
-								parentId: null,
-								type: "message",
-								timestamp: UPDATED_AT,
-								isHostOnly: false,
-								payload: { revision: revision + 1 },
-							},
-						],
+						entries: [userMessageEntry(entryId, revision + 1, UPDATED_AT, entryId)],
 						searchChunks: [{ chunkIndex: revision, entryId, text: entryId }],
 					};
 					const result = await writer.applyTransaction(

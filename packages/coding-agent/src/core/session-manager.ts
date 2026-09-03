@@ -1,6 +1,6 @@
 import { type AgentMessage, uuidv7 } from "@hansjm10/volt-agent-core";
 import type { ImageContent, JsonCompatibleInput, JsonValue, Message, TextContent } from "@hansjm10/volt-ai";
-import { createHash, randomUUID } from "crypto";
+import { randomUUID } from "crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync } from "fs";
 import { readdir } from "fs/promises";
 import { basename, join } from "path";
@@ -26,20 +26,25 @@ import {
 } from "./messages.ts";
 import { clonePlanningState, DEFAULT_PLANNING_STATE, type PlanningState, parsePlanningState } from "./planning.ts";
 import { RpcGitContextSchema } from "./rpc/schema/git-context.ts";
-import { RpcThinkingLevelSchema } from "./rpc/schema/primitives.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
+import { RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX, RPC_SESSION_QUEUE_MAX_ITEMS } from "./rpc/wire-limits.ts";
 import {
-	RPC_CLIENT_MESSAGE_ID_MAX_CHARS,
-	RPC_CLIENT_MESSAGE_ID_PATTERN_SOURCE,
-	RPC_CONVERSATION_INPUT_IMAGE_DATA_MAX_UTF8_BYTES,
-	RPC_CONVERSATION_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES,
-	RPC_CONVERSATION_INPUT_IMAGES_MAX_UTF8_BYTES,
-	RPC_CONVERSATION_INPUT_MAX_IMAGES,
-	RPC_CONVERSATION_INPUT_MAX_SERIALIZED_BYTES,
-	RPC_CONVERSATION_INPUT_MESSAGE_MAX_UTF8_BYTES,
-	RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX,
-	RPC_SESSION_QUEUE_MAX_ITEMS,
-} from "./rpc/wire-limits.ts";
+	assertClientMessageId,
+	boundClientInputError,
+	CLIENT_INPUT_ERROR_MAX_SCALARS,
+	decodeStoredSessionEntry,
+	digestClientInputPayload,
+	isHostOnlySessionEntryType,
+	isValidClientMessageId,
+	normalizeClientInputPayload,
+	normalizeClientInputQueuedPayload,
+	parsePersistedSessionEntry,
+	parseSessionEntryForAdmission,
+	parseSessionReference,
+	parseSessionSnapshotHeader,
+	validatePersistedSessionEntrySequence,
+	validateSessionEntryAdmissionReferences,
+} from "./session-entry-codec.ts";
 import {
 	acquireSharedSQLiteSessionStore,
 	digestSessionStoreTransactionPayload,
@@ -489,22 +494,6 @@ export interface SessionStartGitContextEntry extends SessionEntryBase {
 	gitContext: RpcGitContext | null;
 }
 
-const SessionStartGitContextEntrySchema = Type.Object(
-	{
-		type: Type.Literal("session_start_git_context"),
-		id: Type.String({ minLength: 1 }),
-		parentId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
-		timestamp: Type.String({ minLength: 1, maxLength: 64 }),
-		ordinal: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
-		gitContext: Type.Union([RpcGitContextSchema, Type.Null()]),
-	},
-	{ additionalProperties: false },
-);
-
-function isValidSessionStartGitContextEntry(value: unknown): value is SessionStartGitContextEntry {
-	return Check(SessionStartGitContextEntrySchema, value);
-}
-
 /** Durable host-only active-branch pointer. Never projected into conversation history. */
 export interface LeafEntry extends SessionEntryBase {
 	type: "leaf";
@@ -593,23 +582,11 @@ export function isClientInputWalEntry(
  * and never copy into forks.
  */
 export function isHostOnlySessionEntry(entry: FileEntry): boolean {
-	return (
-		isClientInputWalEntry(entry) ||
-		entry.type === "session_start_git_context" ||
-		entry.type === "subagent_spawn" ||
-		entry.type === "leaf"
-	);
+	return isHostOnlySessionEntryType(entry.type);
 }
 
-const CLIENT_INPUT_ID_MAX_CHARACTERS = RPC_CLIENT_MESSAGE_ID_MAX_CHARS;
-const CLIENT_INPUT_ID_PATTERN = new RegExp(`^${RPC_CLIENT_MESSAGE_ID_PATTERN_SOURCE}$`);
+export { isValidClientMessageId };
 export const RUNTIME_QUEUE_ENTRY_ID_PREFIX = RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX;
-const CLIENT_INPUT_MESSAGE_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_MESSAGE_MAX_UTF8_BYTES;
-const CLIENT_INPUT_MAX_IMAGES = RPC_CONVERSATION_INPUT_MAX_IMAGES;
-const CLIENT_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES;
-const CLIENT_INPUT_IMAGE_DATA_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_IMAGE_DATA_MAX_UTF8_BYTES;
-const CLIENT_INPUT_IMAGES_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_IMAGES_MAX_UTF8_BYTES;
-const CLIENT_INPUT_MAX_SERIALIZED_BYTES = RPC_CONVERSATION_INPUT_MAX_SERIALIZED_BYTES;
 export const CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES = RPC_SESSION_QUEUE_MAX_ITEMS;
 export const CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES = CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES;
 export const CLIENT_INPUT_MAX_OUTSTANDING_BYTES = 16 * 1024 * 1024;
@@ -618,117 +595,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Canonical wire/storage grammar for durable external conversation identities. */
-export function isValidClientMessageId(value: unknown): value is string {
-	if (typeof value !== "string" || value.length === 0 || value.length > CLIENT_INPUT_ID_MAX_CHARACTERS) {
-		return false;
-	}
-	// Runtime-only queue identities use this reserved namespace. Keeping it out
-	// of the external semantic-ID domain makes an observed local queue card
-	// impossible to forge through paired-client ingress.
-	if (value.startsWith(RUNTIME_QUEUE_ENTRY_ID_PREFIX)) {
-		return false;
-	}
-	// Comparing the full match avoids JavaScript `$` accepting a match immediately
-	// before a trailing line terminator.
-	return value.match(CLIENT_INPUT_ID_PATTERN)?.[0] === value;
-}
-
 /** Runtime-only dequeue identity. This namespace is never valid at paired-client ingress. */
 export function isRuntimeQueueEntryId(value: unknown): value is string {
 	return typeof value === "string" && value.startsWith(RUNTIME_QUEUE_ENTRY_ID_PREFIX) && value.length <= 64;
-}
-
-function assertClientMessageId(clientMessageId: string): void {
-	if (!isValidClientMessageId(clientMessageId)) {
-		throw new Error(
-			`Client input id must match [A-Za-z0-9][A-Za-z0-9._:-]{0,255} and be at most ${CLIENT_INPUT_ID_MAX_CHARACTERS} ASCII characters`,
-		);
-	}
-}
-
-function normalizeClientInputImages(value: unknown): ImageContent[] {
-	if (value === undefined) return [];
-	if (!Array.isArray(value)) {
-		throw new Error("Client input images must be an array");
-	}
-	if (value.length > CLIENT_INPUT_MAX_IMAGES) {
-		throw new Error(`Client input images exceed the ${CLIENT_INPUT_MAX_IMAGES}-image limit`);
-	}
-
-	let aggregateBytes = 0;
-	return value.map((candidate, index) => {
-		if (
-			!isRecord(candidate) ||
-			candidate.type !== "image" ||
-			typeof candidate.mimeType !== "string" ||
-			typeof candidate.data !== "string"
-		) {
-			throw new Error(`Client input image ${index} is invalid`);
-		}
-		const mimeTypeBytes = Buffer.byteLength(candidate.mimeType, "utf8");
-		if (mimeTypeBytes > CLIENT_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES) {
-			throw new Error(
-				`Client input image ${index} MIME type exceeds the ${CLIENT_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES}-byte UTF-8 limit`,
-			);
-		}
-		const dataBytes = Buffer.byteLength(candidate.data, "utf8");
-		if (dataBytes > CLIENT_INPUT_IMAGE_DATA_MAX_UTF8_BYTES) {
-			throw new Error(
-				`Client input image ${index} data exceeds the ${CLIENT_INPUT_IMAGE_DATA_MAX_UTF8_BYTES}-byte UTF-8 limit`,
-			);
-		}
-		aggregateBytes += mimeTypeBytes + dataBytes;
-		if (aggregateBytes > CLIENT_INPUT_IMAGES_MAX_UTF8_BYTES) {
-			throw new Error(`Client input images exceed the ${CLIENT_INPUT_IMAGES_MAX_UTF8_BYTES}-byte UTF-8 limit`);
-		}
-		return { type: "image", mimeType: candidate.mimeType, data: candidate.data };
-	});
-}
-
-function normalizeClientInputContent(message: unknown, images: unknown): { message: string; images: ImageContent[] } {
-	if (typeof message !== "string") {
-		throw new Error("Client input message must be a string");
-	}
-	if (Buffer.byteLength(message, "utf8") > CLIENT_INPUT_MESSAGE_MAX_UTF8_BYTES) {
-		throw new Error(`Client input message exceeds the ${CLIENT_INPUT_MESSAGE_MAX_UTF8_BYTES}-byte UTF-8 limit`);
-	}
-	const normalizedImages = normalizeClientInputImages(images);
-	if (
-		Buffer.byteLength(JSON.stringify({ message, images: normalizedImages }), "utf8") >
-		CLIENT_INPUT_MAX_SERIALIZED_BYTES
-	) {
-		throw new Error(`Client input exceeds the ${CLIENT_INPUT_MAX_SERIALIZED_BYTES}-byte serialized limit`);
-	}
-	return { message, images: normalizedImages };
-}
-
-function normalizeClientInputPayload(command: ClientInputCommand, value: unknown): ClientInputPayload {
-	if (!isRecord(value)) {
-		throw new Error("Client input receipt payload is invalid");
-	}
-	const content = normalizeClientInputContent(value.message, value.images);
-	const streamingBehavior = value.streamingBehavior;
-	if (streamingBehavior !== undefined && streamingBehavior !== "steer" && streamingBehavior !== "followUp") {
-		throw new Error("Client input streaming behavior is invalid");
-	}
-	if (command !== "prompt" && streamingBehavior !== undefined) {
-		throw new Error("Only prompt inputs may specify streaming behavior");
-	}
-	return {
-		...content,
-		...(streamingBehavior === undefined ? {} : { streamingBehavior }),
-	};
-}
-
-function normalizeClientInputQueuedPayload(value: unknown): ClientInputQueuedPayload {
-	if (!isRecord(value) || (value.delivery !== "steer" && value.delivery !== "follow_up")) {
-		throw new Error("Client input queued delivery is invalid");
-	}
-	return {
-		delivery: value.delivery,
-		...normalizeClientInputContent(value.message, value.images),
-	};
 }
 
 function measureClientInputPayloadBytes(value: ClientInputPayload | ClientInputQueuedPayload): number {
@@ -779,12 +648,6 @@ function assertClientInputOutstandingBudget(records: Iterable<ClientInputRecord>
 			`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_BYTES}-byte aggregate limit`,
 		);
 	}
-}
-
-function digestClientInputPayload(command: ClientInputCommand, input: ClientInputPayload): string {
-	return createHash("sha256")
-		.update(JSON.stringify({ command, ...input }))
-		.digest("hex");
 }
 
 export function createClientInputSemanticDigest(command: ClientInputCommand, input: ClientInputPayloadInput): string {
@@ -859,15 +722,6 @@ export type SessionBranchListener = (change: SessionBranchChange) => void;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
-
-function assertValidSessionModeEntry(entry: FileEntry): void {
-	if (entry.type === "thinking_level_change" && !Check(RpcThinkingLevelSchema, entry.thinkingLevel)) {
-		throw new Error(`Thinking level entry ${entry.id} has an invalid thinking level`);
-	}
-	if (entry.type === "fast_mode_change" && typeof entry.enabled !== "boolean") {
-		throw new Error(`Fast mode entry ${entry.id} has an invalid enabled state`);
-	}
-}
 
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeNode {
@@ -951,19 +805,7 @@ function sessionInfoFromStoreSummary(
 }
 
 function storedEntryToSessionEntry(stored: SessionStoreSnapshot["entries"][number]): SessionEntry {
-	const parsed = parseSessionEntryLine(JSON.stringify(stored.payload));
-	if (
-		!parsed ||
-		parsed.type === "session" ||
-		parsed.id !== stored.id ||
-		parsed.parentId !== stored.parentId ||
-		parsed.type !== stored.type ||
-		parsed.timestamp !== stored.timestamp
-	) {
-		throw new Error(`Stored session entry ${stored.id} does not match its indexed identity`);
-	}
-	parsed.ordinal = stored.ordinal;
-	return parsed;
+	return decodeStoredSessionEntry(stored);
 }
 
 export type ReadonlySessionManager = Pick<
@@ -1052,9 +894,13 @@ export function serializeSessionJsonlSnapshot(
 		targetId: leafId,
 		ordinal: snapshotEntries.length + 1,
 	};
-	return `${[createSessionSnapshotHeader(header), ...snapshotEntries, leaf]
-		.map((entry) => JSON.stringify(entry))
-		.join("\n")}\n`;
+	const snapshotHeader = parseSessionSnapshotHeader(
+		createSessionSnapshotHeader(header),
+		CURRENT_SESSION_VERSION,
+		CURRENT_SESSION_SNAPSHOT_VERSION,
+	);
+	const validatedEntries = validatePersistedSessionEntrySequence([...snapshotEntries, leaf], { snapshot: true });
+	return `${[snapshotHeader, ...validatedEntries].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 }
 
 /** Exported for compaction tests and snapshot consumers. */
@@ -1335,12 +1181,15 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			}
 		}
 
-		// Ignore a malformed unterminated final fragment as a torn write. Every
-		// newline-terminated malformed record is committed corruption.
+		// JSONL is explicit interchange, not a live append log. A non-empty
+		// malformed final fragment is a truncated snapshot and must fail closed.
 		if (pendingBytes > 0) {
 			const finalLine = Buffer.concat(pendingChunks, pendingBytes);
 			const parsed = parseSessionEntryBytes(finalLine);
 			if (parsed.entry) entries.push(parsed.entry);
+			else if (parsed.malformed && malformedCompleteLine === undefined) {
+				malformedCompleteLine = lineNumber + 1;
+			}
 		}
 	} finally {
 		closeSync(fd);
@@ -1359,93 +1208,30 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 }
 
 export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnapshotHeader {
-	const header = entries[0] as unknown;
-	if (!isRecord(header) || header.type !== "session") {
+	const headerValue = entries[0];
+	if (!headerValue || headerValue.type !== "session") {
 		throw new Error("Session snapshot has no valid header");
 	}
-	const allowedHeaderKeys = new Set([
-		"type",
-		"version",
-		"snapshotVersion",
-		"id",
-		"timestamp",
-		"cwd",
-		"parentSessionDirectory",
-		"parentStoreId",
-		"parentSessionId",
-		"parentSessionGeneration",
-		"origin",
-	]);
-	for (const key of Object.keys(header)) {
-		if (!allowedHeaderKeys.has(key)) throw new Error(`Session snapshot header has unsupported field: ${key}`);
+	if (entries.slice(1).some((entry) => entry.type === "session")) {
+		throw new Error("Session snapshot contains more than one header");
 	}
-	if (header.version !== CURRENT_SESSION_VERSION) {
+	if (headerValue.version !== CURRENT_SESSION_VERSION) {
 		throw new Error(`Session snapshot entry version must be ${CURRENT_SESSION_VERSION}`);
 	}
-	if (header.snapshotVersion !== CURRENT_SESSION_SNAPSHOT_VERSION) {
+	if (
+		(headerValue as SessionHeader & { snapshotVersion?: number }).snapshotVersion !== CURRENT_SESSION_SNAPSHOT_VERSION
+	) {
 		throw new Error(`Session snapshot version must be ${CURRENT_SESSION_SNAPSHOT_VERSION}`);
 	}
-	if (typeof header.id !== "string") throw new Error("Session snapshot header has an invalid id");
-	assertValidSessionId(header.id);
-	if (typeof header.timestamp !== "string" || !header.timestamp) {
-		throw new Error("Session snapshot header has an invalid timestamp");
-	}
-	if (typeof header.cwd !== "string" || !header.cwd) throw new Error("Session snapshot header has an invalid cwd");
-	if (header.origin !== undefined && header.origin !== "subagent") {
-		throw new Error("Session snapshot header has an invalid origin");
-	}
-	const parentFields = [
-		header.parentSessionDirectory,
-		header.parentStoreId,
-		header.parentSessionId,
-		header.parentSessionGeneration,
-	];
-	if (parentFields.some((value) => value !== undefined) && parentFields.some((value) => typeof value !== "string")) {
-		throw new Error("Session snapshot parent reference must be complete");
-	}
-
-	let sawLeaf = false;
-	const seenEntryIds = new Set<string>();
-	const parentIdsByEntryId = new Map<string, string | null>();
-	for (let index = 1; index < entries.length; index++) {
-		const entry = entries[index]!;
-		if (entry.type === "session") throw new Error("Session snapshot contains more than one header");
-		if (typeof entry.id !== "string" || entry.id.length === 0 || seenEntryIds.has(entry.id)) {
-			throw new Error("Session snapshot contains an invalid or duplicate entry identity");
+	for (const entry of entries.slice(1)) {
+		if (entry.type !== "leaf" && isHostOnlySessionEntry(entry)) {
+			throw new Error(`Session snapshot contains unsupported host-only entry: ${entry.type}`);
 		}
-		if (entry.parentId !== null && (typeof entry.parentId !== "string" || !seenEntryIds.has(entry.parentId))) {
-			throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
-		}
-		assertValidSessionModeEntry(entry);
-		if (entry.type === "compaction") {
-			let branchEntryId = entry.parentId;
-			while (branchEntryId !== null && branchEntryId !== entry.firstKeptEntryId) {
-				branchEntryId = parentIdsByEntryId.get(branchEntryId) ?? null;
-			}
-			if (typeof entry.firstKeptEntryId !== "string" || branchEntryId !== entry.firstKeptEntryId) {
-				throw new Error(`Compaction entry ${entry.id} has an invalid first-kept boundary`);
-			}
-		}
-		if (entry.type === "leaf") {
-			if (sawLeaf || index !== entries.length - 1) {
-				throw new Error("Session snapshot leaf must be the final entry");
-			}
-			if (entry.targetId !== null && (typeof entry.targetId !== "string" || !seenEntryIds.has(entry.targetId))) {
-				throw new Error(`Leaf entry ${entry.id} targets an invalid conversation entry`);
-			}
-			sawLeaf = true;
-		} else {
-			if (isHostOnlySessionEntry(entry)) {
-				throw new Error(`Session snapshot contains unsupported host-only entry: ${entry.type}`);
-			}
-			if (entry.type === "message" && entry.message.role === "user" && entry.message.clientMessageId !== undefined) {
-				throw new Error("Session snapshot contains a transport-owned client message identity");
-			}
-		}
-		seenEntryIds.add(entry.id);
-		parentIdsByEntryId.set(entry.id, entry.parentId);
 	}
-	return header as unknown as SessionSnapshotHeader;
+	const header = parseSessionSnapshotHeader(headerValue, CURRENT_SESSION_VERSION, CURRENT_SESSION_SNAPSHOT_VERSION);
+	const sessionEntries = validatePersistedSessionEntrySequence(entries.slice(1), { snapshot: true });
+	entries.splice(0, entries.length, header, ...sessionEntries);
+	return header;
 }
 
 function isMessageWithContent(message: AgentMessage): message is Message {
@@ -1488,15 +1274,6 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 
 function isDisplayedCustomMessage(entry: SessionEntry): entry is CustomMessageEntry {
 	return entry.type === "custom_message" && entry.display;
-}
-
-const CLIENT_INPUT_ERROR_MAX_SCALARS = 2_000;
-
-function boundClientInputError(error: string): string {
-	const scalars = Array.from(error);
-	return scalars.length <= CLIENT_INPUT_ERROR_MAX_SCALARS
-		? error
-		: `${scalars.slice(0, CLIENT_INPUT_ERROR_MAX_SCALARS).join("")}…`;
 }
 
 export interface SessionEntrySummary {
@@ -1746,6 +1523,13 @@ export class SessionManager {
 			throw new Error("Cannot create a new session while persistence is pending; await flush() first");
 		}
 		if (options?.id !== undefined) assertValidSessionId(options.id);
+		if (options?.origin !== undefined && options.origin !== "subagent") {
+			throw new Error("Session origin is invalid");
+		}
+		const parentSession =
+			options?.parentSession === undefined
+				? undefined
+				: parseSessionReference(options.parentSession, "Parent session reference");
 		this.sessionId = options?.id ?? createSessionId();
 		this.sessionGeneration = randomUUID();
 		const timestamp = new Date().toISOString();
@@ -1755,7 +1539,7 @@ export class SessionManager {
 			id: this.sessionId,
 			timestamp,
 			cwd: this.cwd,
-			...(options?.parentSession === undefined ? {} : { parentSession: options.parentSession }),
+			...(parentSession === undefined ? {} : { parentSession }),
 			...(options?.origin === undefined ? {} : { origin: options.origin }),
 		};
 		this.fileEntries = [header];
@@ -1776,7 +1560,7 @@ export class SessionManager {
 			if (!store || !this.storeId) throw new Error("Persisted session requires an initialized session store");
 			const sessionId = this.sessionId;
 			const sessionGeneration = this.sessionGeneration;
-			const parent = options?.parentSession;
+			const parent = parentSession;
 			this._enqueuePersistence(async () => {
 				await store.createHiddenSession({
 					id: sessionId,
@@ -1796,6 +1580,10 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		const header = this.fileEntries[0];
+		if (!header || header.type !== "session") throw new Error("Current session header is unavailable");
+		const validatedEntries = validatePersistedSessionEntrySequence(this.fileEntries.slice(1));
+		this.fileEntries = [header, ...validatedEntries];
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1804,50 +1592,9 @@ export class SessionManager {
 		this.leafId = null;
 		this.nextOrdinal = 1;
 		this.canonicalRevision = 0;
-		const seenEntryIds = new Set<string>();
-		let lastWalOrdinal = 0;
-		let sawStartingGitContext = false;
-		for (const entry of this.fileEntries) {
-			if (entry.type === "session") continue;
-			if (entry.type === "session_start_git_context") {
-				if (!isValidSessionStartGitContextEntry(entry) || sawStartingGitContext) {
-					throw new Error("Current session contains invalid starting Git context metadata");
-				}
-				sawStartingGitContext = true;
-			}
-			if (typeof entry.id !== "string" || entry.id.length === 0 || seenEntryIds.has(entry.id)) {
-				throw new Error("Current session contains an invalid or duplicate entry identity");
-			}
-			if (entry.parentId === entry.id || (entry.parentId !== null && !seenEntryIds.has(entry.parentId))) {
-				throw new Error(`Session entry ${entry.id} has an invalid or forward parent`);
-			}
-			seenEntryIds.add(entry.id);
-			assertValidSessionModeEntry(entry);
-			if (isClientInputWalEntry(entry)) {
-				if (!Number.isSafeInteger(entry.ordinal) || (entry.ordinal ?? 0) <= lastWalOrdinal) {
-					throw new Error(`Client input WAL entry ${entry.id} has an invalid commit ordinal`);
-				}
-				lastWalOrdinal = entry.ordinal!;
-				assertClientMessageId(entry.clientMessageId);
-				if (
-					(entry.type === "client_input_queued" || entry.type === "client_input_state") &&
-					(typeof entry.receiptId !== "string" || entry.receiptId.length === 0)
-				) {
-					throw new Error(`Client input WAL entry ${entry.id} has an invalid receipt identity`);
-				}
-			}
-			if (Number.isSafeInteger(entry.ordinal) && (entry.ordinal ?? 0) > 0) {
-				this.nextOrdinal = Math.max(this.nextOrdinal, (entry.ordinal ?? 0) + 1);
-			}
-			if (entry.type === "leaf") {
-				if (
-					entry.targetId !== null &&
-					(!this.byId.has(entry.targetId) || isHostOnlySessionEntry(this.byId.get(entry.targetId)!))
-				) {
-					throw new Error(`Leaf entry ${entry.id} targets an invalid conversation entry`);
-				}
-				this.leafId = entry.targetId;
-			}
+		for (const entry of validatedEntries) {
+			this.nextOrdinal = entry.ordinal + 1;
+			if (entry.type === "leaf") this.leafId = entry.targetId;
 			if (entry.type === "leaf" || !isHostOnlySessionEntry(entry)) this.canonicalRevision++;
 			this.byId.set(entry.id, entry);
 			if (!isHostOnlySessionEntry(entry)) {
@@ -2050,13 +1797,7 @@ export class SessionManager {
 			}
 		}
 		const storedEntries: SessionStoreEntryWrite[] = entries.map((entry) => ({
-			id: entry.id,
-			parentId: entry.parentId,
-			type: entry.type,
-			timestamp: entry.timestamp,
-			...(entry.ordinal === undefined ? {} : { ordinal: entry.ordinal }),
-			isHostOnly: isHostOnlySessionEntry(entry),
-			payload: entry as unknown as SessionStoreJsonValue,
+			entry: parsePersistedSessionEntry(entry) as unknown as SessionStoreJsonValue,
 		}));
 		return {
 			session: this._storeProjection(),
@@ -2176,20 +1917,18 @@ export class SessionManager {
 			throw new Error("An atomic session append is already in progress");
 		}
 		this._assertPersistenceHealthy();
-		const canonicalEntry = cloneCanonicalData(entry, `Session ${entry.type} entry`);
+		const canonicalEntry = parseSessionEntryForAdmission(entry, `Session ${entry.type} entry`);
+		validateSessionEntryAdmissionReferences(canonicalEntry, this.byId, this.nextOrdinal);
 		if (
-			canonicalEntry.type === "message" &&
-			typeof canonicalEntry.message.timestamp === "number" &&
-			Number.isNaN(new Date(canonicalEntry.message.timestamp).getTime())
+			canonicalEntry.type === "session_start_git_context" &&
+			this.sessionStoreProjection.startingGitContext !== undefined
 		) {
-			throw new Error("Session message timestamp must be representable as a Date");
+			throw new Error("Session contains more than one starting Git context entry");
 		}
-		if (
-			canonicalEntry.parentId === canonicalEntry.id ||
-			(canonicalEntry.parentId !== null && !this.byId.has(canonicalEntry.parentId))
-		) {
-			throw new Error(`Session entry ${canonicalEntry.id} has an invalid or forward parent`);
-		}
+		const stagedClientInputs = new Map(
+			[...this.clientInputsById].map(([id, record]) => [id, cloneClientInputRecord(record)]),
+		);
+		this._indexClientInputEntry(canonicalEntry, stagedClientInputs);
 		canonicalEntry.ordinal = this.nextOrdinal++;
 		this.fileEntries.push(canonicalEntry);
 		this.byId.set(canonicalEntry.id, canonicalEntry);
@@ -2809,7 +2548,10 @@ export class SessionManager {
 		}
 	}
 
-	private _indexClientInputEntry(entry: SessionEntry): void {
+	private _indexClientInputEntry(
+		entry: SessionEntry,
+		records: Map<string, ClientInputRecord> = this.clientInputsById,
+	): void {
 		if (entry.type === "client_input_receipt") {
 			assertClientMessageId(entry.clientMessageId);
 			if (entry.command !== "prompt" && entry.command !== "steer" && entry.command !== "follow_up") {
@@ -2819,11 +2561,11 @@ export class SessionManager {
 			if (entry.semanticDigest !== digestClientInputPayload(entry.command, input)) {
 				throw new Error(`Client input receipt ${entry.id} has a mismatched semantic digest`);
 			}
-			const existing = this.clientInputsById.get(entry.clientMessageId);
+			const existing = records.get(entry.clientMessageId);
 			if (!existing) {
-				assertClientInputOutstandingCount(this.clientInputsById.values(), 1);
-				assertClientInputOutstandingBudget(this.clientInputsById.values(), measureClientInputPayloadBytes(input));
-				this.clientInputsById.set(entry.clientMessageId, {
+				assertClientInputOutstandingCount(records.values(), 1);
+				assertClientInputOutstandingBudget(records.values(), measureClientInputPayloadBytes(input));
+				records.set(entry.clientMessageId, {
 					receiptId: entry.id,
 					clientMessageId: entry.clientMessageId,
 					command: entry.command,
@@ -2841,7 +2583,7 @@ export class SessionManager {
 
 		if (entry.type === "client_input_queued") {
 			assertClientMessageId(entry.clientMessageId);
-			const record = this.clientInputsById.get(entry.clientMessageId);
+			const record = records.get(entry.clientMessageId);
 			if (!record || record.receiptId !== entry.receiptId) {
 				throw new Error(`Queued client input ${entry.id} has no matching receipt`);
 			}
@@ -2857,18 +2599,14 @@ export class SessionManager {
 			}
 			if (
 				!record.queuedInput &&
-				getRecoverableQueuedClientInputCount(this.clientInputsById.values()) >=
-					CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES
+				getRecoverableQueuedClientInputCount(records.values()) >= CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES
 			) {
 				throw new Error(
 					`Recoverable client input queue exceeds ${CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES} entries`,
 				);
 			}
 			if (!record.queuedInput) {
-				assertClientInputOutstandingBudget(
-					this.clientInputsById.values(),
-					measureClientInputPayloadBytes(queuedInput),
-				);
+				assertClientInputOutstandingBudget(records.values(), measureClientInputPayloadBytes(queuedInput));
 			}
 			record.queuedEntryId ??= entry.id;
 			record.queuedInput = queuedInput;
@@ -2897,7 +2635,7 @@ export class SessionManager {
 			) {
 				throw new Error(`Client input state ${entry.id} has an invalid error`);
 			}
-			const record = this.clientInputsById.get(entry.clientMessageId);
+			const record = records.get(entry.clientMessageId);
 			if (!record || record.receiptId !== entry.receiptId) {
 				throw new Error(`Client input state ${entry.id} has no matching receipt`);
 			}
@@ -2925,7 +2663,7 @@ export class SessionManager {
 		if (typeof clientMessageId !== "string") {
 			throw new Error(`Canonical client input ${entry.id} has an invalid client identity`);
 		}
-		const record = requireStartedClientInputReceipt(this.clientInputsById, clientMessageId);
+		const record = requireStartedClientInputReceipt(records, clientMessageId);
 		record.state = "completed";
 		record.error = undefined;
 		record.canonicalEntryId = entry.id;
@@ -3766,14 +3504,15 @@ export class SessionManager {
 
 	/** Open one authoritative SQLite session reference. */
 	static async open(ref: SessionReference, cwdOverride?: string): Promise<SessionManager> {
-		const dir = resolvePath(ref.sessionDirectory);
+		const canonicalRef = parseSessionReference(ref);
+		const dir = resolvePath(canonicalRef.sessionDirectory);
 		const lease = await SessionManager._store(dir);
 		try {
-			if (lease.client.info.storeId !== ref.storeId) {
+			if (lease.client.info.storeId !== canonicalRef.storeId) {
 				throw new Error("Session reference belongs to a different store");
 			}
-			const snapshot = await lease.client.loadSession(ref.sessionId, ref.sessionGeneration);
-			if (!snapshot) throw new Error(`Session not found: ${ref.sessionId}`);
+			const snapshot = await lease.client.loadSession(canonicalRef.sessionId, canonicalRef.sessionGeneration);
+			if (!snapshot) throw new Error(`Session not found: ${canonicalRef.sessionId}`);
 			return new SessionManager(cwdOverride ?? snapshot.session.cwd, dir, true, undefined, lease, snapshot);
 		} catch (error) {
 			return await SessionManager._releaseLeaseAfterFailure(
@@ -4122,13 +3861,16 @@ export class SessionManager {
 	}
 
 	static async delete(ref: SessionReference, expectedRevision?: number): Promise<boolean> {
-		return SessionManager._scopedStore(ref.sessionDirectory, async (store) => {
-			if (store.info.storeId !== ref.storeId) throw new Error("Session reference belongs to a different store");
-			const summary = await store.findSessionSummary(ref.sessionId, ref.sessionGeneration);
+		const canonicalRef = parseSessionReference(ref);
+		return SessionManager._scopedStore(canonicalRef.sessionDirectory, async (store) => {
+			if (store.info.storeId !== canonicalRef.storeId) {
+				throw new Error("Session reference belongs to a different store");
+			}
+			const summary = await store.findSessionSummary(canonicalRef.sessionId, canonicalRef.sessionGeneration);
 			if (!summary) return false;
 			const result = await store.deleteSession({
-				sessionId: ref.sessionId,
-				sessionGeneration: ref.sessionGeneration,
+				sessionId: canonicalRef.sessionId,
+				sessionGeneration: canonicalRef.sessionGeneration,
 				expectedRevision: expectedRevision ?? summary.revision,
 			});
 			if (result.status === "conflict") {

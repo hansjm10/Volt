@@ -202,6 +202,13 @@ describe("SessionManager asynchronous SQLite persistence", () => {
 			id: "snapshot",
 			timestamp: "2025-01-01T00:00:00.000Z",
 			cwd: root,
+		})}\n${JSON.stringify({
+			type: "leaf",
+			id: "snapshot-leaf",
+			parentId: null,
+			ordinal: 1,
+			timestamp: "2025-01-01T00:00:01.000Z",
+			targetId: null,
 		})}\n`;
 		writeFileSync(snapshotPath, snapshotBytes);
 

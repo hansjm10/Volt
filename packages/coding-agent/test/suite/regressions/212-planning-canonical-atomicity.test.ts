@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parsePersistedSessionEntry } from "../../../src/core/session-entry-codec.ts";
 import { type SessionEntry, SessionManager, type SessionReference } from "../../../src/core/session-manager.ts";
 import {
 	acquireSharedSQLiteSessionStore,
@@ -19,7 +20,11 @@ async function faultNextTransaction(
 	const store = lease.client;
 	const applyTransaction = store.applyTransaction.bind(store);
 	vi.spyOn(store, "applyTransaction").mockImplementation(async (input) => {
-		if (!input.payload.entries.some((entry) => entry.type === "planning_state_change")) {
+		if (
+			!input.payload.entries.some(
+				(entry) => parsePersistedSessionEntry(entry.entry).type === "planning_state_change",
+			)
+		) {
 			return applyTransaction(input);
 		}
 		if (stage === "before") throw new Error("injected pre-commit transaction failure");

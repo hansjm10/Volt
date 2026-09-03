@@ -72,6 +72,35 @@ describe("SQLite-backed SessionManager", () => {
 		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "hello sqlite" }]);
 	});
 
+	it("rejects a non-boolean host-only column without poisoning healthy sessions", async () => {
+		const { cwd, sessionDir } = fixture();
+		const corrupted = await own(SessionManager.create(cwd, sessionDir, { id: "corrupted-envelope" }));
+		corrupted.appendMessage({ role: "user", content: "corrupt me", timestamp: Date.now() });
+		await corrupted.flush();
+		const corruptedRef = corrupted.getSessionRef();
+		if (!corruptedRef) throw new Error("Expected a corrupted-session reference");
+		const healthy = await own(SessionManager.create(cwd, sessionDir, { id: "healthy-envelope" }));
+		healthy.appendMessage({ role: "user", content: "keep me", timestamp: Date.now() });
+		await healthy.flush();
+		const healthyRef = healthy.getSessionRef();
+		if (!healthyRef) throw new Error("Expected a healthy-session reference");
+		await Promise.all([corrupted.closePersistence(), healthy.closePersistence()]);
+
+		const database = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME));
+		try {
+			database.exec("PRAGMA ignore_check_constraints = ON");
+			database
+				.prepare("UPDATE entries SET is_host_only = 2 WHERE session_id = ? AND ordinal = 1")
+				.run(corruptedRef.sessionId);
+		} finally {
+			database.close();
+		}
+
+		await expect(SessionManager.open(corruptedRef)).rejects.toThrow("Invalid SQLite isHostOnly boolean column");
+		const reopened = await own(SessionManager.open(healthyRef));
+		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "keep me" }]);
+	});
+
 	it("continues a WAL-only accepted receipt for an exact client retry", async () => {
 		const { cwd, sessionDir } = fixture();
 		const manager = await own(SessionManager.create(cwd, sessionDir, { id: "accepted-only-continuation" }));
