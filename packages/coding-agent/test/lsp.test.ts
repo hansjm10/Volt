@@ -185,15 +185,11 @@ describe("resolveLspConfig", () => {
 			}).servers.find((server) => server.name === "typescript");
 
 		expect(resolveTypescript()?.installRecipe).toBeDefined();
-		expect(resolveTypescript(["typescript-language-server", "--stdio"])?.installRecipe).toBeDefined();
-		for (const command of [
-			["typescript-language-server"],
-			["typescript-language-server", "--custom-mode"],
-			["typescript-language-server", "--stdio", "--extra"],
-		]) {
+		expect(resolveTypescript(["tsc", "--lsp", "--stdio"])?.installRecipe).toBeDefined();
+		for (const command of [["tsc"], ["tsc", "--custom-mode"], ["tsc", "--lsp", "--stdio", "--extra"]]) {
 			const server = resolveTypescript(command);
 			expect(server?.installRecipe, command.join(" ")).toBeUndefined();
-			expect(server?.installHint, command.join(" ")).toContain("npm install -g typescript-language-server");
+			expect(server?.installHint, command.join(" ")).toContain("npm install -g typescript@7.0.2");
 		}
 	});
 
@@ -205,19 +201,16 @@ describe("resolveLspConfig", () => {
 
 describe("installHintForCommand", () => {
 	it("returns install hints for built-in server binaries", () => {
-		expect(installHintForCommand(["typescript-language-server", "--stdio"])).toContain(
-			"npm install -g typescript-language-server",
-		);
+		expect(installHintForCommand(["tsc", "--lsp", "--stdio"])).toContain("npm install -g typescript@7.0.2");
 		expect(installHintForCommand(["gopls"])).toContain("go install");
 	});
 
 	it("returns trusted recipes only for reviewed install commands", () => {
-		expect(installRecipeForCommand(["typescript-language-server", "--stdio"])?.command).toEqual([
+		expect(installRecipeForCommand(["tsc", "--lsp", "--stdio"])?.command).toEqual([
 			"npm",
 			"install",
 			"-g",
-			"typescript-language-server",
-			"typescript",
+			"typescript@7.0.2",
 		]);
 		expect(installRecipeForCommand([join("/tmp", "gopls")])?.displayCommand).toBe(
 			"go install golang.org/x/tools/gopls@latest",
@@ -1464,7 +1457,7 @@ describe("LspManager", () => {
 				config: resolveLspConfig({
 					servers: {
 						typescript: {
-							command: ["typescript-language-server", "--custom-mode"],
+							command: ["tsc", "--custom-mode"],
 							fileExtensions: [".foo"],
 							rootMarkers: [],
 						},
@@ -1480,7 +1473,7 @@ describe("LspManager", () => {
 			const filePath = join(tempDir, "test.foo");
 			const first = await manager.getDiagnostics(filePath, "ERROR\n");
 
-			expect(first).toContain("Install with: npm install -g typescript-language-server typescript");
+			expect(first).toContain("Install with: npm install -g typescript@7.0.2");
 			expect(requests).toEqual([]);
 		} finally {
 			if (previousPath === undefined) delete process.env.PATH;
@@ -1492,10 +1485,7 @@ describe("LspManager", () => {
 		tempDir = mkdtempSync(join(tmpdir(), "volt-lsp-test-"));
 		const binDir = join(tempDir, "bin");
 		mkdirSync(binDir);
-		const unusablePath = join(
-			binDir,
-			process.platform === "win32" ? "typescript-language-server.CMD" : "typescript-language-server",
-		);
+		const unusablePath = join(binDir, process.platform === "win32" ? "tsc.CMD" : "tsc");
 		if (process.platform === "win32") {
 			mkdirSync(unusablePath);
 		} else {
@@ -1558,7 +1548,7 @@ describe("LspManager", () => {
 						go: { enabled: false },
 						rust: { enabled: false },
 						custom: {
-							command: ["typescript-language-server", "--stdio"],
+							command: ["tsc", "--lsp", "--stdio"],
 							fileExtensions: [".foo"],
 							rootMarkers: [],
 						},
@@ -1579,7 +1569,7 @@ describe("LspManager", () => {
 			const first = await manager.getDiagnostics(filePath, "ERROR\n");
 
 			expect(first).toContain("lsp(custom):");
-			expect(first).toContain("Install with: npm install -g typescript-language-server typescript");
+			expect(first).toContain("Install with: npm install -g typescript@7.0.2");
 			expect(requests).toEqual([]);
 			expect(installCommands).toEqual([]);
 		} finally {
@@ -1616,7 +1606,7 @@ describe("LspManager", () => {
 					enabled: true,
 					servers: {
 						typescript: {
-							command: ["typescript-language-server", "--stdio"],
+							command: ["tsc", "--lsp", "--stdio"],
 							fileExtensions: [".foo"],
 							rootMarkers: [],
 						},
@@ -1625,7 +1615,7 @@ describe("LspManager", () => {
 				hostInteraction,
 				installRunner: async (command) => {
 					installCommands.push([...command]);
-					writeFakeServerExecutable(binDir, "typescript-language-server");
+					writeFakeServerExecutable(binDir, "tsc");
 					return { exitCode: 0, output: "installed\n" };
 				},
 			});
@@ -1639,10 +1629,10 @@ describe("LspManager", () => {
 			expect(requests).toHaveLength(1);
 			expect(requests[0]).toMatchObject({
 				action: "lsp.install_server",
-				commandPreview: "npm install -g typescript-language-server typescript",
-				metadata: { server: "typescript", binary: "typescript-language-server" },
+				commandPreview: "npm install -g typescript@7.0.2",
+				metadata: { server: "typescript", binary: "tsc" },
 			});
-			expect(installCommands).toEqual([["npm", "install", "-g", "typescript-language-server", "typescript"]]);
+			expect(installCommands).toEqual([["npm", "install", "-g", "typescript@7.0.2"]]);
 			expect(updates.map((update) => update.status)).toEqual(["running", "completed"]);
 		} finally {
 			if (previousPath === undefined) {
@@ -1674,7 +1664,7 @@ describe("LspManager", () => {
 				config: resolveLspConfig({
 					servers: {
 						typescript: {
-							command: ["typescript-language-server", "--stdio"],
+							command: ["tsc", "--lsp", "--stdio"],
 							fileExtensions: [".foo"],
 							rootMarkers: [".root"],
 						},
@@ -1689,7 +1679,7 @@ describe("LspManager", () => {
 				installRunner: async () => {
 					installs++;
 					await new Promise((resolve) => setTimeout(resolve, 50));
-					writeFakeServerExecutable(binDir, "typescript-language-server");
+					writeFakeServerExecutable(binDir, "tsc");
 					return { exitCode: 0, output: "installed\n" };
 				},
 			});
@@ -1752,7 +1742,7 @@ describe("LspManager", () => {
 				},
 				installRunner: async () => {
 					secondInstalls++;
-					writeFakeServerExecutable(binDir, "typescript-language-server");
+					writeFakeServerExecutable(binDir, "tsc");
 					return { exitCode: 0, output: "installed\n" };
 				},
 			});
@@ -1828,7 +1818,7 @@ describe("LspManager", () => {
 				},
 				installRunner: async () => {
 					installs++;
-					writeFakeServerExecutable(binDir, "typescript-language-server");
+					writeFakeServerExecutable(binDir, "tsc");
 					return { exitCode: 0, output: "installed\n" };
 				},
 			});
@@ -1882,7 +1872,7 @@ describe("LspManager", () => {
 				},
 				installRunner: async () => {
 					installs++;
-					writeFakeServerExecutable(binDir, "typescript-language-server");
+					writeFakeServerExecutable(binDir, "tsc");
 					installFinished.resolve();
 					return { exitCode: 0, output: "installed\n" };
 				},
@@ -1981,7 +1971,7 @@ describe("LspManager", () => {
 					enabled: true,
 					servers: {
 						typescript: {
-							command: ["typescript-language-server", "--stdio"],
+							command: ["tsc", "--lsp", "--stdio"],
 							fileExtensions: [".foo"],
 							rootMarkers: [],
 						},
@@ -1998,7 +1988,7 @@ describe("LspManager", () => {
 			const first = await manager.getDiagnostics(filePath, "ERROR\n");
 			const second = await manager.getDiagnostics(filePath, "ERROR\n");
 
-			expect(first).toContain("Install with: npm install -g typescript-language-server typescript");
+			expect(first).toContain("Install with: npm install -g typescript@7.0.2");
 			expect(second).toBeUndefined();
 			expect(requests).toHaveLength(1);
 		} finally {
