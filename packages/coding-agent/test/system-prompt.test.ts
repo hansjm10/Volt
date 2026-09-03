@@ -85,6 +85,25 @@ describe("buildSystemPrompt", () => {
 			expectBefore(prompt, "<personality>", "<instruction_hierarchy>");
 		});
 
+		test("limits the Simplified Technical English personality to user-facing prose", () => {
+			const settingsManager = SettingsManager.inMemory({ personality: "simplified-technical" });
+			const prompt = buildSystemPrompt({
+				personality: settingsManager.getPersonality(),
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(settingsManager.getPersonality()).toBe("simplified-technical");
+			expect(prompt).toContain("Simplified Technical English based on ASD-STE100");
+			expect(prompt).toContain("Apply this style only to your user-facing prose");
+			expect(prompt).toContain("Do not apply it to source code, identifiers, APIs, commands");
+			expect(prompt).toContain("Follow project conventions for code comments, documentation, commit messages");
+			expect(prompt).not.toContain("Write with warmth, curiosity, and confidence");
+			expect(prompt).not.toContain("you are pragmatic, direct, and solutions-oriented");
+			expectBefore(prompt, "<personality>", "<instruction_hierarchy>");
+		});
+
 		test("includes XML-oriented prompt sections", () => {
 			const prompt = buildSystemPrompt({
 				contextFiles: [],

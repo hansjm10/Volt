@@ -791,13 +791,13 @@ When a host action is needed, Volt emits:
   "id": "ha_123",
   "action": "lsp.install_server",
   "title": "Install typescript language server?",
-  "message": "Volt tried to use LSP for typescript, but typescript-language-server is not installed. Install it now and retry diagnostics?",
+  "message": "Volt tried to use LSP for typescript, but tsc is not installed. Install it now and retry diagnostics?",
   "confirmLabel": "Install",
   "cancelLabel": "Skip",
-  "commandPreview": "npm install -g typescript-language-server typescript",
+  "commandPreview": "npm install -g typescript@7.0.2",
   "blocking": true,
   "destructive": false,
-  "metadata": {"server": "typescript", "binary": "typescript-language-server"}
+  "metadata": {"server": "typescript", "binary": "tsc"}
 }
 ```
 
@@ -810,7 +810,7 @@ The client responds with one of `"approved"`, `"denied"`, or `"dismissed"`:
 Volt may emit progress updates for approved actions:
 
 ```json
-{"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "running", "message": "Running npm install -g typescript-language-server typescript"}
+{"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "running", "message": "Running npm install -g typescript@7.0.2"}
 {"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "completed", "message": "typescript language server installed. Retrying diagnostics.", "exitCode": 0}
 ```
 
