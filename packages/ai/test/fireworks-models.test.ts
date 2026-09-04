@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.ts";
-import { getModel, getModels } from "../src/models.ts";
+import { getModel } from "../src/models.ts";
 import { streamAnthropic } from "../src/providers/anthropic.ts";
 import type { Context, Model, Tool } from "../src/types.ts";
 
@@ -37,15 +37,13 @@ describe("Fireworks models", () => {
 		});
 	});
 
-	it("registers the Fire Pass turbo router model", () => {
-		const model = getModels("fireworks").find(
-			(candidate) => candidate.id.startsWith("accounts/fireworks/routers/") && candidate.id.endsWith("-turbo"),
-		);
+	it("registers the Kimi K3 fast router model", () => {
+		const model = getModel("fireworks", "accounts/fireworks/routers/kimi-k3-fast");
 
 		expect(model).toBeDefined();
-		expect(model?.api).toBe("anthropic-messages");
-		expect(model?.baseUrl).toBe("https://api.fireworks.ai/inference");
-		expect(model?.input).toEqual(["text", "image"]);
+		expect(model.api).toBe("anthropic-messages");
+		expect(model.baseUrl).toBe("https://api.fireworks.ai/inference");
+		expect(model.input).toEqual(["text", "image"]);
 	});
 
 	it("resolves FIREWORKS_API_KEY from the environment", () => {

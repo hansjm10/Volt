@@ -93,6 +93,8 @@ const GPT_5_6_MODELS = [
 	},
 ] as const;
 const GPT_5_6_MODEL_IDS = new Set<string>(["gpt-5.6", ...GPT_5_6_MODELS.map((model) => model.id)]);
+const GPT_6_ASTRA_ID = "gpt-6-astra";
+const GPT_6_ASTRA_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 } as const;
 
 const MOONSHOT_CN_MIRRORED_MODEL_IDS = new Set(["kimi-k2.7-code", "kimi-k2.7-code-highspeed"]);
 
@@ -316,7 +318,7 @@ const IMPLICIT_EXTENDED_PROMPT_CACHE = {
 	refreshesOnHit: true,
 } as const satisfies PromptCacheMetadata;
 
-const OPENAI_GPT_5_6_PROMPT_CACHE = {
+const OPENAI_30_MINUTE_PROMPT_CACHE = {
 	modes: ["implicit", "explicit"],
 	retention: { short: { ttlSeconds: 1_800 } },
 	refreshesOnHit: true,
@@ -354,12 +356,14 @@ function canonicalBedrockModelId(modelId: string): string {
 
 const PROMPT_CACHE_POLICIES: readonly PromptCachePolicyRecord[] = [
 	{
-		name: "OpenAI GPT-5.6",
+		name: "OpenAI 30-minute prompt caching",
 		sourceUrl: "https://developers.openai.com/api/docs/guides/prompt-caching",
-		verifiedAt: "2026-08-18",
+		verifiedAt: "2026-09-04",
 		matches: (model) =>
-			model.provider === "openai" && model.api === "openai-responses" && GPT_5_6_MODEL_IDS.has(model.id),
-		metadata: OPENAI_GPT_5_6_PROMPT_CACHE,
+			model.provider === "openai" &&
+			model.api === "openai-responses" &&
+			(GPT_5_6_MODEL_IDS.has(model.id) || model.id === GPT_6_ASTRA_ID),
+		metadata: OPENAI_30_MINUTE_PROMPT_CACHE,
 	},
 	{
 		name: "OpenAI extended retention",
@@ -382,11 +386,13 @@ const PROMPT_CACHE_POLICIES: readonly PromptCachePolicyRecord[] = [
 		metadata: IMPLICIT_SHORT_PROMPT_CACHE,
 	},
 	{
-		name: "Azure OpenAI GPT-5.6",
+		name: "Azure OpenAI 30-minute prompt caching",
 		sourceUrl: "https://learn.microsoft.com/azure/foundry/openai/how-to/prompt-caching",
-		verifiedAt: "2026-08-18",
-		matches: (model) => model.provider === "azure-openai-responses" && GPT_5_6_MODEL_IDS.has(model.id),
-		metadata: OPENAI_GPT_5_6_PROMPT_CACHE,
+		verifiedAt: "2026-09-04",
+		matches: (model) =>
+			model.provider === "azure-openai-responses" &&
+			(GPT_5_6_MODEL_IDS.has(model.id) || model.id === GPT_6_ASTRA_ID),
+		metadata: OPENAI_30_MINUTE_PROMPT_CACHE,
 	},
 	{
 		name: "Azure OpenAI extended retention",
@@ -548,6 +554,14 @@ function isGemma4Model(modelId: string): boolean {
 }
 
 function applyThinkingLevelMetadata(model: Model<any>): void {
+	if (
+		model.id === GPT_6_ASTRA_ID &&
+		(model.api === "openai-responses" ||
+			model.api === "azure-openai-responses" ||
+			model.api === "openai-codex-responses")
+	) {
+		mergeThinkingLevelMap(model, { off: null, minimal: null, xhigh: "xhigh", max: "max" });
+	}
 	if (
 		(model.api === "openai-responses" || model.api === "azure-openai-responses") &&
 		model.id.startsWith("gpt-5")
@@ -2033,6 +2047,21 @@ async function generateModels() {
 		}
 	}
 
+	if (!allModels.some((m) => m.provider === "openai" && m.id === GPT_6_ASTRA_ID)) {
+		allModels.push({
+			id: GPT_6_ASTRA_ID,
+			name: "GPT-6 Astra",
+			api: "openai-responses",
+			baseUrl: "https://api.openai.com/v1",
+			provider: "openai",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { ...GPT_6_ASTRA_COST },
+			contextWindow: 1050000,
+			maxTokens: 128000,
+		});
+	}
+
 	const deepseekCompat: OpenAICompletionsCompat = {
 		requiresReasoningContentOnAssistantMessages: true,
 		thinkingFormat: "deepseek",
@@ -2159,9 +2188,22 @@ async function generateModels() {
 	const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 	const CODEX_CONTEXT = 272000;
 	const CODEX_GPT_5_6_SOL_CONTEXT = 1000000;
+	const CODEX_GPT_6_ASTRA_CONTEXT = 1050000;
 	const CODEX_SPARK_CONTEXT = 128000;
 	const CODEX_MAX_TOKENS = 128000;
 	const codexModels: Model<"openai-codex-responses">[] = [
+		{
+			id: GPT_6_ASTRA_ID,
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { ...GPT_6_ASTRA_COST },
+			contextWindow: CODEX_GPT_6_ASTRA_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
 		{
 			id: "gpt-5.3-codex-spark",
 			name: "GPT-5.3 Codex Spark",
