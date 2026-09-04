@@ -1074,10 +1074,11 @@ describe.skipIf(!nativeAvailable)("TUI Work observation receipt revisions", () =
 		writeFileSync(join(unresolvedWorkspaceDir, ".git", "HEAD"), "ref: refs/heads/main\n");
 		const workspaceDir = realpathSync(unresolvedWorkspaceDir);
 		const sessionId = randomUUID();
-		const session = SessionManager.create(workspaceDir, getDefaultSessionDir(workspaceDir, agentDir), {
+		const session = await SessionManager.create(workspaceDir, getDefaultSessionDir(workspaceDir, agentDir), {
 			id: sessionId,
 		});
 		await session.materialize();
+		await session.closePersistence();
 
 		const oldPositiveGate = createDeferred();
 		const oldNullGate = createDeferred();
@@ -1230,9 +1231,10 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 		const sourceSessionId = randomUUID();
 		const replacementSessionId = randomUUID();
 		const sessionDir = getDefaultSessionDir(workspaceDir, agentDir);
-		const sourceSession = SessionManager.create(workspaceDir, sessionDir, { id: sourceSessionId });
-		const replacementSession = SessionManager.create(workspaceDir, sessionDir, { id: replacementSessionId });
+		const sourceSession = await SessionManager.create(workspaceDir, sessionDir, { id: sourceSessionId });
+		const replacementSession = await SessionManager.create(workspaceDir, sessionDir, { id: replacementSessionId });
 		await Promise.all([sourceSession.materialize(), replacementSession.materialize()]);
+		await Promise.all([sourceSession.closePersistence(), replacementSession.closePersistence()]);
 
 		const faux = registerFauxProvider();
 		const model = faux.getModel();

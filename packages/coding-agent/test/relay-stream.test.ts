@@ -111,7 +111,6 @@ function mintTestRelay(
 			streamId: "st-1",
 			resolvedTarget: {
 				sessionId: "s-1",
-				sessionFilePath: "/tmp/ws/.sessions/s-1.jsonl",
 				selection: "resumed",
 				requestedSessionId: "s-1",
 				workspaceName: "ws",
@@ -155,7 +154,6 @@ describe("relay framing (§12.2.3)", () => {
 			streamId: "st-1",
 			resolvedTarget: {
 				sessionId: "s-1",
-				sessionFilePath: "/tmp/ws/.sessions/s-1.jsonl",
 				selection: "resumed",
 				requestedSessionId: "s-1",
 				workspaceName: "ws",

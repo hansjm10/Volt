@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync as nodeRealpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync as nodeRealpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +18,7 @@ import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manage
 import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
 import { createConversationOpenError, IntegratedRuntimeRegistry } from "../src/daemon/integrated-runtimes.ts";
 import { createTestSession } from "./iroh-stream-doubles.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const realpathSync = nodeRealpathSync.native;
 
@@ -596,6 +597,8 @@ describe("worktree session-dir keying (§5.1.7 filterCwd pin)", () => {
 	it("a session with a worktree cwd in the parent session dir stays visible in the parent listing", async () => {
 		const agentDir = realpathSync(mkdtempSync(join(tmpdir(), "volt-worktree-sessiondir-")));
 		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
 			// The daemon always uses the env-aware agent dir; pin that setup here so
 			// SessionManager.list's filterCwd stays OFF for the parent's default dir.
@@ -606,26 +609,13 @@ describe("worktree session-dir keying (§5.1.7 filterCwd pin)", () => {
 			mkdirSync(worktreePath, { recursive: true });
 
 			const parentSessionDir = getDefaultSessionDir(parentPath, agentDir);
-			writeFileSync(
-				join(parentSessionDir, "worktree-session.jsonl"),
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "s-worktree",
-					timestamp: new Date().toISOString(),
-					cwd: worktreePath,
-				})}\n`,
-			);
-			writeFileSync(
-				join(parentSessionDir, "parent-session.jsonl"),
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "s-parent",
-					timestamp: new Date().toISOString(),
-					cwd: parentPath,
-				})}\n`,
-			);
+			const worktreeSession = await SessionManager.create(worktreePath, parentSessionDir, {
+				id: "s-worktree",
+			});
+			const parentSession = await SessionManager.create(parentPath, parentSessionDir, { id: "s-parent" });
+			worktreeSession.appendMessage({ role: "user", content: "worktree session", timestamp: Date.now() });
+			parentSession.appendMessage({ role: "user", content: "parent session", timestamp: Date.now() });
+			await Promise.all([worktreeSession.flush(), parentSession.flush()]);
 
 			// The daemon's list_sessions call shape: parent cwd + parent default dir.
 			const sessions = await SessionManager.list(parentPath, parentSessionDir);
@@ -633,6 +623,7 @@ describe("worktree session-dir keying (§5.1.7 filterCwd pin)", () => {
 			expect(ids).toContain("s-worktree");
 			expect(ids).toContain("s-parent");
 		} finally {
+			await managerOwner.drain();
 			if (originalAgentDir === undefined) {
 				delete process.env[ENV_AGENT_DIR];
 			} else {

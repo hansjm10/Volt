@@ -6,6 +6,8 @@
 
 ---
 
+> **Current session-storage note:** Volt now stores live sessions in the parent workspace's `sessions.sqlite` database. References below to a session file/header should be read as the corresponding session row/`SessionReference`; worktree sessions still use the parent workspace session directory and persist their effective worktree `cwd` in the session row. JSONL is import/export only.
+
 ## 1. Summary
 
 Every daemon-owned headless runtime today runs with `cwd = workspace.path` — the one registered checkout — so two concurrent sessions in the same workspace stomp on each other's files, branches, and index. This RFC adds optional **git-worktree-backed session isolation**: the daemon manages worktrees under `~/.volt/agent/worktrees/`, a session can be started "into" a worktree (from the mobile app over the iroh remote protocol, and later from the TUI), and the daemon persists a `sessionId → worktree` binding so resume, relay, lease takeover, and sanitization all follow the worktree cwd. Sessions remain stored and listed under the **parent workspace**, so `list_sessions`, `target:"last"`, and lease keying keep working unchanged.

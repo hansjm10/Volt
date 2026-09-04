@@ -158,8 +158,8 @@ export abstract class RpcClientBase {
 	}
 
 	/** Start a new session, optionally with parent tracking. */
-	async newSession(parentSession?: string): Promise<{ cancelled: boolean }> {
-		const response = await this.send({ type: "new_session", parentSession });
+	async newSession(parentSessionId?: string): Promise<{ cancelled: boolean }> {
+		const response = await this.send({ type: "new_session", parentSessionId });
 		return this.getData(response);
 	}
 
@@ -377,7 +377,7 @@ export abstract class RpcClientBase {
 	}
 
 	/** Get session statistics. */
-	async getSessionStats(): Promise<SessionStats> {
+	async getSessionStats(): Promise<Omit<SessionStats, "sessionRef">> {
 		const response = await this.send({ type: "get_session_stats" });
 		return this.getData(response);
 	}
@@ -400,9 +400,9 @@ export abstract class RpcClientBase {
 		return this.getData(response);
 	}
 
-	/** Switch to a different session file. */
-	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
-		const response = await this.send({ type: "switch_session", sessionPath });
+	/** Switch to a workspace session by stable session id. */
+	async switchSession(sessionId: string): Promise<{ cancelled: boolean }> {
+		const response = await this.send({ type: "switch_session", sessionId });
 		return this.getData(response);
 	}
 

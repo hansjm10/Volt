@@ -255,7 +255,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `sessionDir` | string | - | Directory where session files are stored. Accepts absolute or relative paths, plus `~`. |
+| `sessionDir` | string | - | Directory containing the authoritative `sessions.sqlite` store. Accepts absolute or relative paths, plus `~`. |
 
 ```json
 { "sessionDir": ".volt/sessions" }

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentLoopNextActionContext } from "@hansjm10/volt-agent-core";
@@ -10,6 +10,7 @@ import {
 	registerFauxProvider,
 } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgentSession } from "../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -271,13 +272,14 @@ describe("SubagentManager", () => {
 				rmSync(parentRoot, { recursive: true, force: true });
 			}
 		});
-		const parentSessionManager = SessionManager.create(parentRoot, join(parentRoot, "sessions"));
+		const parentSessionManager = await SessionManager.create(parentRoot, join(parentRoot, "sessions"));
+		cleanups.push(() => parentSessionManager.drainPersistence().then(() => undefined));
 		parentSessionManager.appendMessage({
 			role: "user",
 			content: [{ type: "text", text: "parent prompt" }],
 			timestamp: 1,
 		});
-		const parentSessionFile = parentSessionManager.getSessionFile();
+		const parentSessionRef = parentSessionManager.getSessionRef();
 		const { manager } = await createTestManager({ parentSessionManager, responseText: "persisted child" });
 		const handle = await manager.start();
 
@@ -286,26 +288,110 @@ describe("SubagentManager", () => {
 		await completion;
 		const stats = await handle.getSessionStats();
 
-		expect(stats.sessionFile).toBeTruthy();
-		if (!stats.sessionFile) {
-			throw new Error("expected persisted child session file");
+		expect(stats.sessionRef).toBeTruthy();
+		if (!stats.sessionRef) {
+			throw new Error("expected persisted child session reference");
 		}
-		expect(stats.sessionFile.startsWith(parentSessionManager.getSessionDir())).toBe(true);
-		const headerLine = readFileSync(stats.sessionFile, "utf-8").split("\n")[0];
-		if (!headerLine) {
-			throw new Error("expected child session header");
-		}
-		const header = JSON.parse(headerLine) as { id?: string; origin?: string; parentSession?: string; type?: string };
-		expect(header).toMatchObject({
+		expect(stats.sessionRef.sessionDirectory).toBe(parentSessionManager.getSessionDir());
+		const reopened = await SessionManager.open(stats.sessionRef);
+		cleanups.push(() => reopened.drainPersistence().then(() => undefined));
+		expect(reopened.getHeader()).toMatchObject({
 			type: "session",
 			id: handle.sessionId,
-			parentSession: parentSessionFile,
+			parentSession: parentSessionRef,
 			origin: "subagent",
 		});
-		const reopened = SessionManager.open(stats.sessionFile);
 		expect(reopened.getBranch().some((entry) => entry.type === "message" && entry.message.role === "assistant")).toBe(
 			true,
 		);
+	});
+
+	it("retains an unpublished persisted child when startup fails after creation", async () => {
+		const parentRoot = join(
+			tmpdir(),
+			`subagent-manager-failed-start-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(parentRoot, { recursive: true });
+		cleanups.push(() => {
+			if (existsSync(parentRoot)) {
+				rmSync(parentRoot, { recursive: true, force: true });
+			}
+		});
+		const parentSessionManager = await SessionManager.create(parentRoot, join(parentRoot, "sessions"));
+		cleanups.push(() => parentSessionManager.closePersistence());
+		const startupError = new Error("injected post-creation startup failure");
+		let childSessionRef: SubagentRuntimeCreatedEvent["parentSessionRef"];
+		let childCwd: string | undefined;
+		const { manager } = await createTestManager({
+			parentSessionManager,
+			onRuntimeCreated: (event) => {
+				childSessionRef = event.runtime.session.sessionManager.getSessionRef();
+				childCwd = event.runtime.session.sessionManager.getCwd();
+				throw startupError;
+			},
+		});
+
+		await expect(manager.start()).rejects.toBe(startupError);
+		if (!childSessionRef || !childCwd) throw new Error("expected the failed child session identity");
+
+		const reopened = await SessionManager.open(childSessionRef);
+		expect(reopened.getSessionRef()).toEqual(childSessionRef);
+		await reopened.closePersistence();
+		expect(
+			await SessionManager.list(childCwd, childSessionRef.sessionDirectory, undefined, {
+				includeMessageFreeDurable: true,
+			}),
+		).toEqual([expect.objectContaining({ ref: childSessionRef })]);
+	});
+
+	it("disposes a child runtime when startup fails after partial turn-budget wiring", async () => {
+		const setupError = new Error("injected session accounting subscription failure");
+		const wiringCleanupError = new Error("injected budget policy cleanup failure");
+		let budgetPolicyRegistered = false;
+		let unregisterBudgetPolicyCalls = 0;
+		const registerTurnPolicy = AgentSession.prototype.registerTurnPolicy;
+		const subscribe = AgentSession.prototype.subscribe;
+		const registerSpy = vi.spyOn(AgentSession.prototype, "registerTurnPolicy").mockImplementation(function (
+			this: AgentSession,
+			policy,
+		): () => void {
+			const unregister = registerTurnPolicy.call(this, policy);
+			budgetPolicyRegistered = true;
+			return () => {
+				unregisterBudgetPolicyCalls++;
+				unregister();
+				throw wiringCleanupError;
+			};
+		});
+		const subscribeSpy = vi.spyOn(AgentSession.prototype, "subscribe").mockImplementation(function (
+			this: AgentSession,
+			listener,
+			options,
+		): () => void {
+			if (budgetPolicyRegistered) throw setupError;
+			return subscribe.call(this, listener, options);
+		});
+		const scope = new SubagentDelegationScope();
+		cleanups.push(() => scope.dispose());
+		const { manager, getDisposedSessionCount } = await createTestManager();
+
+		let thrown: unknown;
+		try {
+			thrown = await manager.start({ delegationScope: scope }).catch((error: unknown) => error);
+		} finally {
+			registerSpy.mockRestore();
+			subscribeSpy.mockRestore();
+		}
+
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) throw new Error("expected aggregate subagent startup failure");
+		expect(thrown.message).toBe("Subagent startup failed and cleanup did not complete");
+		expect(thrown.errors as unknown[]).toEqual([setupError, wiringCleanupError]);
+		expect(unregisterBudgetPolicyCalls).toBe(1);
+		expect(getDisposedSessionCount()).toBe(1);
+		expect(scope.snapshot()).toMatchObject({ startsUsed: 0, activeDescendants: 0 });
+		expect(manager.listActivities()).toEqual([]);
+		expect(manager.listDelegations()).toEqual([]);
 	});
 
 	it("emits runtime-created metadata and can retain child runtimes after loopback dispose", async () => {
@@ -375,13 +461,22 @@ describe("SubagentManager", () => {
 		).toBe(true);
 	});
 
-	it("rejects the first prompt when its delegation scope was aborted before publication", async () => {
+	it("rejects the first prompt before publication while retaining the committed child row", async () => {
 		let providerCalls = 0;
 		let registrationCommits = 0;
 		let registrationRollbacks = 0;
 		const scope = new SubagentDelegationScope();
 		cleanups.push(() => scope.dispose());
+		const parentRoot = join(
+			tmpdir(),
+			`subagent-manager-first-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(parentRoot, { recursive: true });
+		cleanups.push(() => rmSync(parentRoot, { recursive: true, force: true }));
+		const parentSessionManager = await SessionManager.create(parentRoot, join(parentRoot, "sessions"));
+		cleanups.push(() => parentSessionManager.closePersistence());
 		const { manager } = await createTestManager({
+			parentSessionManager,
 			responses: [
 				() => {
 					providerCalls += 1;
@@ -411,6 +506,33 @@ describe("SubagentManager", () => {
 		expect(manager.listDelegations()).toEqual([]);
 		expect(scope.snapshot()).toMatchObject({ aborted: true, activeDescendants: 0 });
 		await expect(handle.getState()).rejects.toThrow(`Subagent ${handle.id} is disposed`);
+		const retainedRef = await SessionManager.findForResume(parentSessionManager.getSessionDir(), handle.sessionId);
+		expect(retainedRef).toBeDefined();
+	});
+
+	it("preserves first-prompt and runtime-registration rollback failures", async () => {
+		const cleanupError = new Error("injected runtime registration rollback failure");
+		const scope = new SubagentDelegationScope();
+		cleanups.push(() => scope.dispose());
+		const { manager } = await createTestManager({
+			onRuntimeCreated: () => ({
+				commit: () => undefined,
+				rollback: async () => {
+					throw cleanupError;
+				},
+			}),
+		});
+		const handle = await manager.start({ delegationScope: scope });
+
+		scope.abort(new Error("cancel before first prompt"));
+		const error = await handle.prompt("must not run").catch((thrown: unknown) => thrown);
+
+		expect(error).toBeInstanceOf(AggregateError);
+		expect((error as AggregateError).message).toBe("Subagent prompt failed and cleanup did not complete");
+		expect((error as AggregateError).errors).toEqual([
+			expect.objectContaining({ message: `Subagent ${handle.id} was aborted before prompt acceptance` }),
+			cleanupError,
+		]);
 	});
 
 	it("rejects the first prompt after an explicit handle abort before publication", async () => {

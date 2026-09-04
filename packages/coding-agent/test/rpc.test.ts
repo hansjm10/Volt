@@ -1,9 +1,10 @@
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentEvent } from "@hansjm10/volt-agent-core";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 import { RpcClient } from "../src/modes/rpc/rpc-client.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -33,6 +34,17 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_T
 		}
 	});
 
+	async function readPersistedEntries(): Promise<SessionEntry[]> {
+		const sessionsPath = join(sessionDir, "sessions");
+		expect(existsSync(sessionsPath)).toBe(true);
+		const sessionDirs = readdirSync(sessionsPath);
+		expect(sessionDirs.length).toBeGreaterThan(0);
+		const cwdSessionDir = join(sessionsPath, sessionDirs[0]);
+		const sessions = await SessionManager.list(join(__dirname, ".."), cwdSessionDir);
+		expect(sessions).toHaveLength(1);
+		return (await SessionManager.open(sessions[0]!.ref)).getEntries();
+	}
+
 	test("should get state", async () => {
 		await client.start();
 		const state = await client.getState();
@@ -57,31 +69,13 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_T
 		// Wait for file writes
 		await new Promise((resolve) => setTimeout(resolve, 200));
 
-		// Verify session file
-		const sessionsPath = join(sessionDir, "sessions");
-		expect(existsSync(sessionsPath)).toBe(true);
-
-		const sessionDirs = readdirSync(sessionsPath);
-		expect(sessionDirs.length).toBeGreaterThan(0);
-
-		const cwdSessionDir = join(sessionsPath, sessionDirs[0]);
-		const sessionFiles = readdirSync(cwdSessionDir).filter((f) => f.endsWith(".jsonl"));
-		expect(sessionFiles.length).toBe(1);
-
-		const sessionContent = readFileSync(join(cwdSessionDir, sessionFiles[0]), "utf8");
-		const entries = sessionContent
-			.trim()
-			.split("\n")
-			.map((line) => JSON.parse(line));
-
-		// First entry should be session header
-		expect(entries[0].type).toBe("session");
+		const entries = await readPersistedEntries();
 
 		// Should have user and assistant messages
-		const messages = entries.filter((e: { type: string }) => e.type === "message");
+		const messages = entries.filter((entry) => entry.type === "message");
 		expect(messages.length).toBeGreaterThanOrEqual(2);
 
-		const roles = messages.map((m: { message: { role: string } }) => m.message.role);
+		const roles = messages.map((message) => message.message.role);
 		expect(roles).toContain("user");
 		expect(roles).toContain("assistant");
 	}, 90000);
@@ -100,18 +94,9 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_T
 		// Wait for file writes
 		await new Promise((resolve) => setTimeout(resolve, 200));
 
-		// Verify compaction in session file
-		const sessionsPath = join(sessionDir, "sessions");
-		const sessionDirs = readdirSync(sessionsPath);
-		const cwdSessionDir = join(sessionsPath, sessionDirs[0]);
-		const sessionFiles = readdirSync(cwdSessionDir).filter((f) => f.endsWith(".jsonl"));
-		const sessionContent = readFileSync(join(cwdSessionDir, sessionFiles[0]), "utf8");
-		const entries = sessionContent
-			.trim()
-			.split("\n")
-			.map((line) => JSON.parse(line));
+		const entries = await readPersistedEntries();
 
-		const compactionEntries = entries.filter((e: { type: string }) => e.type === "compaction");
+		const compactionEntries = entries.filter((entry) => entry.type === "compaction");
 		expect(compactionEntries.length).toBe(1);
 		expect(compactionEntries[0].summary).toBeDefined();
 	}, 120000);
@@ -138,23 +123,13 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_T
 		// Wait for file writes
 		await new Promise((resolve) => setTimeout(resolve, 200));
 
-		// Verify bash message in session
-		const sessionsPath = join(sessionDir, "sessions");
-		const sessionDirs = readdirSync(sessionsPath);
-		const cwdSessionDir = join(sessionsPath, sessionDirs[0]);
-		const sessionFiles = readdirSync(cwdSessionDir).filter((f) => f.endsWith(".jsonl"));
-		const sessionContent = readFileSync(join(cwdSessionDir, sessionFiles[0]), "utf8");
-		const entries = sessionContent
-			.trim()
-			.split("\n")
-			.map((line) => JSON.parse(line));
+		const entries = await readPersistedEntries();
 
 		const bashMessages = entries.filter(
-			(e: { type: string; message?: { role: string } }) =>
-				e.type === "message" && e.message?.role === "bashExecution",
+			(entry) => entry.type === "message" && entry.message.role === "bashExecution",
 		);
-		expect(bashMessages.length).toBe(1);
-		expect(bashMessages[0].message.output).toContain(uniqueValue);
+		expect(bashMessages).toHaveLength(1);
+		expect(bashMessages[0]).toMatchObject({ message: { output: expect.stringContaining(uniqueValue) } });
 	}, 90000);
 
 	test("should include bash output in LLM context", async () => {
@@ -231,7 +206,7 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_T
 		await client.promptAndWait("Hello");
 
 		const stats = await client.getSessionStats();
-		expect(stats.sessionFile).toBeDefined();
+		expect(stats).not.toHaveProperty("sessionRef");
 		expect(stats.sessionId).toBeDefined();
 		expect(stats.userMessages).toBeGreaterThanOrEqual(1);
 		expect(stats.assistantMessages).toBeGreaterThanOrEqual(1);
@@ -303,18 +278,9 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_T
 		// Wait for file writes
 		await new Promise((resolve) => setTimeout(resolve, 200));
 
-		// Verify session_info entry in session file
-		const sessionsPath = join(sessionDir, "sessions");
-		const sessionDirs = readdirSync(sessionsPath);
-		const cwdSessionDir = join(sessionsPath, sessionDirs[0]);
-		const sessionFiles = readdirSync(cwdSessionDir).filter((f) => f.endsWith(".jsonl"));
-		const sessionContent = readFileSync(join(cwdSessionDir, sessionFiles[0]), "utf8");
-		const entries = sessionContent
-			.trim()
-			.split("\n")
-			.map((line) => JSON.parse(line));
+		const entries = await readPersistedEntries();
 
-		const sessionInfoEntries = entries.filter((e: { type: string }) => e.type === "session_info");
+		const sessionInfoEntries = entries.filter((entry) => entry.type === "session_info");
 		expect(sessionInfoEntries.length).toBe(1);
 		expect(sessionInfoEntries[0].name).toBe("my-test-session");
 	}, 60000);

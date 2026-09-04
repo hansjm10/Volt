@@ -299,6 +299,31 @@ function killWindowsTree(pid: number): void {
 	}
 }
 
+function terminateWindowsTree(pid: number): Promise<void> {
+	return new Promise((resolveTermination) => {
+		let taskkill: ReturnType<typeof spawn>;
+		try {
+			taskkill = spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+		} catch {
+			resolveTermination();
+			return;
+		}
+		let settled = false;
+		const finish = (): void => {
+			if (settled) return;
+			settled = true;
+			taskkill.removeListener("error", finish);
+			taskkill.removeListener("close", finish);
+			resolveTermination();
+		};
+		taskkill.once("error", finish);
+		taskkill.once("close", finish);
+	});
+}
+
 /** Signal the process group, then each descendant that escaped it. */
 function signalProcessTree(pid: number, descendants: number[], signal: NodeJS.Signals): void {
 	try {
@@ -332,7 +357,7 @@ export function killProcessTree(pid: number, table?: Map<number, number[]>): voi
 export async function terminateProcessTree(pid: number, isExited?: () => boolean): Promise<void> {
 	if (!isSignalablePid(pid)) return;
 	if (process.platform === "win32") {
-		killWindowsTree(pid);
+		await terminateWindowsTree(pid);
 		return;
 	}
 

@@ -11,7 +11,7 @@ import {
 	createAgentSessionServices,
 } from "../../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../../src/core/auth-storage.ts";
-import { SessionManager } from "../../../src/core/session-manager.ts";
+import { SessionManager, type SessionReference } from "../../../src/core/session-manager.ts";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionFactory } from "../../../src/index.ts";
 
 function getText(message: AgentSession["messages"][number]): string {
@@ -93,7 +93,7 @@ describe("regression #2860: replaced session callbacks", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: await SessionManager.create(tempDir),
 		});
 
 		const rebindSession = async (): Promise<void> => {
@@ -115,7 +115,7 @@ describe("regression #2860: replaced session callbacks", () => {
 						});
 						return { cancelled: result.cancelled };
 					},
-					switchSession: async (sessionPath, options) => runtime.switchSession(sessionPath, options),
+					switchSession: async (sessionRef, options) => runtime.switchSession(sessionRef, options),
 					reload: async () => {
 						await session.reload();
 					},
@@ -143,10 +143,10 @@ describe("regression #2860: replaced session callbacks", () => {
 		const events: string[] = [];
 		let oldCtx: ExtensionCommandContext | undefined;
 		let oldVolt: ExtensionAPI | undefined;
-		let oldSessionFile: string | undefined;
+		let oldSessionRef: SessionReference | undefined;
 		let staleCtxThrows = false;
 		let staleVoltThrows = false;
-		let replacementSessionFile: string | undefined;
+		let replacementSessionRef: SessionReference | undefined;
 		let instanceId = 0;
 		const { runtime } = await createRuntimeForTest(
 			(volt) => {
@@ -162,14 +162,14 @@ describe("regression #2860: replaced session callbacks", () => {
 					handler: async (_args, ctx) => {
 						oldCtx = ctx;
 						oldVolt = volt;
-						oldSessionFile = ctx.sessionManager.getSessionFile();
+						oldSessionRef = ctx.sessionManager.getSessionRef();
 						await ctx.newSession({
-							parentSession: oldSessionFile,
+							parentSessionRef: oldSessionRef,
 							withSession: async (replacedCtx) => {
 								events.push(`with:${currentInstance}`);
-								replacementSessionFile = replacedCtx.sessionManager.getSessionFile();
+								replacementSessionRef = replacedCtx.sessionManager.getSessionRef();
 								try {
-									oldCtx?.sessionManager.getSessionFile();
+									oldCtx?.sessionManager.getSessionRef();
 								} catch {
 									staleCtxThrows = true;
 								}
@@ -192,8 +192,8 @@ describe("regression #2860: replaced session callbacks", () => {
 		await runtime.session.prompt("/repro");
 
 		expect(events).toEqual(["start:1", "shutdown:1", "start:2", "with:1"]);
-		expect(replacementSessionFile).toBeDefined();
-		expect(replacementSessionFile).not.toBe(oldSessionFile);
+		expect(replacementSessionRef).toBeDefined();
+		expect(replacementSessionRef).not.toEqual(oldSessionRef);
 		expect(staleCtxThrows).toBe(true);
 		expect(staleVoltThrows).toBe(true);
 		expect(runtime.session.messages.map((message) => `${message.role}:${getText(message)}`)).toEqual([
@@ -236,13 +236,14 @@ describe("regression #2860: replaced session callbacks", () => {
 	});
 
 	it("supports withSession for switchSession", async () => {
-		let targetSessionPath = "";
+		let targetSessionRef: SessionReference | undefined;
 		const { runtime } = await createRuntimeForTest(
 			(volt) => {
 				volt.registerCommand("switch-it", {
 					description: "switch-it",
 					handler: async (_args, ctx) => {
-						await ctx.switchSession(targetSessionPath, {
+						if (!targetSessionRef) throw new Error("Missing target session reference");
+						await ctx.switchSession(targetSessionRef, {
 							withSession: async (replacedCtx) => {
 								await replacedCtx.sendUserMessage("switch callback message");
 							},
@@ -254,16 +255,16 @@ describe("regression #2860: replaced session callbacks", () => {
 		);
 
 		await runtime.session.prompt("root");
-		const originalSessionPath = runtime.session.sessionFile;
+		const originalSessionRef = runtime.session.sessionRef;
 		const newSessionResult = await runtime.newSession();
 		expect(newSessionResult.cancelled).toBe(false);
 		await runtime.session.prompt("target");
-		targetSessionPath = runtime.session.sessionFile!;
-		await runtime.switchSession(originalSessionPath!);
+		targetSessionRef = runtime.session.sessionRef;
+		await runtime.switchSession(originalSessionRef!);
 
 		await runtime.session.prompt("/switch-it");
 
-		expect(runtime.session.sessionFile).toBe(targetSessionPath);
+		expect(runtime.session.sessionRef).toEqual(targetSessionRef);
 		expect(runtime.session.messages.map((message) => `${message.role}:${getText(message)}`)).toEqual([
 			"user:target",
 			"assistant:target reply",

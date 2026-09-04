@@ -87,6 +87,18 @@ clients, and pending pairing tickets. The daemon logs and audits this expected
 migration as `legacy_remote_access_dropped`; it is not corruption. Every old
 client must pair again to receive an explicit current grant.
 
+## Session storage
+
+Conversation history uses the same authoritative SQLite storage as local Volt.
+Each registered workspace's session directory, or an explicitly configured
+session directory, contains `sessions.sqlite`; session lists and resumes use its
+indexes. The daemon addresses conversations by stable workspace/session IDs and
+never sends the database path, session directory, or host-side
+`SessionReference` over the remote wire.
+
+Daemon handoffs reopen stable session identities from SQLite; they do not
+transfer or reopen JSONL snapshot files.
+
 ## Configured remote agents
 
 Hosts advertising `agent_options.v1` expose a read-only workspace-discovery
@@ -177,11 +189,11 @@ and a `worktreeId`.
 
 Key behaviors:
 
-- **Sessions stay with the parent workspace.** Worktree sessions are stored
-  and listed under the parent workspace; leases, push notifications, and
-  `list_sessions` are unchanged. The daemon persists a session→worktree
-  binding so resumes (phone reattach, daemon restart, TUI takeover) land back
-  in the worktree checkout.
+- **Sessions stay with the parent workspace.** Worktree sessions use the
+  parent workspace's SQLite store and remain listed there; leases, push
+  notifications, and `list_sessions` are unchanged. The daemon persists a
+  session→worktree binding so resumes (phone reattach, daemon restart, TUI
+  takeover) land back in the worktree checkout.
 - **Policy inheritance.** A worktree runtime uses exactly the parent
   workspace's trust decision and tool allowlist — never wider. Trust is never
   prompted for or persisted on worktree paths.

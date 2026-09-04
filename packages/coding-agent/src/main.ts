@@ -5,7 +5,11 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { existsSync } from "node:fs";
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { createSessionId } from "@hansjm10/volt-agent-core";
 import { type ImageContent, modelsAreEqual } from "@hansjm10/volt-ai";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.ts";
@@ -15,8 +19,20 @@ import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, isStandaloneBinary, VERSION } from "./config.ts";
-import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
+import {
+	ENV_SESSION_DIR,
+	expandTildePath,
+	getAgentDir,
+	getPackageDir,
+	getSessionsDir,
+	isStandaloneBinary,
+	VERSION,
+} from "./config.ts";
+import {
+	type AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionRuntime,
+} from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
 	createAgentSessionFromServices,
@@ -38,7 +54,15 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import {
+	assertValidSessionId,
+	findSessionInfoById,
+	getDefaultSessionDirPath,
+	type SessionInfo,
+	SessionManager,
+	type SessionReference,
+} from "./core/session-manager.ts";
+import { SESSION_STORE_DATABASE_FILENAME } from "./core/session-store/index.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { SubagentManager } from "./core/subagents/index.ts";
 import { initTheme, stopThemeWatcher } from "./core/theme/runtime.ts";
@@ -52,7 +76,7 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { handleStoreCommand } from "./store/store-cli.ts";
-import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
+import { canonicalizePath, isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 /**
@@ -170,27 +194,95 @@ async function prepareInitialMessage(
 	});
 }
 
-/** Result from resolving a session argument */
+/** Result from resolving a session argument. Paths are explicit JSONL import sources only. */
 type ResolvedSession =
-	| { type: "path"; path: string } // Direct file path
-	| { type: "local"; path: string } // Found in current project
-	| { type: "global"; path: string; cwd: string } // Found in different project
-	| { type: "not_found"; arg: string }; // Not found anywhere
+	| { type: "path"; path: string }
+	| { type: "local"; ref: SessionReference }
+	| { type: "global"; ref: SessionReference; cwd: string }
+	| { type: "not_found"; arg: string };
 
-/**
- * Resolve a session argument to a file path.
- * If it looks like a path, use as-is. Otherwise try to match as session ID prefix.
- */
+function sameFilesystemLocation(left: string, right: string): boolean {
+	return canonicalizePath(resolvePath(left)) === canonicalizePath(resolvePath(right));
+}
+
+function canBeExactSessionId(value: string): boolean {
+	try {
+		assertValidSessionId(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function hasSessionStore(sessionDirectory: string): boolean {
+	return existsSync(join(resolvePath(sessionDirectory), SESSION_STORE_DATABASE_FILENAME));
+}
+
+async function findExactSessionInfoInStore(
+	sessionDirectory: string,
+	sessionId: string,
+): Promise<SessionInfo | undefined> {
+	const directory = resolvePath(sessionDirectory);
+	if (!hasSessionStore(directory)) return undefined;
+	return findSessionInfoById(directory, sessionId);
+}
+
+async function findSessionByExactId(
+	sessionId: string,
+	cwd: string,
+	sessionDir?: string,
+): Promise<{ ref: SessionReference; cwd: string } | undefined> {
+	if (sessionDir) {
+		const info = await findExactSessionInfoInStore(sessionDir, sessionId);
+		return info ? { ref: info.ref, cwd: info.cwd } : undefined;
+	}
+
+	const storeErrors: unknown[] = [];
+	let readableStores = 0;
+	const findInReadableStore = async (directory: string): Promise<SessionInfo | undefined> => {
+		if (!hasSessionStore(directory)) return undefined;
+		try {
+			const info = await findSessionInfoById(directory, sessionId);
+			readableStores++;
+			return info;
+		} catch (error) {
+			storeErrors.push(error);
+			return undefined;
+		}
+	};
+
+	const localSessionDir = getDefaultSessionDirPath(cwd);
+	const localInfo = await findInReadableStore(localSessionDir);
+	if (localInfo) return { ref: localInfo.ref, cwd: localInfo.cwd };
+
+	const sessionsRoot = getSessionsDir();
+	if (existsSync(sessionsRoot)) {
+		const localStorePath = canonicalizePath(resolvePath(localSessionDir));
+		const directories = (await readdir(sessionsRoot, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => join(sessionsRoot, entry.name))
+			.filter((directory) => canonicalizePath(resolvePath(directory)) !== localStorePath)
+			.sort();
+		for (const directory of directories) {
+			const info = await findInReadableStore(directory);
+			if (info) return { ref: info.ref, cwd: info.cwd };
+		}
+	}
+	if (readableStores === 0 && storeErrors.length > 0) {
+		throw new AggregateError(storeErrors, "Could not look up an exact session ID in any project store");
+	}
+	return undefined;
+}
+
 async function findLocalSessionByExactId(
 	sessionId: string,
 	cwd: string,
 	sessionDir?: string,
-): Promise<{ type: "local"; path: string } | undefined> {
-	const localSessions = await SessionManager.list(cwd, sessionDir, undefined, {
-		includeMessageFreeDurable: true,
-	});
-	const localMatch = localSessions.find((s) => s.id === sessionId);
-	return localMatch ? { type: "local", path: localMatch.path } : undefined;
+): Promise<{ type: "local"; ref: SessionReference } | undefined> {
+	const directory = sessionDir ?? getDefaultSessionDirPath(cwd);
+	const info = await findExactSessionInfoInStore(directory, sessionId);
+	if (!info || (info.cwd && !sameFilesystemLocation(info.cwd, cwd))) return undefined;
+	return { type: "local", ref: info.ref };
 }
 
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
@@ -199,38 +291,25 @@ async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: 
 		return { type: "path", path: resolvePath(sessionArg, cwd) };
 	}
 
-	// Exact IDs can address message-free durable sessions without exposing them to prefix search or selectors.
-	const localAddressableSessions = await SessionManager.list(cwd, sessionDir, undefined, {
-		includeMessageFreeDurable: true,
-	});
-	const localExactMatch = localAddressableSessions.find((session) => session.id === sessionArg);
-	if (localExactMatch) {
-		return { type: "local", path: localExactMatch.path };
+	// Exact IDs use indexed summary lookup; only the final owner opens the selected transcript.
+	const exactMatch = canBeExactSessionId(sessionArg)
+		? await findSessionByExactId(sessionArg, cwd, sessionDir)
+		: undefined;
+	if (exactMatch) {
+		return !exactMatch.cwd || sameFilesystemLocation(exactMatch.cwd, cwd)
+			? { type: "local", ref: exactMatch.ref }
+			: { type: "global", ref: exactMatch.ref, cwd: exactMatch.cwd };
 	}
 
-	// Try to match a visible session ID prefix in the current project.
+	// Prefix matching intentionally remains visible-session enumeration.
 	const localSessions = await SessionManager.list(cwd, sessionDir);
 	const localPrefixMatch = localSessions.find((session) => session.id.startsWith(sessionArg));
-	if (localPrefixMatch) {
-		return { type: "local", path: localPrefixMatch.path };
-	}
+	if (localPrefixMatch) return { type: "local", ref: localPrefixMatch.ref };
 
-	// Try global search across all projects.
-	const allAddressableSessions = await SessionManager.listAll(sessionDir, undefined, {
-		includeMessageFreeDurable: true,
-	});
-	const globalExactMatch = allAddressableSessions.find((session) => session.id === sessionArg);
-	if (globalExactMatch) {
-		return { type: "global", path: globalExactMatch.path, cwd: globalExactMatch.cwd };
-	}
 	const allSessions = await SessionManager.listAll(sessionDir);
 	const globalMatch = allSessions.find((session) => session.id.startsWith(sessionArg));
+	if (globalMatch) return { type: "global", ref: globalMatch.ref, cwd: globalMatch.cwd };
 
-	if (globalMatch) {
-		return { type: "global", path: globalMatch.path, cwd: globalMatch.cwd };
-	}
-
-	// Not found anywhere
 	return { type: "not_found", arg: sessionArg };
 }
 
@@ -288,9 +367,16 @@ function validateSessionIdFlags(parsed: Args): void {
 	}
 }
 
-function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string, sessionId?: string): SessionManager {
+async function forkSessionOrExit(
+	source: Extract<ResolvedSession, { type: "path" | "local" | "global" }>,
+	cwd: string,
+	sessionDir?: string,
+	sessionId?: string,
+): Promise<SessionManager> {
 	try {
-		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id: sessionId });
+		return source.type === "path"
+			? await SessionManager.importFromJsonl(source.path, cwd, sessionDir, { id: sessionId ?? createSessionId() })
+			: await SessionManager.forkFrom(source.ref, cwd, sessionDir, { id: sessionId });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -323,7 +409,7 @@ async function createSessionManager(
 			case "path":
 			case "local":
 			case "global":
-				return forkSessionOrExit(resolved.path, cwd, sessionDir, parsed.sessionId);
+				return forkSessionOrExit(resolved, cwd, sessionDir, parsed.sessionId);
 
 			case "not_found":
 				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
@@ -336,8 +422,10 @@ async function createSessionManager(
 
 		switch (resolved.type) {
 			case "path":
+				return SessionManager.importFromJsonl(resolved.path, undefined, sessionDir);
+
 			case "local":
-				return SessionManager.open(resolved.path, sessionDir);
+				return SessionManager.open(resolved.ref);
 
 			case "global": {
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
@@ -346,7 +434,7 @@ async function createSessionManager(
 					console.log(chalk.dim("Aborted."));
 					process.exit(0);
 				}
-				return forkSessionOrExit(resolved.path, cwd, sessionDir);
+				return forkSessionOrExit(resolved, cwd, sessionDir);
 			}
 
 			case "not_found":
@@ -358,15 +446,17 @@ async function createSessionManager(
 	if (parsed.resume) {
 		initTheme(settingsManager.getTheme(), true);
 		try {
-			const selectedPath = await selectSession(
-				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
-				(onProgress) => SessionManager.listAll(sessionDir, onProgress),
+			const selectedRef = await selectSession(
+				(onProgress, query) =>
+					query ? SessionManager.search(cwd, query, sessionDir) : SessionManager.list(cwd, sessionDir, onProgress),
+				(onProgress, query) =>
+					query ? SessionManager.searchAll(query, sessionDir) : SessionManager.listAll(sessionDir, onProgress),
 			);
-			if (!selectedPath) {
+			if (!selectedRef) {
 				console.log(chalk.dim("No session selected"));
 				process.exit(0);
 			}
-			return SessionManager.open(selectedPath, sessionDir);
+			return SessionManager.open(selectedRef);
 		} finally {
 			stopThemeWatcher();
 		}
@@ -379,7 +469,7 @@ async function createSessionManager(
 	if (parsed.sessionId) {
 		const existingSession = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
 		if (existingSession) {
-			return SessionManager.open(existingSession.path, sessionDir);
+			return SessionManager.open(existingSession.ref);
 		}
 	}
 
@@ -501,6 +591,110 @@ async function promptForMissingSessionCwd(
 	]);
 }
 
+async function throwAfterClosingSessionManager(
+	manager: SessionManager,
+	error: unknown,
+	message: string,
+): Promise<never> {
+	try {
+		await manager.closePersistence();
+	} catch (closeError) {
+		throw new AggregateError([error, closeError], message);
+	}
+	throw error;
+}
+
+class CliSessionManagerOwner {
+	private manager: SessionManager | undefined;
+
+	constructor(manager: SessionManager) {
+		this.manager = manager;
+	}
+
+	get current(): SessionManager {
+		if (!this.manager) throw new Error("CLI session manager ownership has already transferred");
+		return this.manager;
+	}
+
+	private release(): SessionManager | undefined {
+		const manager = this.manager;
+		this.manager = undefined;
+		return manager;
+	}
+
+	async close(): Promise<void> {
+		const manager = this.release();
+		if (manager) await manager.closePersistence();
+	}
+
+	async fail(error: unknown, message: string): Promise<never> {
+		const manager = this.release();
+		if (!manager) throw error;
+		return throwAfterClosingSessionManager(manager, error, message);
+	}
+
+	async replace(replacement: SessionManager): Promise<void> {
+		const previous = this.release();
+		if (!previous) {
+			await replacement.closePersistence();
+			throw new Error("Cannot replace a CLI session manager after ownership transferred");
+		}
+		try {
+			await previous.closePersistence();
+		} catch (error) {
+			try {
+				await replacement.closePersistence();
+			} catch (replacementCloseError) {
+				throw new AggregateError(
+					[error, replacementCloseError],
+					"CLI session manager replacement failed and neither manager closed cleanly",
+				);
+			}
+			throw error;
+		}
+		this.manager = replacement;
+	}
+
+	transfer(): SessionManager {
+		const manager = this.release();
+		if (!manager) throw new Error("CLI session manager ownership has already transferred");
+		return manager;
+	}
+}
+
+async function runWithOwnedAgentSessionRuntime(
+	runtime: AgentSessionRuntime,
+	operation: (transferRuntime: () => void) => Promise<void>,
+): Promise<void> {
+	let runtimeOwned = true;
+	let operationError: unknown;
+	let operationFailed = false;
+	try {
+		await operation(() => {
+			runtimeOwned = false;
+		});
+	} catch (error) {
+		operationFailed = true;
+		operationError = error;
+	}
+
+	let cleanupError: unknown;
+	let cleanupFailed = false;
+	if (runtimeOwned) {
+		try {
+			await runtime.dispose();
+		} catch (error) {
+			cleanupFailed = true;
+			cleanupError = error;
+		}
+	}
+	if (operationFailed && cleanupFailed) {
+		throw new AggregateError([operationError, cleanupError], "CLI runtime setup failed and cleanup did not complete");
+	}
+	if (operationFailed) throw operationError;
+	if (cleanupFailed) throw cleanupError;
+}
+
 export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
 }
@@ -618,6 +812,11 @@ export async function main(args: string[], options?: MainOptions) {
 
 	validateForkFlags(parsed);
 	validateSessionIdFlags(parsed);
+	const requestedSessionName = parsed.name?.trim();
+	if (parsed.name !== undefined && !requestedSessionName) {
+		console.error(chalk.red("Error: --name requires a non-empty value"));
+		process.exit(1);
+	}
 
 	// Run migrations (pass cwd for project-local migrations)
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
@@ -643,44 +842,95 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
-	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
+	// From this point until createAgentSessionRuntime() is invoked, this is the sole
+	// owner/finalizer for the acquired manager. Replacement closes the old manager
+	// before adopting the new one; transfer relinquishes it at the runtime-factory boundary.
+	const sessionManagerOwner = new CliSessionManagerOwner(
+		await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager),
+	);
+	let missingSessionCwdIssue: SessionCwdIssue | undefined;
+	try {
+		missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManagerOwner.current, cwd);
+	} catch (error) {
+		return await sessionManagerOwner.fail(error, "Session cwd validation failed and its manager could not be closed");
+	}
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
-			const selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
-			if (!selectedCwd) {
-				process.exit(0);
+			let selectedCwd: string | undefined;
+			try {
+				selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
+			} catch (error) {
+				return await sessionManagerOwner.fail(
+					error,
+					"Session cwd selection failed and its manager could not be closed",
+				);
 			}
-			sessionManager = SessionManager.open(missingSessionCwdIssue.sessionFile!, sessionDir, selectedCwd);
+			if (!selectedCwd) {
+				await sessionManagerOwner.close();
+				process.exitCode = 0;
+				return;
+			}
+			let replacementManager: SessionManager;
+			try {
+				replacementManager = await SessionManager.open(missingSessionCwdIssue.sessionRef!, selectedCwd);
+			} catch (error) {
+				return await sessionManagerOwner.fail(
+					error,
+					"Session cwd replacement failed and its original manager could not be closed",
+				);
+			}
+			await sessionManagerOwner.replace(replacementManager);
 		} else {
-			console.error(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message));
-			process.exit(1);
+			const error = new MissingSessionCwdError(missingSessionCwdIssue);
+			try {
+				await sessionManagerOwner.close();
+			} catch (closeError) {
+				throw new AggregateError([error, closeError], "Invalid session cwd and manager close both failed");
+			}
+			console.error(chalk.red(error.message));
+			process.exitCode = 1;
+			return;
 		}
 	}
-	if (parsed.name !== undefined) {
-		const name = parsed.name.trim();
-		if (!name) {
-			console.error(chalk.red("Error: --name requires a non-empty value"));
-			process.exit(1);
+	if (requestedSessionName) {
+		try {
+			sessionManagerOwner.current.appendSessionInfo(requestedSessionName);
+			await sessionManagerOwner.current.flush();
+		} catch (error) {
+			return await sessionManagerOwner.fail(error, "Session naming failed and its manager could not be closed");
 		}
-		sessionManager.appendSessionInfo(name);
 	}
 	time("createSessionManager");
 
-	const trustStore = new ProjectTrustStore(agentDir);
-	const sessionCwd = sessionManager.getCwd();
-	const autoTrustOnReloadCwd =
-		parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
-			? sessionCwd
-			: undefined;
-	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
+	let trustStore: ProjectTrustStore;
+	let sessionCwd: string;
+	let autoTrustOnReloadCwd: string | undefined;
+	let trustPromptMode: AppMode;
+	let resolvedExtensionPaths: string[] | undefined;
+	let resolvedSkillPaths: string[] | undefined;
+	let resolvedPromptTemplatePaths: string[] | undefined;
+	let resolvedThemePaths: string[] | undefined;
+	let authStorage: AuthStorage;
+	try {
+		trustStore = new ProjectTrustStore(agentDir);
+		sessionCwd = sessionManagerOwner.current.getCwd();
+		autoTrustOnReloadCwd =
+			parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
+				? sessionCwd
+				: undefined;
+		trustPromptMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
+		resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
+		resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
+		resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
+		resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+		authStorage = AuthStorage.create();
+	} catch (error) {
+		return await sessionManagerOwner.fail(
+			error,
+			"Session startup preparation failed and its manager could not be closed",
+		);
+	}
 	const projectTrustByCwd = new Map<string, boolean>();
-
-	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
-	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
-	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
-	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
-	const authStorage = AuthStorage.create();
 	const createRuntime: CreateAgentSessionRuntimeFactory = async (runtimeOptions) => {
 		const { cwd, agentDir, sessionManager, sessionStartEvent, projectTrustContext, subagentContext } = runtimeOptions;
 		const runtimeProfile = Object.hasOwn(runtimeOptions, "profile") ? runtimeOptions.profile : requestedProfile;
@@ -757,196 +1007,225 @@ export async function main(args: string[], options?: MainOptions) {
 				extensionFactories: options?.extensionFactories,
 			},
 		});
-		const { settingsManager, modelRegistry, resourceLoader } = services;
-		if (parsed.lsp) {
-			settingsManager.applyOverrides({ lsp: { enabled: true } });
-		}
-		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
-			...projectTrustDiagnostics,
-			...services.diagnostics,
-			...collectSettingsDiagnostics(settingsManager, "runtime creation"),
-			...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
-				type: "error" as const,
-				message: `Failed to load extension "${path}": ${error}`,
-			})),
-		];
-
-		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
-		const scopedModels =
-			modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
-		const hasExistingSession = sessionStartEvent?.reason !== "new" && sessionManager.getBranch().length > 0;
-		const { options: sessionOptions, diagnostics: sessionOptionDiagnostics } = buildSessionOptions(
-			parsed,
-			scopedModels,
-			hasExistingSession,
-			modelRegistry,
-			settingsManager,
-		);
-		diagnostics.push(...sessionOptionDiagnostics);
-
-		if (parsed.apiKey) {
-			if (!sessionOptions.model) {
-				diagnostics.push({
-					type: "error",
-					message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
-				});
-			} else {
-				authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey);
+		let subagentManager: SubagentManager | undefined;
+		try {
+			const { settingsManager, modelRegistry, resourceLoader } = services;
+			if (parsed.lsp) {
+				settingsManager.applyOverrides({ lsp: { enabled: true } });
 			}
-		}
+			const diagnostics: AgentSessionRuntimeDiagnostic[] = [
+				...projectTrustDiagnostics,
+				...services.diagnostics,
+				...collectSettingsDiagnostics(settingsManager, "runtime creation"),
+				...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
+					type: "error" as const,
+					message: `Failed to load extension "${path}": ${error}`,
+				})),
+			];
 
-		const subagentManager = new SubagentManager({
-			createRuntime,
-			cwd,
-			agentDir,
-			workspaceName: services.workspaceName,
-			baseRef: services.baseRef,
-			resourceLoader,
-			parentSessionManager: sessionManager,
-			...(subagentContext ? { subagentContext } : {}),
-		});
-		const created = await createAgentSessionFromServices({
-			services,
-			sessionManager,
-			sessionStartEvent,
-			model: sessionOptions.model,
-			thinkingLevel: sessionOptions.thinkingLevel,
-			agentMode: sessionStartEvent ? undefined : sessionOptions.agentMode,
-			scopedModels: sessionOptions.scopedModels,
-			tools: sessionOptions.tools,
-			allowUnlistedExtensionTools: sessionOptions.allowUnlistedExtensionTools,
-			excludeTools: sessionOptions.excludeTools,
-			noTools: sessionOptions.noTools,
-			customTools: sessionOptions.customTools,
-			subagentToolManager: subagentManager,
-		});
-		if (hasExistingSession && parsed.models !== undefined && sessionOptions.scopedModels !== undefined) {
-			created.session.setScopedModels(sessionOptions.scopedModels);
-		}
+			const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
+			const scopedModels =
+				modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
+			const hasExistingSession = sessionStartEvent?.reason !== "new" && sessionManager.getBranch().length > 0;
+			const { options: sessionOptions, diagnostics: sessionOptionDiagnostics } = buildSessionOptions(
+				parsed,
+				scopedModels,
+				hasExistingSession,
+				modelRegistry,
+				settingsManager,
+			);
+			diagnostics.push(...sessionOptionDiagnostics);
 
-		return {
-			...created,
-			services,
-			diagnostics,
-		};
+			if (parsed.apiKey) {
+				if (!sessionOptions.model) {
+					diagnostics.push({
+						type: "error",
+						message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
+					});
+				} else {
+					authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey);
+				}
+			}
+
+			subagentManager = new SubagentManager({
+				createRuntime,
+				cwd,
+				agentDir,
+				workspaceName: services.workspaceName,
+				baseRef: services.baseRef,
+				resourceLoader,
+				parentSessionManager: sessionManager,
+				...(subagentContext ? { subagentContext } : {}),
+			});
+			const created = await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				sessionStartEvent,
+				model: sessionOptions.model,
+				thinkingLevel: sessionOptions.thinkingLevel,
+				agentMode: sessionStartEvent ? undefined : sessionOptions.agentMode,
+				scopedModels: sessionOptions.scopedModels,
+				tools: sessionOptions.tools,
+				allowUnlistedExtensionTools: sessionOptions.allowUnlistedExtensionTools,
+				excludeTools: sessionOptions.excludeTools,
+				noTools: sessionOptions.noTools,
+				customTools: sessionOptions.customTools,
+				subagentToolManager: subagentManager,
+			});
+
+			return {
+				...created,
+				services,
+				diagnostics,
+			};
+		} catch (error) {
+			const cleanupErrors: unknown[] = [];
+			if (subagentManager) {
+				try {
+					await subagentManager.dispose();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			try {
+				services.gitContextProvider.dispose();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError(
+					[error, ...cleanupErrors],
+					"Agent session creation failed and untransferred CLI services could not be disposed",
+				);
+			}
+			throw error;
+		}
 	};
 	time("createRuntime");
 	const runtime = await createAgentSessionRuntime(createRuntime, {
-		cwd: sessionManager.getCwd(),
+		cwd: sessionCwd,
 		agentDir,
-		sessionManager,
+		sessionManager: sessionManagerOwner.transfer(),
 	});
 	time("createAgentSessionRuntime");
-	const { services, session, modelFallbackMessage } = runtime;
-	const { settingsManager, modelRegistry, resourceLoader } = services;
-	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
-	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+	await runWithOwnedAgentSessionRuntime(runtime, async (transferRuntime) => {
+		const { services, session, modelFallbackMessage } = runtime;
+		const { settingsManager, modelRegistry, resourceLoader } = services;
+		applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+		configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
 
-	if (parsed.help) {
-		const extensionFlags = resourceLoader
-			.getExtensions()
-			.extensions.flatMap((extension) => Array.from(extension.flags.values()));
-		printHelp(extensionFlags);
-		process.exit(0);
-	}
-
-	if (parsed.listModels !== undefined) {
-		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
-		await listModels(modelRegistry, searchPattern);
-		process.exit(0);
-	}
-
-	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
-	let stdinContent: string | undefined;
-	if (appMode !== "rpc") {
-		stdinContent = await readPipedStdin();
-		if (stdinContent !== undefined && appMode === "interactive") {
-			appMode = "print";
-		}
-	}
-	time("readPipedStdin");
-
-	const { initialMessage, initialImages } = await prepareInitialMessage(
-		parsed,
-		settingsManager.getImageAutoResize(),
-		stdinContent,
-	);
-	time("prepareInitialMessage");
-	initTheme(settingsManager.getTheme(), appMode === "interactive");
-	time("initTheme");
-
-	// Show deprecation warnings in interactive mode
-	if (appMode === "interactive" && deprecationWarnings.length > 0) {
-		await showDeprecationWarnings(deprecationWarnings);
-	}
-
-	time("resolveModelScope");
-	reportDiagnostics(runtime.diagnostics);
-	if (runtime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
-		process.exit(1);
-	}
-	time("createAgentSession");
-
-	if (appMode !== "interactive" && !session.model) {
-		console.error(chalk.red(formatNoModelsAvailableMessage()));
-		process.exit(1);
-	}
-
-	const startupBenchmark = isTruthyEnvFlag(process.env.VOLT_STARTUP_BENCHMARK);
-	if (startupBenchmark && appMode !== "interactive") {
-		console.error(chalk.red("Error: VOLT_STARTUP_BENCHMARK only supports interactive mode"));
-		process.exit(1);
-	}
-
-	if (appMode === "rpc") {
-		printTimings();
-		await runRpcMode(runtime, {
-			onReady: () => {
-				void runtime.startRecoveredClientInputs().catch(() => undefined);
-			},
-		});
-	} else if (appMode === "interactive") {
-		const interactiveMode = new InteractiveMode(runtime, {
-			migratedProviders,
-			modelFallbackMessage,
-			modelScopePatterns: parsed.models,
-			autoTrustOnReloadCwd,
-			initialMessage,
-			initialImages,
-			initialMessages: parsed.messages,
-			verbose: parsed.verbose,
-			...(parsed.tuiMode !== undefined ? { tuiMode: parsed.tuiMode } : {}),
-		});
-		if (startupBenchmark) {
-			await interactiveMode.init();
-			time("interactiveMode.init");
-			printTimings();
-			interactiveMode.stop();
-			stopThemeWatcher();
-			if (process.stdout.writableLength > 0) {
-				await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
-			}
-			if (process.stderr.writableLength > 0) {
-				await new Promise<void>((resolve) => process.stderr.once("drain", resolve));
-			}
+		if (parsed.help) {
+			const extensionFlags = resourceLoader
+				.getExtensions()
+				.extensions.flatMap((extension) => Array.from(extension.flags.values()));
+			printHelp(extensionFlags);
 			return;
 		}
 
-		printTimings();
-		await interactiveMode.run();
-	} else {
-		printTimings();
-		const exitCode = await runPrintMode(runtime, {
-			mode: toPrintOutputMode(appMode),
-			messages: parsed.messages,
-			initialMessage,
-			initialImages,
-		});
-		stopThemeWatcher();
-		restoreStdout();
-		if (exitCode !== 0) {
-			process.exitCode = exitCode;
+		if (parsed.listModels !== undefined) {
+			const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
+			await listModels(modelRegistry, searchPattern);
+			return;
 		}
-		return;
-	}
+
+		// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
+		let stdinContent: string | undefined;
+		if (appMode !== "rpc") {
+			stdinContent = await readPipedStdin();
+			if (stdinContent !== undefined && appMode === "interactive") {
+				appMode = "print";
+			}
+		}
+		time("readPipedStdin");
+
+		const { initialMessage, initialImages } = await prepareInitialMessage(
+			parsed,
+			settingsManager.getImageAutoResize(),
+			stdinContent,
+		);
+		time("prepareInitialMessage");
+		initTheme(settingsManager.getTheme(), appMode === "interactive");
+		time("initTheme");
+
+		// Show deprecation warnings in interactive mode
+		if (appMode === "interactive" && deprecationWarnings.length > 0) {
+			await showDeprecationWarnings(deprecationWarnings);
+		}
+
+		time("resolveModelScope");
+		reportDiagnostics(runtime.diagnostics);
+		if (runtime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+			process.exitCode = 1;
+			return;
+		}
+		time("createAgentSession");
+
+		if (appMode !== "interactive" && !session.model) {
+			console.error(chalk.red(formatNoModelsAvailableMessage()));
+			process.exitCode = 1;
+			return;
+		}
+
+		const startupBenchmark = isTruthyEnvFlag(process.env.VOLT_STARTUP_BENCHMARK);
+		if (startupBenchmark && appMode !== "interactive") {
+			console.error(chalk.red("Error: VOLT_STARTUP_BENCHMARK only supports interactive mode"));
+			process.exitCode = 1;
+			return;
+		}
+
+		if (appMode === "rpc") {
+			printTimings();
+			transferRuntime();
+			await runRpcMode(runtime, {
+				onReady: () => {
+					void runtime.startRecoveredClientInputs().catch(() => undefined);
+				},
+			});
+		} else if (appMode === "interactive") {
+			const interactiveMode = new InteractiveMode(runtime, {
+				migratedProviders,
+				modelFallbackMessage,
+				modelScopePatterns: parsed.models,
+				autoTrustOnReloadCwd,
+				initialMessage,
+				initialImages,
+				initialMessages: parsed.messages,
+				verbose: parsed.verbose,
+				...(parsed.tuiMode !== undefined ? { tuiMode: parsed.tuiMode } : {}),
+			});
+			if (startupBenchmark) {
+				await interactiveMode.init();
+				time("interactiveMode.init");
+				printTimings();
+				interactiveMode.stop();
+				stopThemeWatcher();
+				if (process.stdout.writableLength > 0) {
+					await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
+				}
+				if (process.stderr.writableLength > 0) {
+					await new Promise<void>((resolve) => process.stderr.once("drain", resolve));
+				}
+				return;
+			}
+
+			printTimings();
+			transferRuntime();
+			await interactiveMode.run();
+		} else {
+			printTimings();
+			transferRuntime();
+			const exitCode = await runPrintMode(runtime, {
+				mode: toPrintOutputMode(appMode),
+				messages: parsed.messages,
+				initialMessage,
+				initialImages,
+			});
+			stopThemeWatcher();
+			restoreStdout();
+			if (exitCode !== 0) {
+				process.exitCode = exitCode;
+			}
+			return;
+		}
+	});
 }

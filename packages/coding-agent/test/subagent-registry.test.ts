@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { SessionReference } from "../src/core/session-manager.ts";
 import { SubagentRegistry } from "../src/core/subagents/registry.ts";
 
 function registerRunning(
@@ -269,14 +270,23 @@ describe("SubagentRegistry", () => {
 });
 
 describe("SubagentRegistry hydrate and claimResume", () => {
-	function hydrateAborted(registry: SubagentRegistry, id: string, childSessionFile = "/tmp/child.jsonl"): void {
+	function hydrateAborted(
+		registry: SubagentRegistry,
+		id: string,
+		childSessionRef: SessionReference = {
+			sessionDirectory: "/tmp/sessions",
+			storeId: "store-1",
+			sessionGeneration: "generation-test",
+			sessionId: "child-1",
+		},
+	): void {
 		registry.hydrate({
 			id,
 			agent: { name: "researcher" },
 			path: ["researcher"],
 			status: "aborted",
 			error: "Interrupted before completion",
-			childSessionFile,
+			childSessionRef,
 			startedAt: 1,
 			finishedAt: 2,
 		});
@@ -300,7 +310,10 @@ describe("SubagentRegistry hydrate and claimResume", () => {
 		expect(registry.claimResume("sa_live")).toBeUndefined();
 		expect(registry.claimResume("sa_missing")).toBeUndefined();
 		const claim = registry.claimResume("sa_stuck");
-		expect(claim).toMatchObject({ agentName: "researcher", childSessionFile: "/tmp/child.jsonl" });
+		expect(claim).toMatchObject({
+			agentName: "researcher",
+			childSessionRef: { sessionId: "child-1", storeId: "store-1" },
+		});
 		// Claimed: gone from the registry until re-registered or rolled back.
 		expect(registry.get("sa_stuck")).toBeUndefined();
 		expect(registry.claimResume("sa_stuck")).toBeUndefined();

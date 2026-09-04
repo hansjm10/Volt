@@ -10,7 +10,7 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession, AgentSessionEvent } from "../src/core/agent-session.ts";
 import { AgentSessionRuntime, type CreateAgentSessionRuntimeResult } from "../src/core/agent-session-runtime.ts";
 import type { AgentSessionServices } from "../src/core/agent-session-services.ts";
@@ -18,7 +18,7 @@ import { createIrohRemotePresetAccess } from "../src/core/remote/iroh/access-gra
 import { IrohRemoteAuditLogger } from "../src/core/remote/iroh/audit.ts";
 import type { IrohRemoteWorkspaceWorktree } from "../src/core/remote/iroh/state.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
-import { getDefaultSessionDir, SessionManager } from "../src/core/session-manager.ts";
+import { getDefaultSessionDir, SessionManager, type SessionReference } from "../src/core/session-manager.ts";
 import { createDaemonClient } from "../src/daemon/control-client.ts";
 import {
 	CONTROL_WORKTREES_CAPABILITY,
@@ -52,22 +52,27 @@ import {
 	ManualIrohSendStream,
 	parseWrittenObjects,
 } from "./iroh-stream-doubles.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
+const tempDirs: string[] = [];
+const managerOwner = createSessionManagerTestOwner();
 const HOST_FIXTURE_ROOT = join(tmpdir(), "volt-worktree-tui");
 const HOST_PARENT_PATH = join(HOST_FIXTURE_ROOT, "parent-repo");
 const HOST_AGENT_DIR = join(HOST_FIXTURE_ROOT, ".volt", "agent");
 const HOST_WORKTREE_PATH = join(getWorktreesRoot(HOST_AGENT_DIR), "--repo--", "fix-login");
 
+beforeEach(() => managerOwner.start());
+
 afterEach(async () => {
-	for (const cleanup of cleanups.splice(0)) {
-		await cleanup();
-	}
+	while (cleanups.length > 0) await cleanups.pop()?.();
+	await managerOwner.drain();
+	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function makeTempDir(prefix: string): string {
 	const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
-	cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+	tempDirs.push(dir);
 	return dir;
 }
 
@@ -687,11 +692,11 @@ describe("trust pinning helpers (§5.2.1)", () => {
 });
 
 describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () => {
-	function createRuntimeFixture(parentCwd: string, agentDir: string) {
+	async function createRuntimeFixture(parentCwd: string, agentDir: string) {
 		const createdSessions: Array<{
 			cwd: string;
 			sessionDir: string;
-			sessionFile: string | undefined;
+			sessionRef: SessionReference | undefined;
 			workspaceName?: string;
 			baseRef?: string;
 		}> = [];
@@ -703,8 +708,8 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 				disposeForSessionReplacement: vi.fn(),
 				dispose: vi.fn(),
 				subscribe: vi.fn(() => () => {}),
-				get sessionFile() {
-					return sessionManager.getSessionFile();
+				get sessionRef() {
+					return sessionManager.getSessionRef();
 				},
 				get sessionId() {
 					return sessionManager.getSessionId();
@@ -726,7 +731,7 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 				createdSessions.push({
 					cwd: options.cwd,
 					sessionDir: options.sessionManager.getSessionDir(),
-					sessionFile: options.sessionManager.getSessionFile(),
+					sessionRef: options.sessionManager.getSessionRef(),
 					workspaceName: options.workspaceName,
 					baseRef: options.baseRef,
 				});
@@ -738,7 +743,7 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 			},
 		);
 		const parentSessionDir = getDefaultSessionDir(parentCwd, agentDir);
-		const initialManager = SessionManager.create(parentCwd, parentSessionDir);
+		const initialManager = await SessionManager.create(parentCwd, parentSessionDir);
 		const runtime = new AgentSessionRuntime(
 			makeSessionDouble(initialManager),
 			makeServices(parentCwd),
@@ -753,7 +758,7 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 		const worktreeCwd = join(getWorktreesRoot(agentDir), "--parent-repo--", "fix-login");
 		mkdirSync(parentCwd, { recursive: true });
 		mkdirSync(worktreeCwd, { recursive: true });
-		const fixture = createRuntimeFixture(parentCwd, agentDir);
+		const fixture = await createRuntimeFixture(parentCwd, agentDir);
 
 		const result = await fixture.runtime.newSession({
 			cwd: worktreeCwd,
@@ -797,7 +802,7 @@ describe("new session into a worktree (§5.2.1 cwd/sessionDir overrides)", () =>
 		const agentDir = makeTempDir("volt-wt-newsession2-");
 		const parentCwd = join(agentDir, "parent-repo");
 		mkdirSync(parentCwd, { recursive: true });
-		const fixture = createRuntimeFixture(parentCwd, agentDir);
+		const fixture = await createRuntimeFixture(parentCwd, agentDir);
 
 		await fixture.runtime.newSession();
 		expect(fixture.createdSessions[0]).toMatchObject({ cwd: parentCwd, sessionDir: fixture.parentSessionDir });

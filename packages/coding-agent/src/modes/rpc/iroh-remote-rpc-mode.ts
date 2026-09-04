@@ -396,7 +396,7 @@ export function runIrohRemoteRpcMode(
 	const detachSessionWillProject = options.onSessionWillProject
 		? runtimeHost.subscribeSessionWillProject((nextSession) =>
 				options.onSessionWillProject?.({
-					sessionFile: nextSession.sessionFile,
+					sessionRef: nextSession.sessionRef,
 					sessionId: nextSession.sessionId,
 				}),
 			)

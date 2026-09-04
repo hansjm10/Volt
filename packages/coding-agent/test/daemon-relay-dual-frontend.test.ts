@@ -103,6 +103,7 @@ function createStableSessionRunner<TSession>(getSession: () => TSession) {
 
 function createFanoutSession(sessionId: string) {
 	const session = createTestSession(sessionId, null);
+	Object.assign(session.sessionManager, { getSessionRef: vi.fn(() => undefined) });
 	const subscribers = new Set<(event: AgentSessionEvent) => void>();
 	session.subscribe = vi.fn((handler: (event: AgentSessionEvent) => void) => {
 		subscribers.add(handler);

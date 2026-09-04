@@ -1,34 +1,20 @@
 import { type AgentMessage, uuidv7 } from "@hansjm10/volt-agent-core";
 import type { ImageContent, JsonCompatibleInput, JsonValue, Message, TextContent } from "@hansjm10/volt-ai";
-import { createHash, randomUUID } from "crypto";
-import {
-	closeSync,
-	constants,
-	createReadStream,
-	existsSync,
-	fstatSync,
-	openSync,
-	readdirSync,
-	readFileSync,
-	readSync,
-	statSync,
-} from "fs";
-import { readdir, stat } from "fs/promises";
-import { basename, join, resolve } from "path";
-import { createInterface } from "readline";
+import { randomUUID } from "crypto";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync } from "fs";
+import { readdir } from "fs/promises";
+import { basename, join } from "path";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { TextDecoder } from "util";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
-import { syncDurableFile, writeDurableAtomicFile, writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
-import { canonicalizePath, normalizePath, resolvePath } from "../utils/paths.ts";
+import { writeDurableAtomicFileSync } from "../utils/durable-atomic-write.ts";
+import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	ensurePrivateDirectorySync,
 	hardenPrivateRegularFileSync,
-	openPrivateRegularFile,
 	PRIVATE_DIRECTORY_MODE,
 	PRIVATE_FILE_MODE,
-	writePrivateNewFile,
 } from "../utils/private-files.ts";
 import { cloneCanonicalData } from "./canonical-data.ts";
 import {
@@ -41,18 +27,58 @@ import {
 import { clonePlanningState, DEFAULT_PLANNING_STATE, type PlanningState, parsePlanningState } from "./planning.ts";
 import { RpcGitContextSchema } from "./rpc/schema/git-context.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
+import { RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX } from "./rpc/wire-limits.ts";
 import {
-	RPC_CLIENT_MESSAGE_ID_MAX_CHARS,
-	RPC_CLIENT_MESSAGE_ID_PATTERN_SOURCE,
-	RPC_CONVERSATION_INPUT_IMAGE_DATA_MAX_UTF8_BYTES,
-	RPC_CONVERSATION_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES,
-	RPC_CONVERSATION_INPUT_IMAGES_MAX_UTF8_BYTES,
-	RPC_CONVERSATION_INPUT_MAX_IMAGES,
-	RPC_CONVERSATION_INPUT_MAX_SERIALIZED_BYTES,
-	RPC_CONVERSATION_INPUT_MESSAGE_MAX_UTF8_BYTES,
-	RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX,
-	RPC_SESSION_QUEUE_MAX_ITEMS,
-} from "./rpc/wire-limits.ts";
+	assertClientMessageId,
+	boundClientInputError,
+	decodeStoredSessionEntry,
+	digestClientInputPayload,
+	isHostOnlySessionEntryType,
+	isValidClientMessageId,
+	isValidSessionId,
+	normalizeClientInputPayload,
+	normalizeClientInputQueuedPayload,
+	parsePersistedSessionEntry,
+	parseSessionEntryForAdmission,
+	parseSessionReference,
+	parseSessionSnapshotHeader,
+	SESSION_ID_MAX_CHARACTERS,
+	validatePersistedSessionEntrySequence,
+	validateSessionEntryAdmissionReferences,
+} from "./session-entry-codec.ts";
+import {
+	acquireSharedSQLiteSessionStore,
+	digestSessionStoreTransactionPayload,
+	SESSION_STORE_DATABASE_FILENAME,
+	type SessionStoreApplyTransactionInput,
+	type SessionStoreEntryWrite,
+	type SessionStoreJsonValue,
+	type SessionStoreSessionProjection,
+	type SessionStoreSessionSummary,
+	type SessionStoreSnapshot,
+	type SessionStoreTransactionPayload,
+	type SQLiteSessionStoreClient,
+	type SQLiteSessionStoreLease,
+} from "./session-store/index.ts";
+import {
+	applySessionEntry,
+	CLIENT_INPUT_MAX_OUTSTANDING_BYTES,
+	CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES,
+	CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES,
+	cloneClientInputRecord,
+	cloneSessionDerivedState,
+	createSessionDerivedState,
+	expectedClientInputQueuedDelivery,
+	summarizeSessionEntries as reduceSessionEntries,
+	replaySessionEntries,
+	requireStartedClientInputReceipt,
+	type SessionDerivedState,
+	sessionEntrySummary,
+	sessionStoreClientInputsForEntries,
+	sessionStoreProjection,
+	sessionStoreSearchChunksForEntries,
+	verifySessionStoreProjections,
+} from "./session-store/projection.ts";
 
 function deepFreezeCanonicalData<T>(value: T): T {
 	if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -63,15 +89,37 @@ function deepFreezeCanonicalData<T>(value: T): T {
 }
 
 export const CURRENT_SESSION_VERSION = 5;
+export const CURRENT_SESSION_SNAPSHOT_VERSION = 1;
+
+export interface SessionReference {
+	readonly sessionDirectory: string;
+	readonly storeId: string;
+	readonly sessionId: string;
+	readonly sessionGeneration: string;
+}
 
 export interface SessionHeader {
 	type: "session";
-	version?: number; // v1 sessions don't have this
+	version: number;
 	id: string;
 	timestamp: string;
 	cwd: string;
-	parentSession?: string;
+	parentSession?: SessionReference;
 	/** "subagent" when this session was created for a delegated subagent run. */
+	origin?: SessionOrigin;
+}
+
+export interface SessionSnapshotHeader {
+	type: "session";
+	version: number;
+	snapshotVersion: number;
+	id: string;
+	timestamp: string;
+	cwd: string;
+	parentSessionDirectory?: string;
+	parentStoreId?: string;
+	parentSessionId?: string;
+	parentSessionGeneration?: string;
 	origin?: SessionOrigin;
 }
 
@@ -252,12 +300,12 @@ export interface VerifiedSessionDeliveryNoEffect extends VerifiedSessionDelivery
 export type VerifiedSessionDeliveryReceipt = VerifiedSessionDeliveryCommit | VerifiedSessionDeliveryNoEffect;
 
 class AtomicAppendPersistenceFailure extends Error {
-	readonly effect: Exclude<SessionAtomicAppendEffect, "committed">;
+	readonly effect: SessionAtomicAppendEffect;
 	readonly authority: SessionAtomicAppendAuthority;
 
 	constructor(
 		message: string,
-		effect: Exclude<SessionAtomicAppendEffect, "committed">,
+		effect: SessionAtomicAppendEffect,
 		authority: SessionAtomicAppendAuthority,
 		options?: ErrorOptions,
 	) {
@@ -269,7 +317,7 @@ class AtomicAppendPersistenceFailure extends Error {
 
 export interface NewSessionOptions {
 	id?: string;
-	parentSession?: string;
+	parentSession?: SessionReference;
 	origin?: SessionOrigin;
 }
 
@@ -278,7 +326,7 @@ export interface SessionEntryBase {
 	id: string;
 	parentId: string | null;
 	timestamp: string;
-	/** Monotonic file commit order. Added on append and backfilled by v4 migration. */
+	/** Monotonic commit order assigned when the entry is persisted. */
 	ordinal?: number;
 }
 
@@ -462,22 +510,6 @@ export interface SessionStartGitContextEntry extends SessionEntryBase {
 	gitContext: RpcGitContext | null;
 }
 
-const SessionStartGitContextEntrySchema = Type.Object(
-	{
-		type: Type.Literal("session_start_git_context"),
-		id: Type.String({ minLength: 1 }),
-		parentId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
-		timestamp: Type.String({ minLength: 1, maxLength: 64 }),
-		ordinal: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
-		gitContext: Type.Union([RpcGitContextSchema, Type.Null()]),
-	},
-	{ additionalProperties: false },
-);
-
-function isValidSessionStartGitContextEntry(value: unknown): value is SessionStartGitContextEntry {
-	return Check(SessionStartGitContextEntrySchema, value);
-}
-
 /** Durable host-only active-branch pointer. Never projected into conversation history. */
 export interface LeafEntry extends SessionEntryBase {
 	type: "leaf";
@@ -523,8 +555,8 @@ export interface SubagentSpawnEntry extends SessionEntryBase {
 	subagentId: string;
 	agent: string;
 	childSessionId: string;
-	/** Absolute child session file path at spawn time. Absent for in-memory children. */
-	childSessionFile?: string;
+	/** Durable child reference. Absent for in-memory children. */
+	childSessionRef?: SessionReference;
 	/** Dedup request key of the originating spawn request. Never projected to clients. */
 	requestKey: string;
 }
@@ -566,45 +598,19 @@ export function isClientInputWalEntry(
  * and never copy into forks.
  */
 export function isHostOnlySessionEntry(entry: FileEntry): boolean {
-	return (
-		isClientInputWalEntry(entry) ||
-		entry.type === "session_start_git_context" ||
-		entry.type === "subagent_spawn" ||
-		entry.type === "leaf"
-	);
+	return isHostOnlySessionEntryType(entry.type);
 }
 
-const CLIENT_INPUT_ID_MAX_CHARACTERS = RPC_CLIENT_MESSAGE_ID_MAX_CHARS;
-const CLIENT_INPUT_ID_PATTERN = new RegExp(`^${RPC_CLIENT_MESSAGE_ID_PATTERN_SOURCE}$`);
+export {
+	CLIENT_INPUT_MAX_OUTSTANDING_BYTES,
+	CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES,
+	CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES,
+	isValidClientMessageId,
+};
 export const RUNTIME_QUEUE_ENTRY_ID_PREFIX = RPC_RUNTIME_QUEUE_ENTRY_ID_PREFIX;
-const CLIENT_INPUT_MESSAGE_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_MESSAGE_MAX_UTF8_BYTES;
-const CLIENT_INPUT_MAX_IMAGES = RPC_CONVERSATION_INPUT_MAX_IMAGES;
-const CLIENT_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES;
-const CLIENT_INPUT_IMAGE_DATA_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_IMAGE_DATA_MAX_UTF8_BYTES;
-const CLIENT_INPUT_IMAGES_MAX_UTF8_BYTES = RPC_CONVERSATION_INPUT_IMAGES_MAX_UTF8_BYTES;
-const CLIENT_INPUT_MAX_SERIALIZED_BYTES = RPC_CONVERSATION_INPUT_MAX_SERIALIZED_BYTES;
-export const CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES = RPC_SESSION_QUEUE_MAX_ITEMS;
-export const CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES = CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES;
-export const CLIENT_INPUT_MAX_OUTSTANDING_BYTES = 16 * 1024 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Canonical wire/storage grammar for durable external conversation identities. */
-export function isValidClientMessageId(value: unknown): value is string {
-	if (typeof value !== "string" || value.length === 0 || value.length > CLIENT_INPUT_ID_MAX_CHARACTERS) {
-		return false;
-	}
-	// Runtime-only queue identities use this reserved namespace. Keeping it out
-	// of the external semantic-ID domain makes an observed local queue card
-	// impossible to forge through paired-client ingress.
-	if (value.startsWith(RUNTIME_QUEUE_ENTRY_ID_PREFIX)) {
-		return false;
-	}
-	// Comparing the full match avoids JavaScript `$` accepting a match immediately
-	// before a trailing line terminator.
-	return value.match(CLIENT_INPUT_ID_PATTERN)?.[0] === value;
 }
 
 /** Runtime-only dequeue identity. This namespace is never valid at paired-client ingress. */
@@ -612,196 +618,8 @@ export function isRuntimeQueueEntryId(value: unknown): value is string {
 	return typeof value === "string" && value.startsWith(RUNTIME_QUEUE_ENTRY_ID_PREFIX) && value.length <= 64;
 }
 
-function assertClientMessageId(clientMessageId: string): void {
-	if (!isValidClientMessageId(clientMessageId)) {
-		throw new Error(
-			`Client input id must match [A-Za-z0-9][A-Za-z0-9._:-]{0,255} and be at most ${CLIENT_INPUT_ID_MAX_CHARACTERS} ASCII characters`,
-		);
-	}
-}
-
-function normalizeClientInputImages(value: unknown): ImageContent[] {
-	if (value === undefined) return [];
-	if (!Array.isArray(value)) {
-		throw new Error("Client input images must be an array");
-	}
-	if (value.length > CLIENT_INPUT_MAX_IMAGES) {
-		throw new Error(`Client input images exceed the ${CLIENT_INPUT_MAX_IMAGES}-image limit`);
-	}
-
-	let aggregateBytes = 0;
-	return value.map((candidate, index) => {
-		if (
-			!isRecord(candidate) ||
-			candidate.type !== "image" ||
-			typeof candidate.mimeType !== "string" ||
-			typeof candidate.data !== "string"
-		) {
-			throw new Error(`Client input image ${index} is invalid`);
-		}
-		const mimeTypeBytes = Buffer.byteLength(candidate.mimeType, "utf8");
-		if (mimeTypeBytes > CLIENT_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES) {
-			throw new Error(
-				`Client input image ${index} MIME type exceeds the ${CLIENT_INPUT_IMAGE_MIME_TYPE_MAX_UTF8_BYTES}-byte UTF-8 limit`,
-			);
-		}
-		const dataBytes = Buffer.byteLength(candidate.data, "utf8");
-		if (dataBytes > CLIENT_INPUT_IMAGE_DATA_MAX_UTF8_BYTES) {
-			throw new Error(
-				`Client input image ${index} data exceeds the ${CLIENT_INPUT_IMAGE_DATA_MAX_UTF8_BYTES}-byte UTF-8 limit`,
-			);
-		}
-		aggregateBytes += mimeTypeBytes + dataBytes;
-		if (aggregateBytes > CLIENT_INPUT_IMAGES_MAX_UTF8_BYTES) {
-			throw new Error(`Client input images exceed the ${CLIENT_INPUT_IMAGES_MAX_UTF8_BYTES}-byte UTF-8 limit`);
-		}
-		return { type: "image", mimeType: candidate.mimeType, data: candidate.data };
-	});
-}
-
-function normalizeClientInputContent(message: unknown, images: unknown): { message: string; images: ImageContent[] } {
-	if (typeof message !== "string") {
-		throw new Error("Client input message must be a string");
-	}
-	if (Buffer.byteLength(message, "utf8") > CLIENT_INPUT_MESSAGE_MAX_UTF8_BYTES) {
-		throw new Error(`Client input message exceeds the ${CLIENT_INPUT_MESSAGE_MAX_UTF8_BYTES}-byte UTF-8 limit`);
-	}
-	const normalizedImages = normalizeClientInputImages(images);
-	if (
-		Buffer.byteLength(JSON.stringify({ message, images: normalizedImages }), "utf8") >
-		CLIENT_INPUT_MAX_SERIALIZED_BYTES
-	) {
-		throw new Error(`Client input exceeds the ${CLIENT_INPUT_MAX_SERIALIZED_BYTES}-byte serialized limit`);
-	}
-	return { message, images: normalizedImages };
-}
-
-function normalizeClientInputPayload(command: ClientInputCommand, value: unknown): ClientInputPayload {
-	if (!isRecord(value)) {
-		throw new Error("Client input receipt payload is invalid");
-	}
-	const content = normalizeClientInputContent(value.message, value.images);
-	const streamingBehavior = value.streamingBehavior;
-	if (streamingBehavior !== undefined && streamingBehavior !== "steer" && streamingBehavior !== "followUp") {
-		throw new Error("Client input streaming behavior is invalid");
-	}
-	if (command !== "prompt" && streamingBehavior !== undefined) {
-		throw new Error("Only prompt inputs may specify streaming behavior");
-	}
-	return {
-		...content,
-		...(streamingBehavior === undefined ? {} : { streamingBehavior }),
-	};
-}
-
-function normalizeClientInputQueuedPayload(value: unknown): ClientInputQueuedPayload {
-	if (!isRecord(value) || (value.delivery !== "steer" && value.delivery !== "follow_up")) {
-		throw new Error("Client input queued delivery is invalid");
-	}
-	return {
-		delivery: value.delivery,
-		...normalizeClientInputContent(value.message, value.images),
-	};
-}
-
-function measureClientInputPayloadBytes(value: ClientInputPayload | ClientInputQueuedPayload): number {
-	return Buffer.byteLength(JSON.stringify(value), "utf8");
-}
-
-function getOutstandingClientInputBytes(records: Iterable<ClientInputRecord>): number {
-	let total = 0;
-	for (const record of records) {
-		if (record.state === "completed" || record.state === "failed") continue;
-		total += measureClientInputPayloadBytes(record.input);
-		if (record.queuedInput) {
-			total += measureClientInputPayloadBytes(record.queuedInput);
-		}
-	}
-	return total;
-}
-
-function getOutstandingClientInputCount(records: Iterable<ClientInputRecord>): number {
-	let total = 0;
-	for (const record of records) {
-		if (record.state !== "completed" && record.state !== "failed") {
-			total++;
-		}
-	}
-	return total;
-}
-
-function getRecoverableQueuedClientInputCount(records: Iterable<ClientInputRecord>): number {
-	let total = 0;
-	for (const record of records) {
-		if (record.state === "accepted" && record.queuedInput !== undefined) {
-			total++;
-		}
-	}
-	return total;
-}
-
-function assertClientInputOutstandingCount(records: Iterable<ClientInputRecord>, additionalEntries: number): void {
-	if (getOutstandingClientInputCount(records) + additionalEntries > CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES) {
-		throw new Error(`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES}-entry limit`);
-	}
-}
-
-function assertClientInputOutstandingBudget(records: Iterable<ClientInputRecord>, additionalBytes: number): void {
-	if (getOutstandingClientInputBytes(records) + additionalBytes > CLIENT_INPUT_MAX_OUTSTANDING_BYTES) {
-		throw new Error(
-			`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_BYTES}-byte aggregate limit`,
-		);
-	}
-}
-
-function digestClientInputPayload(command: ClientInputCommand, input: ClientInputPayload): string {
-	return createHash("sha256")
-		.update(JSON.stringify({ command, ...input }))
-		.digest("hex");
-}
-
 export function createClientInputSemanticDigest(command: ClientInputCommand, input: ClientInputPayloadInput): string {
 	return digestClientInputPayload(command, normalizeClientInputPayload(command, input));
-}
-
-function cloneClientInputRecord(record: ClientInputRecord): ClientInputRecord {
-	return {
-		...record,
-		input: { ...record.input, images: record.input.images.map((image) => ({ ...image })) },
-		...(record.queuedInput === undefined
-			? {}
-			: {
-					queuedInput: {
-						...record.queuedInput,
-						images: record.queuedInput.images.map((image) => ({ ...image })),
-					},
-				}),
-	};
-}
-
-function requireStartedClientInputReceipt(
-	records: ReadonlyMap<string, ClientInputRecord>,
-	clientMessageId: string,
-): ClientInputRecord {
-	assertClientMessageId(clientMessageId);
-	const record = records.get(clientMessageId);
-	if (!record) {
-		throw new Error(`Canonical client input ${JSON.stringify(clientMessageId)} has no matching durable receipt`);
-	}
-	if (record.state !== "started") {
-		throw new Error(
-			`Canonical client input ${JSON.stringify(clientMessageId)} requires a started receipt; found ${record.state}`,
-		);
-	}
-	return record;
-}
-
-function getExpectedClientInputQueuedDelivery(record: ClientInputRecord): ClientInputQueuedDelivery | undefined {
-	if (record.command === "steer") return "steer";
-	if (record.command === "follow_up") return "follow_up";
-	if (record.input.streamingBehavior === "steer") return "steer";
-	if (record.input.streamingBehavior === "followUp") return "follow_up";
-	return undefined;
 }
 
 export type SessionEntryListener = (entry: SessionEntry) => void;
@@ -852,14 +670,13 @@ export interface SessionContext {
 }
 
 export interface SessionInfo {
-	path: string;
+	ref: SessionReference;
 	id: string;
 	/** Working directory where the session was started. Empty string for old sessions. */
 	cwd: string;
 	/** User-defined display name from session_info entries. */
 	name?: string;
-	/** Path to the parent session (if this session was forked). */
-	parentSessionPath?: string;
+	parentSessionRef?: SessionReference;
 	/** "subagent" when this session was created for a delegated subagent run. */
 	origin?: SessionOrigin;
 	/** First host-observed path-free Git state for this session. */
@@ -868,7 +685,93 @@ export interface SessionInfo {
 	modified: Date;
 	messageCount: number;
 	firstMessage: string;
-	allMessagesText: string;
+}
+
+function sessionReference(
+	sessionDirectory: string,
+	storeId: string,
+	sessionId: string,
+	sessionGeneration: string,
+): SessionReference {
+	return Object.freeze({ sessionDirectory, storeId, sessionId, sessionGeneration });
+}
+
+function sessionInfoFromStoreSummary(
+	sessionDirectory: string,
+	storeId: string,
+	summary: SessionStoreSessionSummary,
+): SessionInfo {
+	let startingGitContext: RpcGitContext | null | undefined;
+	if (summary.startingGitContextRecorded) {
+		if (!Check(Type.Union([RpcGitContextSchema, Type.Null()]), summary.startingGitContext)) {
+			throw new Error(`Session ${summary.id} has invalid starting Git context metadata`);
+		}
+		startingGitContext = summary.startingGitContext;
+	}
+	return {
+		ref: sessionReference(sessionDirectory, storeId, summary.id, summary.sessionGeneration),
+		id: summary.id,
+		cwd: summary.cwd,
+		...(summary.name === null ? {} : { name: summary.name }),
+		...(summary.parentSessionId === null || summary.parentStoreId === null
+			? {}
+			: {
+					parentSessionRef: sessionReference(
+						summary.parentSessionDirectory!,
+						summary.parentStoreId,
+						summary.parentSessionId,
+						summary.parentSessionGeneration!,
+					),
+				}),
+		...(summary.origin === null ? {} : { origin: summary.origin }),
+		...(startingGitContext === undefined ? {} : { startingGitContext }),
+		created: new Date(summary.createdAt),
+		modified: new Date(summary.updatedAt),
+		messageCount: summary.messageCount,
+		firstMessage: summary.firstMessage || "(no messages)",
+	};
+}
+
+interface SessionSummaryLookupResult {
+	directory: string;
+	storeId: string;
+	summary: SessionStoreSessionSummary;
+}
+
+async function findSessionSummaryById(
+	sessionDir: string,
+	sessionId: string,
+): Promise<SessionSummaryLookupResult | undefined> {
+	assertValidSessionId(sessionId);
+	const directory = resolvePath(sessionDir);
+	const lease = await acquireSharedSQLiteSessionStore(normalizePath(directory));
+	let result: SessionSummaryLookupResult | undefined;
+	try {
+		const summary = await lease.client.findSessionSummaryById(sessionId);
+		if (summary) result = { directory, storeId: lease.client.info.storeId, summary };
+	} catch (error) {
+		try {
+			await lease.release();
+		} catch (releaseError) {
+			throw new AggregateError(
+				[error, releaseError],
+				"Exact session summary lookup failed and its store lease could not be released",
+			);
+		}
+		throw error;
+	}
+	await lease.release();
+	return result;
+}
+
+/** @internal Indexed summary lookup for CLI/runtime owners; not exported from the package entry point. */
+export async function findSessionInfoById(sessionDir: string, sessionId: string): Promise<SessionInfo | undefined> {
+	const result = await findSessionSummaryById(sessionDir, sessionId);
+	return result ? sessionInfoFromStoreSummary(result.directory, result.storeId, result.summary) : undefined;
+}
+
+function storedEntryToSessionEntry(stored: SessionStoreSnapshot["entries"][number]): SessionEntry {
+	return decodeStoredSessionEntry(stored);
 }
 
 export type ReadonlySessionManager = Pick<
@@ -876,7 +779,7 @@ export type ReadonlySessionManager = Pick<
 	| "getCwd"
 	| "getSessionDir"
 	| "getSessionId"
-	| "getSessionFile"
+	| "getSessionRef"
 	| "getLeafId"
 	| "getLeafEntry"
 	| "getEntry"
@@ -894,9 +797,9 @@ function createSessionId(): string {
 }
 
 export function assertValidSessionId(id: string): void {
-	if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(id)) {
+	if (!isValidSessionId(id)) {
 		throw new Error(
-			"Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character",
+			`Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', start and end with an alphanumeric character, and contain at most ${SESSION_ID_MAX_CHARACTERS} characters`,
 		);
 	}
 }
@@ -911,86 +814,6 @@ function generateId(byId: { has(id: string): boolean }): string {
 	return randomUUID();
 }
 
-/** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
-function migrateV1ToV2(entries: FileEntry[]): void {
-	const ids = new Set<string>();
-	let prevId: string | null = null;
-
-	for (const entry of entries) {
-		if (entry.type === "session") {
-			entry.version = 2;
-			continue;
-		}
-
-		entry.id = generateId(ids);
-		entry.parentId = prevId;
-		prevId = entry.id;
-
-		// Convert firstKeptEntryIndex to firstKeptEntryId for compaction
-		if (entry.type === "compaction") {
-			const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
-			if (typeof comp.firstKeptEntryIndex === "number") {
-				const targetEntry = entries[comp.firstKeptEntryIndex];
-				if (targetEntry && targetEntry.type !== "session") {
-					comp.firstKeptEntryId = targetEntry.id;
-				}
-				delete comp.firstKeptEntryIndex;
-			}
-		}
-	}
-}
-
-/** Migrate v2 → v3: rename hookMessage role to custom. Mutates in place. */
-function migrateV2ToV3(entries: FileEntry[]): void {
-	for (const entry of entries) {
-		if (entry.type === "session") {
-			entry.version = 3;
-			continue;
-		}
-
-		// Update message entries with hookMessage role
-		if (entry.type === "message") {
-			const msgEntry = entry as SessionMessageEntry;
-			if (msgEntry.message && (msgEntry.message as { role: string }).role === "hookMessage") {
-				(msgEntry.message as { role: string }).role = "custom";
-			}
-		}
-	}
-}
-
-/** Migrate v3 → v4: assign stable file-order commit ordinals. Mutates in place. */
-function migrateV3ToV4(entries: FileEntry[]): void {
-	let ordinal = 1;
-	for (const entry of entries) {
-		if (entry.type === "session") {
-			entry.version = 4;
-			continue;
-		}
-		entry.ordinal = ordinal++;
-	}
-}
-
-/** Migrate v4 → v5: discard unreplayable legacy WAL while preserving canonical transcript entries. */
-function migrateV4ToV5(entries: FileEntry[]): void {
-	const retainedEntries = entries.filter(
-		(entry) =>
-			entry.type !== "client_input_receipt" &&
-			entry.type !== "client_input_queued" &&
-			entry.type !== "client_input_state",
-	);
-	entries.splice(0, entries.length, ...retainedEntries);
-	for (const entry of retainedEntries) {
-		if (entry.type === "session") {
-			entry.version = 5;
-		} else if (entry.type === "message" && entry.message.role === "user") {
-			// v4 receipts did not retain the replayable payload required by v5. Once
-			// their WAL is discarded, the transport identity must go with it so the
-			// migrated canonical transcript cannot impersonate a v5 completion boundary.
-			delete (entry.message as { clientMessageId?: string }).clientMessageId;
-		}
-	}
-}
-
 function withoutClientInputIdentity(entry: SessionEntry): SessionEntry {
 	if (entry.type !== "message" || entry.message.role !== "user" || entry.message.clientMessageId === undefined) {
 		return entry;
@@ -1000,36 +823,53 @@ function withoutClientInputIdentity(entry: SessionEntry): SessionEntry {
 	return { ...entry, message };
 }
 
-/**
- * Run all necessary migrations to bring entries to current version.
- * Mutates entries in place. Returns true if any migration was applied.
- */
-function migrateToCurrentVersion(entries: FileEntry[]): boolean {
-	const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
-	const version = header?.version ?? 1;
-
-	if (!Number.isSafeInteger(version) || version < 1) {
-		throw new Error(`Session has an invalid schema version: ${String(version)}`);
-	}
-	if (version > CURRENT_SESSION_VERSION) {
-		throw new Error(`Session schema version ${version} is newer than supported version ${CURRENT_SESSION_VERSION}`);
-	}
-	if (version === CURRENT_SESSION_VERSION) return false;
-
-	if (version < 2) migrateV1ToV2(entries);
-	if (version < 3) migrateV2ToV3(entries);
-	if (version < 4) migrateV3ToV4(entries);
-	if (version < 5) migrateV4ToV5(entries);
-
-	return true;
+export function createSessionSnapshotHeader(header: SessionHeader): SessionSnapshotHeader {
+	return {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+		id: header.id,
+		timestamp: header.timestamp,
+		cwd: header.cwd,
+		...(header.parentSession === undefined
+			? {}
+			: {
+					parentSessionDirectory: header.parentSession.sessionDirectory,
+					parentStoreId: header.parentSession.storeId,
+					parentSessionId: header.parentSession.sessionId,
+					parentSessionGeneration: header.parentSession.sessionGeneration,
+				}),
+		...(header.origin === undefined ? {} : { origin: header.origin }),
+	};
 }
 
-/** Exported for testing */
-export function migrateSessionEntries(entries: FileEntry[]): void {
-	migrateToCurrentVersion(entries);
+export function serializeSessionJsonlSnapshot(
+	header: SessionHeader,
+	entries: readonly SessionEntry[],
+	leafId: string | null,
+): string {
+	const snapshotEntries = entries.map((entry, index) => ({
+		...withoutClientInputIdentity(entry),
+		ordinal: index + 1,
+	}));
+	const leaf: LeafEntry = {
+		type: "leaf",
+		id: generateId(new Set(snapshotEntries.map((entry) => entry.id))),
+		parentId: snapshotEntries.at(-1)?.id ?? null,
+		timestamp: new Date().toISOString(),
+		targetId: leafId,
+		ordinal: snapshotEntries.length + 1,
+	};
+	const snapshotHeader = parseSessionSnapshotHeader(
+		createSessionSnapshotHeader(header),
+		CURRENT_SESSION_VERSION,
+		CURRENT_SESSION_SNAPSHOT_VERSION,
+	);
+	const validatedEntries = validatePersistedSessionEntrySequence([...snapshotEntries, leaf], { snapshot: true });
+	return `${[snapshotHeader, ...validatedEntries].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 }
 
-/** Exported for compaction.test.ts */
+/** Exported for compaction tests and snapshot consumers. */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const entries: FileEntry[] = [];
 	const lines = content.trim().split("\n");
@@ -1106,8 +946,11 @@ export function buildSessionContext(
 
 	// Walk from leaf to root, collecting path
 	const path: SessionEntry[] = [];
+	const visited = new Set<string>();
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
+		if (visited.has(current.id)) throw new Error("Session branch contains a parent cycle");
+		visited.add(current.id);
 		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
@@ -1222,8 +1065,6 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 }
 
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
-const SESSION_HEADER_MAX_BYTES = 64 * 1024;
-const SESSION_HEADER_READ_CHUNK_BYTES = 4 * 1024;
 
 function parseSessionEntryLine(line: string): FileEntry | null {
 	if (!line.trim()) return null;
@@ -1244,158 +1085,11 @@ function parseSessionEntryBytes(bytes: Uint8Array): { entry: FileEntry | null; m
 	} catch {
 		return { entry: null, malformed: bytes.length > 0 };
 	}
-	if (!line.trim()) return { entry: null, malformed: false };
+	// A newline commits the preceding record; an ordinary final line terminator
+	// does not create an additional record in the byte reader.
+	if (!line.trim()) return { entry: null, malformed: true };
 	const entry = parseSessionEntryLine(line);
 	return { entry, malformed: entry === null };
-}
-
-function parseAtomicSessionPreimage(content: Buffer): FileEntry[] {
-	const entries: FileEntry[] = [];
-	let lineStart = 0;
-	let lineNumber = 0;
-	for (
-		let newlineIndex = content.indexOf(0x0a);
-		newlineIndex !== -1;
-		newlineIndex = content.indexOf(0x0a, lineStart)
-	) {
-		lineNumber++;
-		const parsed = parseSessionEntryBytes(content.subarray(lineStart, newlineIndex));
-		if (parsed.malformed) {
-			throw new Error(`Current session JSONL is malformed at committed line ${lineNumber}`);
-		}
-		if (parsed.entry) entries.push(parsed.entry);
-		lineStart = newlineIndex + 1;
-	}
-	if (lineStart < content.length) {
-		// Only an unterminated malformed suffix can be a torn append. A complete
-		// final JSON record without its delimiter remains part of the preimage.
-		const parsed = parseSessionEntryBytes(content.subarray(lineStart));
-		if (parsed.entry) entries.push(parsed.entry);
-	}
-	return entries;
-}
-
-function exactOptionalBytesEqual(left: Buffer | undefined, right: Buffer | undefined): boolean {
-	if (left === undefined || right === undefined) return left === right;
-	return left.equals(right);
-}
-
-/**
- * Append at a verified JSONL boundary. A power loss can leave
- * either a complete JSON object without its line delimiter or an incomplete
- * final object. Preserve the former by adding the missing newline and discard
- * only the latter by truncating back to the last committed delimiter.
- *
- * Opening a session is deliberately read-only: target discovery and phone
- * relay attach may inspect a file while another lease owner is writing it.
- * Repair therefore happens only when this manager is actually appending, and
- * any repair is fsynced before the new boundary is written. Windows reopens
- * the verified file with O_APPEND because its O_APPEND handles cannot truncate;
- * other platforms use one no-follow append descriptor throughout.
- */
-const sessionFileOperationQueues = new Map<string, Promise<void>>();
-
-/** Serialize filesystem mutations across managers that temporarily share one session file. */
-function serializeSessionFileOperation(filePath: string, operation: () => Promise<void>): Promise<void> {
-	const previous = sessionFileOperationQueues.get(filePath) ?? Promise.resolve();
-	const task = previous.then(operation);
-	const lane = task.catch(() => {});
-	sessionFileOperationQueues.set(filePath, lane);
-	return task.finally(() => {
-		if (sessionFileOperationQueues.get(filePath) === lane) {
-			sessionFileOperationQueues.delete(filePath);
-		}
-	});
-}
-
-async function appendSessionFileEntry(filePath: string, content: string, durable: boolean): Promise<void> {
-	// Windows rejects ftruncate on a descriptor opened with O_APPEND. Inspect and
-	// repair without it, then reopen with OS-level append semantics for the entry.
-	const appendFlag = process.platform === "win32" ? 0 : constants.O_APPEND;
-	let handle = await openPrivateRegularFile(filePath, constants.O_RDWR | appendFlag);
-	let failed = false;
-	try {
-		const fileStat = await handle.stat();
-		let appendOffset = fileStat.size;
-		if (fileStat.size > 0) {
-			const lastByte = Buffer.allocUnsafe(1);
-			if ((await handle.read(lastByte, 0, 1, fileStat.size - 1)).bytesRead !== 1) {
-				throw new Error(`Failed to inspect session tail: ${filePath}`);
-			}
-			if (lastByte[0] !== 0x0a) {
-				const scanBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
-				let cursor = fileStat.size;
-				let finalRecordOffset = 0;
-				let foundDelimiter = false;
-				while (cursor > 0 && !foundDelimiter) {
-					const length = Math.min(scanBuffer.length, cursor);
-					const offset = cursor - length;
-					const { bytesRead } = await handle.read(scanBuffer, 0, length, offset);
-					if (bytesRead !== length) throw new Error(`Failed to inspect session tail: ${filePath}`);
-					for (let index = length - 1; index >= 0; index--) {
-						if (scanBuffer[index] === 0x0a) {
-							finalRecordOffset = offset + index + 1;
-							foundDelimiter = true;
-							break;
-						}
-					}
-					cursor = offset;
-				}
-
-				const finalRecordLength = fileStat.size - finalRecordOffset;
-				const finalRecord = Buffer.allocUnsafe(finalRecordLength);
-				let bytesLoaded = 0;
-				while (bytesLoaded < finalRecordLength) {
-					const { bytesRead } = await handle.read(
-						finalRecord,
-						bytesLoaded,
-						finalRecordLength - bytesLoaded,
-						finalRecordOffset + bytesLoaded,
-					);
-					if (bytesRead === 0) throw new Error(`Failed to read session tail: ${filePath}`);
-					bytesLoaded += bytesRead;
-				}
-
-				if (parseSessionEntryBytes(finalRecord).entry) {
-					const { bytesWritten } = await handle.write("\n", fileStat.size, "utf8");
-					if (bytesWritten !== 1) throw new Error(`Failed to repair session tail: ${filePath}`);
-					appendOffset = fileStat.size + 1;
-				} else {
-					await handle.truncate(finalRecordOffset);
-					appendOffset = finalRecordOffset;
-				}
-				await handle.sync();
-			}
-		}
-		let appendPosition: number | null = appendOffset;
-		if (process.platform === "win32") {
-			await handle.close();
-			handle = await openPrivateRegularFile(filePath, constants.O_WRONLY | constants.O_APPEND);
-			appendPosition = null;
-		}
-		const entryBuffer = Buffer.from(content, "utf8");
-		let bytesWritten = 0;
-		while (bytesWritten < entryBuffer.length) {
-			const result = await handle.write(
-				entryBuffer,
-				bytesWritten,
-				entryBuffer.length - bytesWritten,
-				appendPosition === null ? null : appendPosition + bytesWritten,
-			);
-			if (result.bytesWritten === 0) throw new Error(`Failed to append session entry: ${filePath}`);
-			bytesWritten += result.bytesWritten;
-		}
-		if (durable) await handle.sync();
-	} catch (error) {
-		failed = true;
-		throw error;
-	} finally {
-		if (failed) {
-			await handle.close().catch(() => {});
-		} else {
-			await handle.close();
-		}
-	}
 }
 
 /** Exported for testing */
@@ -1403,11 +1097,27 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
 
+	hardenPrivateRegularFileSync(resolvedFilePath);
 	const entries: FileEntry[] = [];
 	let malformedCompleteLine: number | undefined;
 	let lineNumber = 0;
-	const fd = openSync(resolvedFilePath, "r");
+	const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	const fd = openSync(resolvedFilePath, constants.O_RDONLY | noFollow);
 	try {
+		const fileStat = fstatSync(fd);
+		if (!fileStat.isFile() || fileStat.nlink !== 1)
+			throw new Error(`Session JSONL is not a private regular file: ${filePath}`);
+		if (noFollow === 0) {
+			const pathStat = lstatSync(resolvedFilePath);
+			if (
+				pathStat.isSymbolicLink() ||
+				!pathStat.isFile() ||
+				pathStat.dev !== fileStat.dev ||
+				pathStat.ino !== fileStat.ino
+			) {
+				throw new Error(`Session JSONL path changed while opening: ${filePath}`);
+			}
+		}
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
 		const pendingChunks: Buffer[] = [];
 		let pendingBytes = 0;
@@ -1439,32 +1149,22 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			}
 		}
 
-		// A malformed unterminated final fragment may be a torn append. Every
-		// newline-terminated malformed record is a committed interior corruption
-		// candidate and is handled fail-closed below for current WAL sessions.
+		// JSONL is explicit interchange, not a live append log. A non-empty
+		// malformed final fragment is a truncated snapshot and must fail closed.
 		if (pendingBytes > 0) {
 			const finalLine = Buffer.concat(pendingChunks, pendingBytes);
 			const parsed = parseSessionEntryBytes(finalLine);
 			if (parsed.entry) entries.push(parsed.entry);
+			else if (parsed.malformed && malformedCompleteLine === undefined) {
+				malformedCompleteLine = lineNumber + 1;
+			}
 		}
 	} finally {
 		closeSync(fd);
 	}
 
-	// Validate session header. Current WAL sessions cannot silently skip a
-	// malformed committed line: it might be the only started/canonical boundary
-	// preventing duplicate side effects. A parseable legacy header retains its
-	// historical best-effort behavior. A file with no parseable records fails
-	// because it cannot be proven to be legacy rather than a current WAL whose
-	// header or only durable boundary was destroyed.
-	const parsedHeader = entries[0];
-	if (
-		malformedCompleteLine !== undefined &&
-		(entries.length === 0 ||
-			(parsedHeader?.type === "session" && (parsedHeader.version ?? 1) >= CURRENT_SESSION_VERSION) ||
-			entries.some(isClientInputWalEntry))
-	) {
-		throw new Error(`Current session JSONL is malformed at committed line ${malformedCompleteLine}`);
+	if (malformedCompleteLine !== undefined) {
+		throw new Error(`Session snapshot JSONL is malformed at committed line ${malformedCompleteLine}`);
 	}
 	if (entries.length === 0) return entries;
 	const header = entries[0];
@@ -1475,337 +1175,41 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	return entries;
 }
 
-/**
- * Hardened first-line header read (O_NOFOLLOW, single-link regular files
- * only). Exported for daemon worktree resolution, which needs a session's
- * stored cwd without paying a full WAL-validating open.
- */
-export function readSessionHeader(filePath: string): SessionHeader | null {
-	let fd: number | undefined;
-	try {
-		hardenPrivateRegularFileSync(filePath);
-		const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-		fd = openSync(filePath, constants.O_RDONLY | noFollow);
-		const fileStat = fstatSync(fd);
-		if (!fileStat.isFile() || fileStat.nlink !== 1) return null;
-
-		const chunks: Buffer[] = [];
-		let byteCount = 0;
-		let reachedBoundary = false;
-		while (byteCount <= SESSION_HEADER_MAX_BYTES) {
-			const remainingProbeBytes = SESSION_HEADER_MAX_BYTES + 1 - byteCount;
-			const buffer = Buffer.allocUnsafe(Math.min(SESSION_HEADER_READ_CHUNK_BYTES, remainingProbeBytes));
-			const bytesRead = readSync(fd, buffer, 0, buffer.length, byteCount);
-			if (bytesRead === 0) {
-				reachedBoundary = true;
-				break;
-			}
-			const newlineIndex = buffer.subarray(0, bytesRead).indexOf(0x0a);
-			const retainedBytes = newlineIndex === -1 ? bytesRead : newlineIndex;
-			if (retainedBytes > 0) chunks.push(buffer.subarray(0, retainedBytes));
-			byteCount += retainedBytes;
-			if (newlineIndex !== -1) {
-				reachedBoundary = true;
-				break;
-			}
+export function assertCurrentSessionSnapshot(entries: FileEntry[]): SessionSnapshotHeader {
+	const headerValue = entries[0];
+	if (!headerValue || headerValue.type !== "session") {
+		throw new Error("Session snapshot has no valid header");
+	}
+	if (entries.slice(1).some((entry) => entry.type === "session")) {
+		throw new Error("Session snapshot contains more than one header");
+	}
+	if (headerValue.version !== CURRENT_SESSION_VERSION) {
+		throw new Error(`Session snapshot entry version must be ${CURRENT_SESSION_VERSION}`);
+	}
+	if (
+		(headerValue as SessionHeader & { snapshotVersion?: number }).snapshotVersion !== CURRENT_SESSION_SNAPSHOT_VERSION
+	) {
+		throw new Error(`Session snapshot version must be ${CURRENT_SESSION_SNAPSHOT_VERSION}`);
+	}
+	for (const entry of entries.slice(1)) {
+		if (entry.type !== "leaf" && isHostOnlySessionEntry(entry)) {
+			throw new Error(`Session snapshot contains unsupported host-only entry: ${entry.type}`);
 		}
-		if (!reachedBoundary || byteCount > SESSION_HEADER_MAX_BYTES) return null;
-		const firstLine = Buffer.concat(chunks, byteCount).toString("utf8");
-		if (!firstLine) return null;
-		const header = JSON.parse(firstLine) as Record<string, unknown>;
-		if (header.type !== "session" || typeof header.id !== "string") {
-			return null;
-		}
-		return header as unknown as SessionHeader;
-	} catch {
-		return null;
-	} finally {
-		if (fd !== undefined) closeSync(fd);
 	}
-}
-
-function getSessionHeaderCwd(header: SessionHeader): string | undefined {
-	const cwd = (header as { cwd?: unknown }).cwd;
-	return typeof cwd === "string" ? cwd : undefined;
-}
-
-function sessionCwdMatches(cwd: string | undefined, resolvedCwd: string): boolean {
-	return cwd !== undefined && cwd !== "" && canonicalizePath(resolvePath(cwd)) === canonicalizePath(resolvedCwd);
-}
-
-/** Exported for testing */
-export function findMostRecentSession(sessionDir: string, cwd?: string): string | null {
-	const resolvedSessionDir = normalizePath(sessionDir);
-	const resolvedCwd = cwd ? resolvePath(cwd) : undefined;
-	try {
-		ensurePrivateDirectorySync(resolvedSessionDir, { hardenExisting: false });
-		const files = readdirSync(resolvedSessionDir)
-			.filter((f) => f.endsWith(".jsonl"))
-			.map((f) => join(resolvedSessionDir, f))
-			.map((path) => ({ path, header: readSessionHeader(path) }))
-			.filter(
-				(file): file is { path: string; header: SessionHeader } =>
-					file.header !== null &&
-					(!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(file.header), resolvedCwd)),
-			)
-			.map(({ path }) => ({ path, mtime: statSync(path).mtime }))
-			.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
-
-		return files[0]?.path || null;
-	} catch {
-		return null;
-	}
-}
-
-function isMessageWithContent(message: AgentMessage): message is Message {
-	return typeof (message as Message).role === "string" && "content" in message;
-}
-
-function extractTextContentFromContent(content: string | Array<{ type: string; text?: string }>): string {
-	if (typeof content === "string") {
-		return content;
-	}
-	return content
-		.filter(
-			(block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string",
-		)
-		.map((block) => block.text)
-		.join(" ");
-}
-
-function extractTextContent(message: Message): string {
-	return extractTextContentFromContent(message.content);
-}
-
-function getEntryTimestamp(entry: Pick<SessionEntryBase, "timestamp">): number | undefined {
-	const t = new Date(entry.timestamp).getTime();
-	return Number.isNaN(t) ? undefined : t;
-}
-
-function getMessageActivityTime(entry: SessionMessageEntry): number | undefined {
-	const message = entry.message;
-	if (!isMessageWithContent(message)) return undefined;
-	if (message.role !== "user" && message.role !== "assistant") return undefined;
-
-	const msgTimestamp = (message as { timestamp?: number }).timestamp;
-	if (typeof msgTimestamp === "number") {
-		return msgTimestamp;
-	}
-
-	return getEntryTimestamp(entry);
-}
-
-function isDisplayedCustomMessage(entry: SessionEntry): entry is CustomMessageEntry {
-	return entry.type === "custom_message" && entry.display;
-}
-
-function isSessionFileFlushContent(entry: FileEntry): boolean {
-	return (
-		entry.type === "client_input_receipt" ||
-		entry.type === "leaf" ||
-		entry.type === "planning_state_change" ||
-		(entry.type === "message" && entry.message.role === "assistant") ||
-		(entry.type === "custom_message" && entry.display)
-	);
-}
-
-function isSessionDurabilityBoundary(entry: SessionEntry): boolean {
-	return (
-		entry.type === "fast_mode_change" ||
-		entry.type === "planning_state_change" ||
-		entry.type === "thinking_level_change" ||
-		entry.type === "model_change" ||
-		entry.type === "leaf" ||
-		isClientInputWalEntry(entry) ||
-		// A spawn edge that only reaches the page cache when the process dies
-		// cannot recover its child; it gets the same fsync treatment as the
-		// client-input WAL.
-		entry.type === "subagent_spawn" ||
-		entry.type === "session_start_git_context" ||
-		(entry.type === "message" && entry.message.role === "user" && typeof entry.message.clientMessageId === "string")
-	);
-}
-
-const CLIENT_INPUT_ERROR_MAX_SCALARS = 2_000;
-
-function boundClientInputError(error: string): string {
-	const scalars = Array.from(error);
-	return scalars.length <= CLIENT_INPUT_ERROR_MAX_SCALARS
-		? error
-		: `${scalars.slice(0, CLIENT_INPUT_ERROR_MAX_SCALARS).join("")}…`;
+	const header = parseSessionSnapshotHeader(headerValue, CURRENT_SESSION_VERSION, CURRENT_SESSION_SNAPSHOT_VERSION);
+	const sessionEntries = validatePersistedSessionEntrySequence(entries.slice(1), { snapshot: true });
+	entries.splice(0, entries.length, header, ...sessionEntries);
+	return header;
 }
 
 export interface SessionEntrySummary {
 	messageCount: number;
 	firstMessage: string;
-	allMessagesText: string;
 	lastActivityTime?: number;
 }
 
 export function summarizeSessionEntries(entries: Iterable<SessionEntry>): SessionEntrySummary {
-	let messageCount = 0;
-	let firstUserMessage = "";
-	let firstFallbackMessage = "";
-	const allMessages: string[] = [];
-	let lastActivityTime: number | undefined;
-
-	for (const entry of entries) {
-		if (entry.type === "message") {
-			messageCount++;
-
-			const activityTime = getMessageActivityTime(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
-
-			const message = entry.message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstUserMessage && message.role === "user") {
-				firstUserMessage = textContent;
-			}
-			if (!firstFallbackMessage && message.role === "assistant") {
-				firstFallbackMessage = textContent;
-			}
-			continue;
-		}
-
-		if (isDisplayedCustomMessage(entry)) {
-			messageCount++;
-
-			const activityTime = getEntryTimestamp(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
-
-			const textContent = extractTextContentFromContent(entry.content);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstFallbackMessage) {
-				firstFallbackMessage = textContent;
-			}
-		}
-	}
-
-	return {
-		messageCount,
-		firstMessage: firstUserMessage || firstFallbackMessage || "(no messages)",
-		allMessagesText: allMessages.join(" "),
-		lastActivityTime,
-	};
-}
-
-async function buildSessionInfo(filePath: string, includeMessageFreeDurable = false): Promise<SessionInfo | null> {
-	try {
-		hardenPrivateRegularFileSync(filePath);
-		const stats = await stat(filePath);
-		let header: SessionHeader | null = null;
-		const entries: SessionEntry[] = [];
-		let name: string | undefined;
-		let startingGitContext: RpcGitContext | null | undefined;
-		let sawStartingGitContext = false;
-
-		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8" }),
-			crlfDelay: Infinity,
-		});
-
-		for await (const line of rl) {
-			const entry = parseSessionEntryLine(line);
-			if (!entry) continue;
-
-			if (!header) {
-				if (entry.type !== "session") return null;
-				header = entry;
-				continue;
-			}
-
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				name = entry.name?.trim() || undefined;
-			}
-			if (entry.type === "session_start_git_context") {
-				const currentFormat = (header.version ?? 1) >= CURRENT_SESSION_VERSION;
-				if (currentFormat && (!isValidSessionStartGitContextEntry(entry) || sawStartingGitContext)) {
-					throw new Error("Current session contains invalid starting Git context metadata");
-				}
-				if (!sawStartingGitContext && isValidSessionStartGitContextEntry(entry)) {
-					startingGitContext = entry.gitContext;
-					sawStartingGitContext = true;
-				}
-			}
-
-			if (entry.type !== "session") {
-				entries.push(entry);
-			}
-		}
-
-		if (!header) return null;
-
-		const summary = summarizeSessionEntries(entries);
-		// A client-input receipt must be durable before admission, but that private
-		// recovery boundary must not materialize an otherwise nonexistent
-		// conversation in session selectors. Keep the file available for explicit
-		// recovery by path; omit it from enumeration until canonical conversation
-		// content has been committed.
-		if (summary.messageCount === 0) {
-			const hasFastModePolicy = entries.some((entry) => entry.type === "fast_mode_change");
-			const hasPrivateClientInputWal = entries.some(isClientInputWalEntry);
-			if ((hasFastModePolicy && !includeMessageFreeDurable) || (!hasFastModePolicy && hasPrivateClientInputWal)) {
-				return null;
-			}
-		}
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const origin = header.origin === "subagent" ? header.origin : undefined;
-		const headerTime = typeof header.timestamp === "string" ? new Date(header.timestamp).getTime() : NaN;
-		const modified =
-			typeof summary.lastActivityTime === "number" && summary.lastActivityTime > 0
-				? new Date(summary.lastActivityTime)
-				: !Number.isNaN(headerTime)
-					? new Date(headerTime)
-					: stats.mtime;
-
-		return {
-			path: filePath,
-			id: header.id,
-			cwd,
-			name,
-			parentSessionPath,
-			origin,
-			...(startingGitContext === undefined ? {} : { startingGitContext }),
-			created: new Date(header.timestamp),
-			modified,
-			messageCount: summary.messageCount,
-			firstMessage: summary.firstMessage,
-			allMessagesText: summary.allMessagesText,
-		};
-	} catch {
-		return null;
-	}
-}
-
-async function readStartingGitContextFromSessionFile(filePath: string): Promise<RpcGitContext | null> {
-	try {
-		hardenPrivateRegularFileSync(filePath);
-		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8" }),
-			crlfDelay: Infinity,
-		});
-		for await (const line of rl) {
-			const entry = parseSessionEntryLine(line);
-			if (entry?.type === "session_start_git_context" && isValidSessionStartGitContextEntry(entry)) {
-				return entry.gitContext;
-			}
-		}
-	} catch {}
-	return null;
+	return reduceSessionEntries(entries);
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -1814,90 +1218,10 @@ export interface SessionListOptions {
 	includeMessageFreeDurable?: boolean;
 }
 
-const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
-
-async function buildSessionInfosWithConcurrency(
-	files: string[],
-	onLoaded: () => void,
-	includeMessageFreeDurable = false,
-): Promise<(SessionInfo | null)[]> {
-	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
-	const inFlight = new Set<Promise<void>>();
-	let nextIndex = 0;
-
-	const startNext = (): void => {
-		const index = nextIndex++;
-		const file = files[index];
-		if (!file) return;
-
-		let task: Promise<void>;
-		task = buildSessionInfo(file, includeMessageFreeDurable)
-			.then((info) => {
-				results[index] = info;
-			})
-			.catch(() => {
-				results[index] = null;
-			})
-			.finally(() => {
-				inFlight.delete(task);
-				onLoaded();
-			});
-		inFlight.add(task);
-	};
-
-	while (nextIndex < files.length || inFlight.size > 0) {
-		while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
-			startNext();
-		}
-		if (inFlight.size > 0) {
-			await Promise.race(inFlight);
-		}
-	}
-
-	return results;
-}
-
-async function listSessionsFromDir(
-	dir: string,
-	onProgress?: SessionListProgress,
-	progressOffset = 0,
-	progressTotal?: number,
-	includeMessageFreeDurable = false,
-): Promise<SessionInfo[]> {
-	const sessions: SessionInfo[] = [];
-	if (!existsSync(dir)) {
-		return sessions;
-	}
-
-	try {
-		ensurePrivateDirectorySync(dir, { hardenExisting: false });
-		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
-		const total = progressTotal ?? files.length;
-
-		let loaded = 0;
-		const results = await buildSessionInfosWithConcurrency(
-			files,
-			() => {
-				loaded++;
-				onProgress?.(progressOffset + loaded, total);
-			},
-			includeMessageFreeDurable,
-		);
-		for (const info of results) {
-			if (info) {
-				sessions.push(info);
-			}
-		}
-	} catch {
-		// Return empty list on error
-	}
-
-	return sessions;
-}
+let importSessionFromJsonlInMemoryImpl: (inputPath: string, targetCwd?: string) => Promise<SessionManager>;
 
 /**
- * Manages conversation sessions as append-only trees stored in JSONL files.
+ * Manages conversation sessions as append-only trees stored in SQLite.
  *
  * Each session entry has an id and parentId forming a tree structure. The "leaf"
  * pointer tracks the current position. Appending creates a child of the current leaf.
@@ -1909,22 +1233,34 @@ async function listSessionsFromDir(
  */
 export class SessionManager {
 	private sessionId: string = "";
-	private sessionFile: string | undefined;
+	private sessionGeneration: string = "";
 	private sessionDir: string;
 	private cwd: string;
 	private persist: boolean;
-	private flushed: boolean = false;
+	private sessionStoreLease: SQLiteSessionStoreLease | undefined;
+	private storeId: string | undefined;
+	private storeRevision = 0;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
-	private labelsById: Map<string, string> = new Map();
-	private labelTimestampsById: Map<string, string> = new Map();
-	private clientInputsById: Map<string, ClientInputRecord> = new Map();
-	private leafId: string | null = null;
-	private nextOrdinal = 1;
-	/** Monotonic revision of provider-visible entries and durable leaf movement. */
-	private canonicalRevision = 0;
-	/** Legacy migration is projected in memory on open and written only by the next actual writer. */
-	private sessionFileNeedsMigration = false;
+	private derivedState!: SessionDerivedState;
+	private get labelsById(): Map<string, string> {
+		return this.derivedState.labelsById;
+	}
+	private get labelTimestampsById(): Map<string, string> {
+		return this.derivedState.labelTimestampsById;
+	}
+	private get clientInputsById(): Map<string, ClientInputRecord> {
+		return this.derivedState.clientInputsById;
+	}
+	private get leafId(): string | null {
+		return this.derivedState.leafId;
+	}
+	private get nextOrdinal(): number {
+		return this.derivedState.nextOrdinal;
+	}
+	private get canonicalRevision(): number {
+		return this.derivedState.canonicalRevision;
+	}
 	/** First uncertain persistence failure. This manager remains fail-stopped until reloaded. */
 	private persistenceError: Error | undefined;
 	/** Sticky authority state carrying the first unresolved atomic-replacement cause. */
@@ -1937,6 +1273,9 @@ export class SessionManager {
 	private persistenceQueue: Promise<void> = Promise.resolve();
 	/** Promise for all persistence work accepted through the latest synchronous mutation. */
 	private persistenceWatermark: Promise<void> = Promise.resolve();
+	/** Queue tasks admitted but not fully settled, including reconciliation. */
+	private unsettledPersistenceTasks = 0;
+	private persistenceDrainPromise: Promise<SessionPersistenceDrainResult> | undefined;
 	private readonly entryListeners = new Set<SessionEntryListener>();
 	private readonly branchListeners = new Set<SessionBranchListener>();
 	private readonly conversationAuthorityListeners = new Set<SessionConversationAuthorityListener>();
@@ -1958,69 +1297,73 @@ export class SessionManager {
 	private constructor(
 		cwd: string,
 		sessionDir: string,
-		sessionFile: string | undefined,
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
-		hardenExistingSessionDir = true,
+		sessionStoreLease?: SQLiteSessionStoreLease,
+		snapshot?: SessionStoreSnapshot,
 	) {
 		this.cwd = resolvePath(cwd);
-		this.sessionDir = normalizePath(sessionDir);
+		this.sessionDir = sessionDir;
 		this.persist = persist;
-		if (persist && this.sessionDir) {
-			ensurePrivateDirectorySync(this.sessionDir, { hardenExisting: hardenExistingSessionDir });
-		}
-
-		if (sessionFile) {
-			this.setSessionFile(sessionFile);
-		} else {
-			this.newSession(newSessionOptions);
-		}
+		this.sessionStoreLease = sessionStoreLease;
+		this.storeId = sessionStoreLease?.client.info.storeId;
+		if (persist && this.sessionDir) ensurePrivateDirectorySync(this.sessionDir);
+		if (snapshot) this._loadStoreSnapshot(snapshot, cwd);
+		else this.newSession(newSessionOptions);
 	}
 
-	/** Switch to a different session file (used for resume and branching) */
-	setSessionFile(sessionFile: string): void {
-		this.assertConversationAuthorityAvailable();
+	private _loadStoreSnapshot(snapshot: SessionStoreSnapshot, cwdOverride?: string): void {
+		const summary = snapshot.session;
+		if (summary.formatVersion !== CURRENT_SESSION_VERSION) {
+			throw new Error(`Session entry version must be ${CURRENT_SESSION_VERSION}`);
+		}
+		const parentSession =
+			summary.parentSessionId === null ||
+			summary.parentStoreId === null ||
+			summary.parentSessionDirectory === null ||
+			summary.parentSessionGeneration === null
+				? undefined
+				: sessionReference(
+						summary.parentSessionDirectory,
+						summary.parentStoreId,
+						summary.parentSessionId,
+						summary.parentSessionGeneration,
+					);
+		const header: SessionHeader = {
+			type: "session",
+			version: summary.formatVersion,
+			id: summary.id,
+			timestamp: summary.createdAt,
+			cwd: cwdOverride ?? summary.cwd,
+			...(parentSession === undefined ? {} : { parentSession }),
+			...(summary.origin === null ? {} : { origin: summary.origin }),
+		};
+		this.cwd = resolvePath(cwdOverride ?? summary.cwd);
+		this.sessionId = summary.id;
+		this.sessionGeneration = summary.sessionGeneration;
+		this.storeRevision = summary.revision;
+		this.fileEntries = [header, ...snapshot.entries.map(storedEntryToSessionEntry)];
 		this.acceptsStartingGitContext = false;
-		if (this.atomicAppendInFlight) {
-			throw new Error("Cannot switch session files during an atomic append");
-		}
-		this.sessionFile = resolvePath(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			hardenPrivateRegularFileSync(this.sessionFile);
-			this.fileEntries = loadEntriesFromFile(this.sessionFile);
-
-			if (this.fileEntries.length === 0) {
-				throw new Error(`Session file has no valid session header: ${this.sessionFile}`);
-			}
-
-			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
-			if (!header || typeof header.id !== "string" || header.id.length === 0) {
-				throw new Error(`Session file has no valid session header: ${this.sessionFile}`);
-			}
-			this.sessionId = header.id;
-
-			// Migration is safe to compute for readers, but writing it here would let
-			// target discovery mutate a session owned by another runtime.
-			this.sessionFileNeedsMigration = migrateToCurrentVersion(this.fileEntries);
-
-			this._buildIndex();
-			this.flushed = true;
-		} else {
-			const explicitPath = this.sessionFile;
-			this.newSession();
-			this.sessionFile = explicitPath; // preserve explicit path from --session flag
-		}
+		this._buildIndex();
+		this._verifyStoreProjections(snapshot);
 	}
 
-	newSession(options?: NewSessionOptions): string | undefined {
-		this.assertConversationAuthorityAvailable();
-		if (this.atomicAppendInFlight) {
-			throw new Error("Cannot create a new session during an atomic append");
+	newSession(options?: NewSessionOptions): SessionReference | undefined {
+		this._assertPersistenceHealthy();
+		if (this.atomicAppendInFlight) throw new Error("Cannot create a new session during an atomic append");
+		if (this.unsettledPersistenceTasks > 0) {
+			throw new Error("Cannot create a new session while persistence is pending; await flush() first");
 		}
-		if (options?.id !== undefined) {
-			assertValidSessionId(options.id);
+		if (options?.id !== undefined) assertValidSessionId(options.id);
+		if (options?.origin !== undefined && options.origin !== "subagent") {
+			throw new Error("Session origin is invalid");
 		}
+		const parentSession =
+			options?.parentSession === undefined
+				? undefined
+				: parseSessionReference(options.parentSession, "Parent session reference");
 		this.sessionId = options?.id ?? createSessionId();
+		this.sessionGeneration = randomUUID();
 		const timestamp = new Date().toISOString();
 		const header: SessionHeader = {
 			type: "session",
@@ -2028,145 +1371,78 @@ export class SessionManager {
 			id: this.sessionId,
 			timestamp,
 			cwd: this.cwd,
-			...(options?.parentSession === undefined ? {} : { parentSession: options.parentSession }),
+			...(parentSession === undefined ? {} : { parentSession }),
 			...(options?.origin === undefined ? {} : { origin: options.origin }),
 		};
 		this.fileEntries = [header];
 		this.byId.clear();
-		this.labelsById.clear();
-		this.clientInputsById.clear();
-		this.leafId = null;
-		this.nextOrdinal = 1;
-		this.canonicalRevision = 0;
-		this.sessionFileNeedsMigration = false;
-		this.flushed = false;
+		this.derivedState = createSessionDerivedState(header);
+		this.storeRevision = 0;
 		this.acceptsStartingGitContext = true;
 
 		if (this.persist) {
-			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
+			const store = this.sessionStoreLease?.client;
+			if (!store || !this.storeId) throw new Error("Persisted session requires an initialized session store");
+			const sessionId = this.sessionId;
+			const sessionGeneration = this.sessionGeneration;
+			const parent = parentSession;
+			this._enqueuePersistence(async () => {
+				await store.createHiddenSession({
+					id: sessionId,
+					sessionGeneration,
+					formatVersion: CURRENT_SESSION_VERSION,
+					cwd: this.cwd,
+					createdAt: timestamp,
+					parentSessionDirectory: parent?.sessionDirectory ?? null,
+					parentStoreId: parent?.storeId ?? null,
+					parentSessionId: parent?.sessionId ?? null,
+					parentSessionGeneration: parent?.sessionGeneration ?? null,
+					origin: options?.origin ?? null,
+				});
+			});
 		}
-		return this.sessionFile;
+		return this.getSessionRef();
+	}
+
+	private _verifyStoreProjections(snapshot: SessionStoreSnapshot): void {
+		verifySessionStoreProjections(this.derivedState, snapshot);
 	}
 
 	private _buildIndex(): void {
-		this.byId.clear();
-		this.labelsById.clear();
-		this.labelTimestampsById.clear();
-		this.clientInputsById.clear();
-		this.leafId = null;
-		this.nextOrdinal = 1;
-		this.canonicalRevision = 0;
-		const currentVersion =
-			(this.fileEntries.find((entry) => entry.type === "session") as SessionHeader | undefined)?.version ===
-			CURRENT_SESSION_VERSION;
-		const seenEntryIds = new Set<string>();
-		let lastWalOrdinal = 0;
-		let sawStartingGitContext = false;
-		for (const entry of this.fileEntries) {
-			if (entry.type === "session") continue;
-			if (currentVersion) {
-				if (entry.type === "session_start_git_context") {
-					if (!isValidSessionStartGitContextEntry(entry) || sawStartingGitContext) {
-						throw new Error("Current session contains invalid starting Git context metadata");
-					}
-					sawStartingGitContext = true;
-				}
-				if (typeof entry.id !== "string" || entry.id.length === 0 || seenEntryIds.has(entry.id)) {
-					throw new Error("Current session contains an invalid or duplicate entry identity");
-				}
-				seenEntryIds.add(entry.id);
-				if (entry.type === "fast_mode_change" && typeof entry.enabled !== "boolean") {
-					throw new Error(`Fast mode entry ${entry.id} has an invalid enabled state`);
-				}
-				if (isClientInputWalEntry(entry)) {
-					if (!Number.isSafeInteger(entry.ordinal) || (entry.ordinal ?? 0) <= lastWalOrdinal) {
-						throw new Error(`Client input WAL entry ${entry.id} has an invalid commit ordinal`);
-					}
-					lastWalOrdinal = entry.ordinal!;
-					assertClientMessageId(entry.clientMessageId);
-					if (
-						(entry.type === "client_input_queued" || entry.type === "client_input_state") &&
-						(typeof entry.receiptId !== "string" || entry.receiptId.length === 0)
-					) {
-						throw new Error(`Client input WAL entry ${entry.id} has an invalid receipt identity`);
-					}
-				}
-			}
-			if (Number.isSafeInteger(entry.ordinal) && (entry.ordinal ?? 0) > 0) {
-				this.nextOrdinal = Math.max(this.nextOrdinal, (entry.ordinal ?? 0) + 1);
-			}
-			if (entry.type === "leaf") {
-				if (
-					entry.targetId !== null &&
-					(!this.byId.has(entry.targetId) || isHostOnlySessionEntry(this.byId.get(entry.targetId)!))
-				) {
-					throw new Error(`Leaf entry ${entry.id} targets an invalid conversation entry`);
-				}
-				this.leafId = entry.targetId;
-			}
-			if (entry.type === "leaf" || !isHostOnlySessionEntry(entry)) this.canonicalRevision++;
-			this.byId.set(entry.id, entry);
-			if (!isHostOnlySessionEntry(entry)) {
-				this.leafId = entry.id;
-			}
-			this._indexClientInputEntry(entry);
-			if (entry.type === "label") {
-				if (entry.label) {
-					this.labelsById.set(entry.targetId, entry.label);
-					this.labelTimestampsById.set(entry.targetId, entry.timestamp);
-				} else {
-					this.labelsById.delete(entry.targetId);
-					this.labelTimestampsById.delete(entry.targetId);
-				}
-			}
-		}
+		const header = this.fileEntries[0];
+		if (!header || header.type !== "session") throw new Error("Current session header is unavailable");
+		const validatedEntries = validatePersistedSessionEntrySequence(this.fileEntries.slice(1));
+		this.fileEntries = [header, ...validatedEntries];
+		this.derivedState = replaySessionEntries(header, validatedEntries);
+		this.byId = new Map(validatedEntries.map((entry) => [entry.id, entry]));
 	}
 
-	private _enqueuePersistence(write: () => Promise<void>): void {
-		const task = this.persistenceQueue.then(async () => {
-			if (this.persistenceError) throw this.persistenceError;
-			try {
-				await write();
-			} catch (error) {
-				this.persistenceError ??= error instanceof Error ? error : new Error(String(error));
-				throw this.persistenceError;
-			}
-		});
+	private _enqueuePersistence(
+		write: () => Promise<void>,
+		failureHandling: "fail_stop" | "propagate" = "fail_stop",
+	): Promise<void> {
+		this.unsettledPersistenceTasks++;
+		const task = this.persistenceQueue
+			.then(async () => {
+				if (this.persistenceError) throw this.persistenceError;
+				try {
+					await write();
+				} catch (error) {
+					if (failureHandling === "propagate") throw error;
+					this.persistenceError ??= error instanceof Error ? error : new Error(String(error));
+					throw this.persistenceError;
+				}
+			})
+			.finally(() => {
+				this.unsettledPersistenceTasks--;
+			});
 		// Keep the serialization lane fulfilled so later accepted work can observe
 		// the sticky error and stop without touching disk. The public watermark
 		// retains rejection for flush callers.
 		this.persistenceQueue = task.catch(() => {});
 		this.persistenceWatermark = task;
 		void task.catch(() => {});
-	}
-
-	private _serializeFileEntries(entries: readonly FileEntry[] = this.fileEntries): string {
-		return `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-	}
-
-	private _createFile(): void {
-		if (!this.persist || !this.sessionFile) return;
-		const filePath = this.sessionFile;
-		const content = this._serializeFileEntries();
-		this._enqueuePersistence(() =>
-			serializeSessionFileOperation(filePath, () => writePrivateNewFile(filePath, content)),
-		);
-	}
-
-	private _rewriteFile(): void {
-		if (!this.persist || !this.sessionFile) return;
-		const filePath = this.sessionFile;
-		const content = this._serializeFileEntries();
-		this._enqueuePersistence(() =>
-			serializeSessionFileOperation(filePath, () =>
-				writeDurableAtomicFile(filePath, content, {
-					directoryMode: PRIVATE_DIRECTORY_MODE,
-					fileMode: PRIVATE_FILE_MODE,
-				}),
-			),
-		);
-		this.sessionFileNeedsMigration = false;
+		return task;
 	}
 
 	isPersisted(): boolean {
@@ -2189,8 +1465,9 @@ export class SessionManager {
 		return this.sessionId;
 	}
 
-	getSessionFile(): string | undefined {
-		return this.sessionFile;
+	getSessionRef(): SessionReference | undefined {
+		if (!this.persist || !this.storeId) return undefined;
+		return sessionReference(this.sessionDir, this.storeId, this.sessionId, this.sessionGeneration);
 	}
 
 	getConversationAuthorityStatus(): SessionConversationAuthorityStatus {
@@ -2242,39 +1519,132 @@ export class SessionManager {
 		return status.error;
 	}
 
-	_persist(entry: SessionEntry): void {
-		if (!this.persist || !this.sessionFile) return;
-		const filePath = this.sessionFile;
-		const appendEntry = () => {
-			const content = `${JSON.stringify(entry)}\n`;
-			this._enqueuePersistence(() =>
-				serializeSessionFileOperation(filePath, () =>
-					appendSessionFileEntry(filePath, content, isSessionDurabilityBoundary(entry)),
-				),
-			);
+	private _storeProjection(): SessionStoreSessionProjection {
+		return sessionStoreProjection(this.derivedState);
+	}
+
+	private _storePayload(entries: readonly SessionEntry[]): SessionStoreTransactionPayload {
+		const storedEntries: SessionStoreEntryWrite[] = entries.map((entry) => ({
+			entry: parsePersistedSessionEntry(entry) as unknown as SessionStoreJsonValue,
+		}));
+		return {
+			session: this._storeProjection(),
+			entries: storedEntries,
+			clientInputs: sessionStoreClientInputsForEntries(this.derivedState, entries),
+			searchChunks: sessionStoreSearchChunksForEntries(this.derivedState, entries),
 		};
+	}
 
-		const hasFlushContent = this.fileEntries.some(isSessionFileFlushContent);
-		if (!hasFlushContent) {
-			if ((entry.type === "fast_mode_change" || entry.type === "planning_state_change") && !this.flushed) {
-				this._createFile();
-				this.flushed = true;
-			} else if (this.flushed) {
-				appendEntry();
-			} else {
-				// Keep the session virtual until content with an explicit materialization
-				// contract arrives.
-				this.flushed = false;
+	private async _commitStorePayload(payload: SessionStoreTransactionPayload): Promise<void> {
+		if (!this.persist) return;
+		const currentLease = this.sessionStoreLease;
+		if (!currentLease || !this.storeId) {
+			throw new Error("Persisted session requires an initialized session store lease");
+		}
+		const commitId = randomUUID();
+		const digest = digestSessionStoreTransactionPayload(payload);
+		const expectedRevision = this.storeRevision;
+		const input: SessionStoreApplyTransactionInput = {
+			sessionId: this.sessionId,
+			sessionGeneration: this.sessionGeneration,
+			expectedRevision,
+			commitId,
+			digest,
+			payload,
+		};
+		let store = currentLease.client;
+		try {
+			const result = await store.applyTransaction(input);
+			if (result.status === "conflict") {
+				throw new AtomicAppendPersistenceFailure(
+					`Session revision changed from ${expectedRevision} to ${result.actualRevision}`,
+					"not_started",
+					"reconciliation_required",
+				);
 			}
+			this.storeRevision = result.evidence.afterRevision;
 			return;
+		} catch (error) {
+			if (error instanceof AtomicAppendPersistenceFailure) throw error;
+			let replacementLease: SQLiteSessionStoreLease | undefined;
+			let replacementInstalled = false;
+			try {
+				replacementLease = await acquireSharedSQLiteSessionStore(this.sessionDir);
+				if (replacementLease.client.info.storeId !== this.storeId) {
+					throw new Error("Replacement session store identity changed during reconciliation");
+				}
+				this.sessionStoreLease = replacementLease;
+				replacementInstalled = true;
+				store = replacementLease.client;
+				await currentLease.release();
+				const reconciliation = await store.reconcileCommit({
+					sessionId: this.sessionId,
+					sessionGeneration: this.sessionGeneration,
+					commitId,
+					digest,
+				});
+				if (reconciliation.status === "committed") {
+					const summary = await store.findSessionSummary(this.sessionId, this.sessionGeneration);
+					if (summary?.revision !== reconciliation.evidence.afterRevision) {
+						throw new AtomicAppendPersistenceFailure(
+							"SQLite session transaction committed but authoritative session state has changed",
+							"committed",
+							"reconciliation_required",
+							{ cause: error },
+						);
+					}
+					this.storeRevision = reconciliation.evidence.afterRevision;
+					return;
+				}
+				const summary = await store.findSessionSummary(this.sessionId, this.sessionGeneration);
+				if (reconciliation.status === "not_found" && summary?.revision === expectedRevision) {
+					throw new AtomicAppendPersistenceFailure(
+						"SQLite session transaction was rolled back",
+						"rolled_back",
+						"available",
+						{ cause: error },
+					);
+				}
+			} catch (reconciliationError) {
+				let effectiveError: unknown = reconciliationError;
+				if (replacementLease && !replacementInstalled) {
+					try {
+						await replacementLease.release();
+					} catch (releaseError) {
+						effectiveError = new AggregateError(
+							[reconciliationError, releaseError],
+							"Session store replacement failed and its lease could not be released",
+						);
+					}
+				}
+				if (effectiveError instanceof AtomicAppendPersistenceFailure) throw effectiveError;
+				throw new AtomicAppendPersistenceFailure(
+					"SQLite session transaction outcome could not be reconciled",
+					"uncertain",
+					"reconciliation_required",
+					{ cause: effectiveError },
+				);
+			}
+			throw new AtomicAppendPersistenceFailure(
+				"SQLite session transaction outcome is ambiguous",
+				"uncertain",
+				"reconciliation_required",
+				{ cause: error },
+			);
 		}
+	}
 
-		if (!this.flushed) {
-			this._createFile();
-			this.flushed = true;
-		} else {
-			appendEntry();
-		}
+	_persist(entry: SessionEntry): void {
+		if (!this.persist) return;
+		const payload = this._storePayload([entry]);
+		this._enqueuePersistence(async () => {
+			try {
+				await this._commitStorePayload(payload);
+			} catch (error) {
+				this._requireConversationReconciliation(error instanceof Error ? error : new Error(String(error)));
+				throw error;
+			}
+		});
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
@@ -2282,27 +1652,13 @@ export class SessionManager {
 			throw new Error("An atomic session append is already in progress");
 		}
 		this._assertPersistenceHealthy();
-		const canonicalEntry = cloneCanonicalData(entry, `Session ${entry.type} entry`);
-		if (this.sessionFileNeedsMigration && !this.atomicAppendEntries) {
-			// Rewriting is a writer action. Deferring it until the first append keeps
-			// every discovery/open path content-read-only. Queueing it before the
-			// append preserves commit order without blocking the caller.
-			this._rewriteFile();
-			this.flushed = true;
-		}
-		canonicalEntry.ordinal = this.nextOrdinal++;
+		const canonicalEntry = parseSessionEntryForAdmission(entry, `Session ${entry.type} entry`);
+		validateSessionEntryAdmissionReferences(canonicalEntry, this.byId, this.nextOrdinal);
+		canonicalEntry.ordinal = this.nextOrdinal;
+		applySessionEntry(this.derivedState, canonicalEntry as SessionEntry & { ordinal: number });
 		this.fileEntries.push(canonicalEntry);
 		this.byId.set(canonicalEntry.id, canonicalEntry);
-		if (canonicalEntry.type === "leaf" || !isHostOnlySessionEntry(canonicalEntry)) this.canonicalRevision++;
-		if (canonicalEntry.type === "leaf") {
-			this.leafId = canonicalEntry.targetId;
-		} else if (!isHostOnlySessionEntry(canonicalEntry)) {
-			this.leafId = canonicalEntry.id;
-		}
-		if (!this.atomicAppendEntries) {
-			this._persist(canonicalEntry);
-		}
-		this._indexClientInputEntry(canonicalEntry);
+		if (!this.atomicAppendEntries) this._persist(canonicalEntry);
 		if (this.atomicAppendEntries) {
 			this.atomicAppendEntries.push(canonicalEntry);
 			return;
@@ -2460,11 +1816,7 @@ export class SessionManager {
 		});
 	}
 
-	/**
-	 * Stage synchronous append operations and publish them only after one atomic
-	 * filesystem replacement settles. Existing append methods remain the sole
-	 * entry mapping and validation path.
-	 */
+	/** Stage synchronous append operations and publish them only after one SQLite transaction commits. */
 	private async appendAtomically(
 		append: () => void,
 		beforePublish: () => void,
@@ -2485,36 +1837,18 @@ export class SessionManager {
 		const snapshot = {
 			fileEntries: [...this.fileEntries],
 			byId: new Map(this.byId),
-			labelsById: new Map(this.labelsById),
-			labelTimestampsById: new Map(this.labelTimestampsById),
-			clientInputsById: new Map(
-				[...this.clientInputsById].map(([id, record]) => [id, cloneClientInputRecord(record)]),
-			),
-			leafId: this.leafId,
-			nextOrdinal: this.nextOrdinal,
-			canonicalRevision: this.canonicalRevision,
-			flushed: this.flushed,
-			sessionFileNeedsMigration: this.sessionFileNeedsMigration,
+			derivedState: cloneSessionDerivedState(this.derivedState),
 		};
 		const restore = (): void => {
 			this.fileEntries = snapshot.fileEntries;
 			this.byId = snapshot.byId;
-			this.labelsById = snapshot.labelsById;
-			this.labelTimestampsById = snapshot.labelTimestampsById;
-			this.clientInputsById = snapshot.clientInputsById;
-			this.leafId = snapshot.leafId;
-			this.nextOrdinal = snapshot.nextOrdinal;
-			this.canonicalRevision = snapshot.canonicalRevision;
-			this.flushed = snapshot.flushed;
-			this.sessionFileNeedsMigration = snapshot.sessionFileNeedsMigration;
+			this.derivedState = snapshot.derivedState;
 		};
 		try {
 			beforeStage();
 		} catch (error) {
 			this.atomicAppendInFlight = false;
-			if (error instanceof SessionCanonicalConflictError || error instanceof SessionAtomicAppendError) {
-				throw error;
-			}
+			if (error instanceof SessionCanonicalConflictError || error instanceof SessionAtomicAppendError) throw error;
 			throw new SessionAtomicAppendError(
 				error instanceof Error ? error.message : String(error),
 				"not_started",
@@ -2522,6 +1856,7 @@ export class SessionManager {
 				{ cause: error },
 			);
 		}
+
 		const entries: SessionEntry[] = [];
 		this.atomicAppendEntries = entries;
 		try {
@@ -2541,172 +1876,23 @@ export class SessionManager {
 		const staged = {
 			fileEntries: this.fileEntries,
 			byId: this.byId,
-			labelsById: this.labelsById,
-			labelTimestampsById: this.labelTimestampsById,
-			clientInputsById: this.clientInputsById,
-			leafId: this.leafId,
-			nextOrdinal: this.nextOrdinal,
-			canonicalRevision: this.canonicalRevision,
+			derivedState: this.derivedState,
 		};
-		let content: Buffer;
+		let payload: SessionStoreTransactionPayload | undefined;
 		try {
-			content = Buffer.from(this._serializeFileEntries(), "utf8");
+			payload = entries.length > 0 && this.persist ? this._storePayload(entries) : undefined;
 		} catch (error) {
 			this.atomicAppendEntries = undefined;
 			this.atomicAppendInFlight = false;
 			restore();
 			throw error;
 		}
-		const shouldPersist =
-			entries.length > 0 &&
-			this.persist &&
-			this.sessionFile !== undefined &&
-			(snapshot.flushed || staged.fileEntries.some(isSessionFileFlushContent));
 		this.atomicAppendEntries = undefined;
 		restore();
 
 		try {
-			if (shouldPersist) {
-				const filePath = this.sessionFile!;
-				const task = this.persistenceQueue.then(async () => {
-					if (this.persistenceError) throw this.persistenceError;
-					await serializeSessionFileOperation(filePath, async () => {
-						let preimage: Buffer | undefined;
-						try {
-							preimage = existsSync(filePath) ? readFileSync(filePath) : undefined;
-						} catch (error) {
-							throw new AtomicAppendPersistenceFailure(
-								"Could not verify atomic append preimage",
-								"not_started",
-								"reconciliation_required",
-								{ cause: error },
-							);
-						}
-						if (snapshot.flushed !== (preimage !== undefined)) {
-							throw new AtomicAppendPersistenceFailure(
-								"Session file presence changed before the atomic append could begin",
-								"not_started",
-								"reconciliation_required",
-							);
-						}
-						if (preimage !== undefined) {
-							let persistedEntries: FileEntry[];
-							try {
-								persistedEntries = parseAtomicSessionPreimage(preimage);
-							} catch (error) {
-								throw new AtomicAppendPersistenceFailure(
-									error instanceof Error ? error.message : "Could not parse atomic append preimage",
-									"not_started",
-									"reconciliation_required",
-									{ cause: error },
-								);
-							}
-							const persistedHeader = persistedEntries.find((entry) => entry.type === "session");
-							if (persistedHeader?.version !== CURRENT_SESSION_VERSION) {
-								try {
-									migrateToCurrentVersion(persistedEntries);
-								} catch (error) {
-									throw new AtomicAppendPersistenceFailure(
-										error instanceof Error ? error.message : "Could not validate atomic append schema",
-										"not_started",
-										"reconciliation_required",
-										{ cause: error },
-									);
-								}
-								if (
-									this._serializeFileEntries(persistedEntries) !==
-									this._serializeFileEntries(snapshot.fileEntries)
-								) {
-									throw new AtomicAppendPersistenceFailure(
-										"Session changed before the atomic append could begin",
-										"not_started",
-										"reconciliation_required",
-									);
-								}
-								throw new AtomicAppendPersistenceFailure(
-									"Atomic append requires the current session schema",
-									"not_started",
-									"available",
-								);
-							}
-							if (
-								this._serializeFileEntries(persistedEntries) !==
-								this._serializeFileEntries(snapshot.fileEntries)
-							) {
-								throw new AtomicAppendPersistenceFailure(
-									"Session changed before the atomic append could begin",
-									"not_started",
-									"reconciliation_required",
-								);
-							}
-						}
-						try {
-							await writeDurableAtomicFile(filePath, content, {
-								directoryMode: PRIVATE_DIRECTORY_MODE,
-								fileMode: PRIVATE_FILE_MODE,
-							});
-						} catch (error) {
-							let visible: Buffer | undefined;
-							try {
-								visible = existsSync(filePath) ? readFileSync(filePath) : undefined;
-							} catch (visibilityError) {
-								throw new AtomicAppendPersistenceFailure(
-									"Atomic append visibility is uncertain",
-									"uncertain",
-									"reconciliation_required",
-									{ cause: visibilityError },
-								);
-							}
-							if (exactOptionalBytesEqual(visible, preimage)) {
-								throw new AtomicAppendPersistenceFailure(
-									"Atomic append was rolled back",
-									"rolled_back",
-									"available",
-									{ cause: error },
-								);
-							}
-							if (!exactOptionalBytesEqual(visible, content)) {
-								throw new AtomicAppendPersistenceFailure(
-									"Atomic append visibility is uncertain",
-									"uncertain",
-									"reconciliation_required",
-									{ cause: error },
-								);
-							}
-							try {
-								await syncDurableFile(filePath);
-							} catch (syncError) {
-								throw new AtomicAppendPersistenceFailure(
-									"Atomic append durability is uncertain",
-									"uncertain",
-									"reconciliation_required",
-									{ cause: syncError },
-								);
-							}
-							let durableVisible: Buffer;
-							try {
-								durableVisible = readFileSync(filePath);
-							} catch (visibilityError) {
-								throw new AtomicAppendPersistenceFailure(
-									"Atomic append visibility is uncertain",
-									"uncertain",
-									"reconciliation_required",
-									{ cause: visibilityError },
-								);
-							}
-							if (!durableVisible.equals(content)) {
-								throw new AtomicAppendPersistenceFailure(
-									"Atomic append visibility changed after durability proof",
-									"uncertain",
-									"reconciliation_required",
-								);
-							}
-						}
-					});
-				});
-				this.persistenceQueue = task.catch(() => {});
-				this.persistenceWatermark = task;
-				await task;
+			if (payload) {
+				await this._enqueuePersistence(() => this._commitStorePayload(payload), "propagate");
 			}
 		} catch (error) {
 			this.atomicAppendInFlight = false;
@@ -2719,27 +1905,15 @@ export class SessionManager {
 							"reconciliation_required",
 							{ cause: error },
 						);
-			if (failure.effect === "uncertain") {
-				this.persistenceError ??= failure;
-			} else {
-				this.persistenceWatermark = this.persistenceQueue;
-			}
-			if (failure.authority === "reconciliation_required") {
-				this._requireConversationReconciliation(failure);
-			}
+			if (failure.effect === "uncertain") this.persistenceError ??= failure;
+			else this.persistenceWatermark = this.persistenceQueue;
+			if (failure.authority === "reconciliation_required") this._requireConversationReconciliation(failure);
 			throw new SessionAtomicAppendError(failure.message, failure.effect, failure.authority, { cause: failure });
 		}
 
 		this.fileEntries = staged.fileEntries;
 		this.byId = staged.byId;
-		this.labelsById = staged.labelsById;
-		this.labelTimestampsById = staged.labelTimestampsById;
-		this.clientInputsById = staged.clientInputsById;
-		this.leafId = staged.leafId;
-		this.nextOrdinal = staged.nextOrdinal;
-		this.canonicalRevision = staged.canonicalRevision;
-		this.flushed = shouldPersist || snapshot.flushed;
-		this.sessionFileNeedsMigration = false;
+		this.derivedState = staged.derivedState;
 		try {
 			beforePublish();
 		} catch (error) {
@@ -2752,8 +1926,8 @@ export class SessionManager {
 		} finally {
 			try {
 				for (const entry of entries) this._notifyEntryListeners(entry);
-				if (snapshot.leafId !== staged.leafId) {
-					this._notifyBranchListeners(snapshot.leafId, staged.leafId);
+				if (snapshot.derivedState.leafId !== staged.derivedState.leafId) {
+					this._notifyBranchListeners(snapshot.derivedState.leafId, staged.derivedState.leafId);
 				}
 			} finally {
 				this.atomicAppendInFlight = false;
@@ -2985,20 +2159,11 @@ export class SessionManager {
 		);
 	}
 
-	/** Explicitly materialize the current canonical session and wait for its durability boundary. */
+	/** Wait for the hidden or visible SQLite session row and all accepted mutations to be durable. */
 	async materialize(): Promise<void> {
 		this._assertPersistenceHealthy();
 		if (this.atomicAppendEntries || this.atomicAppendInFlight) {
 			throw new Error("Cannot materialize a session during an atomic append");
-		}
-		if (!this.persist || !this.sessionFile) return;
-
-		const filePath = this.sessionFile;
-		if (!this.flushed) {
-			this._createFile();
-			this.flushed = true;
-		} else {
-			this._enqueuePersistence(() => serializeSessionFileOperation(filePath, () => syncDurableFile(filePath)));
 		}
 		await this.persistenceWatermark;
 	}
@@ -3009,23 +2174,58 @@ export class SessionManager {
 	}
 
 	/** Seal persistence and classify only this manager's recorded reconciliation failure. */
-	async drainPersistence(): Promise<SessionPersistenceDrainResult> {
-		if (this.persist) {
-			this.persistenceClosed = true;
-		}
-		try {
-			await this.flush();
-		} catch (error) {
-			const authority = this.conversationAuthorityStatus;
-			if (authority.status === "reconciliation_required" && authority.error.cause === error) {
-				return { status: "reconciliation_required", error: authority.error };
+	drainPersistence(): Promise<SessionPersistenceDrainResult> {
+		if (this.persistenceDrainPromise) return this.persistenceDrainPromise;
+		if (this.persist) this.persistenceClosed = true;
+		const watermark = this.persistenceWatermark;
+		this.persistenceDrainPromise = (async () => {
+			let result: SessionPersistenceDrainResult | undefined;
+			let persistenceError: unknown;
+			try {
+				await watermark;
+				const authority = this.conversationAuthorityStatus;
+				result =
+					authority.status === "reconciliation_required"
+						? { status: "reconciliation_required", error: authority.error }
+						: { status: "closed" };
+			} catch (error) {
+				const authority = this.conversationAuthorityStatus;
+				if (authority.status === "reconciliation_required" && authority.error.cause === error) {
+					result = { status: "reconciliation_required", error: authority.error };
+				} else {
+					persistenceError = error;
+				}
 			}
-			throw error;
-		}
-		const authority = this.conversationAuthorityStatus;
-		return authority.status === "reconciliation_required"
-			? { status: "reconciliation_required", error: authority.error }
-			: { status: "closed" };
+
+			const lease = this.sessionStoreLease;
+			let releaseError: unknown;
+			try {
+				await lease?.release();
+			} catch (error) {
+				releaseError = error;
+			} finally {
+				if (this.sessionStoreLease === lease) this.sessionStoreLease = undefined;
+			}
+			if (releaseError !== undefined) {
+				const authoritativeError =
+					persistenceError ??
+					(result?.status === "reconciliation_required"
+						? result.error.cause instanceof Error
+							? result.error.cause
+							: result.error
+						: undefined);
+				if (authoritativeError !== undefined) {
+					throw new AggregateError(
+						[authoritativeError, releaseError],
+						"Session persistence failed and its store lease could not be released",
+					);
+				}
+				throw releaseError;
+			}
+			if (persistenceError !== undefined) throw persistenceError;
+			return result ?? { status: "closed" };
+		})();
+		return this.persistenceDrainPromise;
 	}
 
 	/** Seal a persisted manager against later writes and reject on every failed watermark. */
@@ -3034,128 +2234,6 @@ export class SessionManager {
 		if (result.status === "reconciliation_required") {
 			throw result.error.cause instanceof Error ? result.error.cause : result.error;
 		}
-	}
-
-	private _indexClientInputEntry(entry: SessionEntry): void {
-		if (entry.type === "client_input_receipt") {
-			assertClientMessageId(entry.clientMessageId);
-			if (entry.command !== "prompt" && entry.command !== "steer" && entry.command !== "follow_up") {
-				throw new Error(`Client input receipt ${entry.id} has an invalid command`);
-			}
-			const input = normalizeClientInputPayload(entry.command, entry.input);
-			if (entry.semanticDigest !== digestClientInputPayload(entry.command, input)) {
-				throw new Error(`Client input receipt ${entry.id} has a mismatched semantic digest`);
-			}
-			const existing = this.clientInputsById.get(entry.clientMessageId);
-			if (!existing) {
-				assertClientInputOutstandingCount(this.clientInputsById.values(), 1);
-				assertClientInputOutstandingBudget(this.clientInputsById.values(), measureClientInputPayloadBytes(input));
-				this.clientInputsById.set(entry.clientMessageId, {
-					receiptId: entry.id,
-					clientMessageId: entry.clientMessageId,
-					command: entry.command,
-					semanticDigest: entry.semanticDigest,
-					input,
-					state: "accepted",
-				});
-			} else if (existing.command !== entry.command || existing.semanticDigest !== entry.semanticDigest) {
-				throw new Error(
-					`Client input id ${JSON.stringify(entry.clientMessageId)} has conflicting durable receipts`,
-				);
-			}
-			return;
-		}
-
-		if (entry.type === "client_input_queued") {
-			assertClientMessageId(entry.clientMessageId);
-			const record = this.clientInputsById.get(entry.clientMessageId);
-			if (!record || record.receiptId !== entry.receiptId) {
-				throw new Error(`Queued client input ${entry.id} has no matching receipt`);
-			}
-			if (record.state !== "accepted" && record.state !== "started") {
-				throw new Error(`Queued client input ${entry.id} was persisted after dispatch started`);
-			}
-			const queuedInput = normalizeClientInputQueuedPayload(entry.queuedInput);
-			if (queuedInput.delivery !== getExpectedClientInputQueuedDelivery(record)) {
-				throw new Error(`Queued client input ${entry.id} conflicts with its requested delivery`);
-			}
-			if (record.queuedInput && JSON.stringify(record.queuedInput) !== JSON.stringify(queuedInput)) {
-				throw new Error(`Client input id ${JSON.stringify(entry.clientMessageId)} has conflicting queued payloads`);
-			}
-			if (
-				!record.queuedInput &&
-				getRecoverableQueuedClientInputCount(this.clientInputsById.values()) >=
-					CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES
-			) {
-				throw new Error(
-					`Recoverable client input queue exceeds ${CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES} entries`,
-				);
-			}
-			if (!record.queuedInput) {
-				assertClientInputOutstandingBudget(
-					this.clientInputsById.values(),
-					measureClientInputPayloadBytes(queuedInput),
-				);
-			}
-			record.queuedEntryId ??= entry.id;
-			record.queuedInput = queuedInput;
-			// A queued payload is the durable output of preflight/input hooks. Once it
-			// commits, replay consumes this exact payload without re-running those
-			// side effects, so the receipt is recoverable again.
-			record.state = "accepted";
-			record.error = undefined;
-			return;
-		}
-
-		if (entry.type === "client_input_state") {
-			assertClientMessageId(entry.clientMessageId);
-			if (
-				entry.state !== "accepted" &&
-				entry.state !== "started" &&
-				entry.state !== "completed" &&
-				entry.state !== "failed"
-			) {
-				throw new Error(`Client input state ${entry.id} has an invalid state`);
-			}
-			if (
-				(entry.error !== undefined && typeof entry.error !== "string") ||
-				(entry.state !== "failed" && entry.error !== undefined) ||
-				(typeof entry.error === "string" && Array.from(entry.error).length > CLIENT_INPUT_ERROR_MAX_SCALARS)
-			) {
-				throw new Error(`Client input state ${entry.id} has an invalid error`);
-			}
-			const record = this.clientInputsById.get(entry.clientMessageId);
-			if (!record || record.receiptId !== entry.receiptId) {
-				throw new Error(`Client input state ${entry.id} has no matching receipt`);
-			}
-			if (record.state === "completed" || record.state === "failed") {
-				throw new Error(`Client input state ${entry.id} follows a terminal state`);
-			}
-			if (entry.state === "started" && record.state !== "accepted") {
-				throw new Error(`Client input state ${entry.id} repeats the started boundary`);
-			}
-			if (entry.state === "accepted" && record.state !== "started") {
-				throw new Error(`Client input state ${entry.id} cannot roll back from ${record.state}`);
-			}
-			record.state = entry.state;
-			record.error = entry.state === "failed" ? entry.error : undefined;
-			return;
-		}
-
-		if (entry.type !== "message" || entry.message.role !== "user") {
-			return;
-		}
-		const clientMessageId = (entry.message as { clientMessageId?: unknown }).clientMessageId;
-		if (clientMessageId === undefined) {
-			return;
-		}
-		if (typeof clientMessageId !== "string") {
-			throw new Error(`Canonical client input ${entry.id} has an invalid client identity`);
-		}
-		const record = requireStartedClientInputReceipt(this.clientInputsById, clientMessageId);
-		record.state = "completed";
-		record.error = undefined;
-		record.canonicalEntryId = entry.id;
 	}
 
 	getClientInput(clientMessageId: string): ClientInputRecord | undefined {
@@ -3202,8 +2280,6 @@ export class SessionManager {
 		if (existing) {
 			return { record: cloneClientInputRecord(existing), created: false };
 		}
-		assertClientInputOutstandingCount(this.clientInputsById.values(), 1);
-		assertClientInputOutstandingBudget(this.clientInputsById.values(), measureClientInputPayloadBytes(input));
 		const entry: ClientInputReceiptEntry = {
 			type: "client_input_receipt",
 			id: generateId(this.byId),
@@ -3232,7 +2308,7 @@ export class SessionManager {
 			throw new Error(`Client input ${JSON.stringify(clientMessageId)} cannot be queued from ${record.state}`);
 		}
 		const queuedInput = normalizeClientInputQueuedPayload(queuedInputValue);
-		if (queuedInput.delivery !== getExpectedClientInputQueuedDelivery(record)) {
+		if (queuedInput.delivery !== expectedClientInputQueuedDelivery(record)) {
 			throw new Error(`Client input ${JSON.stringify(clientMessageId)} conflicts with its requested delivery`);
 		}
 		if (record.queuedInput) {
@@ -3240,15 +2316,6 @@ export class SessionManager {
 				throw new Error(`Client input ${JSON.stringify(clientMessageId)} has a conflicting queued payload`);
 			}
 			return cloneClientInputRecord(record);
-		}
-		assertClientInputOutstandingBudget(this.clientInputsById.values(), measureClientInputPayloadBytes(queuedInput));
-		if (
-			getRecoverableQueuedClientInputCount(this.clientInputsById.values()) >=
-			CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES
-		) {
-			throw new Error(
-				`Recoverable client input queue exceeds ${CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES} entries`,
-			);
 		}
 		const entry: ClientInputQueuedEntry = {
 			type: "client_input_queued",
@@ -3508,7 +2575,7 @@ export class SessionManager {
 		if (!this.acceptsStartingGitContext || this.sessionId !== expectedSessionId) {
 			return false;
 		}
-		if (this.fileEntries.some((entry) => entry.type === "session_start_git_context")) {
+		if (this.derivedState.startingGitContext !== undefined) {
 			this.acceptsStartingGitContext = false;
 			return false;
 		}
@@ -3524,24 +2591,20 @@ export class SessionManager {
 	}
 
 	getStartingGitContext(): RpcGitContext | null | undefined {
-		const entry = this.fileEntries.find(
-			(candidate): candidate is SessionStartGitContextEntry => candidate.type === "session_start_git_context",
-		);
-		return entry?.gitContext;
+		const gitContext = this.derivedState.startingGitContext;
+		return gitContext === undefined ? undefined : cloneCanonicalData(gitContext, "Session starting Git context");
+	}
+
+	/** Get the incrementally maintained lifetime message summary for session listing. */
+	getSessionEntrySummary(): SessionEntrySummary {
+		this.assertConversationAuthorityAvailable();
+		return sessionEntrySummary(this.derivedState);
 	}
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
-		// Walk entries in reverse to find the latest session_info entry.
-		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
-			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
-			}
-		}
-		return undefined;
+		this.assertConversationAuthorityAvailable();
+		return this.derivedState.name;
 	}
 
 	/**
@@ -3632,13 +2695,6 @@ export class SessionManager {
 			...(label === undefined ? {} : { label }),
 		};
 		this._appendEntry(entry);
-		if (label) {
-			this.labelsById.set(targetId, label);
-			this.labelTimestampsById.set(targetId, entry.timestamp);
-		} else {
-			this.labelsById.delete(targetId);
-			this.labelTimestampsById.delete(targetId);
-		}
 		return entry.id;
 	}
 
@@ -3653,7 +2709,7 @@ export class SessionManager {
 		subagentId: string;
 		agent: string;
 		childSessionId: string;
-		childSessionFile?: string;
+		childSessionRef?: SessionReference;
 		requestKey: string;
 	}): string {
 		this._assertPersistenceHealthy();
@@ -3666,7 +2722,7 @@ export class SessionManager {
 			subagentId: spawn.subagentId,
 			agent: spawn.agent,
 			childSessionId: spawn.childSessionId,
-			...(spawn.childSessionFile !== undefined ? { childSessionFile: spawn.childSessionFile } : {}),
+			...(spawn.childSessionRef !== undefined ? { childSessionRef: spawn.childSessionRef } : {}),
 			requestKey: spawn.requestKey,
 		};
 		this._appendEntry(entry);
@@ -3676,7 +2732,7 @@ export class SessionManager {
 	/** All durable spawn edges in file order, including edges recorded on other branches. */
 	getSubagentSpawnEntries(): SubagentSpawnEntry[] {
 		this.assertConversationAuthorityAvailable();
-		return this.fileEntries.filter((entry): entry is SubagentSpawnEntry => entry.type === "subagent_spawn");
+		return [...this.derivedState.subagentSpawns];
 	}
 
 	/**
@@ -3688,12 +2744,13 @@ export class SessionManager {
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
 		const path: SessionEntry[] = [];
+		const visited = new Set<string>();
 		const startId = fromId ?? this.getLeafId();
 		let current = startId ? this.getEntry(startId) : undefined;
 		while (current) {
-			if (!isHostOnlySessionEntry(current)) {
-				path.push(current);
-			}
+			if (visited.has(current.id)) throw new Error("Session branch contains a parent cycle");
+			visited.add(current.id);
+			if (!isHostOnlySessionEntry(current)) path.push(current);
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
 		return path.reverse();
@@ -3875,7 +2932,7 @@ export class SessionManager {
 		if (branchFromId !== null && !this.getEntry(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
-		const entry = cloneCanonicalData(
+		const entry = parseSessionEntryForAdmission(
 			{
 				type: "branch_summary",
 				id: generateId(this.byId),
@@ -3888,188 +2945,166 @@ export class SessionManager {
 			} satisfies BranchSummaryEntry,
 			"Session branch_summary entry",
 		);
+		validateSessionEntryAdmissionReferences(entry, this.byId, this.nextOrdinal);
 		this._assertPersistenceHealthy();
 		this._setBranchLeaf(branchFromId);
 		this._appendEntry(entry);
 		return entry.id;
 	}
 
-	/**
-	 * Create a new session file containing only the path from root to the specified leaf.
-	 * Useful for extracting a single conversation path from a branched session.
-	 * Returns the new session file path, or undefined if not persisting.
-	 */
-	createBranchedSession(leafId: string): string | undefined {
-		if (this.atomicAppendInFlight) {
-			throw new Error("Cannot create a branched session during an atomic append");
-		}
-		const previousSessionFile = this.sessionFile;
+	/** Replace this manager with a new session containing only the selected branch. */
+	async createBranchedSession(leafId: string): Promise<SessionReference | undefined> {
+		if (this.atomicAppendInFlight) throw new Error("Cannot create a branched session during an atomic append");
+		await this.persistenceWatermark;
+		this._assertPersistenceHealthy();
+		const previousSession = this.getSessionRef();
 		const path = this.getBranch(leafId);
-		if (path.length === 0) {
-			throw new Error(`Entry ${leafId} not found`);
-		}
+		if (path.length === 0) throw new Error(`Entry ${leafId} not found`);
 
-		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
-		// Because labels are real tree entries, later entries can be children of labels;
-		// removing labels requires re-chaining the retained path to avoid orphaned subtrees.
-		const pathWithoutLabels: SessionEntry[] = [];
-		let pathParentId: string | null = null;
+		const retained: SessionEntry[] = [];
+		const retainedIds = new Set<string>();
+		let parentId: string | null = null;
 		for (const entry of path) {
 			if (entry.type === "label") continue;
-			pathWithoutLabels.push(withoutClientInputIdentity({ ...entry, parentId: pathParentId }));
-			pathParentId = entry.id;
+			const copy = withoutClientInputIdentity({ ...entry, parentId });
+			delete copy.ordinal;
+			retained.push(copy);
+			retainedIds.add(copy.id);
+			parentId = copy.id;
 		}
-
-		const newSessionId = createSessionId();
-		const timestamp = new Date().toISOString();
-		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		const newSessionFile = join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
-
-		const parentSession = this.persist ? previousSessionFile : undefined;
+		const labels = [...this.labelsById]
+			.filter(([targetId]) => retainedIds.has(targetId))
+			.map(([targetId, label]) => ({ targetId, label, timestamp: this.labelTimestampsById.get(targetId)! }));
 		const origin = this.getHeader()?.origin;
-		const header: SessionHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: newSessionId,
-			timestamp,
-			cwd: this.cwd,
-			...(parentSession === undefined ? {} : { parentSession }),
+		this.newSession({
+			...(previousSession === undefined ? {} : { parentSession: previousSession }),
 			...(origin === undefined ? {} : { origin }),
-		};
+		});
+		await this.persistenceWatermark;
+		await this.appendAtomically(
+			() => {
+				for (const entry of retained) this._appendEntry(entry);
+				let labelParentId = retained.at(-1)?.id ?? null;
+				for (const { targetId, label, timestamp } of labels) {
+					const labelEntry: LabelEntry = {
+						type: "label",
+						id: generateId(this.byId),
+						parentId: labelParentId,
+						timestamp,
+						targetId,
+						label,
+					};
+					this._appendEntry(labelEntry);
+					labelParentId = labelEntry.id;
+				}
+			},
+			() => {},
+		);
+		return this.getSessionRef();
+	}
 
-		// Collect labels for entries in the path
-		const pathEntryIds = new Set(pathWithoutLabels.map((e) => e.id));
-		const labelsToWrite: Array<{ targetId: string; label: string; timestamp: string }> = [];
-		for (const [targetId, label] of this.labelsById) {
-			if (pathEntryIds.has(targetId)) {
-				labelsToWrite.push({ targetId, label, timestamp: this.labelTimestampsById.get(targetId)! });
-			}
+	private static async _releaseLeaseAfterFailure(
+		lease: SQLiteSessionStoreLease,
+		error: unknown,
+		message: string,
+	): Promise<never> {
+		try {
+			await lease.release();
+		} catch (releaseError) {
+			throw new AggregateError([error, releaseError], message);
 		}
+		throw error;
+	}
 
-		if (this.persist) {
-			// Build label entries
-			const lastEntryId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
-			let parentId = lastEntryId;
-			const labelEntries: LabelEntry[] = [];
-			for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
-				const labelEntry: LabelEntry = {
-					type: "label",
-					id: generateId(new Set(pathEntryIds)),
-					parentId,
-					timestamp: labelTimestamp,
-					targetId,
-					label,
-				};
-				pathEntryIds.add(labelEntry.id);
-				labelEntries.push(labelEntry);
-				parentId = labelEntry.id;
+	private static async _store(dir: string): Promise<SQLiteSessionStoreLease> {
+		return acquireSharedSQLiteSessionStore(normalizePath(dir));
+	}
+
+	private static async _scopedStore<T>(
+		dir: string,
+		operation: (store: SQLiteSessionStoreClient) => Promise<T>,
+	): Promise<T> {
+		const lease = await SessionManager._store(dir);
+		let result: T;
+		try {
+			result = await operation(lease.client);
+		} catch (error) {
+			try {
+				await lease.release();
+			} catch (releaseError) {
+				throw new AggregateError(
+					[error, releaseError],
+					"Session store operation failed and its lease could not be released",
+				);
 			}
+			throw error;
+		}
+		await lease.release();
+		return result;
+	}
 
-			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
-			this.sessionId = newSessionId;
-			this.sessionFile = newSessionFile;
-			this._buildIndex();
-			this.acceptsStartingGitContext = true;
-
-			// Fast mode is recoverable by exact session ID even without visible
-			// conversation content, so preserve that durable policy immediately.
-			// Otherwise defer to _persist(), which creates the file once flush content
-			// arrives, matching the newSession() contract and avoiding duplicate headers.
-			const shouldWriteImmediately = this.fileEntries.some(
-				(entry) =>
-					isSessionFileFlushContent(entry) ||
-					entry.type === "fast_mode_change" ||
-					entry.type === "planning_state_change",
+	/** Create and durably reserve a hidden persisted session. */
+	static async create(cwd: string, sessionDir?: string, options?: NewSessionOptions): Promise<SessionManager> {
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
+		const lease = await SessionManager._store(dir);
+		try {
+			const manager = new SessionManager(cwd, dir, true, options, lease);
+			await manager.flush();
+			return manager;
+		} catch (error) {
+			return await SessionManager._releaseLeaseAfterFailure(
+				lease,
+				error,
+				"Session creation failed and its store lease could not be released",
 			);
-			if (shouldWriteImmediately) {
-				this._createFile();
-				this.flushed = true;
-			} else {
-				this.flushed = false;
+		}
+	}
+
+	/** Open one authoritative SQLite session reference. */
+	static async open(ref: SessionReference, cwdOverride?: string): Promise<SessionManager> {
+		const canonicalRef = parseSessionReference(ref);
+		const dir = resolvePath(canonicalRef.sessionDirectory);
+		const lease = await SessionManager._store(dir);
+		try {
+			if (lease.client.info.storeId !== canonicalRef.storeId) {
+				throw new Error("Session reference belongs to a different store");
 			}
-
-			return newSessionFile;
+			const snapshot = await lease.client.loadSession(canonicalRef.sessionId, canonicalRef.sessionGeneration);
+			if (!snapshot) throw new Error(`Session not found: ${canonicalRef.sessionId}`);
+			return new SessionManager(cwdOverride ?? snapshot.session.cwd, dir, true, undefined, lease, snapshot);
+		} catch (error) {
+			return await SessionManager._releaseLeaseAfterFailure(
+				lease,
+				error,
+				"Session open failed and its store lease could not be released",
+			);
 		}
-
-		// In-memory mode: replace current session with the path + labels
-		const labelEntries: LabelEntry[] = [];
-		let parentId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id || null;
-		for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
-			const labelEntry: LabelEntry = {
-				type: "label",
-				id: generateId(new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)])),
-				parentId,
-				timestamp: labelTimestamp,
-				targetId,
-				label,
-			};
-			labelEntries.push(labelEntry);
-			parentId = labelEntry.id;
-		}
-		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
-		this.sessionId = newSessionId;
-		this._buildIndex();
-		this.acceptsStartingGitContext = true;
-		return undefined;
 	}
 
-	/**
-	 * Create a new session.
-	 * @param cwd Working directory (stored in session header)
-	 * @param sessionDir Optional session directory. If omitted, uses default (~/.volt/agent/sessions/<encoded-cwd>/).
-	 */
-	static create(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager {
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		return new SessionManager(cwd, dir, undefined, true, options);
+	/** Continue the most recent visible or pending-input session for a cwd, or create one. */
+	static async continueRecent(cwd: string, sessionDir?: string): Promise<SessionManager> {
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
+		const lease = await SessionManager._store(dir);
+		try {
+			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
+			const latest = await lease.client.findContinuationSession(filterCwd ? resolvePath(cwd) : undefined);
+			if (!latest) {
+				const manager = new SessionManager(cwd, dir, true, undefined, lease);
+				await manager.flush();
+				return manager;
+			}
+			const snapshot = await lease.client.loadSession(latest.id, latest.sessionGeneration);
+			if (!snapshot) throw new Error(`Session not found: ${latest.id}`);
+			return new SessionManager(snapshot.session.cwd, dir, true, undefined, lease, snapshot);
+		} catch (error) {
+			return await SessionManager._releaseLeaseAfterFailure(
+				lease,
+				error,
+				"Session continuation failed and its store lease could not be released",
+			);
+		}
 	}
 
-	/**
-	 * Open a specific session file.
-	 * @param path Path to session file
-	 * @param sessionDir Optional session directory for /clear or /branch. If omitted, derives from file's parent.
-	 * @param cwdOverride Optional cwd override instead of the session header cwd.
-	 */
-	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
-		const resolvedPath = resolvePath(path);
-		// An explicitly supplied session directory is a known private artifact
-		// boundary. Harden it before parsing so a fail-closed corrupt session does
-		// not leave sibling session artifacts exposed by permissive directory mode.
-		// Do not chmod an implicitly derived parent, which may be a shared directory.
-		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		if (sessionDir !== undefined) {
-			ensurePrivateDirectorySync(dir);
-		}
-		if (existsSync(resolvedPath)) {
-			hardenPrivateRegularFileSync(resolvedPath);
-		}
-		// Extract cwd from session header if possible, otherwise use process.cwd()
-		const entries = loadEntriesFromFile(resolvedPath);
-		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
-		const cwd = cwdOverride ?? header?.cwd ?? process.cwd();
-		// If no sessionDir provided, derive from file's parent directory
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, sessionDir !== undefined);
-	}
-
-	/**
-	 * Continue the most recent session, or create new if none.
-	 * @param cwd Working directory
-	 * @param sessionDir Optional session directory. If omitted, uses default (~/.volt/agent/sessions/<encoded-cwd>/).
-	 */
-	static continueRecent(cwd: string, sessionDir?: string): SessionManager {
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
-		const mostRecent = findMostRecentSession(dir, filterCwd ? cwd : undefined);
-		if (mostRecent) {
-			return new SessionManager(cwd, dir, mostRecent, true);
-		}
-		return new SessionManager(cwd, dir, undefined, true);
-	}
-
-	/**
-	 * Strict daemon-only lookup for a reconnect target. Unlike user-facing
-	 * selectors, this includes WAL-only sessions and fails closed when the target
-	 * file is corrupt or when more than one file claims the same session id.
-	 */
 	static async readStartingGitContexts(
 		sessionDir: string,
 		sessionIds: readonly string[],
@@ -4079,163 +3114,343 @@ export class SessionManager {
 			throw new Error("Session context lookup requires unique session ids");
 		}
 		const contexts = new Map<string, RpcGitContext | null>(sessionIds.map((sessionId) => [sessionId, null]));
-		const dir = normalizePath(sessionDir);
-		if (!existsSync(dir) || sessionIds.length === 0) return contexts;
-		ensurePrivateDirectorySync(dir, { hardenExisting: false });
-		const requested = new Set(sessionIds);
-		const matches = new Map<string, string[]>();
-		for (const name of await readdir(dir)) {
-			if (!name.endsWith(".jsonl")) continue;
-			for (const sessionId of requested) {
-				if (!name.endsWith(`_${sessionId}.jsonl`)) continue;
-				const paths = matches.get(sessionId) ?? [];
-				paths.push(join(dir, name));
-				matches.set(sessionId, paths);
+		if (sessionIds.length === 0) return contexts;
+		return SessionManager._scopedStore(normalizePath(sessionDir), async (store) => {
+			for (const sessionId of sessionIds) {
+				const summary = await store.findSessionSummaryById(sessionId);
+				if (!summary?.startingGitContextRecorded) continue;
+				if (!Check(Type.Union([RpcGitContextSchema, Type.Null()]), summary.startingGitContext)) {
+					throw new Error(`Session ${sessionId} has invalid starting Git context metadata`);
+				}
+				contexts.set(sessionId, summary.startingGitContext);
 			}
-		}
-		for (const sessionId of sessionIds) {
-			const paths = matches.get(sessionId) ?? [];
-			if (paths.length > 1) {
-				throw new Error(`Multiple session files claim ${sessionId}`);
-			}
-			const filePath = paths[0];
-			if (!filePath) continue;
-			const header = readSessionHeader(filePath);
-			if (header?.id !== sessionId) {
-				throw new Error(`Session file claiming ${sessionId} has an invalid header`);
-			}
-			contexts.set(sessionId, await readStartingGitContextFromSessionFile(filePath));
-		}
-		return contexts;
+			return contexts;
+		});
 	}
 
-	static async findForResume(
-		sessionDir: string,
-		sessionId: string,
-	): Promise<{ id: string; path: string } | undefined> {
-		assertValidSessionId(sessionId);
-		const dir = normalizePath(sessionDir);
-		if (!existsSync(dir)) return undefined;
-		ensurePrivateDirectorySync(dir, { hardenExisting: false });
-		const files = (await readdir(dir)).filter((name) => name.endsWith(".jsonl")).map((name) => join(dir, name));
-		const matches: string[] = [];
-		for (const filePath of files) {
-			const header = readSessionHeader(filePath);
-			const filenameClaimsTarget = basename(filePath).endsWith(`_${sessionId}.jsonl`);
-			if (header?.id !== sessionId && !filenameClaimsTarget) continue;
-			if (header?.id !== sessionId) {
-				throw new Error(`Session file claiming ${sessionId} has an invalid header`);
-			}
-			// Full open validates every current-version WAL boundary and aggregate
-			// resource invariant. Do not let listing's best-effort parser downgrade a
-			// corrupt target to "missing".
-			const manager = SessionManager.open(filePath, dir);
-			if (manager.getSessionId() !== sessionId) {
-				throw new Error(`Session file identity changed while opening ${sessionId}`);
-			}
-			matches.push(filePath);
-		}
-		if (matches.length > 1) {
-			throw new Error(`Multiple session files claim ${sessionId}`);
-		}
-		return matches[0] ? { id: sessionId, path: matches[0] } : undefined;
+	/** Find a generation-pinned reference by exact id; open() performs full snapshot validation. */
+	static async findForResume(sessionDir: string, sessionId: string): Promise<SessionReference | undefined> {
+		const result = await findSessionSummaryById(sessionDir, sessionId);
+		return result
+			? sessionReference(result.directory, result.storeId, result.summary.id, result.summary.sessionGeneration)
+			: undefined;
 	}
 
-	/** Create an in-memory session (no file persistence) */
+	/** Create an in-memory session (no persistence). */
 	static inMemory(cwd: string = process.cwd()): SessionManager {
-		return new SessionManager(cwd, "", undefined, false);
+		return new SessionManager(cwd, "", false);
 	}
 
-	/**
-	 * Fork a session from another project directory into the current project.
-	 * Creates a new session in the target cwd with the full history from the source session.
-	 * @param sourcePath Path to the source session file
-	 * @param targetCwd Target working directory (where the new session will be stored)
-	 * @param sessionDir Optional session directory. If omitted, uses default for targetCwd.
-	 */
-	static forkFrom(
-		sourcePath: string,
+	/** Import an explicit JSONL snapshot into SQLite; the JSONL file is never reopened as live storage. */
+	static async importFromJsonl(
+		inputPath: string,
+		targetCwd?: string,
+		sessionDir?: string,
+		options?: { id?: string },
+	): Promise<SessionManager> {
+		return SessionManager._importFromJsonl(inputPath, targetCwd, sessionDir, options, true);
+	}
+
+	private static async _importFromJsonl(
+		inputPath: string,
+		targetCwd: string | undefined,
+		sessionDir: string | undefined,
+		options: { id?: string } | undefined,
+		persist: boolean,
+	): Promise<SessionManager> {
+		const resolvedPath = resolvePath(inputPath);
+		if (persist && sessionDir !== undefined) ensurePrivateDirectorySync(normalizePath(sessionDir));
+		if (existsSync(resolvedPath)) hardenPrivateRegularFileSync(resolvedPath);
+		const sourceEntries = loadEntriesFromFile(resolvedPath);
+		if (sourceEntries.length === 0) throw new Error(`Cannot import invalid session JSONL: ${resolvedPath}`);
+		const header = assertCurrentSessionSnapshot(sourceEntries);
+
+		const cwd = targetCwd ?? header.cwd;
+		const parentSession =
+			header.parentSessionDirectory !== undefined &&
+			header.parentStoreId !== undefined &&
+			header.parentSessionId !== undefined &&
+			header.parentSessionGeneration !== undefined
+				? sessionReference(
+						header.parentSessionDirectory,
+						header.parentStoreId,
+						header.parentSessionId,
+						header.parentSessionGeneration,
+					)
+				: undefined;
+
+		const sourceById = new Map<string, SessionEntry>();
+		let sourceLeafId: string | null = null;
+		for (const entry of sourceEntries) {
+			if (entry.type === "session") continue;
+			sourceById.set(entry.id, entry);
+			if (entry.type === "leaf") sourceLeafId = entry.targetId;
+			else sourceLeafId = entry.id;
+		}
+		const nearestPublicParent = (parentId: string | null): string | null => {
+			let currentId = parentId;
+			const visited = new Set<string>();
+			while (currentId) {
+				if (visited.has(currentId)) throw new Error("Imported session contains a host-only parent cycle");
+				visited.add(currentId);
+				const current = sourceById.get(currentId);
+				if (!current) throw new Error(`Imported session references an unavailable entry: ${currentId}`);
+				if (!isHostOnlySessionEntry(current)) return current.id;
+				currentId = current.parentId;
+			}
+			return null;
+		};
+		const publicEntries = sourceEntries
+			.filter((entry): entry is SessionEntry => entry.type !== "session" && !isHostOnlySessionEntry(entry))
+			.map((entry) => withoutClientInputIdentity({ ...entry, parentId: nearestPublicParent(entry.parentId) }))
+			.map((entry) => {
+				delete entry.ordinal;
+				return entry;
+			});
+		const finalLeafId = nearestPublicParent(sourceLeafId);
+		const targetId = options?.id ?? header.id;
+		const newSessionOptions = {
+			id: targetId,
+			...(parentSession === undefined ? {} : { parentSession }),
+			...(header.origin === undefined ? {} : { origin: header.origin }),
+		};
+		const stage = async (manager: SessionManager): Promise<void> => {
+			await manager.appendAtomically(
+				() => {
+					for (const entry of publicEntries) manager._appendEntry(entry);
+					if (finalLeafId !== manager.getLeafId()) {
+						if (finalLeafId === null) manager.resetLeaf();
+						else manager.branch(finalLeafId);
+					}
+				},
+				() => {},
+			);
+		};
+
+		const validationManager = SessionManager.inMemory(cwd);
+		validationManager.newSession(newSessionOptions);
+		await stage(validationManager);
+		if (!persist) return validationManager;
+
+		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const manager = await SessionManager.create(cwd, dir, newSessionOptions);
+		try {
+			await stage(manager);
+			return manager;
+		} catch (error) {
+			try {
+				await manager.closePersistence();
+			} catch (closeError) {
+				throw new AggregateError([error, closeError], "Session import failed and its manager could not be closed");
+			}
+			throw error;
+		}
+	}
+
+	static {
+		importSessionFromJsonlInMemoryImpl = (inputPath, targetCwd) =>
+			SessionManager._importFromJsonl(inputPath, targetCwd, undefined, undefined, false);
+	}
+
+	/** Fork a stored session into a new persisted session in another cwd/store. */
+	static async forkFrom(
+		sourceRef: SessionReference,
 		targetCwd: string,
 		sessionDir?: string,
 		options?: NewSessionOptions,
-	): SessionManager {
-		const resolvedSourcePath = resolvePath(sourcePath);
-		const resolvedTargetCwd = resolvePath(targetCwd);
-		if (existsSync(resolvedSourcePath)) {
-			hardenPrivateRegularFileSync(resolvedSourcePath);
+	): Promise<SessionManager> {
+		const source = await SessionManager.open(sourceRef);
+		let target: SessionManager | undefined;
+		try {
+			const sourceLeafId = source.getLeafId();
+			target = await SessionManager.create(targetCwd, sessionDir, {
+				...options,
+				parentSession: sourceRef,
+			});
+			const sourceById = source.byId;
+			const nearestPublicParent = (parentId: string | null): string | null => {
+				let currentId = parentId;
+				while (currentId) {
+					const current = sourceById.get(currentId);
+					if (!current) return null;
+					if (!isHostOnlySessionEntry(current)) return current.id;
+					currentId = current.parentId;
+				}
+				return null;
+			};
+			const entries = source
+				.getEntries()
+				.map((entry) => withoutClientInputIdentity({ ...entry, parentId: nearestPublicParent(entry.parentId) }))
+				.map((entry) => {
+					delete entry.ordinal;
+					return entry;
+				});
+			await target.appendAtomically(
+				() => {
+					for (const entry of entries) target!._appendEntry(entry);
+					if (sourceLeafId === null) target!.resetLeaf();
+					else if (target!.getLeafId() !== sourceLeafId) target!.branch(sourceLeafId);
+				},
+				() => {},
+			);
+		} catch (error) {
+			const cleanupErrors: unknown[] = [];
+			if (target) {
+				try {
+					await target.closePersistence();
+				} catch (closeError) {
+					cleanupErrors.push(closeError);
+				}
+			}
+			try {
+				await source.closePersistence();
+			} catch (closeError) {
+				cleanupErrors.push(closeError);
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Session fork failed and cleanup did not complete");
+			}
+			throw error;
 		}
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
-		if (sourceEntries.length === 0) {
-			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
+		try {
+			await source.closePersistence();
+		} catch (error) {
+			try {
+				await target.closePersistence();
+			} catch (closeError) {
+				throw new AggregateError(
+					[error, closeError],
+					"Session fork source and unreturned target could not be closed",
+				);
+			}
+			throw error;
 		}
-
-		const sourceHeader = sourceEntries.find((e) => e.type === "session") as SessionHeader | undefined;
-		if (!sourceHeader) {
-			throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
-		}
-
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
-		ensurePrivateDirectorySync(dir);
-
-		// Create new session file with new ID but forked content
-		if (options?.id !== undefined) {
-			assertValidSessionId(options.id);
-		}
-		const newSessionId = options?.id ?? createSessionId();
-		const timestamp = new Date().toISOString();
-		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		const newSessionFile = join(dir, `${fileTimestamp}_${newSessionId}.jsonl`);
-
-		// Write new header pointing to source as parent, with updated cwd
-		const newHeader: SessionHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: newSessionId,
-			timestamp,
-			cwd: resolvedTargetCwd,
-			parentSession: resolvedSourcePath,
-		};
-		const forkEntries = [
-			newHeader,
-			...sourceEntries
-				.filter((entry): entry is SessionEntry => entry.type !== "session" && !isHostOnlySessionEntry(entry))
-				.map(withoutClientInputIdentity),
-		];
-		writeDurableAtomicFileSync(newSessionFile, `${forkEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
-			directoryMode: PRIVATE_DIRECTORY_MODE,
-			fileMode: PRIVATE_FILE_MODE,
-		});
-
-		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+		return target;
 	}
 
-	/**
-	 * List all sessions for a directory.
-	 * @param cwd Working directory (used to compute default session directory)
-	 * @param sessionDir Optional session directory. If omitted, uses default (~/.volt/agent/sessions/<encoded-cwd>/).
-	 * @param onProgress Optional callback for progress updates (loaded, total)
-	 * @param options Listing behavior. Message-free durable sessions remain hidden unless explicitly requested.
-	 */
 	static async list(
 		cwd: string,
 		sessionDir?: string,
 		onProgress?: SessionListProgress,
 		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
-		const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
-		const resolvedCwd = resolvePath(cwd);
-		const sessions = (
-			await listSessionsFromDir(dir, onProgress, 0, undefined, options?.includeMessageFreeDurable)
-		).filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd));
-		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-		return sessions;
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
+		return SessionManager._scopedStore(dir, async (store) => {
+			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
+			const summaries = await store.listSessionSummaries({
+				includeHidden: options?.includeMessageFreeDurable,
+				...(filterCwd ? { cwd: resolvePath(cwd) } : {}),
+			});
+			onProgress?.(summaries.length, summaries.length);
+			return summaries.map((summary) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
+		});
 	}
 
-	/**
-	 * List all sessions across all project directories.
-	 * @param onProgress Optional callback for progress updates (loaded, total)
-	 */
+	static async search(
+		cwd: string,
+		query: string,
+		sessionDir?: string,
+		options?: SessionListOptions,
+	): Promise<SessionInfo[]> {
+		const dir = sessionDir ? resolvePath(sessionDir) : getDefaultSessionDir(cwd);
+		return SessionManager._scopedStore(dir, async (store) => {
+			const filterCwd = sessionDir !== undefined && !isDefaultShapedSessionDir(dir, cwd);
+			const results = await store.searchSessionSummaries(query, {
+				includeHidden: options?.includeMessageFreeDurable,
+				...(filterCwd ? { cwd: resolvePath(cwd) } : {}),
+			});
+			return results.map(({ summary }) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
+		});
+	}
+
+	static async searchAll(query: string, sessionDir?: string): Promise<SessionInfo[]> {
+		if (sessionDir) {
+			const dir = resolvePath(sessionDir);
+			return SessionManager._scopedStore(dir, async (store) => {
+				const results = await store.searchSessionSummaries(query);
+				return results.map(({ summary }) => sessionInfoFromStoreSummary(dir, store.info.storeId, summary));
+			});
+		}
+		const sessionsRoot = getSessionsDir();
+		if (!existsSync(sessionsRoot)) return [];
+		const directories = (await readdir(sessionsRoot, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => join(sessionsRoot, entry.name));
+		const result: { session: SessionInfo; score: number }[] = [];
+		const storeFailures: unknown[] = [];
+		let successfulStores = 0;
+		for (const directory of directories) {
+			if (!existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) continue;
+			let storeResults: { session: SessionInfo; score: number }[];
+			try {
+				storeResults = await SessionManager._scopedStore(directory, async (store) => {
+					const results = await store.searchSessionSummaries(query);
+					return results.map(({ summary, score }) => ({
+						session: sessionInfoFromStoreSummary(directory, store.info.storeId, summary),
+						score,
+					}));
+				});
+			} catch (error) {
+				storeFailures.push(error);
+				continue;
+			}
+			successfulStores += 1;
+			result.push(...storeResults);
+		}
+		if (successfulStores === 0 && storeFailures.length > 0) {
+			throw new AggregateError(storeFailures, "Could not search sessions in any project store");
+		}
+		result.sort((left, right) => {
+			if (left.score !== right.score) return left.score - right.score;
+			return right.session.modified.getTime() - left.session.modified.getTime();
+		});
+		return result.map(({ session }) => session);
+	}
+
+	static async exportJsonlSnapshot(ref: SessionReference, outputPath: string): Promise<{ revision: number }> {
+		const manager = await SessionManager.open(ref);
+		let result: { revision: number };
+		try {
+			const header = manager.getHeader();
+			if (!header) throw new Error("Cannot export a session without a header");
+			const content = serializeSessionJsonlSnapshot(header, manager.getEntries(), manager.getLeafId());
+			writeDurableAtomicFileSync(resolvePath(outputPath), content, {
+				directoryMode: PRIVATE_DIRECTORY_MODE,
+				fileMode: PRIVATE_FILE_MODE,
+			});
+			result = { revision: manager.storeRevision };
+		} catch (error) {
+			try {
+				await manager.closePersistence();
+			} catch (closeError) {
+				throw new AggregateError([error, closeError], "Session export failed and its manager could not be closed");
+			}
+			throw error;
+		}
+		await manager.closePersistence();
+		return result;
+	}
+
+	static async delete(ref: SessionReference, expectedRevision?: number): Promise<boolean> {
+		const canonicalRef = parseSessionReference(ref);
+		return SessionManager._scopedStore(canonicalRef.sessionDirectory, async (store) => {
+			if (store.info.storeId !== canonicalRef.storeId) {
+				throw new Error("Session reference belongs to a different store");
+			}
+			const summary = await store.findSessionSummary(canonicalRef.sessionId, canonicalRef.sessionGeneration);
+			if (!summary) return false;
+			const result = await store.deleteSession({
+				sessionId: canonicalRef.sessionId,
+				sessionGeneration: canonicalRef.sessionGeneration,
+				expectedRevision: expectedRevision ?? summary.revision,
+			});
+			if (result.status === "conflict") {
+				throw new Error(`Session changed before deletion (revision ${result.actualRevision})`);
+			}
+			return result.status === "deleted";
+		});
+	}
+
 	static async listAll(onProgress?: SessionListProgress, options?: SessionListOptions): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDir?: string,
@@ -4247,8 +3462,10 @@ export class SessionManager {
 		onProgressOrOptions?: SessionListProgress | SessionListOptions,
 		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
-		const customSessionDir =
-			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
+		const customDir =
+			typeof sessionDirOrOnProgress === "string" && sessionDirOrOnProgress
+				? resolvePath(sessionDirOrOnProgress)
+				: undefined;
 		const progress =
 			typeof sessionDirOrOnProgress === "function"
 				? sessionDirOrOnProgress
@@ -4258,70 +3475,59 @@ export class SessionManager {
 		const listOptions =
 			typeof sessionDirOrOnProgress === "function"
 				? (onProgressOrOptions as SessionListOptions | undefined)
-				: sessionDirOrOnProgress === undefined &&
-						typeof onProgressOrOptions === "object" &&
-						onProgressOrOptions !== null
+				: typeof onProgressOrOptions === "object" && onProgressOrOptions !== null
 					? onProgressOrOptions
 					: options;
-		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(
-				customSessionDir,
-				progress,
-				0,
-				undefined,
-				listOptions?.includeMessageFreeDurable,
-			);
-			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-			return sessions;
+		if (customDir) {
+			return SessionManager._scopedStore(customDir, async (store) => {
+				const summaries = await store.listSessionSummaries({
+					includeHidden: listOptions?.includeMessageFreeDurable,
+				});
+				progress?.(summaries.length, summaries.length);
+				return summaries.map((summary) => sessionInfoFromStoreSummary(customDir, store.info.storeId, summary));
+			});
 		}
 
-		const sessionsDir = getSessionsDir();
-
-		try {
-			if (!existsSync(sessionsDir)) {
-				return [];
-			}
-			const entries = await readdir(sessionsDir, { withFileTypes: true });
-			const dirs = entries.filter((e) => e.isDirectory()).map((e) => join(sessionsDir, e.name));
-
-			// Count total files first for accurate progress
-			let totalFiles = 0;
-			const dirFiles: string[][] = [];
-			for (const dir of dirs) {
+		const sessionsRoot = getSessionsDir();
+		if (!existsSync(sessionsRoot)) return [];
+		const directories = (await readdir(sessionsRoot, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => join(sessionsRoot, entry.name));
+		const result: SessionInfo[] = [];
+		const storeFailures: unknown[] = [];
+		let successfulStores = 0;
+		let loaded = 0;
+		for (const directory of directories) {
+			if (existsSync(join(directory, SESSION_STORE_DATABASE_FILENAME))) {
+				let storeResults: SessionInfo[] | undefined;
 				try {
-					ensurePrivateDirectorySync(dir);
-					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
-					dirFiles.push(files.map((f) => join(dir, f)));
-					totalFiles += files.length;
-				} catch {
-					dirFiles.push([]);
+					storeResults = await SessionManager._scopedStore(directory, async (store) => {
+						const summaries = await store.listSessionSummaries({
+							includeHidden: listOptions?.includeMessageFreeDurable,
+						});
+						return summaries.map((summary) =>
+							sessionInfoFromStoreSummary(directory, store.info.storeId, summary),
+						);
+					});
+				} catch (error) {
+					storeFailures.push(error);
+				}
+				if (storeResults) {
+					successfulStores += 1;
+					result.push(...storeResults);
 				}
 			}
-
-			// Process all files with progress tracking
-			let loaded = 0;
-			const sessions: SessionInfo[] = [];
-			const allFiles = dirFiles.flat();
-
-			const results = await buildSessionInfosWithConcurrency(
-				allFiles,
-				() => {
-					loaded++;
-					progress?.(loaded, totalFiles);
-				},
-				listOptions?.includeMessageFreeDurable,
-			);
-
-			for (const info of results) {
-				if (info) {
-					sessions.push(info);
-				}
-			}
-
-			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-			return sessions;
-		} catch {
-			return [];
+			loaded += 1;
+			progress?.(loaded, directories.length);
 		}
+		if (successfulStores === 0 && storeFailures.length > 0) {
+			throw new AggregateError(storeFailures, "Could not list sessions from any project store");
+		}
+		return result.sort((left, right) => right.modified.getTime() - left.modified.getTime());
 	}
+}
+
+/** @internal Runtime-only JSONL import; intentionally omitted from the package entry point. */
+export function importSessionFromJsonlInMemory(inputPath: string, targetCwd?: string): Promise<SessionManager> {
+	return importSessionFromJsonlInMemoryImpl(inputPath, targetCwd);
 }

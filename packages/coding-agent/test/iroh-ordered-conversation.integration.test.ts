@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@hansjm10/volt-ai";
@@ -18,6 +18,7 @@ import {
 	ManualIrohSendStream,
 	parseWrittenObjects,
 } from "./iroh-stream-doubles.ts";
+import { loadPersistedSessionSnapshot } from "./utilities.ts";
 
 interface OrderedConversationFixture {
 	readonly manager: SessionManager;
@@ -156,7 +157,6 @@ function createSnapshotBuilder(manager: SessionManager, sessionId: string): Conv
 				isCompacting: false,
 				steeringMode: "all",
 				followUpMode: "all",
-				sessionFile: manager.getSessionFile(),
 				sessionId,
 				autoCompactionEnabled: false,
 				messageCount: items.length,
@@ -198,12 +198,12 @@ async function createFixture(
 	const root = mkdtempSync(join(tmpdir(), "volt-iroh-ordered-conversation-"));
 	const workspacePath = join(root, "workspace");
 	const sessionDir = join(root, "sessions");
-	const manager = SessionManager.create(workspacePath, sessionDir);
+	const manager = await SessionManager.create(workspacePath, sessionDir);
 	const sessionId = manager.getSessionId();
 	const listeners = new Set<(event: object) => void>();
 	const session = {
 		...createIrohTestSession(sessionId, null),
-		sessionFile: manager.getSessionFile(),
+		sessionRef: manager.getSessionRef(),
 		sessionManager: manager,
 		gitContextProvider: {
 			getSnapshot: () => null,
@@ -280,6 +280,7 @@ async function createFixture(
 				await modePromise;
 			} finally {
 				runtimeHost.conversationProjectionFeed.dispose();
+				await manager.closePersistence();
 				rmSync(root, { recursive: true, force: true });
 			}
 		},
@@ -328,10 +329,8 @@ describe("Iroh ordered conversation integration", () => {
 			const committedEntryId = fixture.manager.appendMessage(finalMessage);
 			await fixture.manager.flush();
 
-			const sessionFile = fixture.manager.getSessionFile();
-			expect(sessionFile).toBeDefined();
-			expect(existsSync(sessionFile!)).toBe(true);
-			expect(readFileSync(sessionFile!, "utf8")).toContain(`"id":"${committedEntryId}"`);
+			const persisted = await loadPersistedSessionSnapshot(fixture.manager);
+			expect(persisted.entries.some((entry) => entry.id === committedEntryId)).toBe(true);
 
 			await vi.waitFor(() => {
 				expect(parseWrittenObjects(fixture.send).some((value) => value.type === "transcript_entry")).toBe(true);
@@ -467,13 +466,11 @@ describe("Iroh ordered conversation integration", () => {
 				},
 				final: true,
 			});
-			const sessionFile = fixture.manager.getSessionFile();
-			expect(sessionFile).toBeDefined();
 			await fixture.manager.flush();
-			const persisted = readFileSync(sessionFile!, "utf8");
-			expect(persisted).toContain(`"id":"${committedEntryId}"`);
-			expect(persisted).toContain('"text":"1\\n2\\n3"');
-			expect(persisted).toContain('"stopReason":"stop"');
+			const persisted = await loadPersistedSessionSnapshot(fixture.manager);
+			const committed = persisted.entries.find((entry) => entry.id === committedEntryId);
+			expect(JSON.stringify(committed?.payload)).toContain('"text":"1\\n2\\n3"');
+			expect(JSON.stringify(committed?.payload)).toContain('"stopReason":"stop"');
 		} finally {
 			await fixture.close();
 		}

@@ -190,11 +190,12 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		},
 		tempDir,
 		cleanup() {
+			if (sessionManager.isPersisted()) {
+				throw new Error("Persisted harness cleanup must await cleanupAsync()");
+			}
 			session.dispose();
 			fauxProvider.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-			}
+			if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
 		},
 		async cleanupAsync() {
 			session.dispose();
@@ -202,7 +203,11 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			try {
 				await session.waitForClosed();
 			} finally {
-				await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+				await rm(tempDir, {
+					recursive: true,
+					force: true,
+					...(process.platform === "win32" ? { maxRetries: 10, retryDelay: 50 } : {}),
+				});
 			}
 		},
 	};
