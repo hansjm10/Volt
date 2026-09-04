@@ -316,12 +316,6 @@ export function createReviewFileMetadata(
 	};
 }
 
-function pullRequestReferenceFromMetadata(
-	pullRequest: ReviewPullRequestMetadata | undefined,
-): ReviewPullRequestReference | undefined {
-	return pullRequest ? { provider: pullRequest.provider, number: pullRequest.number } : undefined;
-}
-
 function cloneReviewTarget(target: ReviewWorkflowDescriptor["target"]): ReviewWorkflowDescriptor["target"] {
 	return {
 		...target,
@@ -395,6 +389,8 @@ export interface StartedReviewWorkflow {
 
 interface ActiveReviewWorkflow {
 	descriptor: ReviewWorkflowDescriptor;
+	/** Lifecycle identity remains available even when display metadata is rejected. */
+	pullRequest: ReviewPullRequestReference | undefined;
 	abortController: AbortController;
 	fastModeEnabled: boolean;
 	launched: boolean;
@@ -490,6 +486,7 @@ export class ReviewWorkflowManager {
 		});
 		const entry: ActiveReviewWorkflow = {
 			descriptor,
+			pullRequest: createReviewPullRequestReference(resolution.identity),
 			abortController: new AbortController(),
 			fastModeEnabled: options.fastModeEnabled === true,
 			launched: false,
@@ -508,6 +505,7 @@ export class ReviewWorkflowManager {
 				throw new Error(`Review workflow is no longer awaiting preparation: ${workflowId}`);
 			}
 			entry.awaitingPreparation = false;
+			entry.pullRequest = createReviewPullRequestReference(prepared.resolution.identity);
 			descriptor.action = prepared.action;
 			const pullRequest = createReviewPullRequestMetadata(prepared.resolution.identity);
 			const files = prepared.resolution.changedFiles
@@ -522,7 +520,7 @@ export class ReviewWorkflowManager {
 			descriptor.startedAt = prepared.startedAt;
 			entry.disposePending = () => prepared.resolution.dispose?.() ?? Promise.resolve();
 			if (entry.launched && !entry.abortController.signal.aborted) {
-				const eventPullRequest = pullRequestReferenceFromMetadata(descriptor.target.pullRequest);
+				const eventPullRequest = entry.pullRequest;
 				this.emit({
 					type: "workflow_update",
 					workflowId: descriptor.workflowId,
@@ -532,7 +530,7 @@ export class ReviewWorkflowManager {
 					message: formatRunningReviewMessage(descriptor.target.description, false),
 					status: "running",
 					startedAt: descriptor.startedAt,
-					...(eventPullRequest ? { pullRequest: eventPullRequest } : {}),
+					...(eventPullRequest ? { pullRequest: { ...eventPullRequest } } : {}),
 				});
 			}
 		};
@@ -542,7 +540,7 @@ export class ReviewWorkflowManager {
 				return;
 			}
 			entry.launched = true;
-			const eventPullRequest = pullRequestReferenceFromMetadata(descriptor.target.pullRequest);
+			const eventPullRequest = entry.pullRequest;
 			this.emit({
 				type: "workflow_start",
 				workflowId: descriptor.workflowId,
@@ -552,7 +550,7 @@ export class ReviewWorkflowManager {
 				message: formatRunningReviewMessage(descriptor.target.description, entry.awaitingPreparation),
 				status: "running",
 				startedAt: descriptor.startedAt,
-				...(eventPullRequest ? { pullRequest: eventPullRequest } : {}),
+				...(eventPullRequest ? { pullRequest: { ...eventPullRequest } } : {}),
 			});
 			void (async () => {
 				let result: ExecuteReviewWorkflowResult;
@@ -561,7 +559,7 @@ export class ReviewWorkflowManager {
 						signal: entry.abortController.signal,
 						onEvent: (event) => {
 							if (event.type === "workflow_start" && event.workflowId === workflowId) return;
-							const forwardedPullRequest = pullRequestReferenceFromMetadata(descriptor.target.pullRequest);
+							const forwardedPullRequest = entry.pullRequest;
 							if (forwardedPullRequest && (event.type === "workflow_update" || event.type === "workflow_end")) {
 								this.emit({
 									...event,
@@ -711,7 +709,7 @@ export class ReviewWorkflowManager {
 			this.results.delete(oldest);
 		}
 
-		const eventPullRequest = pullRequestReferenceFromMetadata(descriptor.target.pullRequest);
+		const eventPullRequest = entry.pullRequest;
 		this.emit({
 			type: "workflow_end",
 			workflowId: descriptor.workflowId,
@@ -722,7 +720,7 @@ export class ReviewWorkflowManager {
 			status: result.status,
 			startedAt: descriptor.startedAt,
 			endedAt: descriptor.endedAt,
-			...(eventPullRequest ? { pullRequest: eventPullRequest } : {}),
+			...(eventPullRequest ? { pullRequest: { ...eventPullRequest } } : {}),
 		});
 		entry.settle(record);
 	}

@@ -59,6 +59,7 @@ function installNodeCommandShim(directory: string, command: string, source: stri
 
 interface GitHubShimConfig {
 	view: Record<string, unknown>;
+	omitViewFields?: string[];
 	finalHeadOid?: string;
 	graphql?: Record<string, unknown>;
 	maximumGraphqlRequests?: number;
@@ -104,6 +105,7 @@ if (args[0] === "pr" && args[1] === "view") {
     statusCheckRollup: [],
     ...config.view
   };
+  for (const field of config.omitViewFields ?? []) delete view[field];
   process.stdout.write(JSON.stringify(fields === "headRefOid" ? { headRefOid: config.finalHeadOid ?? view.headRefOid } : view));
 } else if (args[0] === "api" && args[1] === "graphql") {
   let input = "";
@@ -734,6 +736,52 @@ describe("review snapshots", () => {
 		expect(first.changedFiles.map((file) => [file.path, file.hunks.map((hunk) => hunk.id)])).toEqual(
 			second.changedFiles.map((file) => [file.path, file.hunks.map((hunk) => hunk.id)]),
 		);
+	});
+
+	it("rejects a changed file missing from Git numstat instead of reporting zero counts", async () => {
+		const repository = createRepository();
+		const realGit =
+			process.platform === "win32"
+				? run(repository, "where.exe", "git").split(/\r?\n/u)[0]
+				: run(repository, "which", "git");
+		if (!realGit) throw new Error("Unable to locate git executable");
+		const bin = join(repository, "missing-numstat-bin");
+		mkdirSync(bin);
+		installNodeCommandShim(
+			bin,
+			"git",
+			`import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+if (!args.includes("--numstat")) {
+  const result = spawnSync(${JSON.stringify(realGit)}, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });
+  if (result.error) throw result.error;
+  process.exitCode = result.status ?? 1;
+}
+`,
+		);
+		process.env.PATH = `${bin}${delimiter}${initialPath ?? ""}`;
+
+		const result = await resolveReviewSnapshot({ kind: "commit", sha: "HEAD" }, repository, OPTIONS);
+		if (!("error" in result)) snapshots.push(result);
+		expect(result).toEqual({ error: "git diff --numstat is missing a changed-file entry." });
+	});
+
+	it("retains explicit zero line counts for a mode-only change", async () => {
+		const repository = createRepository();
+		git(repository, "update-index", "--chmod=+x", "--", "tracked.txt");
+		git(repository, "commit", "-m", "change executable mode");
+
+		const snapshot = await resolve({ kind: "commit", sha: "HEAD" }, repository);
+		expect(snapshot.changedFiles).toMatchObject([
+			{
+				path: "tracked.txt",
+				additions: 0,
+				deletions: 0,
+				binary: false,
+				base: { mode: "100644" },
+				head: { mode: "100755" },
+			},
+		]);
 	});
 
 	it("rejects oversized on-demand blobs before invoking cat-file", async () => {
@@ -1475,6 +1523,66 @@ describe("review snapshots", () => {
 			error: "The pull request moved while Volt captured its GitHub context. Retry the review.",
 		});
 	});
+
+	it.each(["missing", "null", "unrecognized", "oversized checks"])(
+		"captures PR context with %s health metadata",
+		async (health) => {
+			const repository = createRepository();
+			const config: GitHubShimConfig = {
+				view: {
+					id: "PR_optional_health",
+					number: 7,
+					title: "Optional health metadata",
+					body: "Review context remains available",
+					baseRefName: "main",
+					headRefName: "feature",
+					url: "https://example.test/pr/7",
+					baseRefOid: "a".repeat(40),
+					headRefOid: "b".repeat(40),
+					...(health === "null" ? { state: null, mergeable: null, statusCheckRollup: null } : {}),
+					...(health === "unrecognized"
+						? { state: "UNRECOGNIZED", mergeable: "UNRECOGNIZED", statusCheckRollup: {} }
+						: {}),
+					...(health === "oversized checks"
+						? { statusCheckRollup: Array.from({ length: 10_001 }, () => ({})) }
+						: {}),
+				},
+				...(health === "missing" ? { omitViewFields: ["state", "isDraft", "mergeable", "statusCheckRollup"] } : {}),
+			};
+			installGitHubShim(repository, config);
+			process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
+
+			const captured = await capturePullRequestContextWithGitHubCli({
+				cwd: repository,
+				number: "7",
+				maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+			});
+			expect(captured.ok).toBe(true);
+			if (!captured.ok) throw new Error(captured.error);
+			expect(captured.pullRequest).toMatchObject({
+				providerId: "github",
+				number: 7,
+				baseRefOid: "a".repeat(40),
+				headRefOid: "b".repeat(40),
+				observedAt: expect.any(Number),
+			});
+			expect(captured.pullRequest.checks).toBeUndefined();
+			expect(captured.pullRequest.reviewState).toBe(health === "oversized checks" ? "ready" : undefined);
+			expect(captured.pullRequest.mergeability).toBe(health === "oversized checks" ? "unknown" : undefined);
+			expect(captured.context.manifest).toMatchObject({ status: "complete", limitations: [] });
+			expect(captured.context.rendered).toContain("Review context remains available");
+
+			config.view.headRefOid = "invalid-head";
+			writeFileSync(join(repository, "bin", "gh-config.json"), JSON.stringify(config));
+			await expect(
+				capturePullRequestContextWithGitHubCli({
+					cwd: repository,
+					number: "7",
+					maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
+				}),
+			).resolves.toEqual({ ok: false, error: "Could not parse gh pr view output." });
+		},
+	);
 
 	it("keeps the GitHub context fingerprint stable across pull request code revisions", async () => {
 		const repository = createRepository();

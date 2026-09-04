@@ -246,6 +246,54 @@ describe("ReviewWorkflowManager", () => {
 		expect(JSON.stringify(descriptor)).not.toContain("PRIVATE_PULL_REQUEST_BODY");
 	});
 
+	test.each([false, true])(
+		"preserves lifecycle PR identity when display metadata is rejected (provisional: %s)",
+		async (provisional) => {
+			const events: Array<Record<string, unknown>> = [];
+			const manager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+			const target = prepared("review:invalid-display", {
+				workflowDescription: "PR #7",
+				pullRequest: { providerId: "github", number: 7 },
+			});
+			target.resolution.identity!.pullRequest.title = "Title\twith a control character";
+			const started = manager.start({
+				provisional,
+				prepared: provisional
+					? prepared(target.workflowId, { workflowDescription: "Preparing pull request review" })
+					: target,
+				execute: async (hooks) => {
+					if (provisional) started.updatePrepared(target);
+					hooks.onEvent({
+						type: "workflow_update",
+						workflowId: target.workflowId,
+						kind: "review",
+						action: "review.pr",
+						title: "Review",
+						message: "Finalizing findings.",
+						status: "finalizing",
+						startedAt: target.startedAt,
+					});
+					return completed();
+				},
+			});
+			started.launch();
+			await started.finished;
+
+			expect(events.map((event) => event.type)).toEqual([
+				"workflow_start",
+				...(provisional ? ["workflow_update"] : []),
+				"workflow_update",
+				"workflow_end",
+			]);
+			if (provisional) expect(events[0]?.pullRequest).toBeUndefined();
+			for (const event of provisional ? events.slice(1) : events) {
+				expect(event.pullRequest).toEqual({ provider: "github", number: 7 });
+			}
+			expect(manager.get(target.workflowId)?.target.pullRequest).toBeUndefined();
+			expect(JSON.stringify(events)).not.toContain("PRIVATE_PULL_REQUEST_BODY");
+		},
+	);
+
 	test("reports bounded file projection completeness instead of treating omitted files as an empty change", () => {
 		const files = Array.from({ length: 201 }, (_, index) => ({
 			path: `src/file-${index}.ts`,

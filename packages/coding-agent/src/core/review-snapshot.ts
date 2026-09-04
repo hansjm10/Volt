@@ -2317,9 +2317,8 @@ async function buildChangedFiles(
 		const base = baseEntries.get(basePath);
 		const head = headEntries.get(statusEntry.path);
 		const statistics = numstat.get(numstatKey(statusEntry.path, statusEntry.previousPath));
-		const additions = statistics?.additions ?? 0;
-		const deletions = statistics?.deletions ?? 0;
-		const binary = statistics?.binary ?? false;
+		if (!statistics) throw new Error("git diff --numstat is missing a changed-file entry.");
+		const { additions, deletions, binary } = statistics;
 		const oversized = [base, head].some(
 			(entry) => entry?.type === "blob" && (entry.size === undefined || entry.size > source.limits.maxBlobBytes),
 		);

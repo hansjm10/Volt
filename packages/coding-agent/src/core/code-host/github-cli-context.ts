@@ -370,9 +370,6 @@ function parsePullRequestView(
 		!url ||
 		!baseRefName ||
 		!headRefName ||
-		!reviewState ||
-		!mergeability ||
-		!checks ||
 		!Number.isSafeInteger(observedAt) ||
 		observedAt < 0 ||
 		typeof value.baseRefOid !== "string" ||
@@ -396,9 +393,10 @@ function parsePullRequestView(
 		baseRefOid: value.baseRefOid,
 		headRefOid: value.headRefOid,
 		...(author ? { author } : {}),
-		reviewState,
-		mergeability,
-		checks,
+		// Health fields are optional display metadata, not required review evidence.
+		...(reviewState ? { reviewState } : {}),
+		...(mergeability ? { mergeability } : {}),
+		...(checks ? { checks } : {}),
 		observedAt,
 	};
 }
