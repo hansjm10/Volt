@@ -178,6 +178,7 @@ No created/opened classification is required because both outcomes close and ret
 | Subagent handle returns, then first prompt fails | Handle/runtime disposes according to current subagent contract | Row retained |
 | Persistence transaction is proven rolled back | Manager follows existing authority rules | Prior row state retained |
 | Persistence outcome is uncertain | Manager becomes reconciliation-required and closes/fail-stops | Row retained; fresh manager reopens authoritative state |
+| Lost-response commit evidence matches but the exact generation is missing or at another revision | Manager reports effect `committed`, becomes reconciliation-required, and suppresses stale atomic publication or later ordinary work | Current authoritative state is preserved; a fresh manager reopens the exact current generation/reference when it still exists |
 | Explicit user/session-selector delete | Close active manager, export recovery snapshot when applicable, then exact conditional delete | Row deleted only on matching store/generation/revision |
 | Stale manager writes after delete/recreate | Generation/revision check rejects and retires stale authority | Replacement row preserved |
 | Process terminates during setup | OS/worker cleanup eventually releases process resources | Any committed row remains |
@@ -278,7 +279,7 @@ Retain only projections used by indexed operations:
 | `sessions.updated_at`, Git-context fields, `name`, `visible`, `leaf_entry_id`, `message_count`, `first_message` | Listing, exact summary, continuation, and remote enumeration |
 | `client_inputs` | Pending/ambiguous input continuation lookup without transcript replay |
 | `search_chunks` | Deep text search without parsing canonical entry JSON |
-| `transaction_commits` | Commit-outcome reconciliation; evidence rather than a conversation projection |
+| `transaction_commits` | Session-generation-lifetime commit-outcome evidence, with one row per committed revision; evidence rather than a conversation projection |
 
 Remove:
 
@@ -351,7 +352,11 @@ Each session transaction commits together:
 - session revision increment;
 - commit evidence.
 
-Existing expected-revision, session-generation, commit-ID, digest, and reconciliation behavior remains authoritative.
+`transaction_commits.commit_id` remains the store-global primary key. A unique `(session_id, session_generation, after_revision)` index permits only one evidence row for each revision of an exact session generation. All such rows are retained for that generation's lifetime and are removed only by the generation row's delete cascade; advancing the session must not prune older evidence. Consequently, an exact retry or `reconcileCommit()` for commit A returns A's original evidence even after commit B advances the same generation. The current caller contract uses a fresh UUID for every new commit and does not add `expectedRevision` to commit-identity matching.
+
+After a lost or failed transaction response, matching commit identity and digest proves the transaction effect `committed`, but it does not alone prove that the same manager still owns current authority. SessionManager must next read the exact session-generation summary and may accept the reconciliation only when `summary.revision === evidence.afterRevision`. A missing summary, a delete/recreate under another generation, a later descendant revision, or any other revision inconsistency leaves the effect `committed` while making the old manager sticky `reconciliation_required`. Atomic staging keeps its pre-stage in-memory snapshot and suppresses publication, RPC acceptance, and provider work; ordinary queued persistence rejects its watermark and fail-stops. A fresh manager reopens the complete authoritative row and entries. Absent evidence plus the unchanged expected revision still proves rollback; mismatched/unreadable evidence or other unproven state remains uncertain.
+
+This unique-index amendment changes the unreleased schema in place. Local development databases created from an earlier schema are not migrated automatically and fail the existing schema-integrity check until recreated.
 
 Incremental projection calculation must not replay full history for every append. This RFC does not require replacing the current full-history array/map snapshots used by some atomic operations; delta/undo staging is deferred until a dedicated benchmark demonstrates that it is necessary.
 
@@ -651,7 +656,9 @@ Deterministic cases:
 - client-input receipt/queue/terminal/ambiguity state;
 - subagent edges from canonical entries;
 - search eligibility and chunk order;
-- proven atomic rollback and uncertain reconciliation.
+- proven atomic rollback and uncertain reconciliation;
+- retention of old commit evidence after later revisions, uniqueness of evidence per generation/revision, and delete-cascade cleanup; and
+- committed-effect retirement when matched evidence is already behind authoritative state, for atomic and ordinary persistence.
 
 Property oracle with deterministic `fast-check` seed:
 
@@ -762,7 +769,7 @@ Rejected. The manager ownership rule concerns close responsibility only. Deliver
 
 ## 13. Accepted decisions
 
-Reviewers accepted these eight decisions:
+Reviewers accepted these nine decisions:
 
 1. A committed session row is immediately adopted and setup cleanup never deletes it.
 2. Passing a manager to a high-level session/runtime/subagent factory consumes ownership at invocation.
@@ -772,5 +779,6 @@ Reviewers accepted these eight decisions:
 6. Use one reducer and fail-closed open verification for retained projections; defer delta staging.
 7. Preserve search semantics, bound accumulation to one session, state query-dependent cost honestly, and do not add FTS.
 8. Defer durable preparation, crash reclaim, universal setup overlays, host-wide incarnation propagation, and new cross-system ownership state machines.
+9. Retain every commit-evidence row for its session generation, enforce one row per generation/revision, and retire a manager whose matched committed evidence no longer equals authoritative session state.
 
 These decisions are accepted and implemented. Changing them requires a follow-up RFC.

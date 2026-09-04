@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SessionManager } from "../../src/core/session-manager.ts";
+import { SessionConversationStateUnavailableError, SessionManager } from "../../src/core/session-manager.ts";
 import { acquireSharedSQLiteSessionStore } from "../../src/core/session-store/index.ts";
 import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
@@ -166,6 +166,74 @@ describe("SessionManager asynchronous SQLite persistence", () => {
 		expect((await SessionManager.open(secondRef)).buildSessionContext().messages).toMatchObject([
 			{ role: "custom", content: "second entry" },
 		]);
+	});
+
+	it("fail-stops ordinary persistence when matched commit evidence trails a descendant", async () => {
+		const root = createTempDir();
+		const manager = await SessionManager.create(root, root, { id: "reconciled-descendant" });
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const lease = await acquireSharedSQLiteSessionStore(root);
+		const applyTransaction = lease.client.applyTransaction.bind(lease.client);
+		const reconcileCommit = lease.client.reconcileCommit.bind(lease.client);
+		let markReconciliationStarted!: () => void;
+		const reconciliationStarted = new Promise<void>((resolve) => {
+			markReconciliationStarted = resolve;
+		});
+		let releaseReconciliation!: () => void;
+		const reconciliationGate = new Promise<void>((resolve) => {
+			releaseReconciliation = resolve;
+		});
+		let intercepted = false;
+		const applySpy = vi.spyOn(lease.client, "applyTransaction").mockImplementation(async (input) => {
+			if (intercepted) return applyTransaction(input);
+			intercepted = true;
+			await applyTransaction(input);
+			throw new Error("injected lost transaction response");
+		});
+		const reconcileSpy = vi.spyOn(lease.client, "reconcileCommit").mockImplementation(async (input) => {
+			markReconciliationStarted();
+			await reconciliationGate;
+			return reconcileCommit(input);
+		});
+		let watermark: Promise<void> | undefined;
+
+		try {
+			const committedId = manager.appendCustomEntry("test", { writer: "reconciling-manager" });
+			watermark = manager.flush();
+			await reconciliationStarted;
+
+			const descendant = await SessionManager.open(ref);
+			expect(descendant.getEntry(committedId)).toMatchObject({
+				type: "custom",
+				data: { writer: "reconciling-manager" },
+			});
+			const descendantId = descendant.appendCustomEntry("test", { writer: "descendant-manager" });
+			await descendant.flush();
+
+			releaseReconciliation();
+			await expect(watermark).rejects.toMatchObject({
+				effect: "committed",
+				authority: "reconciliation_required",
+			});
+			expect(manager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+			expect(() => manager.appendCustomEntry("test", { writer: "stale-manager" })).toThrow(
+				SessionConversationStateUnavailableError,
+			);
+
+			const reopened = await SessionManager.open(ref);
+			expect(reopened.getEntries().map((entry) => entry.id)).toEqual([committedId, descendantId]);
+			expect(reopened.getEntries().map((entry) => (entry.type === "custom" ? entry.data : undefined))).toEqual([
+				{ writer: "reconciling-manager" },
+				{ writer: "descendant-manager" },
+			]);
+		} finally {
+			releaseReconciliation();
+			if (watermark) await Promise.allSettled([watermark]);
+			reconcileSpy.mockRestore();
+			applySpy.mockRestore();
+			await lease.release();
+		}
 	});
 
 	it("fails stale concurrent managers closed instead of losing a committed update", async () => {

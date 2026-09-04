@@ -1303,13 +1303,23 @@ describe("SQLite session store", () => {
 		await Promise.all([writeTransactions, readSnapshots]);
 	});
 
-	it("returns durable commit evidence and reconciles idempotent retries", async () => {
+	it("retains durable commit evidence across later revisions and reconciles idempotent retries", async () => {
 		const client = await openStore();
 		await client.createHiddenSession(createInput());
 		const payload = emptyPayload();
-		const request = transaction("session-1", 0, "commit-evidence", payload);
+		const request = transaction("session-1", 0, "commit-evidence-a", payload);
 		const committed = await client.applyTransaction(request);
 		if (committed.status !== "committed") throw new Error("Expected committed transaction");
+		const laterRequest = transaction(
+			"session-1",
+			1,
+			"commit-evidence-b",
+			emptyPayload({ updatedAt: "2026-08-31T12:02:00.000Z" }),
+		);
+		expect(await client.applyTransaction(laterRequest)).toMatchObject({
+			status: "committed",
+			evidence: { afterRevision: 2 },
+		});
 
 		const retry = await client.applyTransaction(request);
 		expect(retry).toEqual(committed);
@@ -1317,17 +1327,41 @@ describe("SQLite session store", () => {
 			await client.reconcileCommit({
 				sessionId: "session-1",
 				sessionGeneration: generationFor("session-1"),
-				commitId: "commit-evidence",
+				commitId: "commit-evidence-a",
 				digest: request.digest,
 			}),
 		).toEqual({ status: "committed", evidence: committed.evidence });
+
+		const direct = new DatabaseSync(client.info.databasePath);
+		try {
+			expect(() =>
+				direct
+					.prepare(
+						`INSERT INTO transaction_commits (
+							commit_id, session_id, session_generation, digest,
+							before_revision, after_revision, committed_at
+						) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					)
+					.run(
+						"commit-evidence-duplicate-revision",
+						"session-1",
+						generationFor("session-1"),
+						request.digest,
+						0,
+						1,
+						UPDATED_AT,
+					),
+			).toThrow(/UNIQUE constraint failed/u);
+		} finally {
+			direct.close();
+		}
 
 		const otherDigest = digestSessionStoreTransactionPayload(emptyPayload({ updatedAt: "2026-08-31T12:03:00.000Z" }));
 		expect(
 			await client.reconcileCommit({
 				sessionId: "session-1",
 				sessionGeneration: generationFor("session-1"),
-				commitId: "commit-evidence",
+				commitId: "commit-evidence-a",
 				digest: otherDigest,
 			}),
 		).toEqual({ status: "mismatch" });
@@ -1339,6 +1373,15 @@ describe("SQLite session store", () => {
 				digest: request.digest,
 			}),
 		).toEqual({ status: "not_found" });
+
+		await client.createHiddenSession(createInput("session-2"));
+		await expect(
+			client.applyTransaction({
+				...request,
+				sessionId: "session-2",
+				sessionGeneration: generationFor("session-2"),
+			}),
+		).rejects.toMatchObject({ code: "commit_identity_conflict" });
 	});
 
 	it("deletes sessions and their transaction evidence", async () => {

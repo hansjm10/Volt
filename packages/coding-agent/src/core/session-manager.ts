@@ -300,12 +300,12 @@ export interface VerifiedSessionDeliveryNoEffect extends VerifiedSessionDelivery
 export type VerifiedSessionDeliveryReceipt = VerifiedSessionDeliveryCommit | VerifiedSessionDeliveryNoEffect;
 
 class AtomicAppendPersistenceFailure extends Error {
-	readonly effect: Exclude<SessionAtomicAppendEffect, "committed">;
+	readonly effect: SessionAtomicAppendEffect;
 	readonly authority: SessionAtomicAppendAuthority;
 
 	constructor(
 		message: string,
-		effect: Exclude<SessionAtomicAppendEffect, "committed">,
+		effect: SessionAtomicAppendEffect,
 		authority: SessionAtomicAppendAuthority,
 		options?: ErrorOptions,
 	) {
@@ -1584,6 +1584,15 @@ export class SessionManager {
 					digest,
 				});
 				if (reconciliation.status === "committed") {
+					const summary = await store.findSessionSummary(this.sessionId, this.sessionGeneration);
+					if (summary?.revision !== reconciliation.evidence.afterRevision) {
+						throw new AtomicAppendPersistenceFailure(
+							"SQLite session transaction committed but authoritative session state has changed",
+							"committed",
+							"reconciliation_required",
+							{ cause: error },
+						);
+					}
 					this.storeRevision = reconciliation.evidence.afterRevision;
 					return;
 				}

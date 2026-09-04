@@ -535,6 +535,72 @@ describe("regression #217: SQLite transaction reconciliation", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("retires a reconciled manager whose committed evidence trails a descendant", async () => {
+		const { harness, sessionRef, baseline } = await setup();
+		harness.setResponses([fauxAssistantMessage("must remain unused")]);
+		const proofStarted = deferred();
+		const releaseProof = deferred();
+		const evidence = await faultNextPlanningTransaction(harness.sessionManager, "pause_committed", {
+			started: proofStarted.resolve,
+			release: releaseProof.promise,
+		});
+		const planningEventsBefore = harness.eventsOfType("planning_state_changed").length;
+		const deliveryEventsBefore = harness.eventsOfType("delivery_start").length;
+		const messageEventsBefore = harness.events.filter(
+			(event) => event.type === "message_start" || event.type === "message_end",
+		).length;
+		const preflight: PromptPreflightResult[] = [];
+		const clientMessageId = "issue-217-reconciled-descendant";
+		const prompting = harness.session.prompt("fence the stale manager", {
+			clientMessageId,
+			source: "rpc",
+			preflightResult: (result) => preflight.push(result),
+		});
+
+		try {
+			await proofStarted.promise;
+			const authoritativeAfterCommit = {
+				phase: "draft",
+				checkpoints: baseline.checkpoints + 1,
+				userTexts: ["fence the stale manager"],
+			};
+			const descendant = await own(SessionManager.open(sessionRef));
+			expect(snapshotEntries(descendant.getBranch())).toEqual(authoritativeAfterCommit);
+			const descendantId = descendant.appendSessionInfo("descendant manager state");
+			await descendant.flush();
+
+			releaseProof.resolve();
+			await expect(prompting).rejects.toMatchObject({
+				effect: "committed",
+				authority: "reconciliation_required",
+			});
+
+			expect(evidence.applyResult).toMatchObject({ status: "committed" });
+			expect(evidence.reconcileCalls).toBe(1);
+			expect(harness.sessionManager.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+			expect(() => harness.sessionManager.getEntries()).toThrow(SessionConversationStateUnavailableError);
+			expect(harness.eventsOfType("planning_state_changed")).toHaveLength(planningEventsBefore);
+			expect(harness.eventsOfType("delivery_start")).toHaveLength(deliveryEventsBefore);
+			expect(
+				harness.events.filter((event) => event.type === "message_start" || event.type === "message_end"),
+			).toHaveLength(messageEventsBefore);
+			expect(preflight).toEqual([{ success: false }]);
+			expect(harness.getPendingResponseCount()).toBe(1);
+
+			const reopened = await own(SessionManager.open(sessionRef));
+			expect(snapshotEntries(reopened.getBranch())).toEqual(authoritativeAfterCommit);
+			expect(reopened.getEntry(descendantId)).toMatchObject({
+				type: "session_info",
+				name: "descendant manager state",
+			});
+			expect(reopened.getSessionName()).toBe("descendant manager state");
+			expect(reopened.getClientInput(clientMessageId)).toMatchObject({ state: "completed" });
+		} finally {
+			releaseProof.resolve();
+			await prompting.catch(() => undefined);
+		}
+	});
+
 	it("terminally consumes a stale-generation delivery and recovers it from a fresh manager", async () => {
 		const { harness, sessionRef } = await setup();
 		harness.setResponses([fauxAssistantMessage("must remain unused")]);

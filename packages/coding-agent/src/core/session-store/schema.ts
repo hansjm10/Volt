@@ -138,6 +138,6 @@ CREATE TABLE transaction_commits (
 	FOREIGN KEY (session_id, session_generation) REFERENCES sessions(id, session_generation) ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 
-CREATE INDEX transaction_commits_session_revision_idx
-	ON transaction_commits (session_id, session_generation, after_revision DESC, commit_id);
+CREATE UNIQUE INDEX transaction_commits_session_revision_idx
+	ON transaction_commits (session_id, session_generation, after_revision DESC);
 `;
