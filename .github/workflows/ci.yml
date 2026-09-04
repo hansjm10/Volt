@@ -111,10 +111,19 @@ jobs:
         run: go vet ./...
 
   test-windows:
+    name: Windows tests (${{ matrix.shard }}/3)
     runs-on: windows-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     permissions:
       contents: read
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      VITEST_MAX_FORKS: '2'
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -140,13 +149,21 @@ jobs:
       - name: Load Windows x64 Iroh binding
         run: node scripts/check-iroh-native-load.mjs
 
-      - name: Test
+      # Run the non-coding-agent portions of the root test script only once.
+      - name: Test other suites
+        if: matrix.shard == 1
+        shell: bash
+        run: |
+          ./test.sh run test:memory-benchmark
+          ./test.sh run test:swebench-benchmark
+          ./test.sh test --workspace packages/agent --workspace packages/ai --workspace packages/tui --if-present
+          ./test.sh --prefix packages/coding-agent/examples/remote/firebase-push-relay/functions test
+
+      - name: Test coding-agent shard
         shell: bash
         env:
-          TEMP: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
-          VITEST_MAX_FORKS: '2'
-        run: ./test.sh
+          SHARD: ${{ matrix.shard }}
+        run: ./test.sh test --workspace packages/coding-agent -- --shard="${SHARD}/3"
 
   iroh-native-darwin-arm64:
     name: Iroh native load (Darwin arm64)
