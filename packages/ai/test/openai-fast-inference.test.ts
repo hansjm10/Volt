@@ -51,10 +51,14 @@ function mockToken(): string {
 
 describe("OpenAI fast inference eligibility", () => {
 	it("requires a supported model on a canonical OpenAI endpoint", () => {
+		const astra = getModel("openai", "gpt-6-astra");
+		const codexAstra = getModel("openai-codex", "gpt-6-astra");
 		const canonical = getModel("openai", "gpt-5.6");
 		const direct = getModel("openai", "gpt-5.4");
 		const codex = getModel("openai-codex", "gpt-5.4");
 
+		expect(supportsFastInference(astra)).toBe(true);
+		expect(supportsFastInference(codexAstra)).toBe(true);
 		expect(supportsFastInference(canonical)).toBe(true);
 		expect(supportsFastInference(direct)).toBe(true);
 		expect(supportsFastInference(codex)).toBe(true);
@@ -74,6 +78,24 @@ describe("OpenAI fast inference eligibility", () => {
 });
 
 describe("OpenAI Responses fast inference", () => {
+	it("sends priority and applies the GPT-6 Astra rates", async () => {
+		const model = getModel("openai", "gpt-6-astra");
+		let payload: { service_tier?: string } | undefined;
+		mockSSE("priority");
+
+		const result = await streamSimpleOpenAIResponses(model, context, {
+			apiKey: "test-key",
+			inferenceSpeed: "fast",
+			onPayload: (value) => {
+				payload = value as { service_tier?: string };
+			},
+		}).result();
+
+		expect(payload?.service_tier).toBe("priority");
+		expect(result.usage.serviceTier).toEqual({ requested: "priority", effective: "priority" });
+		expect(result.usage.cost).toEqual({ input: 20, output: 100, cacheRead: 2, cacheWrite: 0, total: 122 });
+	});
+
 	it("sends priority and applies the canonical GPT-5.6 rates", async () => {
 		const model = getModel("openai", "gpt-5.6");
 		let payload: { service_tier?: string } | undefined;
