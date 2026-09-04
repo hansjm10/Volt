@@ -18,6 +18,7 @@ import {
 	type SessionStoreDeleteSessionResult,
 	type SessionStoreEntry,
 	type SessionStoreEntryWrite,
+	SessionStoreError,
 	type SessionStoreErrorCode,
 	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
@@ -681,7 +682,15 @@ function parseSnapshot(value: unknown, path: string): SessionStoreSnapshot {
 	const input = record(value, path);
 	exactKeys(input, path, ["session", "entries", "clientInputs", "searchChunks"]);
 	const entries = arrayValue(input.entries, `${path}.entries`, parseEntry);
-	validatePersistedSessionEntrySequence(entries.map((entry) => entry.payload));
+	try {
+		validatePersistedSessionEntrySequence(entries.map((entry) => entry.payload));
+	} catch (error) {
+		throw new SessionStoreError(
+			"session_store_entry_integrity",
+			"Session store canonical entries are invalid or inconsistent",
+			{ cause: error },
+		);
+	}
 	return {
 		session: parseSummary(input.session, `${path}.session`),
 		entries,
