@@ -713,6 +713,61 @@ describe("issue #129", () => {
 		}
 	});
 
+	it("resume preserves a pre-prompt abort with a handle disposal failure", async () => {
+		const parent = await createPersistedParent();
+		const sessionDir = parent.getSessionDir();
+		const interrupted = await SessionManager.create(tmpdir(), sessionDir);
+		interrupted.appendMessage({ role: "user", content: "interrupted work", timestamp: Date.now() });
+		interrupted.appendMessage(fauxAssistantMessage("partial"));
+		interrupted.appendMessage({ role: "user", content: "continue", timestamp: Date.now() });
+		await interrupted.flush();
+		parent.appendSubagentSpawn({
+			toolCallId: "call_abort_cleanup",
+			subagentId: "sa_abort_cleanup",
+			agent: "researcher",
+			childSessionId: interrupted.getSessionId(),
+			childSessionRef: interrupted.getSessionRef()!,
+			requestKey: "rk-abort-cleanup",
+		});
+		await parent.flush();
+		await interrupted.closePersistence();
+
+		const cleanupError = new Error("injected resumed handle disposal failure");
+		const context = await createTestContext({ withConfiguredAuth: true, parentSessionManager: parent });
+		const startByName = context.manager.startByName.bind(context.manager);
+		let handleDisposeSpy: { mockRestore(): void } | undefined;
+		const startSpy = vi.spyOn(context.manager, "startByName").mockImplementation(async (...args) => {
+			const handle = await startByName(...args);
+			const dispose = handle.dispose.bind(handle);
+			handleDisposeSpy = vi.spyOn(handle, "dispose").mockImplementation(async () => {
+				await dispose();
+				throw cleanupError;
+			});
+			return handle;
+		});
+		const abortController = new AbortController();
+		abortController.abort();
+
+		try {
+			const error = await context.manager
+				.resumeDelegation("sa_abort_cleanup", { signal: abortController.signal })
+				.catch((thrown: unknown) => thrown);
+
+			expect(error).toBeInstanceOf(AggregateError);
+			if (!(error instanceof AggregateError)) throw new Error("expected aggregate resume cleanup failure");
+			expect(error.message).toBe("Subagent resume failed and cleanup did not complete");
+			expect(error.errors).toEqual([expect.objectContaining({ message: "Operation aborted" }), cleanupError]);
+			expect(context.manager.listDelegations()).toContainEqual(
+				expect.objectContaining({ id: "sa_abort_cleanup", status: "aborted", hydrated: true }),
+			);
+		} finally {
+			handleDisposeSpy?.mockRestore();
+			startSpy.mockRestore();
+			await context.cleanup();
+			await parent.closePersistence();
+		}
+	});
+
 	it("resume is refused when child delegation policy denies a fresh start", async () => {
 		const sessionDir = mkdtempSync(join(tmpdir(), "issue-129-policy-"));
 		const interrupted = await SessionManager.create(tmpdir(), sessionDir);

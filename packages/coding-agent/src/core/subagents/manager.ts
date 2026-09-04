@@ -1038,6 +1038,8 @@ export class SubagentManager {
 			void handle.abort().catch(() => undefined);
 		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
+		let resumeError: unknown;
+		let hasResumeError = false;
 		try {
 			// An abort that landed while the runtime was being prepared no-ops
 			// against the idle session; honor it before spending a turn.
@@ -1054,12 +1056,24 @@ export class SubagentManager {
 			// and surface the real cause instead of an unknown-id follow error.
 			if (this.getRegistry().get(subagentId) === undefined) {
 				claim.rollback();
-				throw error;
+				resumeError = error;
+				hasResumeError = true;
 			}
-		} finally {
-			options.signal?.removeEventListener("abort", onAbort);
-			await handle.dispose().catch(() => undefined);
 		}
+		options.signal?.removeEventListener("abort", onAbort);
+		let disposeError: unknown;
+		let hasDisposeError = false;
+		try {
+			await handle.dispose();
+		} catch (error) {
+			disposeError = error;
+			hasDisposeError = true;
+		}
+		if (hasResumeError && hasDisposeError) {
+			throw new AggregateError([resumeError, disposeError], "Subagent resume failed and cleanup did not complete");
+		}
+		if (hasResumeError) throw resumeError;
+		if (hasDisposeError) throw disposeError;
 		return this.followDelegation(subagentId, options);
 	}
 

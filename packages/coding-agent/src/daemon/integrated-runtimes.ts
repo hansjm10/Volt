@@ -262,7 +262,8 @@ function assertAttachAdmissionOpen(signal: AbortSignal | undefined): void {
  * Observe an uncancellable external operation without letting it retain daemon
  * admission after shutdown. A late successful resource result is handed to an
  * explicit disposer so cancellation cannot turn eventual settlement into a
- * leaked runtime.
+ * leaked runtime. The disposer owns reporting because the cancellation caller
+ * has already settled before a late result exists.
  */
 function waitForAttachAdmission<T>(
 	operation: Promise<T>,
@@ -606,7 +607,21 @@ export class IntegratedRuntimeRegistry {
 				projectTrusted,
 			});
 			const runtimeResult = await waitForAttachAdmission(runtimeOperation, options.signal, async (lateResult) => {
-				await cleanupUncommittedRuntime(lateResult.runtime);
+				try {
+					await cleanupUncommittedRuntime(lateResult.runtime);
+				} catch (error) {
+					await this.logAudit({
+						type: "runtime_start_cleanup_failed",
+						clientNodeId: authorization.client.nodeId,
+						workspace: authorization.workspace.name,
+						success: false,
+						error: error instanceof Error ? error.message : String(error),
+						details: {
+							reason: "attach_cancelled",
+							sessionId: lateResult.sessionSelection.sessionId,
+						},
+					});
+				}
 			});
 			runtime = runtimeResult.runtime;
 			sessionSelection = runtimeResult.sessionSelection;

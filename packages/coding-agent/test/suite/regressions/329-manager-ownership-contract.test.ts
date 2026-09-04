@@ -1,6 +1,7 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as startupUi from "../../../src/cli/startup-ui.ts";
 import { ENV_AGENT_DIR, ENV_SESSION_DIR } from "../../../src/config.ts";
 import { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
 import { GitContextProvider } from "../../../src/core/git-context-provider.ts";
@@ -10,7 +11,7 @@ import { McpMetadataCache } from "../../../src/core/mcp/metadata-cache.ts";
 import { McpOutputStore } from "../../../src/core/mcp/output-store.ts";
 import { restoreStdout } from "../../../src/core/output-guard.ts";
 import { createAgentSession } from "../../../src/core/sdk.ts";
-import { SessionManager } from "../../../src/core/session-manager.ts";
+import { getDefaultSessionDirPath, SessionManager } from "../../../src/core/session-manager.ts";
 import { SettingsManager } from "../../../src/core/settings-manager.ts";
 import { SubagentManager } from "../../../src/core/subagents/index.ts";
 import { stopThemeWatcher } from "../../../src/core/theme/runtime.ts";
@@ -45,6 +46,14 @@ async function isPersistenceClosed(manager: SessionManager): Promise<boolean> {
 	} catch {
 		return true;
 	}
+}
+
+function createDeferred(): { promise: Promise<void>; resolve(): void } {
+	let resolve = (): void => undefined;
+	const promise = new Promise<void>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
 }
 
 describe("PR #329 manager ownership contract", () => {
@@ -128,6 +137,146 @@ describe("PR #329 manager ownership contract", () => {
 			"faux-key",
 		];
 	}
+
+	async function seedMissingCwdSession(id: string): Promise<{
+		fallbackCwd: string;
+		ref: NonNullable<ReturnType<SessionManager["getSessionRef"]>>;
+		sessionDir: string;
+	}> {
+		const fallbackCwd = process.cwd();
+		const missingCwd = join(harness.tempDir, `${id}-missing-cwd`);
+		mkdirSync(missingCwd, { recursive: true });
+		delete process.env[ENV_SESSION_DIR];
+		const sessionDir = getDefaultSessionDirPath(fallbackCwd);
+		const manager = await SessionManager.create(missingCwd, sessionDir, { id });
+		manager.appendMessage({ role: "user", content: "missing cwd seed", timestamp: Date.now() });
+		await manager.flush();
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted missing-cwd session reference");
+		await manager.closePersistence();
+		rmSync(missingCwd, { recursive: true, force: true });
+		return { fallbackCwd, ref, sessionDir };
+	}
+
+	it("closes and retains a continued manager when missing-cwd selection is cancelled", async () => {
+		const args = prepareCli("interactive");
+		const seeded = await seedMissingCwdSession("cancelled-missing-cwd");
+		const continueRecent = SessionManager.continueRecent.bind(SessionManager);
+		const closePersistence = SessionManager.prototype.closePersistence;
+		let selectedManager: SessionManager | undefined;
+		let closeCalls = 0;
+		const continueSpy = vi.spyOn(SessionManager, "continueRecent").mockImplementation(async (...callArgs) => {
+			selectedManager = await continueRecent(...callArgs);
+			return selectedManager;
+		});
+		const closeSpy = vi.spyOn(SessionManager.prototype, "closePersistence").mockImplementation(function (
+			this: SessionManager,
+		): Promise<void> {
+			if (this === selectedManager) closeCalls++;
+			return closePersistence.call(this);
+		});
+		const selectorSpy = vi.spyOn(startupUi, "showStartupSelector").mockResolvedValue(undefined);
+
+		try {
+			await main([...args, "--continue"]);
+			expect(selectorSpy).toHaveBeenCalledOnce();
+			expect(process.exitCode).toBe(0);
+			expect(selectedManager).toBeDefined();
+			expect(closeCalls).toBe(1);
+			if (!selectedManager) throw new Error("Expected the continued missing-cwd manager");
+			expect(await isPersistenceClosed(selectedManager)).toBe(true);
+			expect(await SessionManager.findForResume(seeded.sessionDir, seeded.ref.sessionId)).toEqual(seeded.ref);
+		} finally {
+			selectorSpy.mockRestore();
+			continueSpy.mockRestore();
+			closeSpy.mockRestore();
+			if (selectedManager && !(await isPersistenceClosed(selectedManager))) {
+				await closePersistence.call(selectedManager);
+			}
+		}
+	});
+
+	it("closes the original missing-cwd manager before using its replacement", async () => {
+		const args = prepareCli("interactive");
+		const seeded = await seedMissingCwdSession("replaced-missing-cwd");
+		const initializationError = new Error("injected post-replacement initialization failure");
+		const originalCloseGate = createDeferred();
+		const originalCloseStarted = createDeferred();
+		const continueRecent = SessionManager.continueRecent.bind(SessionManager);
+		const open = SessionManager.open.bind(SessionManager);
+		const closePersistence = SessionManager.prototype.closePersistence;
+		const flush = SessionManager.prototype.flush;
+		let originalManager: SessionManager | undefined;
+		let replacementManager: SessionManager | undefined;
+		let originalCloseFinished = false;
+		let replacementUsedBeforeOriginalClose = false;
+		let originalCloseCalls = 0;
+		let replacementCloseCalls = 0;
+		const continueSpy = vi.spyOn(SessionManager, "continueRecent").mockImplementation(async (...callArgs) => {
+			originalManager = await continueRecent(...callArgs);
+			return originalManager;
+		});
+		const openSpy = vi.spyOn(SessionManager, "open").mockImplementation(async (...callArgs) => {
+			const manager = await open(...callArgs);
+			if (callArgs[0].sessionId === seeded.ref.sessionId && callArgs[1] === seeded.fallbackCwd) {
+				replacementManager = manager;
+			}
+			return manager;
+		});
+		const closeSpy = vi.spyOn(SessionManager.prototype, "closePersistence").mockImplementation(async function (
+			this: SessionManager,
+		): Promise<void> {
+			if (this === originalManager) {
+				originalCloseCalls++;
+				originalCloseStarted.resolve();
+				await originalCloseGate.promise;
+				await closePersistence.call(this);
+				originalCloseFinished = true;
+				return;
+			}
+			if (this === replacementManager) replacementCloseCalls++;
+			await closePersistence.call(this);
+		});
+		const flushSpy = vi.spyOn(SessionManager.prototype, "flush").mockImplementation(function (
+			this: SessionManager,
+		): Promise<void> {
+			if (this === replacementManager && !originalCloseFinished) replacementUsedBeforeOriginalClose = true;
+			return flush.call(this);
+		});
+		const selectorSpy = vi.spyOn(startupUi, "showStartupSelector").mockResolvedValue(seeded.fallbackCwd as never);
+		const initSpy = vi.spyOn(InteractiveMode.prototype, "init").mockRejectedValue(initializationError);
+		const running = main([...args, "--continue"]).catch((error: unknown) => error);
+
+		try {
+			await originalCloseStarted.promise;
+			expect(originalManager).toBeDefined();
+			expect(replacementManager).toBeDefined();
+			expect(replacementUsedBeforeOriginalClose).toBe(false);
+			originalCloseGate.resolve();
+			const thrown = await running;
+			expect(thrown).toBe(initializationError);
+			expect(originalCloseFinished).toBe(true);
+			expect(originalCloseCalls).toBe(1);
+			expect(replacementUsedBeforeOriginalClose).toBe(false);
+			expect(replacementCloseCalls).toBe(1);
+			expect(replacementManager?.getCwd()).toBe(seeded.fallbackCwd);
+			expect(await SessionManager.findForResume(seeded.sessionDir, seeded.ref.sessionId)).toEqual(seeded.ref);
+		} finally {
+			originalCloseGate.resolve();
+			selectorSpy.mockRestore();
+			initSpy.mockRestore();
+			continueSpy.mockRestore();
+			openSpy.mockRestore();
+			closeSpy.mockRestore();
+			flushSpy.mockRestore();
+			if (originalManager && !(await isPersistenceClosed(originalManager))) {
+				await closePersistence.call(originalManager);
+			}
+			if (replacementManager && !(await isPersistenceClosed(replacementManager))) {
+				await closePersistence.call(replacementManager);
+			}
+		}
+	});
 
 	it("disposes the transferred CLI runtime exactly once when interactive initialization rejects", async () => {
 		const initializationError = new Error("injected interactive initialization failure");

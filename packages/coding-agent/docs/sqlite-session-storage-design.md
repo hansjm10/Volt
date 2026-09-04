@@ -132,7 +132,7 @@ Rules:
 4. Once an `AgentSession` exists, that session is the sole persistence finalizer. Any still-untransferred service resource remains owned by the factory until attached or cleaned.
 5. Later setup failure disposes the session and separately cleans only resources that were never transferred; it never separately closes the session's manager.
 6. Close is idempotent, but idempotence is not permission to create multiple logical finalizers or discard cleanup errors.
-7. Setup errors and all close/dispose errors are preserved together in `AggregateError`.
+7. Setup errors and all close/dispose errors that settle while the caller remains pending are preserved together in `AggregateError`. When attach cancellation returns before an uncancellable factory later produces a runtime, a failure disposing that late runtime is instead recorded as a failed `runtime_start_cleanup_failed` audit event because the cancellation caller has already settled.
 8. No construction finalizer invokes session deletion.
 9. Static/transient readers continue using scoped `try/finally` close and never transfer ownership to a runtime.
 
@@ -538,7 +538,7 @@ Required result:
 - CLI reacquisition closes the superseded manager;
 - remote selection kind no longer selects close versus delete;
 - failed created rows remain exact-openable/hidden according to their content;
-- original and cleanup errors remain observable.
+- original and cleanup errors remain observable, including an audited failure when a cancelled attach's runtime materializes only after its caller has settled.
 
 ### Phase 2: canonical entry codec
 
@@ -610,8 +610,8 @@ Cover:
 - CLI missing-cwd cancel and manager replacement;
 - runtime new/resume/fork/import failure at pre- and post-session boundaries;
 - remote created/resumed setup failure without selection-based deletion;
-- late remote cleanup retaining the row;
-- public subagent handle return and first-prompt failure;
+- late remote cleanup retaining the row and auditing any detached disposal failure;
+- public subagent handle return, first-prompt failure, and resumed-handle disposal failure;
 - close/dispose failure aggregation;
 - explicit delete remaining generation/revision conditional.
 
