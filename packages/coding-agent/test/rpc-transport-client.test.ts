@@ -47,6 +47,7 @@ import type { Skill } from "../src/core/skills.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import { createInProcessRpcClient } from "../src/modes/rpc/in-process-rpc-client.ts";
 import { createIrohRemoteCloseDeferringRpcTransport } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
+import { RpcClientBase } from "../src/modes/rpc/rpc-client-base.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { RpcTransportClient } from "../src/modes/rpc/rpc-transport-client.ts";
 import { createTestModel } from "./iroh-stream-doubles.ts";
@@ -2324,6 +2325,51 @@ describe("createInProcessRpcClient", () => {
 
 		await expect(createInProcessRpcClient(runtimeHost)).rejects.toBe(bindError);
 		expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	test("finalizes an owned runtime when client construction fails and preserves finalizer errors", async () => {
+		const constructionError = new Error("injected loopback client construction failure");
+		const finalizerError = new Error("injected runtime finalizer failure");
+		const dispose = vi.fn(async () => {
+			throw finalizerError;
+		});
+		const onEventSpy = vi.spyOn(RpcClientBase.prototype, "onEvent").mockImplementationOnce(() => {
+			throw constructionError;
+		});
+
+		try {
+			const thrown = await createInProcessRpcClient(createRuntimeHost(dispose), {
+				disposeRuntimeOnClose: true,
+				onEvent: () => undefined,
+			}).catch((error: unknown) => error);
+
+			expect(thrown).toBeInstanceOf(AggregateError);
+			if (!(thrown instanceof AggregateError)) throw new Error("expected aggregate construction cleanup failure");
+			expect(thrown.errors).toEqual([constructionError, finalizerError]);
+			expect(dispose).toHaveBeenCalledOnce();
+		} finally {
+			onEventSpy.mockRestore();
+		}
+	});
+
+	test("leaves caller-owned runtimes untouched when client construction fails", async () => {
+		const constructionError = new Error("injected loopback client construction failure");
+		const dispose = vi.fn(async () => {});
+		const onEventSpy = vi.spyOn(RpcClientBase.prototype, "onEvent").mockImplementationOnce(() => {
+			throw constructionError;
+		});
+
+		try {
+			await expect(
+				createInProcessRpcClient(createRuntimeHost(dispose), {
+					disposeRuntimeOnClose: false,
+					onEvent: () => undefined,
+				}),
+			).rejects.toBe(constructionError);
+			expect(dispose).not.toHaveBeenCalled();
+		} finally {
+			onEventSpy.mockRestore();
+		}
 	});
 });
 

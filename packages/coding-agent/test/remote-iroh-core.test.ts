@@ -4600,26 +4600,51 @@ describe("Iroh remote core helpers", () => {
 		});
 	});
 
-	test("omits session directories independently of session reference wrapper keys", () => {
-		const sessionDirectory = "/Users/jordan/.volt/agent/sessions/project";
+	test("omits host-local SQLite locator fields independently of session reference wrapper keys", () => {
 		const sessionReference = {
-			sessionDirectory,
+			sessionDirectory: "/Users/jordan/.volt/agent/sessions/project",
 			storeId: "store",
 			sessionId: "session",
 			sessionGeneration: "generation",
+			parentSessionDirectory: "/Users/jordan/.volt/agent/sessions/parent",
+			parentStoreId: "parent-store",
+			parentSessionId: "parent-session",
+			parentSessionGeneration: "parent-generation",
 		};
-		const expectedReference = {
-			storeId: "store",
-			sessionId: "session",
-			sessionGeneration: "generation",
+		const publicPayload = {
+			id: "public-record",
+			requestId: "request",
+			worktreeId: "worktree",
+			status: "completed",
 		};
 		const options = { workspacePath: "/Users/jordan/project" };
+		const values = [
+			sessionReference,
+			{ ...publicPayload, ref: sessionReference },
+			{ ...publicPayload, references: [sessionReference] },
+		];
 
-		expect(sanitizeIrohRemoteOutbound(sessionReference, options)).toEqual(expectedReference);
-		expect(sanitizeIrohRemoteOutbound({ ref: sessionReference }, options)).toEqual({ ref: expectedReference });
-		expect(sanitizeIrohRemoteOutbound({ references: [sessionReference] }, options)).toEqual({
-			references: [expectedReference],
-		});
+		for (const [index, value] of values.entries()) {
+			const sanitized = sanitizeIrohRemoteOutbound(value, options);
+			if (index > 0) expect(sanitized).toMatchObject(publicPayload);
+			const wire = JSON.stringify(sanitized);
+			for (const forbidden of [
+				"sessionDirectory",
+				sessionReference.sessionDirectory,
+				"storeId",
+				sessionReference.storeId,
+				"sessionGeneration",
+				sessionReference.sessionGeneration,
+				"parentSessionDirectory",
+				sessionReference.parentSessionDirectory,
+				"parentStoreId",
+				sessionReference.parentStoreId,
+				"parentSessionGeneration",
+				sessionReference.parentSessionGeneration,
+			]) {
+				expect(wire).not.toContain(forbidden);
+			}
+		}
 	});
 
 	test("sanitizes remote outbound structured paths and preserves free-form text", () => {

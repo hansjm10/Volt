@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { isBundledCli, isStandaloneBinary } from "../../config.ts";
@@ -313,6 +314,35 @@ function evictSharedClient(client: SQLiteSessionStoreClient): void {
 	if (entry?.client === client) sharedStores.delete(client.sessionDirectory);
 }
 
+function physicalStoreDirectory(sessionDirectory: string): string {
+	const resolvedDirectory = resolve(sessionDirectory);
+	try {
+		const stat = lstatSync(resolvedDirectory);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) {
+			throw new Error(`Refusing to use non-directory private path: ${resolvedDirectory}`);
+		}
+		return realpathSync(resolvedDirectory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+
+	const missingNames: string[] = [];
+	let existingAncestor = resolvedDirectory;
+	while (true) {
+		try {
+			lstatSync(existingAncestor);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const parent = dirname(existingAncestor);
+			if (parent === existingAncestor) throw error;
+			missingNames.unshift(basename(existingAncestor));
+			existingAncestor = parent;
+		}
+	}
+	return resolve(realpathSync(existingAncestor), ...missingNames);
+}
+
 function createSharedStoreEntry(resolvedDirectory: string): SharedStoreEntry {
 	let entry: SharedStoreEntry;
 	const promise = SQLiteSessionStoreClient.open(resolvedDirectory)
@@ -342,7 +372,7 @@ async function releaseSharedStoreEntry(resolvedDirectory: string, entry: SharedS
 }
 
 export async function acquireSharedSQLiteSessionStore(sessionDirectory: string): Promise<SQLiteSessionStoreLease> {
-	const resolvedDirectory = resolve(sessionDirectory);
+	const resolvedDirectory = physicalStoreDirectory(sessionDirectory);
 	let entry = sharedStores.get(resolvedDirectory);
 	if (!entry) {
 		entry = createSharedStoreEntry(resolvedDirectory);

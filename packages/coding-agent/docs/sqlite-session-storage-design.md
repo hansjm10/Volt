@@ -41,7 +41,7 @@ Removing automatic deletion collapses the dangerous lifecycle problem:
 - cancellation no longer needs a new cross-system publication state merely to decide whether deletion is safe;
 - created and opened managers have the same failure cleanup: close the manager and preserve the row.
 
-The remaining ownership problem is resource finalization, not row adoption. Existing owners should retain their current domains rather than being wrapped by another long-lived owner.
+The remaining ownership problem is resource finalization, not row adoption. The implementation leaves existing owners in their established domains rather than wrapping them with another long-lived owner.
 
 ## 3. Scope
 
@@ -55,7 +55,7 @@ The remaining ownership problem is resource finalization, not row adoption. Exis
 6. Detect projection drift when opening a selected session without replaying every session during listing.
 7. Preserve current search matching and ranking while bounding worker accumulation to one session document.
 8. Keep JSONL as strict explicit interchange only.
-9. Provide observable acceptance criteria for a separate implementation plan.
+9. Preserve observable acceptance criteria for the implemented contract.
 
 ### 3.2 Non-goals
 
@@ -72,7 +72,7 @@ This RFC does not add or require:
 - changes to remote/mobile wire shapes or iOS code;
 - live JSONL migration or SQLite backward compatibility;
 - replacement of existing delivery, runtime, conversation, lease, workspace, worktree, or subagent ownership;
-- implementation under this document-only revision.
+- implementation of any deferred design in §11 as part of #329.
 
 ### 3.3 Preserved core design
 
@@ -136,7 +136,7 @@ Rules:
 8. No construction finalizer invokes session deletion.
 9. Static/transient readers continue using scoped `try/finally` close and never transfer ownership to a runtime.
 
-This is a deliberate SDK ownership clarification. The public function signatures remain unchanged, but later SDK documentation must state that passing a manager transfers ownership immediately. A caller that needs another live manager opens a separate one.
+This is a deliberate SDK ownership clarification. The public function signatures remain unchanged. SDK documentation records—and must continue to state—that passing a manager transfers ownership immediately. A caller that needs another live manager opens a separate one.
 
 ### 4.3 Flow-specific ownership
 
@@ -154,14 +154,14 @@ This is a deliberate SDK ownership clarification. The public function signatures
 
 ### 4.4 CLI acquisition requirements
 
-`main.ts` currently has exits and manager replacement after acquisition. The implementation must:
+`main.ts` implements these acquisition requirements:
 
-1. validate synchronous flags and `--name` syntax before acquiring a manager;
-2. install one top-level finalizer immediately after acquisition;
-3. avoid direct `process.exit()` while that scope owns an unsettled manager;
-4. resolve missing-cwd choice before final runtime transfer;
-5. when reacquisition is unavoidable, close the first manager before assignment of the replacement;
-6. preserve the committed row even when startup is cancelled or runtime creation fails.
+1. synchronous flags and `--name` syntax are validated before acquiring a manager;
+2. one top-level finalizer is installed immediately after acquisition;
+3. direct `process.exit()` is not used while that scope owns an unsettled manager;
+4. missing-cwd choice is resolved before final runtime transfer;
+5. when reacquisition is unavoidable, the first manager is closed before assignment of the replacement;
+6. the committed row is preserved even when startup is cancelled or runtime creation fails.
 
 No created/opened classification is required because both outcomes close and retain the row.
 
@@ -200,7 +200,7 @@ timestamp
 is_host_only
 ```
 
-The write protocol should carry one canonical entry value rather than independently caller-selected envelope fields. The worker derives indexed columns from the validated entry.
+The write protocol carries one canonical entry value rather than independently caller-selected envelope fields. The worker derives indexed columns from the validated entry.
 
 On load:
 
@@ -263,7 +263,7 @@ Snapshot import:
 
 Snapshot export reconstructs the current full public entry envelope, removes transport-owned identities, excludes host-only state, and appends one final leaf record.
 
-A failed import after a row has committed closes the manager and retains the row. Up-front validation and a single initial transaction should minimize that case; automatic deletion is still forbidden.
+A failed import after a row has committed closes the manager and retains the row. Up-front validation and a single initial transaction minimize that case; automatic deletion is still forbidden.
 
 ## 6. Materialized projection contract
 
@@ -291,7 +291,7 @@ The resulting schema contains only `store_metadata`, `sessions`, `entries`, `cli
 
 ### 6.2 One reducer
 
-The implementation introduces one composed derived-state reducer. Illustrative shape:
+The implementation uses one composed derived-state reducer. Illustrative shape:
 
 ```ts
 interface SessionDerivedState {
@@ -413,9 +413,9 @@ Summary strings such as `name`, `first_message`, and cwd contribute to `M`. The 
 
 ### 7.2 One-session accumulation
 
-The current worker loads every matching store chunk row with `.all()`, retains a `chunksBySession` map, then joins each session document.
+Before #329, the worker loaded every matching store chunk row with `.all()`, retained a `chunksBySession` map, then joined each session document.
 
-The target implementation:
+The implemented worker:
 
 1. obtains candidate summaries;
 2. iterates eligible chunks ordered by session and chunk index;
@@ -464,7 +464,7 @@ FTS belongs in a later query-language design, not #329.
 
 ### 7.5 Benchmark dimensions
 
-The repository benchmark should report independently:
+The repository benchmark contract requires these dimensions to be reported independently:
 
 1. session count;
 2. store count;
@@ -511,9 +511,9 @@ Storage terminology amendments:
 - Remote errors caused by entry/projection integrity failures expose stable bounded messages, not raw payloads, client input, provider data, or new host paths.
 - Explicit local JSONL interchange may carry the documented local parent locator; this does not widen remote behavior.
 
-## 9. Implementation phases for a separate plan
+## 9. Implementation record
 
-This section is an implementation handoff, not authorization.
+The implementation was delivered in the following five phases. Their required results remain normative.
 
 ### Phase 1: manager ownership and fail-preserve cleanup
 
@@ -542,7 +542,7 @@ Required result:
 
 Primary files:
 
-- new internal session-entry codec/schema module;
+- `src/core/session-entry-codec.ts`;
 - `src/core/session-manager.ts`;
 - `src/core/session-store/{types,protocol,worker}.ts`;
 - JSONL import/export paths.
@@ -559,7 +559,7 @@ Required result:
 
 Primary files:
 
-- new `src/core/session-store/projection.ts` or equivalent;
+- `src/core/session-store/projection.ts`;
 - `src/core/session-manager.ts`;
 - `src/core/session-store/{schema,types,protocol,worker}.ts`;
 - projection/store tests.
@@ -579,7 +579,7 @@ Primary files:
 
 - `src/core/session-store/worker.ts`;
 - session search/selector tests;
-- `benchmarks/session-listing.ts` or a renamed benchmark;
+- `benchmarks/session-listing.ts`;
 - README, usage/session/SDK docs, PR description, and primary SQLite changeset.
 
 Required result:
@@ -592,7 +592,7 @@ Required result:
 
 ### Phase 5: integrated acceptance
 
-Run modified focused tests, then `./test.sh` and `npm run check` under repository rules. Build/package smoke testing requires separate explicit authorization.
+The continuing verification requirement is to run modified focused tests, then `./test.sh` and `npm run check` under repository rules. Build/package smoke testing requires separate explicit authorization.
 
 ## 10. Verification contract
 
@@ -668,7 +668,7 @@ Regex tests verify parity and bounded test fixtures, not a false general latency
 
 ### 10.5 Completion definition
 
-#329's corrective implementation is complete only when:
+#329's corrective implementation is complete only while all of these conditions remain true:
 
 - no setup cleanup automatically deletes a committed session;
 - each transferred manager has one finalizer;
@@ -754,9 +754,9 @@ Rejected. Existing fuzzy, cross-chunk phrase, and regex semantics still require 
 
 Rejected. The manager ownership rule concerns close responsibility only. Delivery, runtime, conversation, lease, worktree, and subagent owners remain authoritative in their existing domains.
 
-## 13. Decisions requiring acceptance
+## 13. Accepted decisions
 
-Before an implementation plan, reviewers should accept or revise these eight decisions:
+Reviewers accepted these eight decisions:
 
 1. A committed session row is immediately adopted and setup cleanup never deletes it.
 2. Passing a manager to a high-level session/runtime/subagent factory consumes ownership at invocation.
@@ -767,4 +767,4 @@ Before an implementation plan, reviewers should accept or revise these eight dec
 7. Preserve search semantics, bound accumulation to one session, state query-dependent cost honestly, and do not add FTS.
 8. Defer durable preparation, crash reclaim, universal setup overlays, host-wide incarnation propagation, and new cross-system ownership state machines.
 
-These decisions are accepted. Implementation has not started and requires a separate approved plan.
+These decisions are accepted and implemented. Changing them requires a follow-up RFC.

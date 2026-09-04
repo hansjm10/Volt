@@ -75,9 +75,9 @@ function cloneStartingGitContext(value: RpcGitContext | null | undefined): RpcGi
 	return value === undefined ? undefined : cloneCanonicalData(value, "Session starting Git context projection");
 }
 
-export function createSessionDerivedState(header: SessionHeader): SessionDerivedState {
+function createEmptySessionDerivedState(headerTimestamp: string): SessionDerivedState {
 	return {
-		headerTimestamp: header.timestamp,
+		headerTimestamp,
 		messageSummary: createSessionMessageSummaryAccumulator(),
 		hasPlanningState: false,
 		name: undefined,
@@ -94,6 +94,73 @@ export function createSessionDerivedState(header: SessionHeader): SessionDerived
 		nextSearchChunkIndex: 0,
 		canonicalRevision: 0,
 	};
+}
+
+export function createSessionDerivedState(header: SessionHeader): SessionDerivedState {
+	return createEmptySessionDerivedState(header.timestamp);
+}
+
+function clientInputRecordFromWrite(write: SessionStoreClientInputWrite): ClientInputRecord {
+	const input = normalizeClientInputPayload(write.command, write.input);
+	if (!isDeepStrictEqual(input, write.input)) {
+		throw new Error(`Client input ${JSON.stringify(write.clientMessageId)} has a noncanonical input projection`);
+	}
+	if ((write.queuedEntryId === null) !== (write.queuedInput === null)) {
+		throw new Error(`Client input ${JSON.stringify(write.clientMessageId)} has incomplete queued state`);
+	}
+	const queuedInput = write.queuedInput === null ? undefined : normalizeClientInputQueuedPayload(write.queuedInput);
+	if (queuedInput !== undefined && !isDeepStrictEqual(queuedInput, write.queuedInput)) {
+		throw new Error(`Client input ${JSON.stringify(write.clientMessageId)} has a noncanonical queued projection`);
+	}
+	const record: ClientInputRecord = {
+		receiptId: write.receiptEntryId,
+		clientMessageId: write.clientMessageId,
+		command: write.command,
+		semanticDigest: write.semanticDigest,
+		input,
+		state: write.state,
+		...(write.queuedEntryId === null ? {} : { queuedEntryId: write.queuedEntryId }),
+		...(queuedInput === undefined ? {} : { queuedInput }),
+		...(write.error === null ? {} : { error: write.error }),
+		...(write.canonicalEntryId === null ? {} : { canonicalEntryId: write.canonicalEntryId }),
+	};
+	if (record.semanticDigest !== digestClientInputPayload(record.command, record.input)) {
+		throw new Error(`Client input ${JSON.stringify(record.clientMessageId)} has a mismatched semantic digest`);
+	}
+	if (record.queuedInput && record.queuedInput.delivery !== expectedClientInputQueuedDelivery(record)) {
+		throw new Error(`Client input ${JSON.stringify(record.clientMessageId)} has conflicting queued state`);
+	}
+	if (
+		(record.state !== "failed" && record.error !== undefined) ||
+		(record.error !== undefined && Array.from(record.error).length > CLIENT_INPUT_ERROR_MAX_SCALARS)
+	) {
+		throw new Error(`Client input ${JSON.stringify(record.clientMessageId)} has invalid terminal state`);
+	}
+	return record;
+}
+
+/**
+ * Rehydrate only the bounded state needed to validate one incremental store
+ * transaction. Historical summary, labels, spawns, and search text are
+ * intentionally omitted; retained summaries are verified on session open.
+ */
+export function createSessionStoreTransactionValidationState(
+	headerTimestamp: string,
+	clientInputs: readonly SessionStoreClientInputWrite[],
+	nextOrdinal: number,
+	nextSearchChunkIndex: number,
+): SessionDerivedState {
+	const state = createEmptySessionDerivedState(headerTimestamp);
+	state.nextOrdinal = nextOrdinal;
+	state.nextSearchChunkIndex = nextSearchChunkIndex;
+	for (const write of clientInputs) {
+		if (state.clientInputsById.has(write.clientMessageId)) {
+			throw new Error(`Client input ${JSON.stringify(write.clientMessageId)} has duplicate projected state`);
+		}
+		state.clientInputsById.set(write.clientMessageId, clientInputRecordFromWrite(write));
+	}
+	assertClientInputProjectionBounds(state.clientInputsById.values());
+	return state;
 }
 
 export function cloneClientInputRecord(record: ClientInputRecord): ClientInputRecord {
@@ -239,6 +306,21 @@ function recoverableQueuedClientInputCount(records: Iterable<ClientInputRecord>)
 		if (record.state === "accepted" && record.queuedInput !== undefined) total++;
 	}
 	return total;
+}
+
+export function assertClientInputProjectionBounds(records: Iterable<ClientInputRecord>): void {
+	const retained = [...records];
+	if (outstandingClientInputCount(retained) > CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES) {
+		throw new Error(`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES}-entry limit`);
+	}
+	if (outstandingClientInputBytes(retained) > CLIENT_INPUT_MAX_OUTSTANDING_BYTES) {
+		throw new Error(
+			`Outstanding client input exceeds the ${CLIENT_INPUT_MAX_OUTSTANDING_BYTES}-byte aggregate limit`,
+		);
+	}
+	if (recoverableQueuedClientInputCount(retained) > CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES) {
+		throw new Error(`Recoverable client input queue exceeds ${CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES} entries`);
+	}
 }
 
 export function assertClientInputOutstandingCount(
@@ -454,6 +536,29 @@ export function sessionStoreProjection(state: SessionDerivedState): SessionStore
 		messageCount: summary.messageCount,
 		firstMessage: summary.firstMessage === "(no messages)" ? "" : summary.firstMessage,
 	};
+}
+
+function compareClientInputWrites(left: SessionStoreClientInputWrite, right: SessionStoreClientInputWrite): number {
+	return left.clientMessageId < right.clientMessageId ? -1 : left.clientMessageId > right.clientMessageId ? 1 : 0;
+}
+
+/** Validate bounded client-input and batch-local search projections through the canonical reducer. */
+export function validateSessionStoreTransactionProjections(
+	state: SessionDerivedState,
+	entries: readonly (SessionEntry & { ordinal: number })[],
+	clientInputs: readonly SessionStoreClientInputWrite[],
+	searchChunks: readonly SessionStoreSearchChunkWrite[],
+): void {
+	for (const entry of entries) applySessionEntry(state, entry);
+	const expectedClientInputs = sessionStoreClientInputsForEntries(state, entries).sort(compareClientInputWrites);
+	const suppliedClientInputs = [...clientInputs].sort(compareClientInputWrites);
+	if (!isDeepStrictEqual(expectedClientInputs, suppliedClientInputs)) {
+		throw new Error("Session transaction client inputs do not match their canonical entries");
+	}
+	const expectedSearchChunks = sessionStoreSearchChunksForEntries(state, entries);
+	if (!isDeepStrictEqual(expectedSearchChunks, searchChunks)) {
+		throw new Error("Session transaction search chunks do not match their canonical entries");
+	}
 }
 
 function clientInputWrite(record: ClientInputRecord): SessionStoreClientInputWrite {

@@ -7,6 +7,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -88,7 +89,7 @@ function emptyPayload(
 ): SessionStoreTransactionPayload {
 	return {
 		session: {
-			updatedAt: UPDATED_AT,
+			updatedAt: CREATED_AT,
 			startingGitContextRecorded: false,
 			startingGitContext: null,
 			name: null,
@@ -123,6 +124,65 @@ function userMessageEntry(
 		ordinal,
 		message: { role: "user", content, timestamp: Date.parse(timestamp) },
 	});
+}
+
+function searchablePayload(
+	texts: readonly string[],
+	options: { readonly updatedAt?: string; readonly name?: string } = {},
+): SessionStoreTransactionPayload {
+	const updatedAt = options.updatedAt ?? UPDATED_AT;
+	const entries: SessionStoreTransactionPayload["entries"][number][] = [];
+	let parentId: string | null = null;
+	if (options.name !== undefined) {
+		parentId = "session-info";
+		entries.push(
+			entryWrite({
+				type: "session_info",
+				id: parentId,
+				parentId: null,
+				timestamp: CREATED_AT,
+				ordinal: 1,
+				name: options.name,
+			}),
+		);
+	}
+	const searchChunks = texts.map((text, chunkIndex) => {
+		const entryId = `message-${chunkIndex + 1}`;
+		entries.push(userMessageEntry(entryId, entries.length + 1, updatedAt, text, parentId));
+		parentId = entryId;
+		return { chunkIndex, entryId, text };
+	});
+	return {
+		session: {
+			updatedAt: texts.length === 0 ? CREATED_AT : updatedAt,
+			startingGitContextRecorded: false,
+			startingGitContext: null,
+			name: options.name ?? null,
+			visible: texts.length > 0,
+			leafId: parentId,
+			messageCount: texts.length,
+			firstMessage: texts[0] ?? "",
+		},
+		entries,
+		clientInputs: [],
+		searchChunks,
+	};
+}
+
+function namedPayload(name: string): SessionStoreTransactionPayload {
+	return {
+		...emptyPayload({ name, leafId: "session-info" }),
+		entries: [
+			entryWrite({
+				type: "session_info",
+				id: "session-info",
+				parentId: null,
+				timestamp: CREATED_AT,
+				ordinal: 1,
+				name,
+			}),
+		],
+	};
 }
 
 function transaction(
@@ -160,6 +220,12 @@ async function addContinuationSession(
 	await client.createHiddenSession(createInput(fixture.id));
 	const entries: Array<SessionStoreTransactionPayload["entries"][number]> = [];
 	const clientInputs: Array<SessionStoreTransactionPayload["clientInputs"][number]> = [];
+	const searchChunks: Array<SessionStoreTransactionPayload["searchChunks"][number]> = [];
+	if (fixture.visible) {
+		const entryId = `visible-${fixture.id}`;
+		entries.push(userMessageEntry(entryId, 1, fixture.updatedAt, fixture.id));
+		searchChunks.push({ chunkIndex: 0, entryId, text: fixture.id });
+	}
 	if (fixture.input) {
 		const clientMessageId = `input-${fixture.id}`;
 		const receiptEntryId = `receipt-${fixture.id}`;
@@ -224,13 +290,15 @@ async function addContinuationSession(
 	}
 	const payload: SessionStoreTransactionPayload = {
 		...emptyPayload({
-			updatedAt: fixture.updatedAt,
+			updatedAt: fixture.visible ? fixture.updatedAt : CREATED_AT,
 			visible: fixture.visible ?? false,
+			leafId: fixture.visible ? `visible-${fixture.id}` : null,
 			messageCount: fixture.visible ? 1 : 0,
 			firstMessage: fixture.visible ? fixture.id : "",
 		}),
 		entries,
 		clientInputs,
+		searchChunks,
 	};
 	const result = await client.applyTransaction(transaction(fixture.id, 0, `commit-${fixture.id}`, payload));
 	if (result.status !== "committed") throw new Error(`Could not seed continuation session ${fixture.id}`);
@@ -581,7 +649,9 @@ describe("SQLite session store", () => {
 		rmSync(sessionDirectory);
 
 		const replacement = await acquireStore(sessionDirectory);
-		expect(replacement.client.info.databasePath).toBe(join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME));
+		expect(replacement.client.info.databasePath).toBe(
+			realpathSync(join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME)),
+		);
 	});
 
 	it("replaces a failed pooled client without letting its release close the new generation", async () => {
@@ -675,11 +745,27 @@ describe("SQLite session store", () => {
 					},
 				}),
 				entryWrite({
-					type: "label",
-					id: "label-1",
+					type: "session_start_git_context",
+					id: "git-context-1",
 					parentId: "message-1",
 					timestamp: UPDATED_AT,
 					ordinal: 4,
+					gitContext: null,
+				}),
+				entryWrite({
+					type: "session_info",
+					id: "session-info-1",
+					parentId: "message-1",
+					timestamp: UPDATED_AT,
+					ordinal: 5,
+					name: "Foundation",
+				}),
+				entryWrite({
+					type: "label",
+					id: "label-1",
+					parentId: "session-info-1",
+					timestamp: UPDATED_AT,
+					ordinal: 6,
 					targetId: "message-1",
 					label: "start",
 				}),
@@ -688,7 +774,7 @@ describe("SQLite session store", () => {
 					id: "spawn-1",
 					parentId: "label-1",
 					timestamp: UPDATED_AT,
-					ordinal: 5,
+					ordinal: 7,
 					toolCallId: "tool-1",
 					subagentId: "subagent-1",
 					agent: "general-purpose",
@@ -739,8 +825,10 @@ describe("SQLite session store", () => {
 			["receipt-1", 1],
 			["state-1", 2],
 			["message-1", 3],
-			["label-1", 4],
-			["spawn-1", 5],
+			["git-context-1", 4],
+			["session-info-1", 5],
+			["label-1", 6],
+			["spawn-1", 7],
 		]);
 		expect(snapshot?.entries[2]?.payload).toEqual({
 			type: "message",
@@ -755,9 +843,9 @@ describe("SQLite session store", () => {
 				timestamp: Date.parse(UPDATED_AT),
 			},
 		});
-		expect(snapshot?.entries[3]?.payload).toMatchObject({ targetId: "message-1", label: "start" });
+		expect(snapshot?.entries[5]?.payload).toMatchObject({ targetId: "message-1", label: "start" });
 		expect(snapshot?.clientInputs[0]).toMatchObject({ clientMessageId: "client-1", state: "completed" });
-		expect(snapshot?.entries[4]?.payload).toMatchObject({
+		expect(snapshot?.entries[6]?.payload).toMatchObject({
 			requestKey: "request-1",
 			childSessionId: "child-1",
 			childSessionRef: { storeId: "child-store-1" },
@@ -996,17 +1084,8 @@ describe("SQLite session store", () => {
 		const client = await openStore();
 		await client.createHiddenSession(createInput("matching"));
 		await client.createHiddenSession(createInput("other"));
-		const matchingPayload = {
-			...emptyPayload({ visible: true, name: "Matching session" }),
-			searchChunks: [
-				{ chunkIndex: 0, entryId: null, text: "hello" },
-				{ chunkIndex: 1, entryId: null, text: "sqlite" },
-			],
-		};
-		const otherPayload = {
-			...emptyPayload({ visible: true, name: "Other session" }),
-			searchChunks: [{ chunkIndex: 0, entryId: null, text: "unrelated content" }],
-		};
+		const matchingPayload = searchablePayload(["hello", "sqlite"], { name: "Matching session" });
+		const otherPayload = searchablePayload(["unrelated content"], { name: "Other session" });
 		await client.applyTransaction(transaction("matching", 0, "commit-matching", matchingPayload));
 		await client.applyTransaction(transaction("other", 0, "commit-other", otherPayload));
 
@@ -1028,14 +1107,10 @@ describe("SQLite session store", () => {
 		];
 		for (const document of documents) {
 			await client.createHiddenSession(createInput(document.id));
-			const payload = {
-				...emptyPayload({
-					updatedAt: document.updatedAt,
-					visible: true,
-					name: document.name ?? null,
-				}),
-				searchChunks: document.chunks.map((text, chunkIndex) => ({ chunkIndex, entryId: null, text })),
-			};
+			const payload = searchablePayload(document.chunks, {
+				updatedAt: document.updatedAt,
+				...(document.name === undefined ? {} : { name: document.name }),
+			});
 			await client.applyTransaction(transaction(document.id, 0, `commit-${document.id}`, payload));
 		}
 		const sessions: SessionInfo[] = documents.map((document) => ({
@@ -1084,10 +1159,7 @@ describe("SQLite session store", () => {
 		const client = await openStore();
 		const addMatch = async (id: string, updatedAt: string, text: string): Promise<void> => {
 			await client.createHiddenSession(createInput(id));
-			const payload = {
-				...emptyPayload({ updatedAt, visible: true, firstMessage: "summary only" }),
-				searchChunks: [{ chunkIndex: 0, entryId: null, text }],
-			};
+			const payload = searchablePayload([text], { updatedAt });
 			await client.applyTransaction(transaction(id, 0, `commit-${id}`, payload));
 		};
 
@@ -1109,7 +1181,7 @@ describe("SQLite session store", () => {
 	it("rejects stale revisions without changing session state", async () => {
 		const client = await openStore();
 		await client.createHiddenSession(createInput());
-		const firstPayload = emptyPayload({ name: "winner" });
+		const firstPayload = namedPayload("winner");
 		await client.applyTransaction(transaction("session-1", 0, "commit-winner", firstPayload));
 
 		const stalePayload = emptyPayload({ name: "stale", updatedAt: "2026-08-31T12:02:00.000Z" });
@@ -1130,7 +1202,7 @@ describe("SQLite session store", () => {
 		const replacementGeneration = "generation:reused-session:2";
 
 		await staleClient.createHiddenSession(createInput(sessionId, staleGeneration));
-		const staleRequest = transaction(sessionId, 0, "old-commit", emptyPayload({ name: "old" }));
+		const staleRequest = transaction(sessionId, 0, "old-commit", namedPayload("old"));
 		expect((await staleClient.applyTransaction(staleRequest)).status).toBe("committed");
 		expect(
 			await replacingClient.deleteSession({
@@ -1197,10 +1269,11 @@ describe("SQLite session store", () => {
 					const entryId = `entry-${revision + 1}`;
 					const payload: SessionStoreTransactionPayload = {
 						...emptyPayload({
+							updatedAt: UPDATED_AT,
 							visible: true,
 							leafId: entryId,
 							messageCount: revision + 1,
-							firstMessage: "snapshot",
+							firstMessage: "entry-1",
 						}),
 						entries: [userMessageEntry(entryId, revision + 1, UPDATED_AT, entryId)],
 						searchChunks: [{ chunkIndex: revision, entryId, text: entryId }],

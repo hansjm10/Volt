@@ -15,6 +15,8 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	runtimeDisposePromise: Promise<void> | undefined;
+	disposeRuntimeHost: () => Promise<void>;
 	flushStdout: () => Promise<void>;
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
@@ -28,6 +30,7 @@ type ShutdownThis = {
 };
 
 type InteractiveModePrototypeWithShutdown = {
+	disposeRuntimeHost(this: ShutdownThis): Promise<void>;
 	flushStdout(this: ShutdownThis): Promise<void>;
 	shutdown(this: ShutdownThis, options?: { fromSignal?: boolean }): Promise<void>;
 };
@@ -69,6 +72,8 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
+		runtimeDisposePromise: undefined,
+		disposeRuntimeHost: (interactiveModePrototype as InteractiveModePrototypeWithShutdown).disposeRuntimeHost,
 		flushStdout: (interactiveModePrototype as InteractiveModePrototypeWithShutdown).flushStdout,
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {

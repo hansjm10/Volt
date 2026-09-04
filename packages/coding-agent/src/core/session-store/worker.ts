@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { isDeepStrictEqual } from "node:util";
 import { parentPort, workerData } from "node:worker_threads";
 import { canonicalizePath, resolvePath } from "../../utils/paths.ts";
 import {
@@ -10,13 +9,7 @@ import {
 	hardenPrivateRegularFileSync,
 	writePrivateNewFileSync,
 } from "../../utils/private-files.ts";
-import {
-	type ClientInputSequenceSeed,
-	createClientInputSequenceValidator,
-	decodeStoredSessionEntry,
-	parsePersistedSessionEntry,
-	sessionEntryEnvelope,
-} from "../session-entry-codec.ts";
+import { decodeStoredSessionEntry, parsePersistedSessionEntry, sessionEntryEnvelope } from "../session-entry-codec.ts";
 import type { SessionEntry } from "../session-manager.ts";
 import { fuzzyMatchSessionText } from "../session-search.ts";
 import {
@@ -24,6 +17,11 @@ import {
 	parseCanonicalSessionStoreJson,
 	stringifyCanonicalSessionStoreJson,
 } from "./canonical-json.ts";
+import {
+	CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES,
+	createSessionStoreTransactionValidationState,
+	validateSessionStoreTransactionProjections,
+} from "./projection.ts";
 import {
 	parseSessionStoreOperationResult,
 	parseSessionStoreWorkerData,
@@ -466,17 +464,24 @@ function summaryFromRow(row: Record<string, unknown>): SessionStoreSessionSummar
 	};
 }
 
+function findSummaryRow(
+	db: DatabaseSync,
+	sessionId: string,
+	sessionGeneration?: string,
+): Record<string, unknown> | undefined {
+	return sessionGeneration === undefined
+		? db.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE id = ?`).get(sessionId)
+		: db
+				.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE id = ? AND session_generation = ?`)
+				.get(sessionId, sessionGeneration);
+}
+
 function findSummary(
 	db: DatabaseSync,
 	sessionId: string,
 	sessionGeneration?: string,
 ): SessionStoreSessionSummary | null {
-	const row =
-		sessionGeneration === undefined
-			? db.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE id = ?`).get(sessionId)
-			: db
-					.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE id = ? AND session_generation = ?`)
-					.get(sessionId, sessionGeneration);
+	const row = findSummaryRow(db, sessionId, sessionGeneration);
 	return row ? summaryFromRow(row) : null;
 }
 
@@ -747,11 +752,29 @@ function chunkFromRow(row: Record<string, unknown>): SessionStoreSearchChunk {
 	};
 }
 
+function projectionIntegrityError(
+	component: "summary" | "client_inputs" | "search_chunks",
+	cause: unknown,
+): SessionStoreError {
+	return new SessionStoreError(
+		"session_store_projection_integrity",
+		`Session store ${component} projection does not match canonical entries`,
+		{ cause },
+	);
+}
+
 function loadSession(sessionId: string, sessionGeneration: string): SessionStoreSnapshot | null {
 	const db = requireDatabase();
 	return withDeferredReadTransaction(db, () => {
-		const session = findSummary(db, sessionId, sessionGeneration);
-		if (!session) return null;
+		const summaryRow = findSummaryRow(db, sessionId, sessionGeneration);
+		if (!summaryRow) return null;
+		let session: SessionStoreSessionSummary;
+		try {
+			session = summaryFromRow(summaryRow);
+			parseSessionStoreOperationResult("find_session", session);
+		} catch (error) {
+			throw projectionIntegrityError("summary", error);
+		}
 		const entries = db
 			.prepare(
 				`SELECT entry_id AS id, parent_entry_id AS parentId, entry_type AS type, timestamp, ordinal,
@@ -760,22 +783,32 @@ function loadSession(sessionId: string, sessionGeneration: string): SessionStore
 			)
 			.all(sessionId)
 			.map(entryFromRow);
-		const clientInputs = db
-			.prepare(
-				`SELECT client_message_id AS clientMessageId, receipt_entry_id AS receiptEntryId, command,
-				semantic_digest AS semanticDigest, input_json AS inputJson, queued_entry_id AS queuedEntryId,
-				queued_input_json AS queuedInputJson, state, error, canonical_entry_id AS canonicalEntryId
-			FROM client_inputs WHERE session_id = ? ORDER BY client_message_id`,
-			)
-			.all(sessionId)
-			.map(clientInputFromRow);
-		const searchChunks = db
-			.prepare(
-				`SELECT chunk_index AS chunkIndex, entry_id AS entryId, text
-			FROM search_chunks WHERE session_id = ? ORDER BY chunk_index`,
-			)
-			.all(sessionId)
-			.map(chunkFromRow);
+		let clientInputs: SessionStoreClientInput[];
+		try {
+			clientInputs = db
+				.prepare(
+					`SELECT client_message_id AS clientMessageId, receipt_entry_id AS receiptEntryId, command,
+					semantic_digest AS semanticDigest, input_json AS inputJson, queued_entry_id AS queuedEntryId,
+					queued_input_json AS queuedInputJson, state, error, canonical_entry_id AS canonicalEntryId
+				FROM client_inputs WHERE session_id = ? ORDER BY client_message_id`,
+				)
+				.all(sessionId)
+				.map(clientInputFromRow);
+		} catch (error) {
+			throw projectionIntegrityError("client_inputs", error);
+		}
+		let searchChunks: SessionStoreSearchChunk[];
+		try {
+			searchChunks = db
+				.prepare(
+					`SELECT chunk_index AS chunkIndex, entry_id AS entryId, text
+				FROM search_chunks WHERE session_id = ? ORDER BY chunk_index`,
+				)
+				.all(sessionId)
+				.map(chunkFromRow);
+		} catch (error) {
+			throw projectionIntegrityError("search_chunks", error);
+		}
 		return { session, entries, clientInputs, searchChunks };
 	});
 }
@@ -937,76 +970,60 @@ function clientMessageIdForEntry(entry: SessionEntry): string | undefined {
 	return entry.type === "message" && entry.message.role === "user" ? entry.message.clientMessageId : undefined;
 }
 
-function validateTransactionClientInputs(
+function loadTransactionClientInputs(
 	db: DatabaseSync,
-	input: SessionStoreApplyTransactionInput,
+	sessionId: string,
 	entries: readonly SessionEntry[],
-): void {
-	const affectedClientIds = new Set(entries.map(clientMessageIdForEntry).filter((id) => id !== undefined));
+): SessionStoreClientInput[] {
+	const selected = new Map<string, SessionStoreClientInput>();
+	const selectColumns = `client_message_id AS clientMessageId, receipt_entry_id AS receiptEntryId, command,
+		semantic_digest AS semanticDigest, input_json AS inputJson, queued_entry_id AS queuedEntryId,
+		queued_input_json AS queuedInputJson, state, error, canonical_entry_id AS canonicalEntryId`;
+	const retain = (row: Record<string, unknown>): void => {
+		const clientInput = clientInputFromRow(row);
+		selected.set(clientInput.clientMessageId, clientInput);
+	};
+	for (const row of db
+		.prepare(
+			`SELECT ${selectColumns} FROM client_inputs
+			WHERE session_id = ? AND state IN ('accepted', 'started')
+			LIMIT ${CLIENT_INPUT_MAX_OUTSTANDING_ENTRIES + 1}`,
+		)
+		.all(sessionId)) {
+		retain(row);
+	}
 	const findStored = db.prepare(
-		`SELECT client_message_id AS clientMessageId, receipt_entry_id AS receiptEntryId, command,
-			semantic_digest AS semanticDigest, input_json AS inputJson, queued_entry_id AS queuedEntryId,
-			queued_input_json AS queuedInputJson, state, error, canonical_entry_id AS canonicalEntryId
-		FROM client_inputs WHERE session_id = ? AND client_message_id = ?`,
+		`SELECT ${selectColumns} FROM client_inputs WHERE session_id = ? AND client_message_id = ?`,
 	);
-	const seeds: ClientInputSequenceSeed[] = [];
+	const affectedClientIds = new Set(entries.map(clientMessageIdForEntry).filter((id) => id !== undefined));
 	for (const clientMessageId of affectedClientIds) {
-		const row = findStored.get(input.sessionId, clientMessageId);
-		if (!row) continue;
-		const stored = clientInputFromRow(row);
-		seeds.push({
-			receiptId: stored.receiptEntryId,
-			clientMessageId: stored.clientMessageId,
-			command: stored.command,
-			semanticDigest: stored.semanticDigest,
-			input: stored.input,
-			state: stored.state,
-			...(stored.queuedEntryId === null ? {} : { queuedEntryId: stored.queuedEntryId }),
-			...(stored.queuedInput === null ? {} : { queuedInput: stored.queuedInput }),
-			...(stored.error === null ? {} : { error: stored.error }),
-			...(stored.canonicalEntryId === null ? {} : { canonicalEntryId: stored.canonicalEntryId }),
-		});
+		if (selected.has(clientMessageId)) continue;
+		const row = findStored.get(sessionId, clientMessageId);
+		if (row) retain(row);
 	}
-	const validator = createClientInputSequenceValidator(seeds);
-	for (const entry of entries) validator.apply(entry);
+	return [...selected.values()];
+}
 
-	const writes = new Map(input.payload.clientInputs.map((write) => [write.clientMessageId, write]));
-	if (writes.size !== input.payload.clientInputs.length) {
-		throw new SessionStoreError("constraint_failed", "Session transaction contains duplicate client input writes");
+function nextEntryOrdinal(db: DatabaseSync, sessionId: string): number {
+	const row = db
+		.prepare("SELECT COALESCE(MAX(ordinal), 0) AS maxOrdinal FROM entries WHERE session_id = ?")
+		.get(sessionId);
+	if (!row) throw new Error("Could not determine the current session entry ordinal");
+	return sqlInteger(row, "maxOrdinal") + 1;
+}
+
+function nextSearchChunkIndex(db: DatabaseSync, sessionId: string): number {
+	const row = db
+		.prepare(
+			"SELECT COALESCE(MAX(chunk_index), -1) AS maxChunkIndex, COUNT(*) AS chunkCount FROM search_chunks WHERE session_id = ?",
+		)
+		.get(sessionId);
+	if (!row) throw new Error("Could not determine the current session search chunk index");
+	const nextIndex = sqlInteger(row, "maxChunkIndex") + 1;
+	if (nextIndex !== sqlInteger(row, "chunkCount")) {
+		throw new Error("Stored session search chunk indexes are not contiguous");
 	}
-	for (const clientMessageId of writes.keys()) {
-		if (!affectedClientIds.has(clientMessageId)) {
-			throw new SessionStoreError(
-				"constraint_failed",
-				"Session transaction contains a client input write without a canonical entry",
-			);
-		}
-	}
-	for (const clientMessageId of affectedClientIds) {
-		const record = validator.get(clientMessageId);
-		const write = writes.get(clientMessageId);
-		if (!record || !write) {
-			throw new SessionStoreError("constraint_failed", "Session transaction omits canonical client input state");
-		}
-		const expected = {
-			clientMessageId: record.clientMessageId,
-			receiptEntryId: record.receiptId,
-			command: record.command,
-			semanticDigest: record.semanticDigest,
-			input: record.input,
-			queuedEntryId: record.queuedEntryId ?? null,
-			queuedInput: record.queuedInput ?? null,
-			state: record.state,
-			error: record.error ?? null,
-			canonicalEntryId: record.canonicalEntryId ?? null,
-		};
-		if (!isDeepStrictEqual(write, expected)) {
-			throw new SessionStoreError(
-				"constraint_failed",
-				`Client input ${JSON.stringify(clientMessageId)} does not match its canonical entries`,
-			);
-		}
-	}
+	return nextIndex;
 }
 
 function applyTransactionInCurrentTransaction(
@@ -1028,20 +1045,29 @@ function applyTransactionInCurrentTransaction(
 		return { status: "committed", evidence: previousCommit };
 	}
 
-	const summary = findSummary(db, input.sessionId, input.sessionGeneration);
-	if (!summary) {
+	const summaryRow = findSummaryRow(db, input.sessionId, input.sessionGeneration);
+	if (!summaryRow) {
 		throw new SessionStoreError("session_not_found", `Session ${JSON.stringify(input.sessionId)} does not exist`);
 	}
+	const summary = summaryFromRow(summaryRow);
 	if (summary.revision !== input.expectedRevision) {
 		return { status: "conflict", actualRevision: summary.revision };
 	}
 	const canonicalEntries = validateTransactionEntryReferences(db, input.sessionId, input.payload.entries);
-	validateTransactionClientInputs(db, input, canonicalEntries);
-	const maxOrdinalRow = db
-		.prepare("SELECT COALESCE(MAX(ordinal), 0) AS maxOrdinal FROM entries WHERE session_id = ?")
-		.get(input.sessionId);
-	if (!maxOrdinalRow) throw new Error("Could not determine the current session entry ordinal");
-	let nextOrdinal = sqlInteger(maxOrdinalRow, "maxOrdinal") + 1;
+	const firstNewOrdinal = nextEntryOrdinal(db, input.sessionId);
+	const transitionState = createSessionStoreTransactionValidationState(
+		summary.createdAt,
+		loadTransactionClientInputs(db, input.sessionId, canonicalEntries),
+		firstNewOrdinal,
+		nextSearchChunkIndex(db, input.sessionId),
+	);
+	validateSessionStoreTransactionProjections(
+		transitionState,
+		canonicalEntries,
+		input.payload.clientInputs,
+		input.payload.searchChunks,
+	);
+	let insertionOrdinal = firstNewOrdinal;
 	const insertEntry = db.prepare(
 		`INSERT INTO entries (
 			session_id, entry_id, ordinal, parent_entry_id, entry_type, timestamp, is_host_only, payload_json
@@ -1049,7 +1075,7 @@ function applyTransactionInCurrentTransaction(
 	);
 	for (const entry of canonicalEntries) {
 		const envelope = sessionEntryEnvelope(entry);
-		if (envelope.ordinal !== nextOrdinal) {
+		if (envelope.ordinal !== insertionOrdinal) {
 			throw new SessionStoreError(
 				"constraint_failed",
 				`Entry ${JSON.stringify(envelope.id)} has a non-contiguous ordinal`,
@@ -1065,7 +1091,7 @@ function applyTransactionInCurrentTransaction(
 			envelope.isHostOnly ? 1 : 0,
 			stringifyCanonicalSessionStoreJson(entry, `Entry ${envelope.id} payload`),
 		);
-		nextOrdinal += 1;
+		insertionOrdinal += 1;
 	}
 
 	const upsertClientInput = db.prepare(
@@ -1102,12 +1128,11 @@ function applyTransactionInCurrentTransaction(
 		);
 	}
 
-	const upsertChunk = db.prepare(
-		`INSERT INTO search_chunks (session_id, chunk_index, entry_id, text) VALUES (?, ?, ?, ?)
-		ON CONFLICT (session_id, chunk_index) DO UPDATE SET entry_id = excluded.entry_id, text = excluded.text`,
+	const insertChunk = db.prepare(
+		"INSERT INTO search_chunks (session_id, chunk_index, entry_id, text) VALUES (?, ?, ?, ?)",
 	);
 	for (const chunk of input.payload.searchChunks) {
-		upsertChunk.run(input.sessionId, chunk.chunkIndex, chunk.entryId, chunk.text);
+		insertChunk.run(input.sessionId, chunk.chunkIndex, chunk.entryId, chunk.text);
 	}
 
 	if (

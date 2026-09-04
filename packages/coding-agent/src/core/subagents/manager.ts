@@ -1216,7 +1216,11 @@ export class SubagentManager {
 				await this.waitForPendingStarts();
 				const handles = Array.from(this.handles.values());
 				try {
-					await Promise.allSettled(handles.map((handle) => handle.dispose()));
+					const results = await Promise.allSettled(handles.map(async (handle) => handle.dispose()));
+					const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+					if (errors.length > 0) {
+						throw new AggregateError(errors, "Subagent manager cleanup did not complete");
+					}
 				} finally {
 					this.activityListeners.clear();
 				}
@@ -1588,6 +1592,7 @@ export class SubagentManager {
 			unregisterBudgetPolicy();
 		};
 		let client: InProcessRpcClient | undefined;
+		let runtimeFinalizerTransferredToRpc = false;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;
 		let rollbackRuntimeRegistrationErrorReported = false;
@@ -1619,14 +1624,19 @@ export class SubagentManager {
 			}
 
 			let handle: LocalSubagentHandle | undefined;
-			client = await createInProcessRpcClient(runtime, {
-				disposeRuntimeOnClose: !this.retainRuntimeOnDispose,
+			const disposeRuntimeOnClose = !this.retainRuntimeOnDispose;
+			const pendingClient = createInProcessRpcClient(runtime, {
+				disposeRuntimeOnClose,
 				requestTimeoutMs: options.requestTimeoutMs ?? this.requestTimeoutMs,
 				onEvent: (event) => {
 					this.recordActivityEvent(id, event);
 					handle?.handleEvent(event);
 				},
 			});
+			// The in-process RPC mode consumes finalizer ownership at invocation,
+			// including when its asynchronous startup later rejects.
+			runtimeFinalizerTransferredToRpc = disposeRuntimeOnClose;
+			client = await pendingClient;
 			runtimeRegistration = await this.notifyRuntimeCreated({
 				id,
 				runtime,
@@ -1731,7 +1741,7 @@ export class SubagentManager {
 			} catch (cleanupError) {
 				cleanupErrors.push(cleanupError);
 			}
-			if (!client || this.retainRuntimeOnDispose) {
+			if (!runtimeFinalizerTransferredToRpc) {
 				try {
 					await runtime.dispose();
 				} catch (cleanupError) {

@@ -28,7 +28,9 @@ import type {
 	SessionSnapshotHeader,
 } from "./session-manager.ts";
 
-const ENTRY_ID_MAX_CHARACTERS = 512;
+export const SESSION_ID_MAX_CHARACTERS = 512;
+const ENTRY_ID_MAX_CHARACTERS = SESSION_ID_MAX_CHARACTERS;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const CLIENT_INPUT_ID_PATTERN = new RegExp(`^${RPC_CLIENT_MESSAGE_ID_PATTERN_SOURCE}$`);
 export const CLIENT_INPUT_ERROR_MAX_SCALARS = 2_000;
 
@@ -750,10 +752,12 @@ export function parseSessionSnapshotHeader(
 	return canonical as unknown as SessionSnapshotHeader;
 }
 
+export function isValidSessionId(value: unknown): value is string {
+	return typeof value === "string" && value.length <= SESSION_ID_MAX_CHARACTERS && SESSION_ID_PATTERN.test(value);
+}
+
 function assertValidSessionIdValue(value: unknown, path: string): asserts value is string {
-	if (typeof value !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(value)) {
-		fail(path, "invalid session identity");
-	}
+	if (!isValidSessionId(value)) fail(path, "invalid session identity");
 }
 
 export function parseSessionReference(value: unknown, description = "Session reference"): SessionReference {

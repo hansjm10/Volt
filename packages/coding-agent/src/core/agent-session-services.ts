@@ -183,36 +183,48 @@ export async function createAgentSessionServices(
 	});
 	void gitContextProvider.refresh();
 
-	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
-	const extensionsResult = resourceLoader.getExtensions();
-	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
-		try {
-			modelRegistry.registerProvider(name, config);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
+	try {
+		const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+		const extensionsResult = resourceLoader.getExtensions();
+		for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+			try {
+				modelRegistry.registerProvider(name, config);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				diagnostics.push({
+					type: "error",
+					message: `Extension "${extensionPath}" error: ${message}`,
+				});
+			}
 		}
-	}
-	extensionsResult.runtime.pendingProviderRegistrations = [];
-	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+		extensionsResult.runtime.pendingProviderRegistrations = [];
+		diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
-	return {
-		cwd,
-		projectCwd,
-		lexicalProjectCwd,
-		agentDir,
-		authStorage,
-		settingsManager,
-		modelRegistry,
-		resourceLoader,
-		gitContextProvider,
-		workspaceName: options.workspaceName,
-		baseRef: options.baseRef,
-		diagnostics,
-	};
+		return {
+			cwd,
+			projectCwd,
+			lexicalProjectCwd,
+			agentDir,
+			authStorage,
+			settingsManager,
+			modelRegistry,
+			resourceLoader,
+			gitContextProvider,
+			workspaceName: options.workspaceName,
+			baseRef: options.baseRef,
+			diagnostics,
+		};
+	} catch (error) {
+		try {
+			gitContextProvider.dispose();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[error, cleanupError],
+				"Agent session service creation failed and its Git context provider could not be disposed",
+			);
+		}
+		throw error;
+	}
 }
 
 /**

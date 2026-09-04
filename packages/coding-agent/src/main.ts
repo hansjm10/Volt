@@ -5,6 +5,9 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { existsSync } from "node:fs";
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { createSessionId } from "@hansjm10/volt-agent-core";
 import { type ImageContent, modelsAreEqual } from "@hansjm10/volt-ai";
@@ -16,7 +19,15 @@ import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, isStandaloneBinary, VERSION } from "./config.ts";
+import {
+	ENV_SESSION_DIR,
+	expandTildePath,
+	getAgentDir,
+	getPackageDir,
+	getSessionsDir,
+	isStandaloneBinary,
+	VERSION,
+} from "./config.ts";
 import {
 	type AgentSessionRuntime,
 	type CreateAgentSessionRuntimeFactory,
@@ -43,7 +54,15 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager, type SessionReference } from "./core/session-manager.ts";
+import {
+	assertValidSessionId,
+	findSessionInfoById,
+	getDefaultSessionDirPath,
+	type SessionInfo,
+	SessionManager,
+	type SessionReference,
+} from "./core/session-manager.ts";
+import { SESSION_STORE_DATABASE_FILENAME } from "./core/session-store/index.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { SubagentManager } from "./core/subagents/index.ts";
 import { initTheme, stopThemeWatcher } from "./core/theme/runtime.ts";
@@ -57,7 +76,7 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { handleStoreCommand } from "./store/store-cli.ts";
-import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
+import { canonicalizePath, isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 /**
@@ -182,16 +201,88 @@ type ResolvedSession =
 	| { type: "global"; ref: SessionReference; cwd: string }
 	| { type: "not_found"; arg: string };
 
+function sameFilesystemLocation(left: string, right: string): boolean {
+	return canonicalizePath(resolvePath(left)) === canonicalizePath(resolvePath(right));
+}
+
+function canBeExactSessionId(value: string): boolean {
+	try {
+		assertValidSessionId(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function hasSessionStore(sessionDirectory: string): boolean {
+	return existsSync(join(resolvePath(sessionDirectory), SESSION_STORE_DATABASE_FILENAME));
+}
+
+async function findExactSessionInfoInStore(
+	sessionDirectory: string,
+	sessionId: string,
+): Promise<SessionInfo | undefined> {
+	const directory = resolvePath(sessionDirectory);
+	if (!hasSessionStore(directory)) return undefined;
+	return findSessionInfoById(directory, sessionId);
+}
+
+async function findSessionByExactId(
+	sessionId: string,
+	cwd: string,
+	sessionDir?: string,
+): Promise<{ ref: SessionReference; cwd: string } | undefined> {
+	if (sessionDir) {
+		const info = await findExactSessionInfoInStore(sessionDir, sessionId);
+		return info ? { ref: info.ref, cwd: info.cwd } : undefined;
+	}
+
+	const storeErrors: unknown[] = [];
+	let readableStores = 0;
+	const findInReadableStore = async (directory: string): Promise<SessionInfo | undefined> => {
+		if (!hasSessionStore(directory)) return undefined;
+		try {
+			const info = await findSessionInfoById(directory, sessionId);
+			readableStores++;
+			return info;
+		} catch (error) {
+			storeErrors.push(error);
+			return undefined;
+		}
+	};
+
+	const localSessionDir = getDefaultSessionDirPath(cwd);
+	const localInfo = await findInReadableStore(localSessionDir);
+	if (localInfo) return { ref: localInfo.ref, cwd: localInfo.cwd };
+
+	const sessionsRoot = getSessionsDir();
+	if (existsSync(sessionsRoot)) {
+		const localStorePath = canonicalizePath(resolvePath(localSessionDir));
+		const directories = (await readdir(sessionsRoot, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => join(sessionsRoot, entry.name))
+			.filter((directory) => canonicalizePath(resolvePath(directory)) !== localStorePath)
+			.sort();
+		for (const directory of directories) {
+			const info = await findInReadableStore(directory);
+			if (info) return { ref: info.ref, cwd: info.cwd };
+		}
+	}
+	if (readableStores === 0 && storeErrors.length > 0) {
+		throw new AggregateError(storeErrors, "Could not look up an exact session ID in any project store");
+	}
+	return undefined;
+}
+
 async function findLocalSessionByExactId(
 	sessionId: string,
 	cwd: string,
 	sessionDir?: string,
 ): Promise<{ type: "local"; ref: SessionReference } | undefined> {
-	const localSessions = await SessionManager.list(cwd, sessionDir, undefined, {
-		includeMessageFreeDurable: true,
-	});
-	const localMatch = localSessions.find((session) => session.id === sessionId);
-	return localMatch ? { type: "local", ref: localMatch.ref } : undefined;
+	const directory = sessionDir ?? getDefaultSessionDirPath(cwd);
+	const info = await findExactSessionInfoInStore(directory, sessionId);
+	if (!info || (info.cwd && !sameFilesystemLocation(info.cwd, cwd))) return undefined;
+	return { type: "local", ref: info.ref };
 }
 
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
@@ -200,30 +291,25 @@ async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: 
 		return { type: "path", path: resolvePath(sessionArg, cwd) };
 	}
 
-	// Exact IDs can address message-free durable sessions without exposing them to prefix search or selectors.
-	const localAddressableSessions = await SessionManager.list(cwd, sessionDir, undefined, {
-		includeMessageFreeDurable: true,
-	});
-	const localExactMatch = localAddressableSessions.find((session) => session.id === sessionArg);
-	if (localExactMatch) return { type: "local", ref: localExactMatch.ref };
+	// Exact IDs use indexed summary lookup; only the final owner opens the selected transcript.
+	const exactMatch = canBeExactSessionId(sessionArg)
+		? await findSessionByExactId(sessionArg, cwd, sessionDir)
+		: undefined;
+	if (exactMatch) {
+		return !exactMatch.cwd || sameFilesystemLocation(exactMatch.cwd, cwd)
+			? { type: "local", ref: exactMatch.ref }
+			: { type: "global", ref: exactMatch.ref, cwd: exactMatch.cwd };
+	}
 
-	// Try to match a visible session ID prefix in the current project.
+	// Prefix matching intentionally remains visible-session enumeration.
 	const localSessions = await SessionManager.list(cwd, sessionDir);
 	const localPrefixMatch = localSessions.find((session) => session.id.startsWith(sessionArg));
 	if (localPrefixMatch) return { type: "local", ref: localPrefixMatch.ref };
 
-	// Try global search across all projects.
-	const allAddressableSessions = await SessionManager.listAll(sessionDir, undefined, {
-		includeMessageFreeDurable: true,
-	});
-	const globalExactMatch = allAddressableSessions.find((session) => session.id === sessionArg);
-	if (globalExactMatch) return { type: "global", ref: globalExactMatch.ref, cwd: globalExactMatch.cwd };
 	const allSessions = await SessionManager.listAll(sessionDir);
 	const globalMatch = allSessions.find((session) => session.id.startsWith(sessionArg));
-
 	if (globalMatch) return { type: "global", ref: globalMatch.ref, cwd: globalMatch.cwd };
 
-	// Not found anywhere
 	return { type: "not_found", arg: sessionArg };
 }
 
@@ -518,6 +604,64 @@ async function throwAfterClosingSessionManager(
 	throw error;
 }
 
+class CliSessionManagerOwner {
+	private manager: SessionManager | undefined;
+
+	constructor(manager: SessionManager) {
+		this.manager = manager;
+	}
+
+	get current(): SessionManager {
+		if (!this.manager) throw new Error("CLI session manager ownership has already transferred");
+		return this.manager;
+	}
+
+	private release(): SessionManager | undefined {
+		const manager = this.manager;
+		this.manager = undefined;
+		return manager;
+	}
+
+	async close(): Promise<void> {
+		const manager = this.release();
+		if (manager) await manager.closePersistence();
+	}
+
+	async fail(error: unknown, message: string): Promise<never> {
+		const manager = this.release();
+		if (!manager) throw error;
+		return throwAfterClosingSessionManager(manager, error, message);
+	}
+
+	async replace(replacement: SessionManager): Promise<void> {
+		const previous = this.release();
+		if (!previous) {
+			await replacement.closePersistence();
+			throw new Error("Cannot replace a CLI session manager after ownership transferred");
+		}
+		try {
+			await previous.closePersistence();
+		} catch (error) {
+			try {
+				await replacement.closePersistence();
+			} catch (replacementCloseError) {
+				throw new AggregateError(
+					[error, replacementCloseError],
+					"CLI session manager replacement failed and neither manager closed cleanly",
+				);
+			}
+			throw error;
+		}
+		this.manager = replacement;
+	}
+
+	transfer(): SessionManager {
+		const manager = this.release();
+		if (!manager) throw new Error("CLI session manager ownership has already transferred");
+		return manager;
+	}
+}
+
 async function runWithOwnedAgentSessionRuntime(
 	runtime: AgentSessionRuntime,
 	operation: (transferRuntime: () => void) => Promise<void>,
@@ -698,16 +842,17 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	// From this point until createAgentSessionRuntime() is invoked, this is the sole
+	// owner/finalizer for the acquired manager. Replacement closes the old manager
+	// before adopting the new one; transfer relinquishes it at the runtime-factory boundary.
+	const sessionManagerOwner = new CliSessionManagerOwner(
+		await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager),
+	);
 	let missingSessionCwdIssue: SessionCwdIssue | undefined;
 	try {
-		missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
+		missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManagerOwner.current, cwd);
 	} catch (error) {
-		return await throwAfterClosingSessionManager(
-			sessionManager,
-			error,
-			"Session cwd validation failed and its manager could not be closed",
-		);
+		return await sessionManagerOwner.fail(error, "Session cwd validation failed and its manager could not be closed");
 	}
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -715,14 +860,13 @@ export async function main(args: string[], options?: MainOptions) {
 			try {
 				selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
 			} catch (error) {
-				return await throwAfterClosingSessionManager(
-					sessionManager,
+				return await sessionManagerOwner.fail(
 					error,
 					"Session cwd selection failed and its manager could not be closed",
 				);
 			}
 			if (!selectedCwd) {
-				await sessionManager.closePersistence();
+				await sessionManagerOwner.close();
 				process.exitCode = 0;
 				return;
 			}
@@ -730,26 +874,16 @@ export async function main(args: string[], options?: MainOptions) {
 			try {
 				replacementManager = await SessionManager.open(missingSessionCwdIssue.sessionRef!, selectedCwd);
 			} catch (error) {
-				return await throwAfterClosingSessionManager(
-					sessionManager,
+				return await sessionManagerOwner.fail(
 					error,
 					"Session cwd replacement failed and its original manager could not be closed",
 				);
 			}
-			try {
-				await sessionManager.closePersistence();
-			} catch (error) {
-				return await throwAfterClosingSessionManager(
-					replacementManager,
-					error,
-					"Session cwd replacement failed and neither manager could be closed cleanly",
-				);
-			}
-			sessionManager = replacementManager;
+			await sessionManagerOwner.replace(replacementManager);
 		} else {
 			const error = new MissingSessionCwdError(missingSessionCwdIssue);
 			try {
-				await sessionManager.closePersistence();
+				await sessionManagerOwner.close();
 			} catch (closeError) {
 				throw new AggregateError([error, closeError], "Invalid session cwd and manager close both failed");
 			}
@@ -760,14 +894,10 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	if (requestedSessionName) {
 		try {
-			sessionManager.appendSessionInfo(requestedSessionName);
-			await sessionManager.flush();
+			sessionManagerOwner.current.appendSessionInfo(requestedSessionName);
+			await sessionManagerOwner.current.flush();
 		} catch (error) {
-			return await throwAfterClosingSessionManager(
-				sessionManager,
-				error,
-				"Session naming failed and its manager could not be closed",
-			);
+			return await sessionManagerOwner.fail(error, "Session naming failed and its manager could not be closed");
 		}
 	}
 	time("createSessionManager");
@@ -783,7 +913,7 @@ export async function main(args: string[], options?: MainOptions) {
 	let authStorage: AuthStorage;
 	try {
 		trustStore = new ProjectTrustStore(agentDir);
-		sessionCwd = sessionManager.getCwd();
+		sessionCwd = sessionManagerOwner.current.getCwd();
 		autoTrustOnReloadCwd =
 			parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)
 				? sessionCwd
@@ -795,8 +925,7 @@ export async function main(args: string[], options?: MainOptions) {
 		resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
 		authStorage = AuthStorage.create();
 	} catch (error) {
-		return await throwAfterClosingSessionManager(
-			sessionManager,
+		return await sessionManagerOwner.fail(
 			error,
 			"Session startup preparation failed and its manager could not be closed",
 		);
@@ -878,55 +1007,56 @@ export async function main(args: string[], options?: MainOptions) {
 				extensionFactories: options?.extensionFactories,
 			},
 		});
-		const { settingsManager, modelRegistry, resourceLoader } = services;
-		if (parsed.lsp) {
-			settingsManager.applyOverrides({ lsp: { enabled: true } });
-		}
-		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
-			...projectTrustDiagnostics,
-			...services.diagnostics,
-			...collectSettingsDiagnostics(settingsManager, "runtime creation"),
-			...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
-				type: "error" as const,
-				message: `Failed to load extension "${path}": ${error}`,
-			})),
-		];
-
-		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
-		const scopedModels =
-			modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
-		const hasExistingSession = sessionStartEvent?.reason !== "new" && sessionManager.getBranch().length > 0;
-		const { options: sessionOptions, diagnostics: sessionOptionDiagnostics } = buildSessionOptions(
-			parsed,
-			scopedModels,
-			hasExistingSession,
-			modelRegistry,
-			settingsManager,
-		);
-		diagnostics.push(...sessionOptionDiagnostics);
-
-		if (parsed.apiKey) {
-			if (!sessionOptions.model) {
-				diagnostics.push({
-					type: "error",
-					message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
-				});
-			} else {
-				authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey);
-			}
-		}
-
-		const subagentManager = new SubagentManager({
-			createRuntime,
-			cwd,
-			agentDir,
-			workspaceName: services.workspaceName,
-			baseRef: services.baseRef,
-			resourceLoader,
-			parentSessionManager: sessionManager,
-			...(subagentContext ? { subagentContext } : {}),
-		});
+		let subagentManager: SubagentManager | undefined;
 		try {
+			const { settingsManager, modelRegistry, resourceLoader } = services;
+			if (parsed.lsp) {
+				settingsManager.applyOverrides({ lsp: { enabled: true } });
+			}
+			const diagnostics: AgentSessionRuntimeDiagnostic[] = [
+				...projectTrustDiagnostics,
+				...services.diagnostics,
+				...collectSettingsDiagnostics(settingsManager, "runtime creation"),
+				...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
+					type: "error" as const,
+					message: `Failed to load extension "${path}": ${error}`,
+				})),
+			];
+
+			const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
+			const scopedModels =
+				modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
+			const hasExistingSession = sessionStartEvent?.reason !== "new" && sessionManager.getBranch().length > 0;
+			const { options: sessionOptions, diagnostics: sessionOptionDiagnostics } = buildSessionOptions(
+				parsed,
+				scopedModels,
+				hasExistingSession,
+				modelRegistry,
+				settingsManager,
+			);
+			diagnostics.push(...sessionOptionDiagnostics);
+
+			if (parsed.apiKey) {
+				if (!sessionOptions.model) {
+					diagnostics.push({
+						type: "error",
+						message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
+					});
+				} else {
+					authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey);
+				}
+			}
+
+			subagentManager = new SubagentManager({
+				createRuntime,
+				cwd,
+				agentDir,
+				workspaceName: services.workspaceName,
+				baseRef: services.baseRef,
+				resourceLoader,
+				parentSessionManager: sessionManager,
+				...(subagentContext ? { subagentContext } : {}),
+			});
 			const created = await createAgentSessionFromServices({
 				services,
 				sessionManager,
@@ -949,12 +1079,23 @@ export async function main(args: string[], options?: MainOptions) {
 				diagnostics,
 			};
 		} catch (error) {
+			const cleanupErrors: unknown[] = [];
+			if (subagentManager) {
+				try {
+					await subagentManager.dispose();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
 			try {
-				await subagentManager.dispose();
+				services.gitContextProvider.dispose();
 			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (cleanupErrors.length > 0) {
 				throw new AggregateError(
-					[error, cleanupError],
-					"Agent session creation failed and its untransferred subagent manager could not be disposed",
+					[error, ...cleanupErrors],
+					"Agent session creation failed and untransferred CLI services could not be disposed",
 				);
 			}
 			throw error;
@@ -964,7 +1105,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const runtime = await createAgentSessionRuntime(createRuntime, {
 		cwd: sessionCwd,
 		agentDir,
-		sessionManager,
+		sessionManager: sessionManagerOwner.transfer(),
 	});
 	time("createAgentSessionRuntime");
 	await runWithOwnedAgentSessionRuntime(runtime, async (transferRuntime) => {

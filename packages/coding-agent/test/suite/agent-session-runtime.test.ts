@@ -26,6 +26,7 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../../src/index.ts";
+import { createDirectorySymlinkSync } from "../symlink-utils.ts";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -609,6 +610,31 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.session.sessionId).toBe(fastSessionId);
 		expect(runtime.session.fastModeEnabled).toBe(true);
 		expect(runtime.session.thinkingLevel).toBe("high");
+	});
+
+	it("treats symlinked cwd aliases as the same workspace for listing and exact switching", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const aliasCwd = join(tempDir, "workspace-alias");
+		createDirectorySymlinkSync(tempDir, aliasCwd);
+		const target = await SessionManager.create(aliasCwd, runtime.session.sessionManager.getSessionDir(), {
+			id: "symlink-alias-session",
+		});
+		try {
+			target.appendMessage({ role: "user", content: "alias prompt", timestamp: Date.now() });
+			await target.flush();
+		} finally {
+			await target.closePersistence();
+		}
+
+		expect((await runtime.listSessions()).some((session) => session.sessionId === target.getSessionId())).toBe(true);
+		await expect(runtime.switchSessionById(target.getSessionId())).resolves.toEqual({
+			cancelled: false,
+			seeded: false,
+		});
+		await runtime.session.bindExtensions({});
+
+		expect(runtime.session.sessionId).toBe(target.getSessionId());
+		expect(realpathSync(runtime.cwd)).toBe(realpathSync(tempDir));
 	});
 
 	it("honors session_before_switch cancellation for new and resume", async () => {

@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(sessions): Closed consumed session managers exactly once after setup failures without deleting committed sessions.
+fix(sessions): Finalized failed CLI session resources exactly once and resolved exact session IDs through isolated indexed summaries without duplicate transcript opens.

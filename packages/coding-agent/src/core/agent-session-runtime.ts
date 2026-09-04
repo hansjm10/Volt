@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { resolvePath } from "../utils/paths.ts";
+import { canonicalizePath, resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
 import type {
@@ -29,6 +29,9 @@ import { assertSessionCwdExists, MissingSessionCwdError } from "./session-cwd.ts
 import {
 	assertCurrentSessionSnapshot,
 	assertValidSessionId,
+	findSessionInfoById,
+	getDefaultSessionDir,
+	importSessionFromJsonlInMemory,
 	isHostOnlySessionEntry,
 	loadEntriesFromFile,
 	type SessionEntry,
@@ -205,6 +208,10 @@ function toSessionTimestamp(value: string | undefined): string {
 	}
 	const date = new Date(value);
 	return Number.isNaN(date.getTime()) ? new Date(0).toISOString() : date.toISOString();
+}
+
+function sameFilesystemLocation(left: string, right: string): boolean {
+	return canonicalizePath(resolvePath(left)) === canonicalizePath(resolvePath(right));
 }
 
 function sessionRefsEqual(left: SessionReference, right: SessionReference): boolean {
@@ -655,7 +662,7 @@ export class AgentSessionRuntime {
 	}
 
 	private getReplacementGitContextOptions(cwd: string): { workspaceName?: string; baseRef?: string } {
-		if (resolvePath(cwd) !== resolvePath(this.cwd)) return {};
+		if (!sameFilesystemLocation(cwd, this.cwd)) return {};
 		return {
 			workspaceName: this.services.workspaceName,
 			baseRef: this.services.baseRef,
@@ -1012,12 +1019,11 @@ export class AgentSessionRuntime {
 	}
 
 	private async listWorkspaceSessionInfos(includeMessageFreeDurable = false): Promise<SessionInfo[]> {
-		const workspaceCwd = resolvePath(this.cwd);
 		return (
 			await SessionManager.list(this.cwd, this.session.sessionManager.getSessionDir(), undefined, {
 				includeMessageFreeDurable,
 			})
-		).filter((session) => !session.cwd || resolvePath(session.cwd) === workspaceCwd);
+		).filter((session) => !session.cwd || sameFilesystemLocation(session.cwd, this.cwd));
 	}
 
 	getCurrentSessionSummary(): WorkspaceSessionSummary {
@@ -1081,9 +1087,10 @@ export class AgentSessionRuntime {
 			}
 			return this.switchSessionWithinOperation(sessionRef, options, operation, true);
 		}
-		const target = (await this.listWorkspaceSessionInfos(true)).find((session) => session.id === sessionId);
+		const sessionDir = this.session.sessionManager.getSessionDir() || getDefaultSessionDir(this.cwd);
+		const target = await findSessionInfoById(sessionDir, sessionId);
 		this.assertStructuralOperationCurrent(operation);
-		if (!target) {
+		if (!target || (target.cwd && !sameFilesystemLocation(target.cwd, this.cwd))) {
 			throw new Error(`Session not found in current workspace: ${sessionId}`);
 		}
 		return this.switchSessionWithinOperation(
@@ -1604,150 +1611,18 @@ export class AgentSessionRuntime {
 			});
 		}
 
-		const parentSession: SessionReference | undefined =
-			header.parentSessionDirectory !== undefined &&
-			header.parentStoreId !== undefined &&
-			header.parentSessionId !== undefined &&
-			header.parentSessionGeneration !== undefined
-				? Object.freeze({
-						sessionDirectory: header.parentSessionDirectory,
-						storeId: header.parentStoreId,
-						sessionId: header.parentSessionId,
-						sessionGeneration: header.parentSessionGeneration,
-					})
-				: undefined;
-		const newSessionOptions = {
-			id: header.id,
-			...(parentSession === undefined ? {} : { parentSession }),
-			...(header.origin === undefined ? {} : { origin: header.origin }),
-		};
-		let sessionManager: SessionManager;
-		if (this.session.sessionManager.isPersisted()) {
-			sessionManager = await SessionManager.create(
-				importedCwd,
-				this.session.sessionManager.getSessionDir(),
-				newSessionOptions,
-			);
-		} else {
-			sessionManager = SessionManager.inMemory(importedCwd);
-			sessionManager.newSession(newSessionOptions);
-		}
+		assertCurrent();
+		const sessionManager = this.session.sessionManager.isPersisted()
+			? await SessionManager.importFromJsonl(inputPath, importedCwd, this.session.sessionManager.getSessionDir())
+			: await importSessionFromJsonlInMemory(inputPath, importedCwd);
 		try {
-			assertCurrent();
-
-			const sourceById = new Map<string, SessionEntry>();
-			let sourceLeafId: string | null = null;
-			for (const entry of fileEntries) {
-				if (entry.type === "session") continue;
-				sourceById.set(entry.id, entry);
-				if (entry.type === "leaf") sourceLeafId = entry.targetId;
-				else sourceLeafId = entry.id;
-			}
-
-			const nearestPublicSourceId = (sourceId: string | null): string | null => {
-				let currentId = sourceId;
-				while (currentId) {
-					const current = sourceById.get(currentId);
-					if (!current) return null;
-					if (!isHostOnlySessionEntry(current)) return current.id;
-					currentId = current.parentId;
-				}
-				return null;
-			};
-			const importedIds = new Map<string, string>();
-			const importedId = (sourceId: string | null): string | null => {
-				const publicSourceId = nearestPublicSourceId(sourceId);
-				return publicSourceId === null ? null : (importedIds.get(publicSourceId) ?? null);
-			};
-			const moveTo = (targetId: string | null): void => {
-				if (sessionManager.getLeafId() === targetId) return;
-				if (targetId === null) sessionManager.resetLeaf();
-				else sessionManager.branch(targetId);
-			};
-
-			for (const entry of fileEntries) {
-				if (entry.type === "session" || isHostOnlySessionEntry(entry)) continue;
-				const parentId = importedId(entry.parentId);
-				moveTo(parentId);
-				let nextId: string;
-				switch (entry.type) {
-					case "message": {
-						const message = entry.message;
-						if (message.role === "branchSummary" || message.role === "compactionSummary") {
-							throw new Error(`Cannot import non-canonical ${message.role} message entry`);
-						}
-						nextId = sessionManager.appendMessage(message);
-						break;
-					}
-					case "thinking_level_change":
-						nextId = sessionManager.appendThinkingLevelChange(entry.thinkingLevel);
-						break;
-					case "fast_mode_change":
-						nextId = sessionManager.appendFastModeChange(entry.enabled);
-						break;
-					case "model_change":
-						nextId = sessionManager.appendModelChange(entry.provider, entry.modelId);
-						break;
-					case "planning_state_change":
-						nextId = sessionManager.appendPlanningState(entry.planning);
-						break;
-					case "compaction": {
-						const firstKeptEntryId = importedId(entry.firstKeptEntryId);
-						if (!firstKeptEntryId) {
-							throw new Error(`Compaction entry ${entry.id} references an unavailable retained entry`);
-						}
-						nextId = sessionManager.appendCompaction(
-							entry.summary,
-							firstKeptEntryId,
-							entry.tokensBefore,
-							entry.details,
-							entry.fromHook,
-						);
-						break;
-					}
-					case "branch_summary":
-						nextId = sessionManager.branchWithSummary(
-							entry.fromId === "root" ? null : importedId(entry.fromId),
-							entry.summary,
-							entry.details,
-							entry.fromHook,
-						);
-						break;
-					case "custom":
-						nextId = sessionManager.appendCustomEntry(entry.customType, entry.data);
-						break;
-					case "custom_message":
-						nextId = sessionManager.appendCustomMessageEntry(
-							entry.customType,
-							entry.content,
-							entry.display,
-							entry.details,
-						);
-						break;
-					case "label": {
-						const targetId = importedId(entry.targetId);
-						if (!targetId) throw new Error(`Label entry ${entry.id} references an unavailable target`);
-						nextId = sessionManager.appendLabelChange(targetId, entry.label);
-						break;
-					}
-					case "session_info":
-						nextId = sessionManager.appendSessionInfo(entry.name ?? "");
-						break;
-					default:
-						throw new Error(`Cannot import unsupported session entry type: ${entry.type}`);
-				}
-				importedIds.set(entry.id, nextId);
-			}
-
-			moveTo(importedId(sourceLeafId));
-			await sessionManager.flush();
 			assertCurrent();
 			return sessionManager;
 		} catch (error) {
 			return await closeOwnedSessionManager(
 				sessionManager,
 				error,
-				"Session import failed and its owned manager could not be closed",
+				"Session import became stale and its owned manager could not be closed",
 			);
 		}
 	}

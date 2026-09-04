@@ -617,6 +617,7 @@ export class InteractiveMode {
 	// Shutdown state
 	private shutdownRequested = false;
 	private turnDoneAlertTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	private runtimeDisposePromise: Promise<void> | undefined;
 
 	// Daemon integration (conversation leases + byte relay). Supported TUIs keep
 	// a reconnecting client even when auto-start is off, so a daemon started by
@@ -1197,6 +1198,38 @@ export class InteractiveMode {
 	 * Initializes the UI, shows warnings, processes initial messages, and starts the interactive loop.
 	 */
 	async run(): Promise<void> {
+		try {
+			await this.runInteractiveLoop();
+		} catch (error) {
+			const cleanupErrors: unknown[] = [];
+			try {
+				this.stop();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				await this.disposeRuntimeHost();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				await this.releaseDaemonLeaseOnQuit();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				stopThemeWatcher();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Interactive mode failed and cleanup did not complete");
+			}
+			throw error;
+		}
+	}
+
+	private async runInteractiveLoop(): Promise<void> {
 		await this.init();
 
 		// Start version check asynchronously
@@ -4606,6 +4639,11 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
+	private disposeRuntimeHost(): Promise<void> {
+		this.runtimeDisposePromise ??= Promise.resolve().then(() => this.runtimeHost.dispose());
+		return this.runtimeDisposePromise;
+	}
+
 	private async flushStdout(): Promise<void> {
 		await new Promise<void>((resolve) => {
 			let settled = false;
@@ -4648,7 +4686,7 @@ export class InteractiveMode {
 			// terminal. If the terminal is gone, the restore writes below emit EIO,
 			// which the stdout/stderr error handler turns into emergencyTerminalExit;
 			// the render loop is already idle, so this cannot hot-spin (see #4144).
-			await this.runtimeHost.dispose();
+			await this.disposeRuntimeHost();
 			// Hand the session back to the daemon only after the runtime finished
 			// writing the session file, so the daemon's lazy resume sees final state.
 			await this.releaseDaemonLeaseOnQuit();
@@ -4667,7 +4705,7 @@ export class InteractiveMode {
 		await this.ui.terminal.drainInput(1000);
 
 		this.stop();
-		await this.runtimeHost.dispose();
+		await this.disposeRuntimeHost();
 		// Hand the session back to the daemon only after the runtime finished
 		// writing the session file, so the daemon's lazy resume sees final state.
 		await this.releaseDaemonLeaseOnQuit();

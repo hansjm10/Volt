@@ -1530,39 +1530,50 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 
-	const cleanupStartupFailure = async (): Promise<void> => {
+	const cleanupStartupFailure = async (): Promise<unknown[]> => {
 		shuttingDown = true;
-		try {
-			restoreRebindSession();
-			stopModelCatalogWatcher();
-			cancelPendingExtensionRequests();
-			detachHostActionBridge();
-			detachReviewWorkflowSink();
-			await rpcSubagents.disposeAll();
-			pendingReviewWorkflows.clear();
-			if (shouldDisposeRuntimeOnClose) {
-				cancelPendingHostActionRequests();
+		const cleanupErrors: unknown[] = [];
+		const recordCleanupError = (error: unknown): void => {
+			if (error instanceof AggregateError) {
+				for (const nestedError of error.errors as unknown[]) recordCleanupError(nestedError);
+				return;
 			}
-			for (const cleanup of signalCleanupHandlers) {
-				cleanup();
-			}
-			unsubscribe?.();
-			endSessionProjector();
-			unsubscribeBackpressure?.();
-			if (shouldDisposeRuntimeOnClose) {
-				await runtimeHost.dispose();
-			}
-			detachInput();
-			detachClose();
-		} finally {
+			cleanupErrors.push(error);
+		};
+		const captureCleanupError = async (cleanup: () => void | Promise<void>): Promise<void> => {
 			try {
-				await transport.close();
-			} finally {
-				if (shouldRestoreStdout) {
-					restoreStdout();
-				}
+				await cleanup();
+			} catch (error) {
+				recordCleanupError(error);
 			}
+		};
+
+		await captureCleanupError(restoreRebindSession);
+		await captureCleanupError(stopModelCatalogWatcher);
+		await captureCleanupError(cancelPendingExtensionRequests);
+		await captureCleanupError(detachHostActionBridge);
+		await captureCleanupError(detachReviewWorkflowSink);
+		await captureCleanupError(() => rpcSubagents.disposeAll());
+		pendingReviewWorkflows.clear();
+		if (shouldDisposeRuntimeOnClose) {
+			await captureCleanupError(cancelPendingHostActionRequests);
 		}
+		for (const cleanup of signalCleanupHandlers) {
+			await captureCleanupError(cleanup);
+		}
+		await captureCleanupError(() => unsubscribe?.());
+		await captureCleanupError(endSessionProjector);
+		await captureCleanupError(() => unsubscribeBackpressure?.());
+		if (shouldDisposeRuntimeOnClose) {
+			await captureCleanupError(() => runtimeHost.dispose());
+		}
+		await captureCleanupError(detachInput);
+		await captureCleanupError(detachClose);
+		await captureCleanupError(() => transport.close());
+		if (shouldRestoreStdout) {
+			await captureCleanupError(restoreStdout);
+		}
+		return cleanupErrors;
 	};
 
 	let startupComplete = false;
@@ -1834,9 +1845,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			} catch {}
 			throw startupAbortError ?? startupError;
 		}
-		try {
-			await cleanupStartupFailure();
-		} catch {}
+		const cleanupErrors = await cleanupStartupFailure();
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError(
+				[startupError, ...cleanupErrors],
+				"RPC mode startup failed and cleanup did not complete",
+			);
+		}
 		throw startupError;
 	}
 	if (shuttingDown) {

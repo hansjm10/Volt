@@ -208,6 +208,7 @@ export type SessionStoreErrorCode =
 	| "commit_identity_conflict"
 	| "commit_digest_mismatch"
 	| "constraint_failed"
+	| "session_store_projection_integrity"
 	| "worker_failed";
 
 export class SessionStoreError extends Error {

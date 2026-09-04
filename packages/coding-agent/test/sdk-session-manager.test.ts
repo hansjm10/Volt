@@ -7,6 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { GitContextProvider } from "../src/core/git-context-provider.ts";
+import { LspManager } from "../src/core/lsp/manager.ts";
+import { createEmptyMcpMergedConfig, finalizeMcpConfig } from "../src/core/mcp/config.ts";
+import { McpManager } from "../src/core/mcp/manager.ts";
+import { McpMetadataCache } from "../src/core/mcp/metadata-cache.ts";
+import { McpOutputStore } from "../src/core/mcp/output-store.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -146,6 +151,106 @@ describe("createAgentSession session manager defaults", () => {
 		).rejects.toBe(setupError);
 
 		expect(disposeGitContext).not.toHaveBeenCalled();
+	});
+
+	it("preserves every acquired-resource cleanup failure from partial construction", async () => {
+		const constructionError = new Error("injected late construction failure");
+		const lspCleanupError = new Error("injected LSP cleanup failure");
+		const gitEventCleanupError = new Error("injected Git event cleanup failure");
+		const gitObservationCleanupError = new Error("injected Git observation cleanup failure");
+		const mcpListenerCleanupError = new Error("injected MCP listener cleanup failure");
+		const resourceLoader = createTestResourceLoader();
+		vi.spyOn(resourceLoader, "getSystemPrompt").mockImplementation(() => {
+			throw constructionError;
+		});
+
+		const listenerCleanupCalls = {
+			gitEvent: 0,
+			gitObservation: 0,
+			mcp: 0,
+		};
+		const gitContextProvider = new GitContextProvider(cwd);
+		vi.spyOn(gitContextProvider, "refresh").mockResolvedValue({ status: "definitive", gitContext: null });
+		vi.spyOn(gitContextProvider, "subscribeObservations").mockReturnValue(() => {
+			listenerCleanupCalls.gitObservation++;
+			throw gitObservationCleanupError;
+		});
+		vi.spyOn(gitContextProvider, "subscribe").mockReturnValue(() => {
+			listenerCleanupCalls.gitEvent++;
+			throw gitEventCleanupError;
+		});
+		const mcpManager = new McpManager({
+			config: finalizeMcpConfig(createEmptyMcpMergedConfig()),
+			clientFactory: {
+				connect: async () => {
+					throw new Error("Inert MCP manager must not connect");
+				},
+			},
+			metadataCache: new McpMetadataCache({ agentDir }),
+			outputStore: new McpOutputStore({ agentDir, maxOutputBytes: 1024, maxOutputLines: 10 }),
+		});
+		vi.spyOn(mcpManager, "subscribe").mockReturnValue(() => {
+			listenerCleanupCalls.mcp++;
+			throw mcpListenerCleanupError;
+		});
+		let mcpManagerDisposeCalls = 0;
+		const disposeMcpManager = mcpManager.dispose.bind(mcpManager);
+		vi.spyOn(mcpManager, "dispose").mockImplementation(async () => {
+			mcpManagerDisposeCalls++;
+			await disposeMcpManager();
+		});
+		let gitContextProviderDisposeCalls = 0;
+		const disposeGitContextProvider = gitContextProvider.dispose.bind(gitContextProvider);
+		vi.spyOn(gitContextProvider, "dispose").mockImplementation(() => {
+			gitContextProviderDisposeCalls++;
+			disposeGitContextProvider();
+		});
+		let lspDisposeCalls = 0;
+		const disposeLspManager = LspManager.prototype.dispose;
+		vi.spyOn(LspManager.prototype, "dispose").mockImplementation(function (this: LspManager): void {
+			lspDisposeCalls++;
+			disposeLspManager.call(this);
+			throw lspCleanupError;
+		});
+
+		let thrown: unknown;
+		try {
+			await createAgentSession({
+				cwd,
+				agentDir,
+				model: getModel("anthropic", "claude-sonnet-4-5")!,
+				settingsManager: SettingsManager.inMemory({ lsp: { enabled: true } }),
+				resourceLoader,
+				sessionManager: SessionManager.inMemory(cwd),
+				gitContextProvider,
+				mcpManager,
+				noTools: "all",
+			});
+		} catch (error) {
+			thrown = error;
+		}
+
+		try {
+			expect(thrown).toBeInstanceOf(AggregateError);
+			if (!(thrown instanceof AggregateError)) throw new Error("Expected construction cleanup aggregation");
+			expect(thrown.errors[0]).toBe(constructionError);
+			expect(thrown.errors.slice(1)).toHaveLength(4);
+			for (const cleanupError of [
+				lspCleanupError,
+				gitEventCleanupError,
+				gitObservationCleanupError,
+				mcpListenerCleanupError,
+			]) {
+				expect(thrown.errors.slice(1)).toContain(cleanupError);
+			}
+			expect(listenerCleanupCalls).toEqual({ gitEvent: 1, gitObservation: 1, mcp: 1 });
+			expect(lspDisposeCalls).toBe(1);
+			expect(gitContextProviderDisposeCalls).toBe(0);
+			expect(mcpManagerDisposeCalls).toBe(0);
+		} finally {
+			disposeGitContextProvider();
+			await disposeMcpManager();
+		}
 	});
 
 	it("preserves setup and cleanup errors when default manager close fails", async () => {

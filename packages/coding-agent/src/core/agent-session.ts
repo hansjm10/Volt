@@ -568,6 +568,9 @@ export class QueueClearPersistenceError extends Error {
 	}
 }
 
+/** @internal Preserves the primary constructor failure and every synchronous rollback failure. */
+export class AgentSessionConstructionCleanupError extends AggregateError {}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -769,62 +772,130 @@ export class AgentSession {
 		});
 		this._streamOptions = this._harness.getStreamOptions();
 		this.settingsManager = config.settingsManager;
+		const ownsGitContextProvider = config.gitContextProvider === undefined;
 		this.gitContextProvider = config.gitContextProvider ?? new GitContextProvider(config.cwd);
-		if (!config.gitContextProvider) void this.gitContextProvider.refresh();
-		this._scopedModels = config.scopedModels ?? [];
-		this._resourceLoader = config.resourceLoader;
-		this._customTools = config.customTools ?? [];
-		this._cwd = resolvePath(config.cwd);
-		this._lexicalProjectCwd = resolvePath(config.projectCwd ?? this._cwd);
-		this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
-		this._modelRegistry = config.modelRegistry;
-		const restoredContext = this.sessionManager.buildSessionContext();
-		this._restoreFastModePolicy(restoredContext.fastMode);
-		this._planningState = clonePlanningState(restoredContext.planning);
-		this._extensionRunnerRef = config.extensionRunnerRef;
-		this._initialActiveToolNames = config.initialActiveToolNames;
-		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
-		this._allowUnlistedExtensionTools = config.allowUnlistedExtensionTools ?? false;
-		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
-		this._baseToolsOverride = config.baseToolsOverride;
-		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
-		this._hostInteraction = config.hostInteraction;
-		this._subagentToolManager = config.subagentToolManager;
-		this._mcpManager = config.mcpManager;
-		this._mcpManagerFactory = config.mcpManagerFactory;
-		this._attachMcpManagerEvents();
+		const gitContextSubscriptionFinalizers: Array<() => void> = [];
 
-		// Always subscribe to finalized Harness events for internal handling.
-		this._unsubscribeAgent = this._harness.subscribe(async (event) => {
-			if (isAgentEvent(event)) await this._handleAgentEvent(event);
-		});
-		const startingGitContextSessionId = this.sessionManager.getSessionId();
-		const unsubscribeStartingGitContext = this.gitContextProvider.subscribeObservations((observation) => {
-			if (observation.status !== "definitive") return;
-			try {
-				this.sessionManager.recordStartingGitContext(startingGitContextSessionId, observation.gitContext);
-			} catch {
-				// Git replacement delivery remains independent from metadata persistence.
+		try {
+			if (ownsGitContextProvider) void this.gitContextProvider.refresh();
+			this._scopedModels = config.scopedModels ?? [];
+			this._resourceLoader = config.resourceLoader;
+			this._customTools = config.customTools ?? [];
+			this._cwd = resolvePath(config.cwd);
+			this._lexicalProjectCwd = resolvePath(config.projectCwd ?? this._cwd);
+			this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
+			this._modelRegistry = config.modelRegistry;
+			const restoredContext = this.sessionManager.buildSessionContext();
+			this._restoreFastModePolicy(restoredContext.fastMode);
+			this._planningState = clonePlanningState(restoredContext.planning);
+			this._extensionRunnerRef = config.extensionRunnerRef;
+			this._initialActiveToolNames = config.initialActiveToolNames;
+			this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
+			this._allowUnlistedExtensionTools = config.allowUnlistedExtensionTools ?? false;
+			this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
+			this._baseToolsOverride = config.baseToolsOverride;
+			this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+			this._hostInteraction = config.hostInteraction;
+			this._subagentToolManager = config.subagentToolManager;
+			this._mcpManager = config.mcpManager;
+			this._mcpManagerFactory = config.mcpManagerFactory;
+			this._attachMcpManagerEvents();
+
+			// Always subscribe to finalized Harness events for internal handling.
+			this._unsubscribeAgent = this._harness.subscribe(async (event) => {
+				if (isAgentEvent(event)) await this._handleAgentEvent(event);
+			});
+			this._unsubscribeGitContext = () => {
+				const cleanupErrors: unknown[] = [];
+				for (const unsubscribe of gitContextSubscriptionFinalizers.splice(0).reverse()) {
+					try {
+						unsubscribe();
+					} catch (error) {
+						cleanupErrors.push(error);
+					}
+				}
+				if (cleanupErrors.length === 1) throw cleanupErrors[0];
+				if (cleanupErrors.length > 1) {
+					throw new AggregateError(cleanupErrors, "Git context subscription cleanup did not complete");
+				}
+			};
+			const startingGitContextSessionId = this.sessionManager.getSessionId();
+			gitContextSubscriptionFinalizers.push(
+				this.gitContextProvider.subscribeObservations((observation) => {
+					if (observation.status !== "definitive") return;
+					try {
+						this.sessionManager.recordStartingGitContext(startingGitContextSessionId, observation.gitContext);
+					} catch {
+						// Git replacement delivery remains independent from metadata persistence.
+					}
+				}),
+			);
+			gitContextSubscriptionFinalizers.push(
+				this.gitContextProvider.subscribe((gitContext) => this._emit({ type: "git_context_changed", gitContext }), {
+					monitor: false,
+				}),
+			);
+			void this.gitContextProvider.refresh();
+			this._installAgentToolHooks();
+
+			this._buildRuntime({
+				activeToolNames: this._initialActiveToolNames,
+				includeAllExtensionTools: true,
+			});
+			this._planningRuntimeInitialized = true;
+			this._syncPlanningRuntime();
+			this._recoverDurableQueuedClientInputs();
+		} catch (error) {
+			this._disposed = true;
+			this._canonicalProducerRetired = true;
+			const cleanupErrors: unknown[] = [];
+			const cleanup = (finalize: () => void): void => {
+				try {
+					finalize();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			};
+
+			const extensionRunner = this._extensionRunner as ExtensionRunner | undefined;
+			if (extensionRunner) {
+				cleanup(() => extensionRunner.invalidate("AgentSession construction failed before ownership transfer"));
 			}
-		});
-		const unsubscribeGitContextEvents = this.gitContextProvider.subscribe(
-			(gitContext) => this._emit({ type: "git_context_changed", gitContext }),
-			{ monitor: false },
-		);
-		this._unsubscribeGitContext = () => {
-			unsubscribeStartingGitContext();
-			unsubscribeGitContextEvents();
-		};
-		void this.gitContextProvider.refresh();
-		this._installAgentToolHooks();
+			const extensionErrorUnsubscriber = this._extensionErrorUnsubscriber;
+			this._extensionErrorUnsubscriber = undefined;
+			if (extensionErrorUnsubscriber) cleanup(extensionErrorUnsubscriber);
+			if (extensionRunner && this._extensionRunnerRef) {
+				cleanup(() => {
+					if (this._extensionRunnerRef?.current === extensionRunner) {
+						this._extensionRunnerRef.current = undefined;
+					}
+				});
+			}
 
-		this._buildRuntime({
-			activeToolNames: this._initialActiveToolNames,
-			includeAllExtensionTools: true,
-		});
-		this._planningRuntimeInitialized = true;
-		this._syncPlanningRuntime();
-		this._recoverDurableQueuedClientInputs();
+			const lspManager = this._lspManager;
+			this._lspManager = undefined;
+			if (lspManager) cleanup(() => lspManager.dispose());
+			this._unsubscribeGitContext = undefined;
+			for (const unsubscribeGitContext of gitContextSubscriptionFinalizers.splice(0).reverse()) {
+				cleanup(unsubscribeGitContext);
+			}
+			const unsubscribeAgent = this._unsubscribeAgent;
+			this._unsubscribeAgent = undefined;
+			if (unsubscribeAgent) cleanup(unsubscribeAgent);
+			const unsubscribeMcpManager = this._unsubscribeMcpManager;
+			this._unsubscribeMcpManager = undefined;
+			if (unsubscribeMcpManager) cleanup(unsubscribeMcpManager);
+			if (ownsGitContextProvider) cleanup(() => this.gitContextProvider.dispose());
+			cleanup(() => this._harness.dispose("session_replacement"));
+
+			if (cleanupErrors.length > 0) {
+				throw new AgentSessionConstructionCleanupError(
+					[error, ...cleanupErrors],
+					"Agent session construction cleanup did not complete",
+				);
+			}
+			throw error;
+		}
 	}
 
 	private _assertConversationAuthorityAvailable(): void {

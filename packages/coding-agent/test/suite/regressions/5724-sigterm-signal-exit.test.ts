@@ -10,6 +10,8 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	runtimeDisposePromise: Promise<void> | undefined;
+	disposeRuntimeHost: () => Promise<void>;
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
@@ -22,6 +24,7 @@ type ShutdownThis = {
 };
 
 type InteractiveModePrototypeWithShutdown = {
+	disposeRuntimeHost(this: ShutdownThis): Promise<void>;
 	shutdown(this: ShutdownThis, options?: { fromSignal?: boolean }): Promise<void>;
 };
 
@@ -62,6 +65,8 @@ describe("InteractiveMode SIGTERM shutdown with signal-exit (#5724)", () => {
 		const dispose = deferred();
 		const context: ShutdownThis = {
 			isShuttingDown: false,
+			runtimeDisposePromise: undefined,
+			disposeRuntimeHost: (interactiveModePrototype as InteractiveModePrototypeWithShutdown).disposeRuntimeHost,
 			unregisterSignalHandlers: vi.fn(() => {
 				order.push("unregister");
 			}),

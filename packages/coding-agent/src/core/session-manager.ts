@@ -35,12 +35,14 @@ import {
 	digestClientInputPayload,
 	isHostOnlySessionEntryType,
 	isValidClientMessageId,
+	isValidSessionId,
 	normalizeClientInputPayload,
 	normalizeClientInputQueuedPayload,
 	parsePersistedSessionEntry,
 	parseSessionEntryForAdmission,
 	parseSessionReference,
 	parseSessionSnapshotHeader,
+	SESSION_ID_MAX_CHARACTERS,
 	validatePersistedSessionEntrySequence,
 	validateSessionEntryAdmissionReferences,
 } from "./session-entry-codec.ts";
@@ -730,6 +732,44 @@ function sessionInfoFromStoreSummary(
 	};
 }
 
+interface SessionSummaryLookupResult {
+	directory: string;
+	storeId: string;
+	summary: SessionStoreSessionSummary;
+}
+
+async function findSessionSummaryById(
+	sessionDir: string,
+	sessionId: string,
+): Promise<SessionSummaryLookupResult | undefined> {
+	assertValidSessionId(sessionId);
+	const directory = resolvePath(sessionDir);
+	const lease = await acquireSharedSQLiteSessionStore(normalizePath(directory));
+	let result: SessionSummaryLookupResult | undefined;
+	try {
+		const summary = await lease.client.findSessionSummaryById(sessionId);
+		if (summary) result = { directory, storeId: lease.client.info.storeId, summary };
+	} catch (error) {
+		try {
+			await lease.release();
+		} catch (releaseError) {
+			throw new AggregateError(
+				[error, releaseError],
+				"Exact session summary lookup failed and its store lease could not be released",
+			);
+		}
+		throw error;
+	}
+	await lease.release();
+	return result;
+}
+
+/** @internal Indexed summary lookup for CLI/runtime owners; not exported from the package entry point. */
+export async function findSessionInfoById(sessionDir: string, sessionId: string): Promise<SessionInfo | undefined> {
+	const result = await findSessionSummaryById(sessionDir, sessionId);
+	return result ? sessionInfoFromStoreSummary(result.directory, result.storeId, result.summary) : undefined;
+}
+
 function storedEntryToSessionEntry(stored: SessionStoreSnapshot["entries"][number]): SessionEntry {
 	return decodeStoredSessionEntry(stored);
 }
@@ -757,9 +797,9 @@ function createSessionId(): string {
 }
 
 export function assertValidSessionId(id: string): void {
-	if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(id)) {
+	if (!isValidSessionId(id)) {
 		throw new Error(
-			"Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character",
+			`Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', start and end with an alphanumeric character, and contain at most ${SESSION_ID_MAX_CHARACTERS} characters`,
 		);
 	}
 }
@@ -1045,7 +1085,9 @@ function parseSessionEntryBytes(bytes: Uint8Array): { entry: FileEntry | null; m
 	} catch {
 		return { entry: null, malformed: bytes.length > 0 };
 	}
-	if (!line.trim()) return { entry: null, malformed: false };
+	// A newline commits the preceding record; an ordinary final line terminator
+	// does not create an additional record in the byte reader.
+	if (!line.trim()) return { entry: null, malformed: true };
 	const entry = parseSessionEntryLine(line);
 	return { entry, malformed: entry === null };
 }
@@ -1175,6 +1217,8 @@ export type SessionListProgress = (loaded: number, total: number) => void;
 export interface SessionListOptions {
 	includeMessageFreeDurable?: boolean;
 }
+
+let importSessionFromJsonlInMemoryImpl: (inputPath: string, targetCwd?: string) => Promise<SessionManager>;
 
 /**
  * Manages conversation sessions as append-only trees stored in SQLite.
@@ -2879,7 +2923,7 @@ export class SessionManager {
 		if (branchFromId !== null && !this.getEntry(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
-		const entry = cloneCanonicalData(
+		const entry = parseSessionEntryForAdmission(
 			{
 				type: "branch_summary",
 				id: generateId(this.byId),
@@ -2892,6 +2936,7 @@ export class SessionManager {
 			} satisfies BranchSummaryEntry,
 			"Session branch_summary entry",
 		);
+		validateSessionEntryAdmissionReferences(entry, this.byId, this.nextOrdinal);
 		this._assertPersistenceHealthy();
 		this._setBranchLeaf(branchFromId);
 		this._appendEntry(entry);
@@ -3076,13 +3121,10 @@ export class SessionManager {
 
 	/** Find a generation-pinned reference by exact id; open() performs full snapshot validation. */
 	static async findForResume(sessionDir: string, sessionId: string): Promise<SessionReference | undefined> {
-		assertValidSessionId(sessionId);
-		const dir = resolvePath(sessionDir);
-		return SessionManager._scopedStore(dir, async (store) => {
-			const summary = await store.findSessionSummaryById(sessionId);
-			if (!summary) return undefined;
-			return sessionReference(dir, store.info.storeId, summary.id, summary.sessionGeneration);
-		});
+		const result = await findSessionSummaryById(sessionDir, sessionId);
+		return result
+			? sessionReference(result.directory, result.storeId, result.summary.id, result.summary.sessionGeneration)
+			: undefined;
 	}
 
 	/** Create an in-memory session (no persistence). */
@@ -3097,15 +3139,24 @@ export class SessionManager {
 		sessionDir?: string,
 		options?: { id?: string },
 	): Promise<SessionManager> {
+		return SessionManager._importFromJsonl(inputPath, targetCwd, sessionDir, options, true);
+	}
+
+	private static async _importFromJsonl(
+		inputPath: string,
+		targetCwd: string | undefined,
+		sessionDir: string | undefined,
+		options: { id?: string } | undefined,
+		persist: boolean,
+	): Promise<SessionManager> {
 		const resolvedPath = resolvePath(inputPath);
-		if (sessionDir !== undefined) ensurePrivateDirectorySync(normalizePath(sessionDir));
+		if (persist && sessionDir !== undefined) ensurePrivateDirectorySync(normalizePath(sessionDir));
 		if (existsSync(resolvedPath)) hardenPrivateRegularFileSync(resolvedPath);
 		const sourceEntries = loadEntriesFromFile(resolvedPath);
 		if (sourceEntries.length === 0) throw new Error(`Cannot import invalid session JSONL: ${resolvedPath}`);
 		const header = assertCurrentSessionSnapshot(sourceEntries);
 
 		const cwd = targetCwd ?? header.cwd;
-		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const parentSession =
 			header.parentSessionDirectory !== undefined &&
 			header.parentStoreId !== undefined &&
@@ -3149,6 +3200,11 @@ export class SessionManager {
 			});
 		const finalLeafId = nearestPublicParent(sourceLeafId);
 		const targetId = options?.id ?? header.id;
+		const newSessionOptions = {
+			id: targetId,
+			...(parentSession === undefined ? {} : { parentSession }),
+			...(header.origin === undefined ? {} : { origin: header.origin }),
+		};
 		const stage = async (manager: SessionManager): Promise<void> => {
 			await manager.appendAtomically(
 				() => {
@@ -3163,18 +3219,12 @@ export class SessionManager {
 		};
 
 		const validationManager = SessionManager.inMemory(cwd);
-		validationManager.newSession({
-			id: targetId,
-			...(parentSession === undefined ? {} : { parentSession }),
-			...(header.origin === undefined ? {} : { origin: header.origin }),
-		});
+		validationManager.newSession(newSessionOptions);
 		await stage(validationManager);
+		if (!persist) return validationManager;
 
-		const manager = await SessionManager.create(cwd, dir, {
-			id: targetId,
-			...(parentSession === undefined ? {} : { parentSession }),
-			...(header.origin === undefined ? {} : { origin: header.origin }),
-		});
+		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const manager = await SessionManager.create(cwd, dir, newSessionOptions);
 		try {
 			await stage(manager);
 			return manager;
@@ -3186,6 +3236,11 @@ export class SessionManager {
 			}
 			throw error;
 		}
+	}
+
+	static {
+		importSessionFromJsonlInMemoryImpl = (inputPath, targetCwd) =>
+			SessionManager._importFromJsonl(inputPath, targetCwd, undefined, undefined, false);
 	}
 
 	/** Fork a stored session into a new persisted session in another cwd/store. */
@@ -3461,4 +3516,9 @@ export class SessionManager {
 		}
 		return result.sort((left, right) => right.modified.getTime() - left.modified.getTime());
 	}
+}
+
+/** @internal Runtime-only JSONL import; intentionally omitted from the package entry point. */
+export function importSessionFromJsonlInMemory(inputPath: string, targetCwd?: string): Promise<SessionManager> {
+	return importSessionFromJsonlInMemoryImpl(inputPath, targetCwd);
 }

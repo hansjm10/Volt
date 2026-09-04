@@ -90,6 +90,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<SessionStoreErrorCode>([
 	"commit_identity_conflict",
 	"commit_digest_mismatch",
 	"constraint_failed",
+	"session_store_projection_integrity",
 	"worker_failed",
 ]);
 

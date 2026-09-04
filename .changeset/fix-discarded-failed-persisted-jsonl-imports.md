@@ -2,4 +2,4 @@
 "@hansjm10/volt-coding-agent": patch
 ---
 
-fix(sessions): Retained committed JSONL imports when later runtime setup fails.
+fix(sessions): Imported persisted and in-memory JSONL snapshots through one canonical timestamp-preserving path while retaining committed imports after runtime setup failures.
