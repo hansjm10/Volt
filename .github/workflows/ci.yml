@@ -121,8 +121,6 @@ jobs:
     permissions:
       contents: read
     env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
       VITEST_MAX_FORKS: '2'
     steps:
       - name: Checkout
@@ -153,6 +151,9 @@ jobs:
       - name: Test other suites
         if: matrix.shard == 1
         shell: bash
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: |
           ./test.sh run test:memory-benchmark
           ./test.sh run test:swebench-benchmark
@@ -162,6 +163,8 @@ jobs:
       - name: Test coding-agent shard
         shell: bash
         env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
           SHARD: ${{ matrix.shard }}
         run: ./test.sh test --workspace packages/coding-agent -- --shard="${SHARD}/3"
 
