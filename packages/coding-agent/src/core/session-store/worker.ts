@@ -425,6 +425,28 @@ const SUMMARY_COLUMNS = `
 	first_message AS firstMessage
 `;
 
+const SUMMARY_RESULT_COLUMNS = `
+	id,
+	sessionGeneration,
+	formatVersion,
+	cwd,
+	createdAt,
+	updatedAt,
+	parentSessionDirectory,
+	parentStoreId,
+	parentSessionId,
+	parentSessionGeneration,
+	origin,
+	startingGitContextRecorded,
+	startingGitContextJson,
+	name,
+	visible,
+	revision,
+	leafId,
+	messageCount,
+	firstMessage
+`;
+
 function summaryFromRow(row: Record<string, unknown>): SessionStoreSessionSummary {
 	const origin = sqlNullableString(row, "origin");
 	if (origin !== null && origin !== "subagent") throw new Error("Invalid SQLite origin column");
@@ -535,9 +557,10 @@ function sessionCwdMatches(summary: SessionStoreSessionSummary, canonicalCwd: st
 }
 
 function listSessions(includeHidden: boolean, cwd: string | null): SessionStoreSessionSummary[] {
-	const rows = requireDatabase()
-		.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE (? = 1 OR visible = 1) ORDER BY updated_at DESC, id`)
-		.all(includeHidden ? 1 : 0);
+	const db = requireDatabase();
+	const rows = includeHidden
+		? db.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions ORDER BY updated_at DESC, id`).all()
+		: db.prepare(`SELECT ${SUMMARY_COLUMNS} FROM sessions WHERE visible = 1 ORDER BY updated_at DESC, id`).all();
 	const canonicalCwd = cwd === null ? null : canonicalCwdIdentity(cwd);
 	return rows.map(summaryFromRow).filter((summary) => sessionCwdMatches(summary, canonicalCwd));
 }
@@ -569,7 +592,7 @@ function findContinuationSession(cwd: string | null): SessionStoreSessionSummary
 				) AS pendingInputAt
 			FROM sessions
 		)
-		SELECT *
+		SELECT ${SUMMARY_RESULT_COLUMNS}
 		FROM continuation_candidates
 		WHERE visible = 1 OR hasPendingInput = 1
 		ORDER BY

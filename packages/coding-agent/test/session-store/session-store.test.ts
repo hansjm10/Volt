@@ -564,6 +564,9 @@ describe("SQLite session store", () => {
 		expect(schemaObjects).not.toContain("labels_label_idx");
 		expect(schemaObjects).not.toContain("subagent_spawns");
 		expect(schemaObjects).not.toContain("subagent_spawns_child_idx");
+		expect(schemaObjects).toContain("sessions_visible_updated_idx");
+		expect(schemaObjects).not.toContain("sessions_cwd_visible_updated_idx");
+		expect(schemaObjects).not.toContain("sessions_parent_idx");
 		const storeId = client.info.storeId;
 
 		await client.close();

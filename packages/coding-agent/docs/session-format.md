@@ -22,7 +22,7 @@ Default storage is organized by workspace:
 
 A directory passed through `--session-dir`, `VOLT_CODING_AGENT_SESSION_DIR`, or the SDK instead contains its own `sessions.sqlite`. SQLite may keep active `sessions.sqlite-wal` and `sessions.sqlite-shm` sidecars beside it. The directory is owner-only (`0700`), and the database and sidecars are owner-readable/writable only (`0600`). Treat all three SQLite files as one live store.
 
-Listing, exact-ID resolution, continuation candidate selection, and RPC session discovery use materialized SQLite summaries rather than scanning canonical entries or JSONL. Tree loading opens and verifies one selected session. Deep search scans extracted searchable chunks one session at a time; those chunks are not a full-text index.
+Listing, exact-ID resolution, continuation candidate selection, and RPC session discovery use materialized SQLite summaries rather than scanning canonical entries or JSONL. Custom-session-directory cwd filters compare canonical filesystem identities after reading summaries so symlink and junction aliases match the same workspace. Tree loading opens and verifies one selected session. Deep search scans extracted searchable chunks one session at a time; those chunks are not a full-text index.
 
 ## JSONL Snapshots
 

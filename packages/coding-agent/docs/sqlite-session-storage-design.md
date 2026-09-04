@@ -283,13 +283,15 @@ Retain only projections used by indexed operations:
 Remove:
 
 - `labels` table and index;
-- `subagent_spawns` table and index.
+- `subagent_spawns` table and index;
+- the raw-cwd `sessions_cwd_visible_updated_idx` index;
+- the reverse-parent `sessions_parent_idx` index.
 
-Current code reads labels and subagent edges from canonical entries after opening a session. No indexed list/search/lookup path consumes their duplicate tables. Removing unused projections is safer than maintaining and verifying redundant state for hypothetical future queries.
+Current code reads labels and subagent edges from canonical entries after opening a session. No indexed list/search/lookup path consumes their duplicate tables. Cwd-filtered custom-store operations compare canonical filesystem identities after reading summaries so symlink and junction aliases remain equivalent; indexing the stored raw `cwd` would not implement that contract. Parent locators are returned with selected summaries, but no current operation queries sessions by parent. Removing unused projections and indexes is safer than maintaining write amplification for hypothetical future queries.
 
-If a future feature needs an indexed label or child lookup, it adds the projection with a concrete reader, reducer rule, and verification test in the same change.
+If a future feature needs an indexed label, child, canonical-cwd, or reverse-parent lookup, it adds the correct projection/index with a concrete reader, reducer rule where applicable, and verification test in the same change.
 
-The resulting schema contains only `store_metadata`, `sessions`, `entries`, `client_inputs`, `search_chunks`, and `transaction_commits`.
+The resulting schema contains only `store_metadata`, `sessions`, `entries`, `client_inputs`, `search_chunks`, and `transaction_commits`. Visible listings retain the consumed `(visible, updated_at DESC, id)` index.
 
 ### 6.2 One reducer
 
@@ -411,7 +413,7 @@ Let:
 | Fuzzy/phrase search | Metadata plus eligible search chunks | Parsing `O(Q)`; fuzzy scans `O(F × B)`; phrase substring cost also depends on query length |
 | Regex search | Same extracted document | Document/query construction is bounded by `Q + B`; JavaScript RegExp compile/match has no general time bound |
 
-Summary strings such as `name`, `first_message`, and cwd contribute to `M`. The guarantee is independence from cumulative canonical transcript payload, not zero cost per summary byte.
+Summary strings such as `name`, `first_message`, and cwd contribute to `M`. The guarantee is independence from cumulative canonical transcript payload, not zero cost per summary byte. Visible listings use the `(visible, updated_at DESC, id)` summary index. Custom-store cwd filtering happens after summary retrieval because matching canonical filesystem identities cannot be implemented by equality on the stored raw path.
 
 ### 7.2 One-session accumulation
 
@@ -571,6 +573,7 @@ Required result:
 
 - incremental and replay state use one transition path;
 - `labels` and `subagent_spawns` duplicate tables/indexes are removed;
+- raw-cwd and reverse-parent indexes with no current reader are removed;
 - session summary, `client_inputs`, and `search_chunks` commit with canonical entries;
 - open compares replay with every retained projection and fails closed;
 - list/exact lookup remain summary-only;
@@ -676,7 +679,7 @@ Regex tests verify parity and bounded test fixtures, not a false general latency
 - no setup cleanup automatically deletes a committed session;
 - each transferred manager has one finalizer;
 - every canonical entry is exhaustively validated and agrees with its SQL envelope;
-- only concretely consumed projections remain;
+- only concretely consumed projections and indexes remain;
 - incremental and replay projection state agree;
 - open rejects every retained projection mismatch;
 - list/exact/continuation discovery remains summary-only;
@@ -765,7 +768,7 @@ Reviewers accepted these eight decisions:
 2. Passing a manager to a high-level session/runtime/subagent factory consumes ownership at invocation.
 3. Before `AgentSession` construction the factory closes; afterward only the session/runtime disposes.
 4. Full validated `payload_json` is canonical and every SQL envelope column is derived and checked.
-5. Remove duplicate label and subagent-spawn tables because no indexed reader consumes them.
+5. Remove duplicate label and subagent-spawn tables plus raw-cwd and reverse-parent indexes because no current reader consumes them.
 6. Use one reducer and fail-closed open verification for retained projections; defer delta staging.
 7. Preserve search semantics, bound accumulation to one session, state query-dependent cost honestly, and do not add FTS.
 8. Defer durable preparation, crash reclaim, universal setup overlays, host-wide incarnation propagation, and new cross-system ownership state machines.

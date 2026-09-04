@@ -11,8 +11,6 @@ export const SESSION_STORE_TABLE_NAMES = [
 
 export const SESSION_STORE_INDEX_NAMES = [
 	"sessions_visible_updated_idx",
-	"sessions_cwd_visible_updated_idx",
-	"sessions_parent_idx",
 	"entries_parent_idx",
 	"entries_type_idx",
 	"client_inputs_state_idx",
@@ -67,9 +65,6 @@ BEGIN
 END;
 
 CREATE INDEX sessions_visible_updated_idx ON sessions (visible, updated_at DESC, id);
-CREATE INDEX sessions_cwd_visible_updated_idx ON sessions (cwd, visible, updated_at DESC, id);
-CREATE INDEX sessions_parent_idx
-	ON sessions (parent_session_directory, parent_store_id, parent_session_id, parent_session_generation);
 
 CREATE TABLE entries (
 	session_id TEXT NOT NULL,
