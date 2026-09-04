@@ -27,9 +27,9 @@ vi.mock("../src/core/compaction/index.js", () => ({
 		totalTokens?: number;
 	}) => usage.totalTokens ?? usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
 	collectEntriesForBranchSummary: () => ({ entries: [], commonAncestorId: null }),
-	compact: async () => ({
+	compact: async (preparation: { firstKeptEntryId?: string }) => ({
 		summary: "compacted",
-		firstKeptEntryId: "entry-1",
+		firstKeptEntryId: preparation.firstKeptEntryId ?? "entry-1",
 		tokensBefore: 100,
 		details: {},
 	}),
@@ -68,7 +68,17 @@ vi.mock("../src/core/compaction/index.js", () => ({
 		return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
 	},
 	generateBranchSummary: async () => ({ summary: "", aborted: false, readFiles: [], modifiedFiles: [] }),
-	prepareCompaction: () => ({ dummy: true }),
+	prepareCompaction: (pathEntries: Array<{ id: string; type: string; message?: { role: string } }>) => {
+		let firstKeptEntryId = "entry-1";
+		for (let index = pathEntries.length - 1; index >= 0; index--) {
+			const entry = pathEntries[index];
+			if (entry.type === "message" && entry.message?.role === "assistant") {
+				firstKeptEntryId = entry.id;
+				break;
+			}
+		}
+		return { dummy: true, firstKeptEntryId };
+	},
 	shouldCompact: (
 		contextTokens: number,
 		contextWindow: number,
@@ -166,6 +176,23 @@ describe("AgentSession auto-compaction queue resume", () => {
 	it("should continue after threshold compaction when a length stop has no visible response", async () => {
 		const model = session.model!;
 		let streamCallCount = 0;
+		const extensionCompactionEvents: Array<{
+			type: "session_before_compact" | "session_compact";
+			willRetry: boolean;
+		}> = [];
+		vi.spyOn(session.extensionRunner, "hasHandlers").mockImplementation(
+			(eventType) => eventType === "session_before_compact",
+		);
+		vi.spyOn(session.extensionRunner, "emit").mockImplementation(async (event) => {
+			if (event.type === "session_before_compact" || event.type === "session_compact") {
+				extensionCompactionEvents.push({ type: event.type, willRetry: event.willRetry });
+			}
+			return undefined;
+		});
+		const compactionRetries: boolean[] = [];
+		session.subscribe((event) => {
+			if (event.type === "compaction_end") compactionRetries.push(event.willRetry);
+		});
 
 		control.setStreamFn(() => {
 			const callNumber = ++streamCallCount;
@@ -220,6 +247,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await session.prompt("trigger length continuation");
 
 		expect(streamCallCount).toBe(2);
+		expect(extensionCompactionEvents).toEqual([
+			{ type: "session_before_compact", willRetry: true },
+			{ type: "session_compact", willRetry: true },
+		]);
+		expect(compactionRetries).toEqual([true]);
 	});
 
 	it("should compact mid-run when a turn with tool calls crosses the threshold", async () => {

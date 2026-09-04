@@ -1026,82 +1026,41 @@ export async function compact(
 		settings,
 	} = preparation;
 
-	// Generate summaries (can be parallel if both needed) and merge into one
+	// Generate summaries and merge into one
 	let summary: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Generate both summaries in parallel under one child cancellation scope.
-		// A terminal failure aborts its sibling, and both requests settle before
-		// compaction reports the original failure to its caller.
-		const summariesAbortController = new AbortController();
-		const abortSummaries = (): void => summariesAbortController.abort();
-		if (signal?.aborted) {
-			abortSummaries();
-		} else {
-			signal?.addEventListener("abort", abortSummaries, { once: true });
-		}
-		let firstFailure: unknown;
-		let hasFailure = false;
-		const runSummary = async (operation: () => Promise<string>): Promise<string> => {
-			try {
-				return await operation();
-			} catch (error) {
-				if (!hasFailure) {
-					hasFailure = true;
-					firstFailure = error;
-					abortSummaries();
-				}
-				throw error;
-			}
-		};
-		let summaryResults: [PromiseSettledResult<string>, PromiseSettledResult<string>];
-		try {
-			summaryResults = await Promise.allSettled([
-				runSummary(() =>
-					messagesToSummarize.length > 0
-						? generateSummaryInChunks(
-								messagesToSummarize,
-								model,
-								settings.reserveTokens,
-								apiKey,
-								headers,
-								summariesAbortController.signal,
-								customInstructions,
-								previousSummary,
-								thinkingLevel,
-								streamFn,
-								env,
-								retry,
-							)
-						: Promise.resolve("No prior history."),
-				),
-				runSummary(() =>
-					generateTurnPrefixSummary(
-						turnPrefixMessages,
+		const historySummary =
+			messagesToSummarize.length > 0
+				? await generateSummaryInChunks(
+						messagesToSummarize,
 						model,
 						settings.reserveTokens,
 						apiKey,
 						headers,
-						env,
-						summariesAbortController.signal,
+						signal,
+						customInstructions,
+						previousSummary,
 						thinkingLevel,
 						streamFn,
+						env,
 						retry,
-					),
-				),
-			]);
-		} finally {
-			signal?.removeEventListener("abort", abortSummaries);
-		}
-		if (hasFailure) {
-			throw firstFailure;
-		}
-		const [historySummary, turnPrefixSummary] = summaryResults;
-		if (historySummary.status !== "fulfilled" || turnPrefixSummary.status !== "fulfilled") {
-			throw new Error("Split compaction summaries failed without an error");
-		}
+					)
+				: "No prior history.";
+		const turnPrefixSummary = await generateTurnPrefixSummary(
+			turnPrefixMessages,
+			model,
+			settings.reserveTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			streamFn,
+			retry,
+		);
 		// Merge into single summary
-		summary = `${historySummary.value}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixSummary.value}`;
+		summary = `${historySummary}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixSummary}`;
 	} else {
 		// Just generate history summary
 		summary = await generateSummaryInChunks(

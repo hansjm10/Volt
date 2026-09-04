@@ -677,6 +677,60 @@ describe("harness compaction", () => {
 		expect(seenOptions.map((options) => options?.["maxTokens"])).toEqual([128000, 128000]);
 	});
 
+	it("serializes split-turn summary requests", async () => {
+		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
+		const { faux, model } = createFauxModel(false);
+		let activeRequests = 0;
+		let maxActiveRequests = 0;
+		let releaseHistory!: () => void;
+		const historyReleased = new Promise<void>((resolve) => {
+			releaseHistory = resolve;
+		});
+		let markHistoryStarted!: () => void;
+		const historyStarted = new Promise<void>((resolve) => {
+			markHistoryStarted = resolve;
+		});
+		const requestOrder: string[] = [];
+		faux.setSimpleResponses([
+			async () => {
+				activeRequests++;
+				maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+				requestOrder.push("history-start");
+				markHistoryStarted();
+				await historyReleased;
+				requestOrder.push("history-end");
+				activeRequests--;
+				return fauxAssistantMessage("history summary");
+			},
+			() => {
+				activeRequests++;
+				maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+				requestOrder.push("prefix-start");
+				activeRequests--;
+				return fauxAssistantMessage("prefix summary");
+			},
+		]);
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: messages,
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		const compaction = compact(preparation, model, "test-key");
+		await historyStarted;
+		expect(faux.state.simpleCallCount).toBe(1);
+		releaseHistory();
+		getOrThrow(await compaction);
+
+		expect(faux.state.simpleCallCount).toBe(2);
+		expect(maxActiveRequests).toBe(1);
+		expect(requestOrder).toEqual(["history-start", "history-end", "prefix-start"]);
+	});
+
 	it("returns compaction error results without throwing", async () => {
 		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
 		const preparation: CompactionPreparation = {
