@@ -192,12 +192,21 @@ export async function createIrohRemoteAgentRuntimeWithSessionSelection(
 				diagnostics: services.diagnostics,
 			};
 		} catch (error) {
+			const cleanupErrors: unknown[] = [];
 			try {
 				await subagentManager.dispose();
 			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				services.gitContextProvider.dispose();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (cleanupErrors.length > 0) {
 				throw new AggregateError(
-					[error, cleanupError],
-					"Remote agent session creation failed and its untransferred subagent manager could not be disposed",
+					[error, ...cleanupErrors],
+					"Remote agent session creation failed and its untransferred services could not be disposed",
 				);
 			}
 			throw error;

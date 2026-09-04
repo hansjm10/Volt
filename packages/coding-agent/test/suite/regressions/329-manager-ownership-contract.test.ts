@@ -12,6 +12,7 @@ import { restoreStdout } from "../../../src/core/output-guard.ts";
 import { createAgentSession } from "../../../src/core/sdk.ts";
 import { SessionManager } from "../../../src/core/session-manager.ts";
 import { SettingsManager } from "../../../src/core/settings-manager.ts";
+import { SubagentManager } from "../../../src/core/subagents/index.ts";
 import { stopThemeWatcher } from "../../../src/core/theme/runtime.ts";
 import { main } from "../../../src/main.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
@@ -258,6 +259,50 @@ describe("PR #329 manager ownership contract", () => {
 				disposeGitContext.call(serviceGitContext);
 			}
 			if (cliManager && !managerClosed) await cliManager.closePersistence();
+		}
+	});
+
+	it("consumes supplied managers when either public subagent start rejects admission immediately", async () => {
+		for (const method of ["start", "startByName"] as const) {
+			const subagentManager = new SubagentManager({
+				createRuntime: async () => {
+					throw new Error("child runtime creation is not expected");
+				},
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+			});
+			await subagentManager.dispose();
+			const sessionManager = await SessionManager.create(
+				harness.tempDir,
+				join(harness.tempDir, `${method}-disposed-subagent-sessions`),
+				{ id: `${method}-disposed-subagent` },
+			);
+			const sessionRef = sessionManager.getSessionRef();
+			if (!sessionRef) throw new Error("Expected a persisted supplied manager reference");
+			const closePersistence = sessionManager.closePersistence.bind(sessionManager);
+			let closeCalls = 0;
+			const closeSpy = vi.spyOn(sessionManager, "closePersistence").mockImplementation(async () => {
+				closeCalls++;
+				await closePersistence();
+			});
+
+			try {
+				const start =
+					method === "start"
+						? subagentManager.start({ sessionManager })
+						: subagentManager.startByName("unused", { sessionManager });
+				await expect(start).rejects.toThrow("Subagent manager is disposed");
+				expect(closeCalls).toBe(1);
+				await expect(sessionManager.materialize()).rejects.toThrow("Session persistence is closed");
+				expect(await SessionManager.findForResume(sessionRef.sessionDirectory, sessionRef.sessionId)).toEqual(
+					sessionRef,
+				);
+				expect(subagentManager.listActivities()).toEqual([]);
+				expect(subagentManager.listDelegations()).toEqual([]);
+			} finally {
+				closeSpy.mockRestore();
+				if (closeCalls === 0) await closePersistence();
+			}
 		}
 	});
 

@@ -6,6 +6,7 @@ import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansj
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import { GitContextProvider } from "../src/core/git-context-provider.ts";
 import { DEFAULT_IROH_REMOTE_ALLOW_TOOLS } from "../src/core/remote/iroh/index.ts";
 import { CURRENT_SESSION_VERSION, SessionManager } from "../src/core/session-manager.ts";
 import { DEFAULT_SUBAGENT_TURN_LIMITS, SubagentManager } from "../src/core/subagents/index.ts";
@@ -506,6 +507,101 @@ export default function (volt) {
 		if (!(error instanceof Error)) throw new Error("expected runtime diagnostics to reject");
 		expect(error.message).toContain("broken-provider");
 		expect(await SessionManager.findForResume(sessionDir, "failed-diagnostics")).toBeDefined();
+	});
+
+	it("finalizes remote Git services and preserves cleanup errors before AgentSession construction", async () => {
+		writeRuntimeConfig({});
+		const sessionDir = join(agentDir, "sessions", "remote-workspace");
+		mkdirSync(sessionDir, { recursive: true });
+		const setupError = new Error("injected remote pre-session failure");
+		const gitCleanupError = new Error("injected remote Git cleanup failure");
+		let targetManager: SessionManager | undefined;
+		let serviceGitContext: GitContextProvider | undefined;
+		let managerCloseCalls = 0;
+		let gitDisposeCalls = 0;
+		let failureInjected = false;
+		const createSessionManager = SessionManager.create.bind(SessionManager);
+		const flush = SessionManager.prototype.flush;
+		const closePersistence = SessionManager.prototype.closePersistence;
+		const disposeGitContext = GitContextProvider.prototype.dispose;
+		const createSpy = vi.spyOn(SessionManager, "create").mockImplementation(async (...args) => {
+			const manager = await createSessionManager(...args);
+			if (args[2]?.id === "failed-remote-services") targetManager = manager;
+			return manager;
+		});
+		const refreshSpy = vi.spyOn(GitContextProvider.prototype, "refresh").mockImplementation(function (
+			this: GitContextProvider,
+		) {
+			serviceGitContext ??= this;
+			return Promise.resolve({ status: "definitive", gitContext: null });
+		});
+		const disposeSpy = vi.spyOn(GitContextProvider.prototype, "dispose").mockImplementation(function (
+			this: GitContextProvider,
+		): void {
+			if (this !== serviceGitContext) {
+				disposeGitContext.call(this);
+				return;
+			}
+			gitDisposeCalls++;
+			disposeGitContext.call(this);
+			throw gitCleanupError;
+		});
+		const flushSpy = vi.spyOn(SessionManager.prototype, "flush").mockImplementation(function (
+			this: SessionManager,
+		): Promise<void> {
+			if (this === targetManager && serviceGitContext && !failureInjected) {
+				failureInjected = true;
+				return Promise.reject(setupError);
+			}
+			return flush.call(this);
+		});
+		const closeSpy = vi.spyOn(SessionManager.prototype, "closePersistence").mockImplementation(function (
+			this: SessionManager,
+		): Promise<void> {
+			if (this === targetManager) managerCloseCalls++;
+			return closePersistence.call(this);
+		});
+
+		let thrown: unknown;
+		try {
+			thrown = await createIrohRemoteAgentRuntimeWithSessionSelection({
+				agentDir,
+				conversationTarget: { target: "new", sessionId: "failed-remote-services" },
+				cwd,
+				sessionDir,
+			}).catch((error: unknown) => error);
+		} finally {
+			createSpy.mockRestore();
+			refreshSpy.mockRestore();
+			disposeSpy.mockRestore();
+			flushSpy.mockRestore();
+			closeSpy.mockRestore();
+		}
+
+		try {
+			expect(failureInjected).toBe(true);
+			expect(thrown).toBeInstanceOf(AggregateError);
+			if (!(thrown instanceof AggregateError)) throw new Error("expected an aggregate service cleanup failure");
+			expect(thrown.message).toBe(
+				"Remote agent session creation failed and its untransferred services could not be disposed",
+			);
+			expect(thrown.errors as unknown[]).toEqual([setupError, gitCleanupError]);
+			expect(serviceGitContext).toBeDefined();
+			expect(gitDisposeCalls).toBe(1);
+			expect(targetManager).toBeDefined();
+			expect(managerCloseCalls).toBe(1);
+			if (!targetManager) throw new Error("expected the consumed remote session manager");
+			await expect(targetManager.materialize()).rejects.toThrow("Session persistence is closed");
+			const retainedRef = await SessionManager.findForResume(sessionDir, "failed-remote-services");
+			expect(retainedRef).toBeDefined();
+			if (!retainedRef) throw new Error("expected the committed remote session row");
+			const reopened = await SessionManager.open(retainedRef);
+			expect(reopened.getSessionRef()).toEqual(retainedRef);
+			await reopened.closePersistence();
+		} finally {
+			if (serviceGitContext && gitDisposeCalls === 0) disposeGitContext.call(serviceGitContext);
+			if (targetManager && managerCloseCalls === 0) await closePersistence.call(targetManager);
+		}
 	});
 
 	it("retains a newly created remote session even when runtime disposal fails", async () => {

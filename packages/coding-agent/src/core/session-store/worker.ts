@@ -775,14 +775,23 @@ function loadSession(sessionId: string, sessionGeneration: string): SessionStore
 		} catch (error) {
 			throw projectionIntegrityError("summary", error);
 		}
-		const entries = db
+		const entryRows = db
 			.prepare(
 				`SELECT entry_id AS id, parent_entry_id AS parentId, entry_type AS type, timestamp, ordinal,
 				is_host_only AS isHostOnly, payload_json AS payloadJson
 			FROM entries WHERE session_id = ? ORDER BY ordinal`,
 			)
-			.all(sessionId)
-			.map(entryFromRow);
+			.all(sessionId);
+		let entries: SessionStoreEntry[];
+		try {
+			entries = entryRows.map(entryFromRow);
+		} catch (error) {
+			throw new SessionStoreError(
+				"session_store_entry_integrity",
+				"Session store canonical entries are invalid or inconsistent",
+				{ cause: error },
+			);
+		}
 		let clientInputs: SessionStoreClientInput[];
 		try {
 			clientInputs = db

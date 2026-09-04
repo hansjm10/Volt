@@ -911,6 +911,102 @@ describe("PR #329 projection reducer contract", () => {
 		});
 	});
 
+	describe("canonical entry integrity classification", () => {
+		it.each([
+			{
+				name: "malformed canonical payload",
+				slug: "payload",
+				mutate(database: DatabaseSync, sessionId: string): void {
+					const result = database
+						.prepare("UPDATE entries SET payload_json = '{}' WHERE session_id = ? AND ordinal = 1")
+						.run(sessionId);
+					if (result.changes !== 1) throw new Error("Could not corrupt the canonical entry payload");
+				},
+				read(database: DatabaseSync, sessionId: string): unknown {
+					return database
+						.prepare("SELECT payload_json AS value FROM entries WHERE session_id = ? AND ordinal = 1")
+						.get(sessionId)?.value;
+				},
+				expectedStoredValue: "{}",
+			},
+			{
+				name: "canonical payload and envelope mismatch",
+				slug: "envelope",
+				mutate(database: DatabaseSync, sessionId: string): void {
+					const result = database
+						.prepare("UPDATE entries SET entry_type = 'custom' WHERE session_id = ? AND ordinal = 1")
+						.run(sessionId);
+					if (result.changes !== 1) throw new Error("Could not corrupt the canonical entry envelope");
+				},
+				read(database: DatabaseSync, sessionId: string): unknown {
+					return database
+						.prepare("SELECT entry_type AS value FROM entries WHERE session_id = ? AND ordinal = 1")
+						.get(sessionId)?.value;
+				},
+				expectedStoredValue: "custom",
+			},
+		])("classifies $name without repair and releases the failed-open lease", async (testCase) => {
+			const cwd = join(root, `entry-integrity-${testCase.slug}-workspace`);
+			const sessionDir = join(root, `entry-integrity-${testCase.slug}-sessions`);
+			mkdirSync(cwd, { recursive: true });
+			const corrupted = await SessionManager.create(cwd, sessionDir, {
+				id: `corrupted-${testCase.slug}`,
+			});
+			corrupted.appendMessage({ role: "user", content: "corrupt me", timestamp: Date.parse(CREATED_AT) });
+			await corrupted.flush();
+			const corruptedRef = corrupted.getSessionRef();
+			if (!corruptedRef) throw new Error("Expected a persisted corrupted-session reference");
+			const healthy = await SessionManager.create(cwd, sessionDir, { id: `healthy-${corruptedRef.sessionId}` });
+			healthy.appendMessage({ role: "user", content: "healthy sibling", timestamp: Date.parse(SECOND_AT) });
+			await healthy.flush();
+			const healthyRef = healthy.getSessionRef();
+			if (!healthyRef) throw new Error("Expected a persisted healthy-session reference");
+			await Promise.all([corrupted.closePersistence(), healthy.closePersistence()]);
+
+			const database = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME));
+			let foreignKeysValid = false;
+			try {
+				testCase.mutate(database, corruptedRef.sessionId);
+				foreignKeysValid = database.prepare("PRAGMA foreign_key_check").all().length === 0;
+			} finally {
+				database.close();
+			}
+
+			const openError = await captureAsyncError(() => SessionManager.open(corruptedRef));
+			const probeLease = await acquireSharedSQLiteSessionStore(sessionDir);
+			leases.add(probeLease);
+			const close = vi.spyOn(probeLease.client, "close");
+			await probeLease.release();
+			leases.delete(probeLease);
+			const releasedFinalLease = close.mock.calls.length === 1;
+			if (!releasedFinalLease) await probeLease.client.close();
+			const reopenedHealthy = await SessionManager.open(healthyRef);
+			const unchanged = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME), { readOnly: true });
+			let storedCorruption: unknown;
+			try {
+				storedCorruption = testCase.read(unchanged, corruptedRef.sessionId);
+			} finally {
+				unchanged.close();
+			}
+
+			expect({
+				foreignKeysValid,
+				openErrorCode: errorCode(openError),
+				openErrorMessage: errorMessage(openError),
+				releasedFinalLease,
+				storedCorruption,
+				healthyMessages: reopenedHealthy.buildSessionContext().messages.map(messageText),
+			}).toEqual({
+				foreignKeysValid: true,
+				openErrorCode: "session_store_entry_integrity",
+				openErrorMessage: "Session store canonical entries are invalid or inconsistent",
+				releasedFinalLease: true,
+				storedCorruption: testCase.expectedStoredValue,
+				healthyMessages: ["healthy sibling"],
+			});
+		});
+	});
+
 	describe("batch-local canonical search projection agreement", () => {
 		it.each(TRANSACTION_PROJECTION_MISMATCH_CASES)("$name at write time", async ({ name, malformedPayload }) => {
 			const store = await openLowLevelStore(

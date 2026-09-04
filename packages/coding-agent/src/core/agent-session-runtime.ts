@@ -232,6 +232,27 @@ async function closeOwnedSessionManager(manager: SessionManager, error: unknown,
 	throw error;
 }
 
+async function finalizeRuntimeOwnedSession(
+	session: AgentSession,
+	finalizeSession: () => void | Promise<void>,
+	message: string,
+	initialErrors: readonly unknown[] = [],
+): Promise<void> {
+	const errors = [...initialErrors];
+	try {
+		await session.disposeSubagentToolManager();
+	} catch (error) {
+		errors.push(error);
+	}
+	try {
+		await finalizeSession();
+	} catch (error) {
+		errors.push(error);
+	}
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, message);
+}
+
 function sessionInfoToSummary(info: SessionInfo, currentSessionId: string): WorkspaceSessionSummary {
 	return {
 		sessionId: info.id,
@@ -723,20 +744,22 @@ export class AgentSessionRuntime {
 		}
 		this.beforeSessionInvalidate?.();
 		onInvalidated?.();
-		try {
-			await this.session.disposeSubagentToolManager();
-		} finally {
-			await this.session.disposeForSessionReplacement();
-		}
+		await finalizeRuntimeOwnedSession(
+			this.session,
+			() => this.session.disposeForSessionReplacement(),
+			"Agent session replacement cleanup did not complete",
+		);
 	}
 
 	private async disposeReplacementSession(session: AgentSession): Promise<void> {
-		try {
-			await session.disposeSubagentToolManager();
-		} finally {
-			session.dispose("disposal");
-			await session.waitForClosed();
-		}
+		await finalizeRuntimeOwnedSession(
+			session,
+			async () => {
+				session.dispose("disposal");
+				await session.waitForClosed();
+			},
+			"Replacement agent session cleanup did not complete",
+		);
 	}
 
 	private async replaceCurrentSession(options: {
@@ -1710,6 +1733,7 @@ export class AgentSessionRuntime {
 			if (this.sessionInvalidated) {
 				return;
 			}
+			const shutdownErrors: unknown[] = [];
 			try {
 				if (this.session.sessionManager.getConversationAuthorityStatus().status === "available") {
 					await emitSessionShutdownEvent(this.session.extensionRunner, {
@@ -1718,15 +1742,22 @@ export class AgentSessionRuntime {
 					});
 				}
 				this.beforeSessionInvalidate?.();
+			} catch (error) {
+				shutdownErrors.push(error);
+			}
+			try {
+				await finalizeRuntimeOwnedSession(
+					this.session,
+					async () => {
+						this.session.dispose("disposal");
+						await this.session.waitForClosed();
+					},
+					"Agent session runtime cleanup did not complete",
+					shutdownErrors,
+				);
 			} finally {
-				try {
-					await this.session.disposeSubagentToolManager();
-				} finally {
-					this.session.dispose("disposal");
-					await this.session.waitForClosed();
-					this.sessionInvalidated = true;
-					this.lifecycleRevision++;
-				}
+				this.sessionInvalidated = true;
+				this.lifecycleRevision++;
 			}
 		};
 		this.disposePromise = this.runOrEnqueueLifecycleOperation(execute);

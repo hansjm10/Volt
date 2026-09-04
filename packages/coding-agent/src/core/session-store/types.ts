@@ -208,6 +208,7 @@ export type SessionStoreErrorCode =
 	| "commit_identity_conflict"
 	| "commit_digest_mismatch"
 	| "constraint_failed"
+	| "session_store_entry_integrity"
 	| "session_store_projection_integrity"
 	| "worker_failed";
 

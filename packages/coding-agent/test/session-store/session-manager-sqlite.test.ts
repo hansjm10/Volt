@@ -96,7 +96,10 @@ describe("SQLite-backed SessionManager", () => {
 			database.close();
 		}
 
-		await expect(SessionManager.open(corruptedRef)).rejects.toThrow("Invalid SQLite isHostOnly boolean column");
+		await expect(SessionManager.open(corruptedRef)).rejects.toMatchObject({
+			code: "session_store_entry_integrity",
+			message: "Session store canonical entries are invalid or inconsistent",
+		});
 		const reopened = await own(SessionManager.open(healthyRef));
 		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "keep me" }]);
 	});

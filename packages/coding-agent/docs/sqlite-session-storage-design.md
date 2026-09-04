@@ -210,6 +210,8 @@ On load:
 4. compare every stored column exactly;
 5. reject any mismatch before reduction.
 
+Canonical payload, row-value, or envelope disagreement during open is reported as `session_store_entry_integrity` with the fixed bounded message `Session store canonical entries are invalid or inconsistent`. The worker retains the underlying cause internally while exposing only that code and message across its protocol.
+
 `session_id` comes from the containing row/transaction. `is_host_only` is deterministic from entry type and cannot be chosen by payload data. A stored ordinal is required and must be a positive contiguous safe integer.
 
 Keeping the full entry payload avoids an unrelated body-only storage redesign while still establishing one source of truth.
@@ -552,6 +554,7 @@ Required result:
 - one full canonical entry drives SQL envelope columns;
 - every entry type rejects malformed and unknown fields;
 - column/payload ordinal, ID, parent, type, timestamp, and host-only classification agree exactly;
+- malformed canonical rows and envelope disagreement use the stable `session_store_entry_integrity` classification;
 - dangling/invalid references reject before state mutation;
 - the current deterministic compaction CI regression asserts the authoritative validation boundary rather than obsolete later text.
 
@@ -629,7 +632,7 @@ For every entry type:
 - invalid compaction, leaf, label, client-input, and subagent references;
 - strict JSONL import/export parity.
 
-Corruption rejection must release the store lease and leave other sessions/stores usable.
+Corruption rejection must release the store lease and leave other sessions/stores usable. Malformed canonical payloads, invalid row values, and valid payload/envelope mismatches all use the exact `session_store_entry_integrity` code and bounded message defined in §5.1.
 
 ### 10.3 Projection tests
 

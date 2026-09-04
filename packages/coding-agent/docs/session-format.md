@@ -201,19 +201,19 @@ interface SessionEntryBase {
 
 ### Snapshot Header
 
-The first line of an exported snapshot is metadata only and is not part of the tree (no `parentId`). `SessionManager.getHeader()` exposes the live form as `SessionHeader`, whose optional `parentSession` is a `SessionReference`; export converts that reference to the path-free identity fields shown below.
+The first line of an exported snapshot is metadata only and is not part of the tree (no `parentId`). `SessionManager.getHeader()` exposes the live form as `SessionHeader`, whose optional `parentSession` is a `SessionReference`; export converts that reference to the host-local locator fields shown below.
 
 ```json
 {"type":"session","version":5,"snapshotVersion":1,"id":"uuid","timestamp":"2026-08-31T14:00:00.000Z","cwd":"/path/to/project"}
 ```
 
-A snapshot exported from a session with a persisted parent carries the host-local store locator needed to restore that relationship, never a live storage path:
+A snapshot exported from a session with a persisted parent carries the complete host-local store locator needed to restore that relationship. `parentSessionDirectory` can identify the parent session's active SQLite store directory:
 
 ```json
 {"type":"session","version":5,"snapshotVersion":1,"id":"uuid","timestamp":"2026-08-31T14:00:00.000Z","cwd":"/path/to/project","parentSessionDirectory":"/path/to/parent/store","parentStoreId":"store-uuid","parentSessionId":"parent-uuid","parentSessionGeneration":"parent-generation-uuid"}
 ```
 
-Session store directories are local interchange metadata and never cross the remote RPC surface.
+Every snapshot header includes the session `cwd`, and a parent locator can include another host path. Treat snapshots as sensitive local interchange artifacts. These store locators are accepted only during local snapshot import and never cross the remote RPC surface.
 
 ### SessionMessageEntry
 

@@ -10,6 +10,7 @@ import {
 	registerFauxProvider,
 } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgentSession } from "../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -341,6 +342,56 @@ describe("SubagentManager", () => {
 				includeMessageFreeDurable: true,
 			}),
 		).toEqual([expect.objectContaining({ ref: childSessionRef })]);
+	});
+
+	it("disposes a child runtime when startup fails after partial turn-budget wiring", async () => {
+		const setupError = new Error("injected session accounting subscription failure");
+		const wiringCleanupError = new Error("injected budget policy cleanup failure");
+		let budgetPolicyRegistered = false;
+		let unregisterBudgetPolicyCalls = 0;
+		const registerTurnPolicy = AgentSession.prototype.registerTurnPolicy;
+		const subscribe = AgentSession.prototype.subscribe;
+		const registerSpy = vi.spyOn(AgentSession.prototype, "registerTurnPolicy").mockImplementation(function (
+			this: AgentSession,
+			policy,
+		): () => void {
+			const unregister = registerTurnPolicy.call(this, policy);
+			budgetPolicyRegistered = true;
+			return () => {
+				unregisterBudgetPolicyCalls++;
+				unregister();
+				throw wiringCleanupError;
+			};
+		});
+		const subscribeSpy = vi.spyOn(AgentSession.prototype, "subscribe").mockImplementation(function (
+			this: AgentSession,
+			listener,
+			options,
+		): () => void {
+			if (budgetPolicyRegistered) throw setupError;
+			return subscribe.call(this, listener, options);
+		});
+		const scope = new SubagentDelegationScope();
+		cleanups.push(() => scope.dispose());
+		const { manager, getDisposedSessionCount } = await createTestManager();
+
+		let thrown: unknown;
+		try {
+			thrown = await manager.start({ delegationScope: scope }).catch((error: unknown) => error);
+		} finally {
+			registerSpy.mockRestore();
+			subscribeSpy.mockRestore();
+		}
+
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) throw new Error("expected aggregate subagent startup failure");
+		expect(thrown.message).toBe("Subagent startup failed and cleanup did not complete");
+		expect(thrown.errors as unknown[]).toEqual([setupError, wiringCleanupError]);
+		expect(unregisterBudgetPolicyCalls).toBe(1);
+		expect(getDisposedSessionCount()).toBe(1);
+		expect(scope.snapshot()).toMatchObject({ startsUsed: 0, activeDescendants: 0 });
+		expect(manager.listActivities()).toEqual([]);
+		expect(manager.listDelegations()).toEqual([]);
 	});
 
 	it("emits runtime-created metadata and can retain child runtimes after loopback dispose", async () => {

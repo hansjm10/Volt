@@ -1072,12 +1072,13 @@ export class SubagentManager {
 	}
 
 	async start(options: SubagentStartOptions = {}): Promise<SubagentHandle> {
-		const finishStart = this.beginStart();
+		let finishStart = (): void => undefined;
 		let releaseReservation = (): void => undefined;
 		let scopeLease: SubagentDelegationScopeLease | undefined;
 		let treeReservation: SubagentDelegationReservation | undefined;
 		let managerTransferred = false;
 		try {
+			finishStart = this.beginStart();
 			releaseReservation = this.reserveChildStart(undefined);
 			scopeLease = this.resolveDelegationScope(options.delegationScope);
 			treeReservation = scopeLease.scope.reserve("subagent", (this.subagentContext?.depth ?? 0) + 1);
@@ -1161,12 +1162,13 @@ export class SubagentManager {
 	}
 
 	async startByName(agentName: string, options: SubagentStartByNameOptions = {}): Promise<SubagentHandle> {
-		const finishStart = this.beginStart();
+		let finishStart = (): void => undefined;
 		let releaseReservation = (): void => undefined;
 		let scopeLease: SubagentDelegationScopeLease | undefined;
 		let treeReservation: SubagentDelegationReservation | undefined;
 		let managerTransferred = false;
 		try {
+			finishStart = this.beginStart();
 			const definition = this.getDefinition(agentName, { resourceLoader: options.resourceLoader });
 			if (options.spawnBatchLease) {
 				const admission = this.batchAdmissions.get(options.spawnBatchLease);
@@ -1485,111 +1487,20 @@ export class SubagentManager {
 			abortRequested = true;
 			this.markActivityAbortRequested(id);
 		};
-		const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
-		let requiresFinalTurnReport = false;
-		let stopAfterTurnForBudget = false;
-		let pendingBudgetDelivery: string | undefined;
-		let finalResponseSatisfiedBudget = false;
-		const abortForTurnBudget = (): void => {
-			stopAfterTurnForBudget = true;
-			markRunAbortRequested();
-			void runtime.session.abort().catch(() => undefined);
-		};
-		const unregisterBudgetPolicy = runtime.session.registerTurnPolicy({
-			beforeToolCall: async () => {
-				if (!requiresFinalTurnReport) return undefined;
-				return {
-					block: true,
-					reason: "This subagent's turn budget is exhausted. Do not use tools; return your best final report now.",
-				};
-			},
-			nextAction: async (context) => {
-				if (context.requestAuthority === "final_response") {
-					pendingBudgetDelivery = undefined;
-					finalResponseSatisfiedBudget = requiresFinalTurnReport;
-					return context.defaultAction;
-				}
-				if (pendingBudgetDelivery !== undefined) {
-					const content = pendingBudgetDelivery;
-					pendingBudgetDelivery = undefined;
-					return {
-						type: "request",
-						reason: "delivery",
-						deliveries: [
-							{
-								messages: [
-									{
-										role: "user",
-										content: [{ type: "text", text: content }],
-										timestamp: Date.now(),
-									},
-								],
-							},
-						],
-					};
-				}
-				if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
-				return context.defaultAction;
-			},
-		});
-		const unsubscribeSessionAccounting = runtime.session.subscribe(
-			(event) => {
-				if (event.type === "turn_end") {
-					// turn_end also fires for error/aborted turns; those deliberately
-					// consume budget so a flaky child still converges on its report
-					// stage instead of retrying without bound.
-					delegation.scopeLease.scope.recordTurn();
-					if (finalResponseSatisfiedBudget) {
-						finalResponseSatisfiedBudget = false;
-						return;
-					}
-					const requestedTool =
-						event.message.role === "assistant" &&
-						event.message.content.some((content) => content.type === "toolCall");
-					if (requiresFinalTurnReport) {
-						stopAfterTurnForBudget = true;
-						if (requestedTool) abortForTurnBudget();
-						return;
-					}
-					const turnBudgetEvent = turnBudget.recordTurn();
-					if (!turnBudgetEvent) return;
-					if (turnBudgetEvent.stage === "exceeded") {
-						// Defensive backstop only: both final-report branches below keep
-						// requiresFinalTurnReport set, which short-circuits before
-						// recordTurn, so this handler never advances the budget past
-						// maxTurns itself.
-						abortForTurnBudget();
-						return;
-					}
-					if (turnBudgetEvent.stage === "warning") {
-						if (!requestedTool) return;
-						pendingBudgetDelivery = `This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`;
-						return;
-					}
-					if (!requestedTool) {
-						// The child finished naturally at its limit. Keep the report-only
-						// posture so a later re-prompt yields tool-blocked one-turn
-						// replies instead of burning a turn into the exceeded backstop.
-						requiresFinalTurnReport = true;
-						stopAfterTurnForBudget = true;
-						return;
-					}
-					requiresFinalTurnReport = true;
-					pendingBudgetDelivery = `This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`;
-					return;
-				}
-				if (event.type !== "message_end" || event.message.role !== "assistant") return;
-				const usage = event.message.usage;
-				delegation.scopeLease.scope.recordUsage(
-					usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
-					usage.cost.total,
-				);
-			},
-			{ monitorGitContext: false },
-		);
+		const budgetFinalizers: Array<() => void> = [];
 		const teardownBudgetWiring = (): void => {
-			unsubscribeSessionAccounting();
-			unregisterBudgetPolicy();
+			const cleanupErrors: unknown[] = [];
+			for (const finalize of budgetFinalizers.splice(0).reverse()) {
+				try {
+					finalize();
+				} catch (error) {
+					cleanupErrors.push(error);
+				}
+			}
+			if (cleanupErrors.length === 1) throw cleanupErrors[0];
+			if (cleanupErrors.length > 1) {
+				throw new AggregateError(cleanupErrors, "Subagent turn-budget cleanup did not complete");
+			}
 		};
 		let client: InProcessRpcClient | undefined;
 		let runtimeFinalizerTransferredToRpc = false;
@@ -1614,6 +1525,111 @@ export class SubagentManager {
 			}
 		};
 		try {
+			const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
+			let requiresFinalTurnReport = false;
+			let stopAfterTurnForBudget = false;
+			let pendingBudgetDelivery: string | undefined;
+			let finalResponseSatisfiedBudget = false;
+			const abortForTurnBudget = (): void => {
+				stopAfterTurnForBudget = true;
+				markRunAbortRequested();
+				void runtime.session.abort().catch(() => undefined);
+			};
+			const unregisterBudgetPolicy = runtime.session.registerTurnPolicy({
+				beforeToolCall: async () => {
+					if (!requiresFinalTurnReport) return undefined;
+					return {
+						block: true,
+						reason:
+							"This subagent's turn budget is exhausted. Do not use tools; return your best final report now.",
+					};
+				},
+				nextAction: async (context) => {
+					if (context.requestAuthority === "final_response") {
+						pendingBudgetDelivery = undefined;
+						finalResponseSatisfiedBudget = requiresFinalTurnReport;
+						return context.defaultAction;
+					}
+					if (pendingBudgetDelivery !== undefined) {
+						const content = pendingBudgetDelivery;
+						pendingBudgetDelivery = undefined;
+						return {
+							type: "request",
+							reason: "delivery",
+							deliveries: [
+								{
+									messages: [
+										{
+											role: "user",
+											content: [{ type: "text", text: content }],
+											timestamp: Date.now(),
+										},
+									],
+								},
+							],
+						};
+					}
+					if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
+					return context.defaultAction;
+				},
+			});
+			budgetFinalizers.push(unregisterBudgetPolicy);
+			const unsubscribeSessionAccounting = runtime.session.subscribe(
+				(event) => {
+					if (event.type === "turn_end") {
+						// turn_end also fires for error/aborted turns; those deliberately
+						// consume budget so a flaky child still converges on its report
+						// stage instead of retrying without bound.
+						delegation.scopeLease.scope.recordTurn();
+						if (finalResponseSatisfiedBudget) {
+							finalResponseSatisfiedBudget = false;
+							return;
+						}
+						const requestedTool =
+							event.message.role === "assistant" &&
+							event.message.content.some((content) => content.type === "toolCall");
+						if (requiresFinalTurnReport) {
+							stopAfterTurnForBudget = true;
+							if (requestedTool) abortForTurnBudget();
+							return;
+						}
+						const turnBudgetEvent = turnBudget.recordTurn();
+						if (!turnBudgetEvent) return;
+						if (turnBudgetEvent.stage === "exceeded") {
+							// Defensive backstop only: both final-report branches below keep
+							// requiresFinalTurnReport set, which short-circuits before
+							// recordTurn, so this handler never advances the budget past
+							// maxTurns itself.
+							abortForTurnBudget();
+							return;
+						}
+						if (turnBudgetEvent.stage === "warning") {
+							if (!requestedTool) return;
+							pendingBudgetDelivery = `This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`;
+							return;
+						}
+						if (!requestedTool) {
+							// The child finished naturally at its limit. Keep the report-only
+							// posture so a later re-prompt yields tool-blocked one-turn
+							// replies instead of burning a turn into the exceeded backstop.
+							requiresFinalTurnReport = true;
+							stopAfterTurnForBudget = true;
+							return;
+						}
+						requiresFinalTurnReport = true;
+						pendingBudgetDelivery = `This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`;
+						return;
+					}
+					if (event.type !== "message_end" || event.message.role !== "assistant") return;
+					const usage = event.message.usage;
+					delegation.scopeLease.scope.recordUsage(
+						usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+						usage.cost.total,
+					);
+				},
+				{ monitorGitContext: false },
+			);
+			budgetFinalizers.push(unsubscribeSessionAccounting);
 			if (definitionOptions) {
 				await this.applyDefinitionToRuntime(
 					runtime,

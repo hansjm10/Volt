@@ -50,6 +50,11 @@ copy only `sessions.sqlite` while Volt is running. Session content can include
 prompts, model responses, tool arguments/results, workspace paths, and
 extension state.
 
+JSONL snapshot exports are equally sensitive. Every snapshot header includes the
+session cwd, and a child-session snapshot may include the parent session's live
+SQLite store directory so local import can restore the relationship. Those
+host-local locators never cross remote RPC, but sharing the snapshot shares them.
+
 ## Standalone Release Integrity
 
 Prebuilt Volt executables are Node.js 22.23.1 Single Executable Applications.
