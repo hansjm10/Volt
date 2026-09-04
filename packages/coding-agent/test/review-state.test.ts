@@ -16,6 +16,7 @@ import {
 	getReviewRun,
 	listReviewRuns,
 	MAX_HYDRATED_REVIEW_RUNS,
+	MAX_REVIEW_INVENTORY_FILES,
 	MAX_REVIEW_STATE_RECORD_BYTES,
 	planIncrementalReview,
 	REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE,
@@ -23,6 +24,7 @@ import {
 	reconcileFindingIdentities,
 	restoreReviewStateFromHandoff,
 } from "../src/core/review-state.ts";
+import { createReviewFileMetadata } from "../src/core/review-workflows.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
@@ -339,6 +341,67 @@ describe("durable review state", () => {
 		if (!ref) throw new Error("Expected a persisted session reference");
 		const reopened = await SessionManager.open(ref);
 		expect(listReviewRuns(reopened).runs).toMatchObject([{ runId: "run-before-prompt", status: "completed" }]);
+	});
+
+	it.each([
+		{ limit: "file count", count: MAX_REVIEW_INVENTORY_FILES + 1, padding: 0 },
+		{ limit: "serialized bytes", count: 300, padding: 200 },
+	])("preserves totals after the $limit inventory limit and restart", async ({ count, padding }) => {
+		const root = join(tmpdir(), `volt-review-inventory-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(root, { recursive: true });
+		directories.push(root);
+		const manager = await SessionManager.create(root, join(root, "sessions"));
+		const source = snapshot("inventory-blob");
+		const file = source.changedFiles[0]!;
+		source.changedFiles = Array.from({ length: count }, (_, index) => ({
+			...file,
+			path: `src/${"x".repeat(padding)}file-${index}.ts`,
+			additions: 2,
+			deletions: 1,
+		}));
+		const controls = {
+			scope: [],
+			effort: "standard" as const,
+			includeOptional: false,
+			scopeMode: "incremental" as const,
+		};
+		await appendReviewRunDurably(
+			manager,
+			createReviewRunRecord({
+				workflowId: "review:inventory-limit",
+				workflowAction: "review.branch",
+				startedAt: 1,
+				snapshot: source,
+				controls,
+				status: "completed",
+				result: result(),
+			}),
+		);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
+		const restored = getReviewRun(reopened, "review:inventory-limit");
+		if (!restored) throw new Error("Expected a restored review run");
+		expect(restored.target.files).toEqual([]);
+		expect(restored.target.fileSummary).toEqual({
+			totalCount: count,
+			additions: count * 2,
+			deletions: count,
+			inventoryComplete: false,
+		});
+		expect(createReviewFileMetadata(restored.target.files, restored.target.fileSummary)).toEqual({
+			totalCount: count,
+			projectedCount: 0,
+			omittedCount: count,
+			additions: count * 2,
+			deletions: count,
+			isComplete: false,
+			items: [],
+		});
+		expect(planIncrementalReview(reopened, source, controls)).toMatchObject({
+			mode: "full",
+			fallbackReason: "The prior changed-file inventory exceeded its persistence bound.",
+		});
 	});
 
 	it("persists branch-local review acknowledgment idempotently and ignores malformed entries", async () => {

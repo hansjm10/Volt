@@ -62,6 +62,8 @@ export interface ReviewChangedFile {
 	base?: ReviewSnapshotTreeEntry;
 	head?: ReviewSnapshotTreeEntry;
 	hunks: ReviewSnapshotHunk[];
+	additions?: number;
+	deletions?: number;
 	binary: boolean;
 	reviewable: boolean;
 	unsupportedReason?: string;
@@ -1490,18 +1492,63 @@ function parseNameStatus(stdout: Buffer): NameStatusEntry[] {
 	return entries;
 }
 
-function parseBinaryPathsFromNumstat(stdout: Buffer): Set<string> {
-	const binaryPaths = new Set<string>();
-	for (const token of stdout.toString("utf8").split("\0")) {
+interface NumstatEntry {
+	path: string;
+	previousPath?: string;
+	additions: number;
+	deletions: number;
+	binary: boolean;
+}
+
+function numstatKey(path: string, previousPath?: string): string {
+	return `${previousPath ?? ""}\0${path}`;
+}
+
+function parseNumstat(stdout: Buffer): Map<string, NumstatEntry> {
+	const tokens = stdout.toString("utf8").split("\0");
+	const entries = new Map<string, NumstatEntry>();
+	let index = 0;
+	while (index < tokens.length) {
+		const token = tokens[index++];
 		if (!token) continue;
 		const firstTab = token.indexOf("\t");
 		const secondTab = firstTab < 0 ? -1 : token.indexOf("\t", firstTab + 1);
-		if (firstTab < 0 || secondTab < 0) continue;
-		if (token.slice(0, firstTab) === "-" && token.slice(firstTab + 1, secondTab) === "-") {
-			binaryPaths.add(token.slice(secondTab + 1));
+		if (firstTab < 0 || secondTab < 0) throw new Error("git diff --numstat returned malformed output.");
+		const additionsText = token.slice(0, firstTab);
+		const deletionsText = token.slice(firstTab + 1, secondTab);
+		const binary = additionsText === "-" && deletionsText === "-";
+		const additions = binary ? 0 : Number(additionsText);
+		const deletions = binary ? 0 : Number(deletionsText);
+		if (
+			(!binary && (additionsText === "-" || deletionsText === "-")) ||
+			!Number.isSafeInteger(additions) ||
+			additions < 0 ||
+			!Number.isSafeInteger(deletions) ||
+			deletions < 0
+		) {
+			throw new Error("git diff --numstat returned invalid line counts.");
 		}
+		let path = token.slice(secondTab + 1);
+		let previousPath: string | undefined;
+		if (!path) {
+			previousPath = tokens[index++];
+			path = tokens[index++] ?? "";
+		}
+		if (!path || (previousPath !== undefined && !previousPath)) {
+			throw new Error("git diff --numstat returned malformed rename paths.");
+		}
+		const entry = {
+			path,
+			...(previousPath ? { previousPath } : {}),
+			additions,
+			deletions,
+			binary,
+		};
+		const key = numstatKey(path, previousPath);
+		if (entries.has(key)) throw new Error("git diff --numstat returned a duplicate path.");
+		entries.set(key, entry);
 	}
-	return binaryPaths;
+	return entries;
 }
 
 interface ParsedReviewSnapshotTree {
@@ -2260,16 +2307,18 @@ async function buildChangedFiles(
 ): Promise<ReviewChangedFile[]> {
 	const statusResult = await git(source, ["diff", "--name-status", "-z", "--find-renames", baseTree, headTree]);
 	if (!statusResult.ok) throw new Error(`git diff --name-status failed: ${commandError(statusResult)}`);
-	const numstatResult = await git(source, ["diff", "--numstat", "-z", "--no-renames", baseTree, headTree]);
+	const numstatResult = await git(source, ["diff", "--numstat", "-z", "--find-renames", baseTree, headTree]);
 	if (!numstatResult.ok) throw new Error(`git diff --numstat failed: ${commandError(numstatResult)}`);
-	const binaryPaths = parseBinaryPathsFromNumstat(numstatResult.stdout);
+	const numstat = parseNumstat(numstatResult.stdout);
 	const changed: ReviewChangedFile[] = [];
 	let retainedPatchBytes = 0;
 	for (const statusEntry of parseNameStatus(statusResult.stdout)) {
 		const basePath = statusEntry.previousPath ?? statusEntry.path;
 		const base = baseEntries.get(basePath);
 		const head = headEntries.get(statusEntry.path);
-		const binary = binaryPaths.has(basePath) || binaryPaths.has(statusEntry.path);
+		const statistics = numstat.get(numstatKey(statusEntry.path, statusEntry.previousPath));
+		if (!statistics) throw new Error("git diff --numstat is missing a changed-file entry.");
+		const { additions, deletions, binary } = statistics;
 		const oversized = [base, head].some(
 			(entry) => entry?.type === "blob" && (entry.size === undefined || entry.size > source.limits.maxBlobBytes),
 		);
@@ -2323,6 +2372,8 @@ async function buildChangedFiles(
 			...(base ? { base } : {}),
 			...(head ? { head } : {}),
 			hunks,
+			additions,
+			deletions,
 			binary,
 			reviewable: unsupportedReason === undefined,
 			...(unsupportedReason ? { unsupportedReason } : {}),

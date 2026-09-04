@@ -31,7 +31,12 @@ export type {
 	ReviewCodeHostLinkedIssue,
 	ReviewCodeHostPublishRequest,
 	ReviewCodeHostPublishResult,
+	ReviewPullRequestAuthor,
+	ReviewPullRequestCheckState,
+	ReviewPullRequestCheckSummary,
 	ReviewPullRequestIdentity,
+	ReviewPullRequestMergeability,
+	ReviewPullRequestReviewState,
 } from "./types.ts";
 
 export function getCodeHostProvider(providerId: string): CodeHostProvider {

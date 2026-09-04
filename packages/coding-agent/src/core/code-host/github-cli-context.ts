@@ -10,7 +10,11 @@ import type {
 	ReviewCodeHostContextManifest,
 	ReviewCodeHostDiscussionEntry,
 	ReviewCodeHostLinkedIssue,
+	ReviewPullRequestAuthor,
+	ReviewPullRequestCheckSummary,
 	ReviewPullRequestIdentity,
+	ReviewPullRequestMergeability,
+	ReviewPullRequestReviewState,
 } from "./types.ts";
 
 export const REVIEW_GITHUB_TEXT_MAX_BYTES = 32 * 1024;
@@ -256,10 +260,97 @@ function actor(value: unknown): ReviewCodeHostActor | undefined {
 	return login && type ? { login, type } : undefined;
 }
 
+function pullRequestAuthor(value: unknown, pullRequestUrl: string): ReviewPullRequestAuthor | undefined {
+	if (!isObject(value) || typeof value.login !== "string") return undefined;
+	const login = value.login.trim();
+	if (login.length === 0 || Buffer.byteLength(login, "utf8") > 256 || /[\s/\\\u0000-\u001f\u007f]/u.test(login)) {
+		return undefined;
+	}
+	try {
+		const pullRequest = new URL(pullRequestUrl);
+		if (pullRequest.protocol !== "https:") return { login };
+		const avatar = new URL(`/${encodeURIComponent(login)}.png`, pullRequest.origin);
+		return avatar.toString().length <= 2_000 ? { login, avatarUrl: avatar.toString() } : { login };
+	} catch {
+		return { login };
+	}
+}
+
+function pullRequestReviewState(state: unknown, isDraft: unknown): ReviewPullRequestReviewState | undefined {
+	if (state === "MERGED") return "merged";
+	if (state === "CLOSED") return "closed";
+	if (state !== "OPEN" || typeof isDraft !== "boolean") return undefined;
+	return isDraft ? "draft" : "ready";
+}
+
+function pullRequestMergeability(value: unknown): ReviewPullRequestMergeability | undefined {
+	if (value === "MERGEABLE") return "mergeable";
+	if (value === "CONFLICTING") return "conflicting";
+	return value === "UNKNOWN" ? "unknown" : undefined;
+}
+
+function pullRequestCheckSummary(value: unknown): ReviewPullRequestCheckSummary | undefined {
+	if (!Array.isArray(value) || value.length > 10_000) return undefined;
+	let passedCount = 0;
+	let pendingCount = 0;
+	let failedCount = 0;
+	let neutralCount = 0;
+	let unknownCount = 0;
+	for (const item of value) {
+		if (!isObject(item) || typeof item.__typename !== "string") {
+			unknownCount++;
+			continue;
+		}
+		if (item.__typename === "StatusContext") {
+			if (item.state === "SUCCESS") passedCount++;
+			else if (item.state === "PENDING" || item.state === "EXPECTED") pendingCount++;
+			else if (item.state === "ERROR" || item.state === "FAILURE") failedCount++;
+			else unknownCount++;
+			continue;
+		}
+		if (item.__typename !== "CheckRun") {
+			unknownCount++;
+			continue;
+		}
+		if (item.status !== "COMPLETED") {
+			if (typeof item.status === "string") pendingCount++;
+			else unknownCount++;
+			continue;
+		}
+		if (item.conclusion === "SUCCESS") passedCount++;
+		else if (item.conclusion === "NEUTRAL" || item.conclusion === "SKIPPED") neutralCount++;
+		else if (
+			item.conclusion === "ACTION_REQUIRED" ||
+			item.conclusion === "CANCELLED" ||
+			item.conclusion === "FAILURE" ||
+			item.conclusion === "STALE" ||
+			item.conclusion === "STARTUP_FAILURE" ||
+			item.conclusion === "TIMED_OUT"
+		) {
+			failedCount++;
+		} else {
+			unknownCount++;
+		}
+	}
+	const totalCount = value.length;
+	const state =
+		totalCount === 0
+			? "none"
+			: failedCount > 0
+				? "failing"
+				: pendingCount > 0
+					? "pending"
+					: unknownCount > 0
+						? "unknown"
+						: "passing";
+	return { state, totalCount, passedCount, pendingCount, failedCount, neutralCount, unknownCount };
+}
+
 function parsePullRequestView(
 	value: unknown,
 	maximumNumber: number,
 	limitations: ReviewCodeHostContextLimitation[],
+	observedAt: number,
 ): PullRequestView | undefined {
 	if (!isObject(value)) return undefined;
 	const number = integer(value.number);
@@ -267,6 +358,10 @@ function parsePullRequestView(
 	const url = boundedStructuralString(value.url);
 	const baseRefName = boundedStructuralString(value.baseRefName, 500);
 	const headRefName = boundedStructuralString(value.headRefName, 500);
+	const reviewState = pullRequestReviewState(value.state, value.isDraft);
+	const mergeability = pullRequestMergeability(value.mergeable);
+	const checks = pullRequestCheckSummary(value.statusCheckRollup);
+	const author = pullRequestAuthor(value.author, url ?? "");
 	if (
 		number === undefined ||
 		number < 1 ||
@@ -275,6 +370,8 @@ function parsePullRequestView(
 		!url ||
 		!baseRefName ||
 		!headRefName ||
+		!Number.isSafeInteger(observedAt) ||
+		observedAt < 0 ||
 		typeof value.baseRefOid !== "string" ||
 		typeof value.headRefOid !== "string" ||
 		!CANONICAL_GIT_OBJECT_ID_PATTERN.test(value.baseRefOid) ||
@@ -295,6 +392,12 @@ function parsePullRequestView(
 		headRefName,
 		baseRefOid: value.baseRefOid,
 		headRefOid: value.headRefOid,
+		...(author ? { author } : {}),
+		// Health fields are optional display metadata, not required review evidence.
+		...(reviewState ? { reviewState } : {}),
+		...(mergeability ? { mergeability } : {}),
+		...(checks ? { checks } : {}),
+		observedAt,
 	};
 }
 
@@ -866,7 +969,7 @@ export async function capturePullRequestContextWithGitHubCli(
 			"view",
 			...(options.number ? [options.number] : []),
 			"--json",
-			"id,number,title,body,baseRefName,headRefName,url,baseRefOid,headRefOid",
+			"id,number,title,body,baseRefName,headRefName,url,baseRefOid,headRefOid,author,state,isDraft,mergeable,statusCheckRollup",
 		],
 		options.cwd,
 		undefined,
@@ -883,7 +986,12 @@ export async function capturePullRequestContextWithGitHubCli(
 			remoteError: "Could not load pull request metadata with GitHub CLI.",
 		};
 	}
-	const pullRequest = parsePullRequestView(parseJson(result.stdout), options.maxPullRequestNumber, initialLimitations);
+	const pullRequest = parsePullRequestView(
+		parseJson(result.stdout),
+		options.maxPullRequestNumber,
+		initialLimitations,
+		Date.now(),
+	);
 	if (!pullRequest) return { ok: false, error: "Could not parse gh pr view output." };
 
 	options.onProgress?.("Capturing pull request context…");
@@ -1020,6 +1128,11 @@ export async function capturePullRequestContextWithGitHubCli(
 		headRefName: pullRequest.headRefName,
 		baseRefOid: pullRequest.baseRefOid,
 		headRefOid: pullRequest.headRefOid,
+		...(pullRequest.author ? { author: { ...pullRequest.author } } : {}),
+		...(pullRequest.reviewState ? { reviewState: pullRequest.reviewState } : {}),
+		...(pullRequest.mergeability ? { mergeability: pullRequest.mergeability } : {}),
+		...(pullRequest.checks ? { checks: { ...pullRequest.checks } } : {}),
+		...(pullRequest.observedAt === undefined ? {} : { observedAt: pullRequest.observedAt }),
 	};
 	const capturedAt = new Date().toISOString();
 	const createManifest = (

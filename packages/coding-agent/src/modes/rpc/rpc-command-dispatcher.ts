@@ -24,7 +24,7 @@ import {
 	type HydratedReviewRunRecord,
 	listReviewRuns,
 } from "../../core/review-state.ts";
-import { createReviewPullRequestReference } from "../../core/review-workflows.ts";
+import { createReviewFileMetadata, createReviewPullRequestMetadata } from "../../core/review-workflows.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
 import { projectSessionTreePage } from "../../core/rpc/session-tree.ts";
@@ -227,9 +227,39 @@ export function createRpcErrorResponse(
 
 export { getRpcErrorResponseTarget };
 
+function projectReviewTargetIdentity(
+	identity: HydratedReviewRunRecord["target"]["identity"],
+	includePullRequestBody: boolean,
+): Record<string, unknown> {
+	const pullRequest = identity.pullRequest;
+	return {
+		kind: identity.kind,
+		baseTree: identity.baseTree,
+		headTree: identity.headTree,
+		...(identity.baseCommit ? { baseCommit: identity.baseCommit } : {}),
+		...(identity.mergeBaseCommit ? { mergeBaseCommit: identity.mergeBaseCommit } : {}),
+		...(identity.headCommit ? { headCommit: identity.headCommit } : {}),
+		...(pullRequest
+			? {
+					pullRequest: {
+						number: pullRequest.number,
+						title: pullRequest.title,
+						...(includePullRequestBody ? { body: pullRequest.body } : {}),
+						url: pullRequest.url,
+						baseRefName: pullRequest.baseRefName,
+						headRefName: pullRequest.headRefName,
+						baseRefOid: pullRequest.baseRefOid,
+						headRefOid: pullRequest.headRefOid,
+					},
+				}
+			: {}),
+	};
+}
+
 function projectReviewRun(record: HydratedReviewRunRecord, includeResult: boolean): Record<string, unknown> {
 	const result = record.result;
-	const pullRequest = createReviewPullRequestReference(record.target.identity);
+	const pullRequest = createReviewPullRequestMetadata(record.target.identity);
+	const files = createReviewFileMetadata(record.target.files, record.target.fileSummary, includeResult);
 	return {
 		runId: record.runId,
 		workflowAction: record.workflowAction,
@@ -240,8 +270,9 @@ function projectReviewRun(record: HydratedReviewRunRecord, includeResult: boolea
 		target: {
 			description: record.target.description,
 			diffCommand: record.target.diffCommand,
-			identity: record.target.identity,
+			identity: projectReviewTargetIdentity(record.target.identity, includeResult),
 			...(pullRequest ? { pullRequest } : {}),
+			files,
 			...(record.target.context ? { context: record.target.context } : {}),
 		},
 		options: record.options,

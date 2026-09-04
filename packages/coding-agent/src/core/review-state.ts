@@ -40,6 +40,15 @@ export interface ReviewRunFileIdentity {
 	headType?: ReviewSnapshotTreeEntry["type"];
 	hunkIds: string[];
 	reviewable: boolean;
+	additions?: number;
+	deletions?: number;
+}
+
+export interface ReviewRunFileSummary {
+	totalCount: number;
+	additions: number;
+	deletions: number;
+	inventoryComplete: boolean;
 }
 
 export interface ReviewRunContextMetadata {
@@ -66,6 +75,7 @@ export interface ReviewRunRecord {
 		identity: ReviewSnapshotIdentity;
 		branchBase?: ReviewBranchBase;
 		context?: ReviewRunContextMetadata;
+		fileSummary?: ReviewRunFileSummary;
 		files: ReviewRunFileIdentity[];
 	};
 	options: ReviewRunControls;
@@ -162,6 +172,18 @@ function boundSnapshotIdentity(identity: ReviewSnapshotIdentity): ReviewSnapshot
 						url: truncateUtf8(identity.pullRequest.url, 2_000),
 						baseRefName: truncateUtf8(identity.pullRequest.baseRefName, 500),
 						headRefName: truncateUtf8(identity.pullRequest.headRefName, 500),
+						...(identity.pullRequest.author
+							? {
+									author: {
+										login: truncateUtf8(identity.pullRequest.author.login, 256),
+										...(identity.pullRequest.author.avatarUrl &&
+										Buffer.byteLength(identity.pullRequest.author.avatarUrl, "utf8") <= 2_000
+											? { avatarUrl: identity.pullRequest.author.avatarUrl }
+											: {}),
+									},
+								}
+							: {}),
+						...(identity.pullRequest.checks ? { checks: { ...identity.pullRequest.checks } } : {}),
 					},
 				}
 			: {}),
@@ -535,8 +557,31 @@ export function snapshotFileIdentities(snapshot: ReviewSnapshot): ReviewRunFileI
 		...(file.head ? { headOid: file.head.oid, headMode: file.head.mode, headType: file.head.type } : {}),
 		hunkIds: file.hunks.map((hunk) => hunk.id),
 		reviewable: file.reviewable,
+		...(file.additions === undefined ? {} : { additions: file.additions }),
+		...(file.deletions === undefined ? {} : { deletions: file.deletions }),
 	}));
 	return serializedBytes(files) <= MAX_REVIEW_INVENTORY_BYTES ? files : [];
+}
+
+function snapshotFileInventory(snapshot: ReviewSnapshot): {
+	files: ReviewRunFileIdentity[];
+	summary: ReviewRunFileSummary;
+} {
+	const files = snapshotFileIdentities(snapshot);
+	const additions = snapshot.changedFiles.reduce((total, file) => total + (file.additions ?? 0), 0);
+	const deletions = snapshot.changedFiles.reduce((total, file) => total + (file.deletions ?? 0), 0);
+	if (!Number.isSafeInteger(additions) || !Number.isSafeInteger(deletions)) {
+		throw new Error("Review changed-line totals exceed the safe integer range.");
+	}
+	return {
+		files,
+		summary: {
+			totalCount: snapshot.changedFiles.length,
+			additions,
+			deletions,
+			inventoryComplete: files.length === snapshot.changedFiles.length,
+		},
+	};
 }
 
 function snapshotContextMetadata(snapshot: ReviewSnapshot): ReviewRunContextMetadata | undefined {
@@ -567,6 +612,7 @@ export function createReviewRunRecord(options: {
 	incrementalPlan?: ReviewIncrementalPlan;
 }): ReviewRunRecord {
 	assertReviewControlsPersistLosslessly(options.controls);
+	const fileInventory = snapshotFileInventory(options.snapshot);
 	const createRecord = (includeEvidence: boolean): ReviewRunRecord => ({
 		schemaVersion: REVIEW_STATE_SCHEMA_VERSION,
 		runId: options.workflowId,
@@ -580,7 +626,8 @@ export function createReviewRunRecord(options: {
 			identity: boundSnapshotIdentity(options.snapshot.identity),
 			...(options.snapshot.branchBase ? { branchBase: structuredClone(options.snapshot.branchBase) } : {}),
 			...(snapshotContextMetadata(options.snapshot) ? { context: snapshotContextMetadata(options.snapshot) } : {}),
-			files: snapshotFileIdentities(options.snapshot),
+			fileSummary: { ...fileInventory.summary },
+			files: fileInventory.files.map((file) => ({ ...file, hunkIds: [...file.hunkIds] })),
 		},
 		options: cloneControls(options.controls),
 		...(options.result ? { result: boundPublicReviewResult(options.result, includeEvidence) } : {}),
@@ -684,7 +731,10 @@ export function planIncrementalReview(
 	if (!controlsCompatible(previousRun.options, controls)) {
 		return fullReviewPlan(snapshot, "The prior review controls are incompatible with this run.");
 	}
-	if (previousRun.target.files.length === 0 && snapshot.changedFiles.length > 0) {
+	if (
+		previousRun.target.fileSummary?.inventoryComplete === false ||
+		(previousRun.target.files.length === 0 && snapshot.changedFiles.length > 0)
+	) {
 		return fullReviewPlan(snapshot, "The prior changed-file inventory exceeded its persistence bound.");
 	}
 	const priorFiles = new Map(previousRun.target.files.map((file) => [file.path, file]));

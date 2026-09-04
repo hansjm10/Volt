@@ -12,6 +12,25 @@ export interface ReviewCodeHostContextLimitation {
 	count: number;
 }
 
+export type ReviewPullRequestReviewState = "draft" | "ready" | "merged" | "closed";
+export type ReviewPullRequestMergeability = "mergeable" | "conflicting" | "unknown";
+export type ReviewPullRequestCheckState = "passing" | "pending" | "failing" | "none" | "unknown";
+
+export interface ReviewPullRequestAuthor {
+	login: string;
+	avatarUrl?: string;
+}
+
+export interface ReviewPullRequestCheckSummary {
+	state: ReviewPullRequestCheckState;
+	totalCount: number;
+	passedCount: number;
+	pendingCount: number;
+	failedCount: number;
+	neutralCount: number;
+	unknownCount: number;
+}
+
 export interface ReviewPullRequestIdentity {
 	providerId: string;
 	number: number;
@@ -22,6 +41,12 @@ export interface ReviewPullRequestIdentity {
 	headRefName: string;
 	baseRefOid: string;
 	headRefOid: string;
+	author?: ReviewPullRequestAuthor;
+	reviewState?: ReviewPullRequestReviewState;
+	mergeability?: ReviewPullRequestMergeability;
+	checks?: ReviewPullRequestCheckSummary;
+	/** Host epoch milliseconds when mutable pull-request health was observed. */
+	observedAt?: number;
 }
 
 export interface ReviewCodeHostActor {

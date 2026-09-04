@@ -69,8 +69,18 @@ function durableRecord(runId = "review:test"): ReviewRunRecord {
 			description: "uncommitted changes",
 			diffCommand: "git diff exact-base..exact-head",
 			identity: { kind: "uncommitted", baseTree: "base-tree", headTree: "head-tree" },
+			fileSummary: { totalCount: 1, additions: 3, deletions: 1, inventoryComplete: true },
 			files: [
-				{ path: "src/value.ts", baseOid: "base-blob", headOid: "head-blob", hunkIds: ["hunk-1"], reviewable: true },
+				{
+					path: "src/value.ts",
+					status: "modified",
+					baseOid: "base-blob",
+					headOid: "head-blob",
+					hunkIds: ["hunk-1"],
+					reviewable: true,
+					additions: 3,
+					deletions: 1,
+				},
 			],
 		},
 		options: { scope: [], effort: "standard", includeOptional: false, scopeMode: "incremental" },
@@ -94,13 +104,29 @@ function durablePullRequestRecord(runId = "review:test"): ReviewRunRecord {
 				pullRequest: {
 					providerId: "github",
 					number: 243,
-					title: "PRIVATE_PULL_REQUEST_TITLE",
+					title: "Compact width UI",
 					body: "PRIVATE_PULL_REQUEST_BODY",
 					url: "https://example.test/pull/243",
 					baseRefName: "main",
 					headRefName: "fix/compact-width-ui",
-					baseRefOid: "base-oid",
-					headRefOid: "head-oid",
+					baseRefOid: "a".repeat(40),
+					headRefOid: "b".repeat(40),
+					author: {
+						login: "review-author",
+						avatarUrl: "https://example.test/review-author.png",
+					},
+					reviewState: "ready",
+					mergeability: "mergeable",
+					checks: {
+						state: "passing",
+						totalCount: 2,
+						passedCount: 2,
+						pendingCount: 0,
+						failedCount: 0,
+						neutralCount: 0,
+						unknownCount: 0,
+					},
+					observedAt: 1_782_470_400_000,
 				},
 			},
 		},
@@ -477,12 +503,37 @@ describe("RPC durable review actions", () => {
 		line(JSON.stringify({ id: "get", type: "get_review_result", runId: "review:newer" }));
 		await vi.waitFor(() => expect(response(collecting.writes, "get")).toBeDefined());
 		const listData = response(collecting.writes, "list")?.data as {
-			runs: Array<{ runId: string; target: { pullRequest?: { provider: string; number: number } } }>;
+			runs: Array<{
+				runId: string;
+				target: {
+					pullRequest?: { provider: string; number: number; title: string };
+					files: { totalCount: number; projectedCount: number; isComplete: boolean };
+				};
+			}>;
 			nextCursor?: string;
 		};
 		expect(listData.runs).toHaveLength(1);
-		expect(listData.runs[0]?.target.pullRequest).toEqual({ provider: "github", number: 243 });
-		expect(Object.keys(listData.runs[0]?.target.pullRequest ?? {})).toEqual(["provider", "number"]);
+		expect(listData.runs[0]?.target).toMatchObject({
+			pullRequest: {
+				provider: "github",
+				number: 243,
+				title: "Compact width UI",
+				author: { login: "review-author", avatarUrl: "https://example.test/review-author.png" },
+				reviewState: "ready",
+				mergeability: "mergeable",
+				checks: { state: "passing", totalCount: 2 },
+			},
+			files: {
+				totalCount: 1,
+				projectedCount: 0,
+				omittedCount: 1,
+				additions: 3,
+				deletions: 1,
+				isComplete: false,
+				items: [],
+			},
+		});
+		expect(JSON.stringify(listData)).not.toContain("PRIVATE_PULL_REQUEST_BODY");
 		expect(listData.nextCursor).toBeTruthy();
 		line(JSON.stringify({ id: "next", type: "list_review_workflows", cursor: listData.nextCursor, limit: 1 }));
 		line(JSON.stringify({ id: "oversized", type: "list_review_workflows", limit: 101 }));
@@ -501,7 +552,13 @@ describe("RPC durable review actions", () => {
 			completionStatus: "complete",
 			overallCorrectness: "incorrect",
 			target: {
-				pullRequest: { provider: "github", number: 243 },
+				pullRequest: { provider: "github", number: 243, title: "Compact width UI" },
+				files: {
+					totalCount: 1,
+					projectedCount: 1,
+					isComplete: true,
+					items: [{ path: "src/value.ts", status: "modified", additions: 3, deletions: 1 }],
+				},
 				context: { linkedIssueCount: 2, discussionEntryCount: 5, fingerprint: "c".repeat(64) },
 			},
 			coverage: {
@@ -512,6 +569,7 @@ describe("RPC durable review actions", () => {
 			},
 		});
 		expect(JSON.stringify(getData)).toContain("changeLocation");
+		expect(JSON.stringify(getData)).toContain("PRIVATE_PULL_REQUEST_BODY");
 		expect(JSON.stringify(getData)).not.toContain('"file"');
 		expect(JSON.stringify(getData)).not.toContain("filesReviewed");
 		expect(JSON.stringify(getData)).not.toContain("PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT");
