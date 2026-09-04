@@ -70,6 +70,8 @@ const { session } = await createAgentSession({
 
 `agentMode` defaults to `"build"`. A new Plan-mode session exposes only read-only exploration and native checklist tools; persisted branches restore their own planning state.
 
+Passing `sessionManager` transfers its ownership to `createAgentSession()` immediately. On success, dispose the returned session and await `session.waitForClosed()`. If setup fails, the factory closes the consumed manager but retains any committed session row; do not reuse the manager object. Open its `SessionReference` again when another live manager is needed.
+
 ### AgentSession
 
 The session manages agent lifecycle, message history, model state, compaction, and event streaming.
@@ -89,8 +91,8 @@ interface AgentSession {
   // Subscribe to events (returns unsubscribe function)
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
 
-  // Session info
-  sessionFile: string | undefined;
+  // Session identity
+  sessionRef: SessionReference | undefined; // undefined for in-memory sessions
   sessionId: string;
 
   // Model control
@@ -113,7 +115,7 @@ interface AgentSession {
   isStreaming: boolean; // provider run or session continuation
   isBusy: boolean;      // also includes prompt preflight and standalone session operations
 
-  // In-place tree navigation within the current session file
+  // In-place tree navigation within the current session
   navigateTree(targetId: string, options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string }): Promise<{ editorText?: string; cancelled: boolean }>;
 
   // Compaction
@@ -146,7 +148,7 @@ All user plan actions are fenced by the exact plan ID and revision. Repeating an
 Use the runtime API when you need to replace the active session and rebuild cwd-bound runtime state.
 This is the same layer used by the built-in interactive, print, and RPC modes.
 
-`createAgentSessionRuntime()` takes a runtime factory plus the initial cwd/session target. The factory closes over process-global fixed inputs, recreates cwd-bound services for the effective cwd, resolves session options against those services, and returns a full runtime result.
+`createAgentSessionRuntime()` takes a runtime factory plus the initial cwd/session target. Passing the manager consumes it immediately. The factory closes over process-global fixed inputs, recreates cwd-bound services for the effective cwd, resolves session options against those services, and returns a full runtime result. A `CreateAgentSessionRuntimeFactory` callback borrows cleanup ownership from its enclosing runtime operation until it returns an `AgentSession`; construct and return the session as its final ownership-transferring step.
 
 ```typescript
 import {
@@ -174,7 +176,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 ```
 
@@ -193,6 +195,8 @@ Important behavior:
 - if you use extensions, call `runtime.session.bindExtensions(...)` again for the new session
 - creation returns diagnostics on `runtime.diagnostics`
 - if runtime creation or replacement fails, the method throws and the caller decides how to handle it
+
+`AgentSession` owns its manager: `session.dispose()` installs the shutdown fence, and `await session.waitForClosed()` drains persistence and releases the SQLite store. `AgentSessionRuntime` does the same for its active session during `await runtime.dispose()`.
 
 ```typescript
 let session = runtime.session;
@@ -273,7 +277,7 @@ interface SubagentResult {
 
 `status` is the authoritative terminal outcome, and `error` supplies terminal failure detail when available. Do not infer the outcome from `event` or its assistant stop reasons: the latest low-level `agent_end` retains attempt history and can contain an error from a retry that was subsequently aborted.
 
-Cancellation remains authoritative while a child is prepared but not yet published. If `handle.abort()` is called or the delegation scope aborts before the first prompt is accepted, a later `handle.prompt()` rejects, rolls back the prepared runtime registration, disposes the handle, and leaves no activity or registry record.
+Cancellation remains authoritative while a child is prepared but not yet published. If `handle.abort()` is called or the delegation scope aborts before the first prompt is accepted, a later `handle.prompt()` rejects, rolls back the prepared runtime registration, disposes the handle, and leaves no activity or registry record. Any already committed child session row is retained and remains addressable by its session identity.
 
 Definition-less `start()` children join the session tree exactly like definition-backed ones — they share the session-wide registry, the delegation scope's ceilings, and depth accounting — but they are fail-closed for nested delegation: only a definition can declare an `allowedSubagents` policy, so an unnamed child cannot spawn further subagents.
 
@@ -501,7 +505,7 @@ const { session } = await createAgentSession({
   - `.agents/skills/` in `cwd` and ancestor directories (up to git repo root, or filesystem root when not in a repo)
 - Project prompts (`.volt/prompts/`)
 - Context files (`AGENTS.md` walking up from cwd)
-- Session directory naming
+- Workspace session-store directory selection
 
 `agentDir` is used by `DefaultResourceLoader` for:
 - Global extensions (`extensions/`)
@@ -513,9 +517,9 @@ const { session } = await createAgentSession({
 - Settings (`settings.json`)
 - Custom models (`models.json`)
 - Credentials (`auth.json`)
-- Sessions (`sessions/`)
+- Per-workspace SQLite session stores (`sessions/`)
 
-When you pass a custom `ResourceLoader`, `cwd` and `agentDir` no longer control resource discovery. They still influence session naming and tool path resolution.
+When you pass a custom `ResourceLoader`, `cwd` and `agentDir` no longer control resource discovery. They still influence workspace session-store selection and tool path resolution.
 
 ### Model
 
@@ -829,7 +833,18 @@ const { session } = await createAgentSession({ resourceLoader: loader });
 
 ### Session Management
 
-Sessions use a tree structure with `id`/`parentId` linking, enabling in-place branching.
+Each workspace or custom session directory has one authoritative `sessions.sqlite` store. Persisted sessions use stable references:
+
+```typescript
+interface SessionReference {
+  readonly sessionDirectory: string;
+  readonly storeId: string;
+  readonly sessionId: string;
+  readonly sessionGeneration: string;
+}
+```
+
+Persisted factories and store queries are asynchronous. JSONL paths are explicit snapshot imports only.
 
 ```typescript
 import {
@@ -849,25 +864,41 @@ const { session } = await createAgentSession({
 
 // New persistent session
 const { session: persisted } = await createAgentSession({
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 // Continue most recent
 const { session: continued, modelFallbackMessage } = await createAgentSession({
-  sessionManager: SessionManager.continueRecent(process.cwd()),
+  sessionManager: await SessionManager.continueRecent(process.cwd()),
 });
 if (modelFallbackMessage) {
   console.log("Note:", modelFallbackMessage);
 }
 
-// Open specific file
-const { session: opened } = await createAgentSession({
-  sessionManager: SessionManager.open("/path/to/session.jsonl"),
-});
-
-// List sessions
+// Summary-only listing and deep search return SessionInfo objects with stable refs.
+// Search scans extracted searchable text one session at a time.
 const currentProjectSessions = await SessionManager.list(process.cwd());
-const allSessions = await SessionManager.listAll(process.cwd());
+const matchingSessions = await SessionManager.search(process.cwd(), "authentication");
+const allSessions = await SessionManager.listAll();
+const selectedRef = currentProjectSessions[0]?.ref;
+
+if (selectedRef) {
+  const { session: opened } = await createAgentSession({
+    sessionManager: await SessionManager.open(selectedRef),
+  });
+  console.log(opened.sessionId);
+}
+
+// Explicitly import or export a JSONL interchange snapshot
+const imported = await SessionManager.importFromJsonl("/path/to/session-snapshot.jsonl");
+try {
+  const importedRef = imported.getSessionRef();
+  if (importedRef) {
+    await SessionManager.exportJsonlSnapshot(importedRef, "/path/to/export.jsonl");
+  }
+} finally {
+  await imported.closePersistence();
+}
 
 // Session replacement API for /clear, /resume, /fork, /clone, and import flows.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
@@ -886,48 +917,44 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
-// Replace the active session with a fresh one
 await runtime.newSession();
-
-// Replace the active session with another saved session
-await runtime.switchSession("/path/to/session.jsonl");
-
-// Replace the active session with a fork from a specific user entry
+if (selectedRef) await runtime.switchSession(selectedRef);
 await runtime.fork("entry-id");
-
-// Clone the active path through a specific entry
-await runtime.fork("entry-id", { position: "at" });
+await runtime.fork("entry-id", { position: "at" }); // clone through this entry
+await runtime.importFromJsonl("/path/to/session-snapshot.jsonl");
 ```
+
+`AgentSession.sessionRef` is the current persisted reference, or `undefined` for an in-memory session. `AgentSession.sessionId` is always available.
 
 **SessionManager tree API:**
 
 ```typescript
-const sm = SessionManager.open("/path/to/session.jsonl");
+if (!selectedRef) throw new Error("No saved session");
+const sm = await SessionManager.open(selectedRef);
+try {
+  const entries = sm.getEntries();
+  const tree = sm.getTree();
+  const path = sm.getBranch();
+  const leaf = sm.getLeafEntry();
+  const entry = sm.getEntry(id);
+  const children = sm.getChildren(id);
 
-// Session listing
-const currentProjectSessions = await SessionManager.list(process.cwd());
-const allSessions = await SessionManager.listAll(process.cwd());
+  const label = sm.getLabel(id);
+  sm.appendLabelChange(id, "checkpoint");
 
-// Tree traversal
-const entries = sm.getEntries();        // All entries (excludes header)
-const tree = sm.getTree();              // Full tree structure
-const path = sm.getPath();              // Path from root to current leaf
-const leaf = sm.getLeafEntry();         // Current leaf entry
-const entry = sm.getEntry(id);          // Get entry by ID
-const children = sm.getChildren(id);    // Direct children of entry
-
-// Labels
-const label = sm.getLabel(id);          // Get label for entry
-sm.appendLabelChange(id, "checkpoint"); // Set label
-
-// Branching
-sm.branch(entryId);                     // Move leaf to earlier entry
-sm.branchWithSummary(id, "Summary...");  // Branch with context summary
-sm.createBranchedSession(leafId);       // Extract path to new file
+  sm.branch(entryId);
+  sm.branchWithSummary(id, "Summary...");
+  await sm.createBranchedSession(leafId);
+  await sm.flush();
+} finally {
+  await sm.closePersistence();
+}
 ```
+
+Callers that directly own a persisted `SessionManager` must await `closePersistence()` before deleting its session directory or exiting. Static list, search, context lookup, export, and delete operations release their scoped store ownership before resolving.
 
 > See [examples/sdk/11-sessions.ts](../examples/sdk/11-sessions.ts) and [Session Format](session-format.md)
 
@@ -1140,7 +1167,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 const mode = new InteractiveMode(runtime, {
@@ -1180,7 +1207,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 await runPrintMode(runtime, {
@@ -1217,7 +1244,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 await runRpcMode(runtime);
@@ -1247,7 +1274,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: process.cwd(),
   agentDir: getAgentDir(),
-  sessionManager: SessionManager.create(process.cwd()),
+  sessionManager: await SessionManager.create(process.cwd()),
 });
 
 const client = await createInProcessRpcClient(runtime);
@@ -1317,6 +1344,7 @@ getExamplesPath
 
 // Session management
 SessionManager
+type SessionReference
 SettingsManager
 
 // Tool factories

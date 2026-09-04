@@ -76,12 +76,7 @@ import {
 } from "../core/remote/iroh/workspace.ts";
 import type { IrohRemoteWorktreeRpcBackend } from "../core/remote/iroh/worktree-rpc.ts";
 import type { IrohBiStreamLike } from "../core/rpc/iroh-transport.ts";
-import {
-	getDefaultSessionDir,
-	getDefaultSessionDirPath,
-	readSessionHeader,
-	SessionManager,
-} from "../core/session-manager.ts";
+import { getDefaultSessionDir, getDefaultSessionDirPath, SessionManager } from "../core/session-manager.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { getCurrentThemeName, getResolvedThemeColors } from "../core/theme/runtime.ts";
 import { ProjectTrustStore } from "../core/trust-manager.ts";
@@ -174,6 +169,7 @@ import { RelayRegistry } from "./relay-stream.ts";
 import {
 	createSessionManagerTargetStore,
 	type IrohRemoteSessionTarget,
+	type ResolvedSessionTargetWithManager,
 	resolveIrohRemoteSessionTarget,
 } from "./session-target.ts";
 import { resolveWorktreeCleanupPolicy } from "./state.ts";
@@ -1320,10 +1316,22 @@ class IrohDaemonService {
 		}
 
 		const sessionDir = getDefaultSessionDirPath(workspace.path, this.services.agentDir);
-		const session = await SessionManager.findForResume(sessionDir, request.sessionId);
+		let sessionCwd: string | undefined;
+		try {
+			const sessionRef = await SessionManager.findForResume(sessionDir, request.sessionId);
+			if (sessionRef !== undefined) {
+				const manager = await SessionManager.open(sessionRef);
+				try {
+					sessionCwd = manager.getCwd();
+				} finally {
+					await manager.closePersistence();
+				}
+			}
+		} catch {
+			sessionCwd = undefined;
+		}
 		if (await finishIfSuperseded()) return;
-		const header = session ? readSessionHeader(session.path) : null;
-		if (!header || header.id !== request.sessionId || typeof header.cwd !== "string") {
+		if (sessionCwd === undefined) {
 			connection.send({ type: "error", id: request.id, code: "not_found", message: "session not found" });
 			return;
 		}
@@ -1334,7 +1342,7 @@ class IrohDaemonService {
 		let runtimeDirectory: WorkspaceDirectoryResolution;
 		try {
 			const rootPath = await realpath(worktree?.path ?? workspace.path);
-			const absolutePath = await realpath(header.cwd);
+			const absolutePath = await realpath(sessionCwd);
 			if (!isPathInside(rootPath, absolutePath) || !(await stat(absolutePath)).isDirectory()) {
 				throw new Error("session working directory escaped its workspace");
 			}
@@ -3622,12 +3630,11 @@ class IrohDaemonService {
 			handshake.hello.mode === "conversation" && handshake.hello.conversation.target === "session"
 				? { kind: "session", sessionId: targetSessionId }
 				: { kind: "last", resumeSessionId: targetSessionId };
-		// A worktree-bound session must resolve against the worktree cwd (the
-		// parent-keyed session dir plus a non-matching cwd makes SessionManager.list
-		// filter by header cwd, restricting resolution to that worktree's sessions).
-		// resolveSessionWorktree also heals stranded bindings (rekeyed/subagent
-		// session ids) from the session's stored cwd, so relays fail with the
-		// designed worktree gates instead of session_unavailable (#83).
+		// A worktree-bound session opens with its stored cwd while retaining the
+		// parent workspace's session store. resolveSessionWorktree also heals
+		// stranded bindings (rekeyed/subagent session ids) from that stored cwd, so
+		// relays fail with the designed worktree gates instead of
+		// session_unavailable (#83).
 		const boundWorktree = await this.worktrees.resolveSessionWorktree(workspaceName, targetSessionId);
 		const relayOwnerCapabilities = this.services.controlServer
 			.connections()
@@ -3659,7 +3666,8 @@ class IrohDaemonService {
 			});
 			return;
 		}
-		let resolvedTarget: Awaited<ReturnType<typeof resolveIrohRemoteSessionTarget>>;
+		let resolvedTarget: ResolvedSessionTargetWithManager<SessionManager>;
+		let resolvedSessionCwd: string;
 		try {
 			resolvedTarget = await resolveIrohRemoteSessionTarget(
 				sessionTarget,
@@ -3670,13 +3678,15 @@ class IrohDaemonService {
 					{ listAll: true, preserveSessionCwd: true },
 				),
 			);
+			try {
+				resolvedSessionCwd = resolvedTarget.sessionManager.getCwd();
+			} finally {
+				await resolvedTarget.sessionManager.closePersistence();
+			}
 		} catch (error) {
 			await this.sendHandshakeError(stream, error);
 			return;
 		}
-		const resolvedSessionManager = resolvedTarget.sessionManager as { getCwd?: () => string };
-		const resolvedSessionCwd =
-			resolvedSessionManager.getCwd?.() ?? boundWorktree?.path ?? authorization.workspace.path;
 		const relayWorkingDirectoryRelativeToRoot = getRelativeWorkingDirectoryForRoot(
 			boundWorktree?.path ?? authorization.workspace.path,
 			resolvedSessionCwd,
@@ -3797,9 +3807,6 @@ class IrohDaemonService {
 				streamId,
 				resolvedTarget: {
 					sessionId: resolvedTarget.sessionId,
-					...(resolvedTarget.sessionFilePath === undefined
-						? {}
-						: { sessionFilePath: resolvedTarget.sessionFilePath }),
 					selection: isExplicitSessionAlias ? "session_rekeyed" : resolvedTarget.selection,
 					...(isExplicitSessionAlias
 						? { requestedSessionId: target.requestedSessionId }

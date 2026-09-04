@@ -4600,6 +4600,53 @@ describe("Iroh remote core helpers", () => {
 		});
 	});
 
+	test("omits host-local SQLite locator fields independently of session reference wrapper keys", () => {
+		const sessionReference = {
+			sessionDirectory: "/Users/jordan/.volt/agent/sessions/project",
+			storeId: "store",
+			sessionId: "session",
+			sessionGeneration: "generation",
+			parentSessionDirectory: "/Users/jordan/.volt/agent/sessions/parent",
+			parentStoreId: "parent-store",
+			parentSessionId: "parent-session",
+			parentSessionGeneration: "parent-generation",
+		};
+		const publicPayload = {
+			id: "public-record",
+			requestId: "request",
+			worktreeId: "worktree",
+			status: "completed",
+		};
+		const options = { workspacePath: "/Users/jordan/project" };
+		const values = [
+			sessionReference,
+			{ ...publicPayload, ref: sessionReference },
+			{ ...publicPayload, references: [sessionReference] },
+		];
+
+		for (const [index, value] of values.entries()) {
+			const sanitized = sanitizeIrohRemoteOutbound(value, options);
+			if (index > 0) expect(sanitized).toMatchObject(publicPayload);
+			const wire = JSON.stringify(sanitized);
+			for (const forbidden of [
+				"sessionDirectory",
+				sessionReference.sessionDirectory,
+				"storeId",
+				sessionReference.storeId,
+				"sessionGeneration",
+				sessionReference.sessionGeneration,
+				"parentSessionDirectory",
+				sessionReference.parentSessionDirectory,
+				"parentStoreId",
+				sessionReference.parentStoreId,
+				"parentSessionGeneration",
+				sessionReference.parentSessionGeneration,
+			]) {
+				expect(wire).not.toContain(forbidden);
+			}
+		}
+	});
+
 	test("sanitizes remote outbound structured paths and preserves free-form text", () => {
 		const workspacePath = "/Users/jordan/project";
 		const sessionFile = "/Users/jordan/.volt/agent/sessions/project/session.jsonl";
@@ -4613,6 +4660,12 @@ describe("Iroh remote core helpers", () => {
 				success: true,
 				data: {
 					sessionFile,
+					sessionRef: {
+						sessionDirectory: "/Users/jordan/.volt/agent/sessions/project",
+						storeId: "store",
+						sessionId: "session",
+						sessionGeneration: "generation",
+					},
 					sessionPath: sessionFile,
 					sourceInfo: { path: `${workspacePath}/src/index.ts` },
 					remotePathList: { path: "/workspace/bin:/Users/jordan/.volt/auth.json" },
@@ -4649,6 +4702,7 @@ describe("Iroh remote core helpers", () => {
 				keyedPaths: Record<string, string>;
 				remotePathList: { path: string };
 				sessionFile?: string;
+				sessionRef?: unknown;
 				sessionPath: string;
 				sourceInfo: { path: string };
 				tildeSessionPath: string;
@@ -4658,6 +4712,7 @@ describe("Iroh remote core helpers", () => {
 
 		expect(sanitized.id).toBe("/Users/jordan/private/request-id");
 		expect(sanitized.data.sessionFile).toBeUndefined();
+		expect(sanitized.data.sessionRef).toBeUndefined();
 		expect(sanitized.data.sessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
 		expect(sanitized.data.tildeSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
 		expect(sanitized.data.tildeUserSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);

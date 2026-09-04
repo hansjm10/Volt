@@ -13,7 +13,7 @@ import {
 	Text,
 } from "@hansjm10/volt-tui";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
-import type { Personality } from "../../../core/personality.ts";
+import { PERSONALITIES, type Personality } from "../../../core/personality.ts";
 import type {
 	DefaultProjectTrust,
 	FullscreenExitOutput,
@@ -289,7 +289,7 @@ export class SettingsSelectorComponent extends Container {
 				label: "Personality",
 				description: "Communication style for Volt's built-in system prompt",
 				currentValue: config.personality,
-				values: ["default", "pragmatic"],
+				values: [...PERSONALITIES],
 			},
 			{
 				id: "steering-mode",

@@ -17,6 +17,7 @@ import { convertToLlm } from "../src/core/messages.ts";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import type { ResourceLoader } from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { acquireSharedSQLiteSessionStore, type SessionStoreSnapshot } from "../src/core/session-store/index.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createCodingTools } from "../src/index.ts";
 
@@ -201,7 +202,7 @@ export interface TestSessionContext {
 	session: AgentSession;
 	sessionManager: SessionManager;
 	tempDir: string;
-	cleanup: () => void;
+	cleanup: () => Promise<void>;
 }
 
 export interface CreateTestExtensionsResultInput {
@@ -261,52 +262,70 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
  * Create an AgentSession for testing with proper setup and cleanup.
  * Use this for e2e tests that need real LLM calls.
  */
-export function createTestSession(options: TestSessionOptions = {}): TestSessionContext {
+export function createTestSession(options: TestSessionOptions & { inMemory: true }): TestSessionContext;
+export function createTestSession(options?: TestSessionOptions & { inMemory?: false }): Promise<TestSessionContext>;
+export function createTestSession(options: TestSessionOptions = {}): TestSessionContext | Promise<TestSessionContext> {
 	const tempDir = join(tmpdir(), `volt-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 
-	const model = getModel("anthropic", "claude-sonnet-4-5")!;
+	const finish = (sessionManager: SessionManager): TestSessionContext => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
 
-	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
-	const settingsManager = SettingsManager.create(tempDir, tempDir);
-
-	if (options.settingsOverrides) {
-		settingsManager.applyOverrides(options.settingsOverrides);
-	}
-
-	const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
-	const modelRegistry = ModelRegistry.create(authStorage, tempDir);
-
-	const session = new AgentSession({
-		sessionManager,
-		model,
-		thinkingLevel: "off",
-		streamFn: (requestModel, context, streamOptions) =>
-			streamSimple(requestModel, context, {
-				...streamOptions,
-				...(API_KEY === undefined ? {} : { apiKey: API_KEY }),
-			}),
-		convertToLlm,
-		settingsManager,
-		cwd: tempDir,
-		modelRegistry,
-		resourceLoader: createTestResourceLoader({
-			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
-		}),
-		baseToolsOverride: Object.fromEntries(createCodingTools(process.cwd()).map((tool) => [tool.name, tool])),
-	});
-
-	// Must subscribe to enable session persistence
-	session.subscribe(() => {});
-
-	const cleanup = () => {
-		session.dispose();
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true });
+		if (options.settingsOverrides) {
+			settingsManager.applyOverrides(options.settingsOverrides);
 		}
+
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+
+		const session = new AgentSession({
+			sessionManager,
+			model,
+			thinkingLevel: "off",
+			streamFn: (requestModel, context, streamOptions) =>
+				streamSimple(requestModel, context, {
+					...streamOptions,
+					...(API_KEY === undefined ? {} : { apiKey: API_KEY }),
+				}),
+			convertToLlm,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader({
+				systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+			}),
+			baseToolsOverride: Object.fromEntries(createCodingTools(process.cwd()).map((tool) => [tool.name, tool])),
+		});
+
+		// Must subscribe to enable session persistence
+		session.subscribe(() => {});
+
+		const cleanup = async () => {
+			session.dispose();
+			await session.waitForClosed();
+			if (tempDir && existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true });
+			}
+		};
+
+		return { session, sessionManager, tempDir, cleanup };
 	};
 
-	return { session, sessionManager, tempDir, cleanup };
+	return options.inMemory ? finish(SessionManager.inMemory()) : SessionManager.create(tempDir).then(finish);
+}
+
+export async function loadPersistedSessionSnapshot(manager: SessionManager): Promise<SessionStoreSnapshot> {
+	const ref = manager.getSessionRef();
+	if (!ref) throw new Error("Expected a persisted session reference");
+	const lease = await acquireSharedSQLiteSessionStore(ref.sessionDirectory);
+	try {
+		const snapshot = await lease.client.loadSession(ref.sessionId, ref.sessionGeneration);
+		if (!snapshot) throw new Error(`Expected persisted session ${ref.sessionId}`);
+		return snapshot;
+	} finally {
+		await lease.release();
+	}
 }
 
 /**

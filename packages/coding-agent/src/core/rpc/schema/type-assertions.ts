@@ -1,7 +1,7 @@
 /**
  * Compile-time drift tripwires pinning the contract schemas to the upstream
  * types they project onto the wire (volt-ai, volt-agent-core, and host
- * modules that own the source shapes). No runtime exports — `tsgo --noEmit`
+ * modules that own the source shapes). No runtime exports — `tsc --noEmit`
  * and every build fail when an upstream shape changes until the contract is
  * updated consciously.
  *

@@ -15,7 +15,9 @@ Common options:
 - `--model <pattern>`: Model pattern or ID (supports `provider/id` and optional `:<thinking>`)
 - `--name <name>` / `-n <name>`: Set the session display name at startup
 - `--no-session`: Disable session persistence
-- `--session-dir <path>`: Custom session storage directory
+- `--session-dir <path>`: Directory containing the authoritative `sessions.sqlite` store
+
+RPC session state, lists, and mutation commands use stable session IDs. They do not expose or accept live store paths.
 
 ## Protocol Overview
 
@@ -152,10 +154,12 @@ Start a fresh session. Can be cancelled by a `session_before_switch` extension e
 {"type": "new_session"}
 ```
 
-With optional parent session tracking:
+With optional stable parent identity:
 ```json
-{"type": "new_session", "parentSession": "/path/to/parent-session.jsonl"}
+{"type": "new_session", "parentSessionId": "parent-session-id"}
 ```
+
+`parentSessionId` must identify a session in the active store. The new session receives its own stable ID; refresh with `get_state` after a successful replacement.
 
 Response:
 ```json
@@ -212,7 +216,6 @@ Response:
     "isCompacting": true,
     "steeringMode": "all",
     "followUpMode": "one-at-a-time",
-    "sessionFile": "/path/to/session.jsonl",
     "sessionId": "abc123",
     "sessionName": "my-feature-work",
     "autoCompactionEnabled": true,
@@ -223,7 +226,7 @@ Response:
 }
 ```
 
-The `model` field is a full [Model](#model) object or `null`. `availableThinkingLevels` lists the thinking levels the current model supports (`["off"]` for non-reasoning models). `fastModeEnabled` is the authoritative branch-local Fast state used by initial and replacement conversation bootstraps. `isStreaming` indicates an active provider run or session-level continuation; `isBusy` also includes asynchronous prompt preflight and standalone session operations such as manual compaction and tree navigation. The `sessionName` field is the display name set via `set_session_name`, or omitted if not set. `activeCompaction` is present only while context compaction is currently running; `startedAt` is Unix epoch milliseconds.
+The `model` field is a full [Model](#model) object or `null`. `availableThinkingLevels` lists the thinking levels the current model supports (`["off"]` for non-reasoning models). `fastModeEnabled` is the authoritative branch-local Fast state used by initial and replacement conversation bootstraps. `isStreaming` indicates an active provider run or session-level continuation; `isBusy` also includes asynchronous prompt preflight and standalone session operations such as manual compaction and tree navigation. `sessionId` is the stable identity used by session switch and resume commands. The `sessionName` field is the display name set via `set_session_name`, or omitted if not set. `activeCompaction` is present only while context compaction is currently running; `startedAt` is Unix epoch milliseconds.
 
 `gitContext` is a required nullable field read from a host-owned cache; `get_state` never waits for Git. It is `null` when the session cwd is not a usable Git worktree or before an initial scan has succeeded. A non-null value has these semantics:
 
@@ -234,11 +237,11 @@ The `model` field is a full [Model](#model) object or `null`. `availableThinking
 - `operation` is `null` or a host-detected merge, rebase, cherry-pick, revert, bisect, or sequencer operation. Rebase metadata may include `step` and `total`.
 - `revision` is monotonic only for one provider lifetime. `observedAt` advances only after a complete successful scan. On a later scan failure, Volt retains the last good value, increments its revision once, and sets `stale:true`; recovery emits another replacement with `stale:false`.
 
-Collection is local-only and performs no fetch. It uses bounded, fixed-argument Git reads and never includes changed path names, absolute checkout paths, remote URLs, credentials, or diff content. Live `gitContext` is not persisted. A newly created session may additionally expose optional `startingGitContext`, which is the first definitive path-free observation (`null` for a definitive non-Git cwd) stored in one strictly validated host-only `session_start_git_context` JSONL entry. That entry never enters model context, transcript projection, extension prompts, handshake `remoteHost`, or host-global metadata.
+Collection is local-only and performs no fetch. It uses bounded, fixed-argument Git reads and never includes changed path names, absolute checkout paths, remote URLs, credentials, or diff content. Live `gitContext` is not persisted. A newly created session may additionally expose optional `startingGitContext`, which is the first definitive path-free observation (`null` for a definitive non-Git cwd) stored as one strictly validated host-only `session_start_git_context` entry in SQLite. That entry never enters model context, transcript projection, extension prompts, handshake `remoteHost`, or host-global metadata.
 
 #### get_transcript
 
-Get a UI-ready projected transcript for the active session. The response is ordered oldest-to-newest and omits raw provider payloads, thinking blocks, image data, raw tool output, full file contents, and session file paths. Text, summaries, and mutation previews are bounded.
+Get a UI-ready projected transcript for the active session. The response is ordered oldest-to-newest and omits raw provider payloads, thinking blocks, image data, raw tool output, full file contents, and host store paths. Text, summaries, and mutation previews are bounded.
 
 ```json
 {"type": "get_transcript", "limit": 100}
@@ -760,7 +763,7 @@ Review invocations return `accepted` with a `workflowId` and run detached from t
 
 #### Native UI Action Security
 
-Descriptors must not expose host-local paths, extension source paths, prompt template bodies, skill content, provider secrets, environment values, auth internals, raw model/provider metadata, raw transcript payloads, or host session file paths. Iroh remote discovery responses pass through the remote outbound redaction layer in addition to descriptor-level sanitization. Remote invocation is allowlist-based and re-checks action availability, remote safety, authorization, streaming policy, and argument validity at invocation time.
+Descriptors must not expose host-local paths, extension source paths, prompt template bodies, skill content, provider secrets, environment values, auth internals, raw model/provider metadata, raw transcript payloads, or host session store paths. Iroh remote discovery responses pass through the remote outbound redaction layer in addition to descriptor-level sanitization. Remote invocation is allowlist-based and re-checks action availability, remote safety, authorization, streaming policy, and argument validity at invocation time.
 
 `get_commands` remains the legacy local command-discovery surface for raw slash invocation and may include source metadata useful to local clients. Remote clients and native mobile clients should use sanitized `get_ui_actions`; raw `get_commands` remains blocked over Iroh.
 
@@ -788,13 +791,13 @@ When a host action is needed, Volt emits:
   "id": "ha_123",
   "action": "lsp.install_server",
   "title": "Install typescript language server?",
-  "message": "Volt tried to use LSP for typescript, but typescript-language-server is not installed. Install it now and retry diagnostics?",
+  "message": "Volt tried to use LSP for typescript, but tsc is not installed. Install it now and retry diagnostics?",
   "confirmLabel": "Install",
   "cancelLabel": "Skip",
-  "commandPreview": "npm install -g typescript-language-server typescript",
+  "commandPreview": "npm install -g typescript@7.0.2",
   "blocking": true,
   "destructive": false,
-  "metadata": {"server": "typescript", "binary": "typescript-language-server"}
+  "metadata": {"server": "typescript", "binary": "tsc"}
 }
 ```
 
@@ -807,7 +810,7 @@ The client responds with one of `"approved"`, `"denied"`, or `"dismissed"`:
 Volt may emit progress updates for approved actions:
 
 ```json
-{"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "running", "message": "Running npm install -g typescript-language-server typescript"}
+{"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "running", "message": "Running npm install -g typescript@7.0.2"}
 {"type": "host_action_update", "id": "ha_123", "action": "lsp.install_server", "status": "completed", "message": "typescript language server installed. Retrying diagnostics.", "exitCode": 0}
 ```
 
@@ -1119,7 +1122,6 @@ Response:
   "command": "get_session_stats",
   "success": true,
   "data": {
-    "sessionFile": "/path/to/session.jsonl",
     "sessionId": "abc123",
     "userMessages": 5,
     "assistantMessages": 5,
@@ -1196,7 +1198,7 @@ Iroh conversation streams also allow this command for paired clients with `host.
 
 #### list_sessions
 
-List sessions for the current workspace. The response omits host file paths so remote clients can present workspace-scoped session choices safely.
+List sessions for the current workspace through the SQLite summary index. The response uses stable IDs and omits the store directory, database path, and `SessionReference` internals so local and remote clients can present workspace-scoped choices safely.
 
 ```json
 {"type": "list_sessions"}
@@ -1272,10 +1274,10 @@ Response:
 
 #### switch_session
 
-Load a different session file. Can be cancelled by a `session_before_switch` extension event handler.
+Load another session from the active workspace store by stable ID. Can be cancelled by a `session_before_switch` extension event handler.
 
 ```json
-{"type": "switch_session", "sessionPath": "/path/to/session.jsonl"}
+{"type": "switch_session", "sessionId": "abc123"}
 ```
 
 Response:
@@ -1290,7 +1292,7 @@ If an extension cancelled the switch:
 
 #### switch_session_by_id
 
-Load another session from the current workspace by session ID. This is the remote-safe form of session switching; clients do not need to know host session file paths.
+Load another session from the current workspace by stable ID. It has the same path-free request semantics as `switch_session`. Conversation-bound mobile streams reject direct retargeting; select the session when opening the stream instead.
 
 ```json
 {"type": "switch_session_by_id", "sessionId": "abc123"}

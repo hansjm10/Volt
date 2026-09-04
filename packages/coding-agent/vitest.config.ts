@@ -1,6 +1,10 @@
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { configDefaults, defineConfig } from "vitest/config";
 
+const testAgentDir = join(tmpdir(), `volt-coding-agent-vitest-${randomUUID()}`);
 const aiSrcIndex = fileURLToPath(new URL("../ai/src/index.ts", import.meta.url));
 const aiSrcOAuth = fileURLToPath(new URL("../ai/src/oauth.ts", import.meta.url));
 const agentSrcIndex = fileURLToPath(new URL("../agent/src/index.ts", import.meta.url));
@@ -18,6 +22,11 @@ export default defineConfig({
 			"examples/remote/firebase-push-relay/functions/**/*.test.js",
 		],
 		testTimeout: 30000,
+		globalSetup: "./test/vitest-global-setup.ts",
+		env: {
+			VOLT_CODING_AGENT_DIR: testAgentDir,
+			VOLT_CODING_AGENT_SESSION_DIR: "",
+		},
 		maxWorkers: 8,
 		minWorkers: 1,
 		server: {

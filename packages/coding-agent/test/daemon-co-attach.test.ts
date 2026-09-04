@@ -14,6 +14,7 @@ import { type IrohRemoteAuditEvent, IrohRemoteAuditLogger } from "../src/core/re
 import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import type { IrohRemoteHandshakeSuccess, IrohRemoteHello } from "../src/core/remote/iroh/handshake.ts";
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
 import {
 	ConversationCoordinatorRegistry,
 	type ConversationCoordinatorRekeyReservation,
@@ -354,9 +355,18 @@ describe("daemon co-attach (one runtime per conversation)", () => {
 		await registry.stopAll("test_cleanup");
 	});
 
-	it("cancels provisional attach without waiting for runtime creation and disposes a late result", async () => {
+	it("cancels provisional attach without waiting and audits failed cleanup of a retained late row", async () => {
 		const abortController = new AbortController();
-		const dispose = vi.fn(async () => {});
+		const cleanupError = new Error("injected late runtime cleanup failure");
+		const sessionDir = join(fixtureRoot, "late-runtime-sessions");
+		const sessionManager = await SessionManager.create(workspacePath, sessionDir, { id: "late-runtime" });
+		const sessionRef = sessionManager.getSessionRef();
+		if (!sessionRef) throw new Error("Expected a persisted late-runtime reference");
+		const auditEvents: IrohRemoteAuditEvent[] = [];
+		const dispose = vi.fn(async () => {
+			await sessionManager.closePersistence();
+			throw cleanupError;
+		});
 		const lateRuntime = {
 			cwd: workspacePath,
 			session: createTestSession("late-runtime", null),
@@ -377,7 +387,13 @@ describe("daemon co-attach (one runtime per conversation)", () => {
 		);
 		const registry = new IntegratedRuntimeRegistry({
 			agentDir,
-			auditLogger: new IrohRemoteAuditLogger(),
+			auditLogger: new IrohRemoteAuditLogger({
+				sink: {
+					write: (event) => {
+						auditEvents.push(event);
+					},
+				},
+			}),
 			stateManager: new IrohRemoteHostStateManager(),
 			activeStreams: new IrohRemoteActiveStreamRegistry(),
 			detachedRuntimeTtlMs: () => 60_000,
@@ -387,25 +403,46 @@ describe("daemon co-attach (one runtime per conversation)", () => {
 			createRuntime,
 		});
 		const authorization = createAuthorization("n-cancelled-attach");
-		const pending = registry.getOrCreateEntry(
-			{ hello: createHello({ target: "new" }), response: HANDSHAKE_RESPONSE },
-			authorization,
-			{ signal: abortController.signal },
-		);
-		await vi.waitFor(() => expect(createRuntime).toHaveBeenCalledOnce());
+		let reopened: SessionManager | undefined;
+		try {
+			const pending = registry.getOrCreateEntry(
+				{ hello: createHello({ target: "new", sessionId: "late-runtime" }), response: HANDSHAKE_RESPONSE },
+				authorization,
+				{ signal: abortController.signal },
+			);
+			await vi.waitFor(() => expect(createRuntime).toHaveBeenCalledOnce());
 
-		abortController.abort();
-		await expect(pending).rejects.toThrow("Conversation attach cancelled because daemon admission closed");
-		expect(registry.size).toBe(0);
-		expect(dispose).not.toHaveBeenCalled();
+			abortController.abort();
+			await expect(pending).rejects.toThrow("Conversation attach cancelled because daemon admission closed");
+			expect(registry.size).toBe(0);
+			expect(dispose).not.toHaveBeenCalled();
 
-		resolveRuntime({
-			runtime: lateRuntime,
-			sessionSelection: { kind: "created", sessionId: "late-runtime" },
-		});
-		await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
-		expect(registry.size).toBe(0);
-		expect(registry.findOwner("ws", "late-runtime")).toBeUndefined();
+			resolveRuntime({
+				runtime: lateRuntime,
+				sessionSelection: { kind: "created", sessionId: "late-runtime" },
+			});
+			await vi.waitFor(() =>
+				expect(auditEvents).toContainEqual(
+					expect.objectContaining({
+						type: "runtime_start_cleanup_failed",
+						clientNodeId: "n-cancelled-attach",
+						workspace: "ws",
+						success: false,
+						error: cleanupError.message,
+						details: expect.objectContaining({ reason: "attach_cancelled", sessionId: "late-runtime" }),
+					}),
+				),
+			);
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(registry.size).toBe(0);
+			expect(registry.findOwner("ws", "late-runtime")).toBeUndefined();
+			expect(await SessionManager.findForResume(sessionDir, "late-runtime")).toEqual(sessionRef);
+			reopened = await SessionManager.open(sessionRef);
+			expect(reopened.getSessionRef()).toEqual(sessionRef);
+		} finally {
+			await reopened?.closePersistence().catch(() => undefined);
+			await sessionManager.closePersistence().catch(() => undefined);
+		}
 	});
 
 	it("starts recovered input only on the committed winner after subscriber admission", async () => {

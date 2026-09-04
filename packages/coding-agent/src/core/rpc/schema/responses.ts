@@ -60,7 +60,6 @@ import {
 /** Wire projection of core/agent-session.ts SessionStats (pinned in type-assertions.ts). */
 export const RpcSessionStatsSchema = Type.Object(
 	{
-		sessionFile: Type.Optional(Type.String()),
 		sessionId: Type.String(),
 		userMessages: Type.Number(),
 		assistantMessages: Type.Number(),

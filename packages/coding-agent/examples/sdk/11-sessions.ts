@@ -10,22 +10,22 @@ import { createAgentSession, SessionManager } from "@hansjm10/volt-coding-agent"
 const { session: inMemory } = await createAgentSession({
 	sessionManager: SessionManager.inMemory(),
 });
-console.log("In-memory session:", inMemory.sessionFile ?? "(none)");
+console.log("In-memory session:", inMemory.sessionRef ?? "(none)");
 inMemory.dispose();
 
 // New persistent session
 const { session: newSession } = await createAgentSession({
-	sessionManager: SessionManager.create(process.cwd()),
+	sessionManager: await SessionManager.create(process.cwd()),
 });
-console.log("New session file:", newSession.sessionFile);
+console.log("New session reference:", newSession.sessionRef);
 newSession.dispose();
 
 // Continue most recent session (or create new if none)
 const { session: continued, modelFallbackMessage } = await createAgentSession({
-	sessionManager: SessionManager.continueRecent(process.cwd()),
+	sessionManager: await SessionManager.continueRecent(process.cwd()),
 });
 if (modelFallbackMessage) console.log("Note:", modelFallbackMessage);
-console.log("Continued session:", continued.sessionFile);
+console.log("Continued session:", continued.sessionRef);
 continued.dispose();
 
 // List and open specific session
@@ -37,7 +37,7 @@ for (const info of sessions.slice(0, 3)) {
 
 if (sessions.length > 0) {
 	const { session: opened } = await createAgentSession({
-		sessionManager: SessionManager.open(sessions[0].path),
+		sessionManager: await SessionManager.open(sessions[0].ref),
 	});
 	console.log(`\nOpened: ${opened.sessionId}`);
 	opened.dispose();
@@ -46,7 +46,7 @@ if (sessions.length > 0) {
 // Custom session directory (no cwd encoding)
 // const customDir = "/path/to/my-sessions";
 // const { session } = await createAgentSession({
-//   sessionManager: SessionManager.create(process.cwd(), customDir),
+//   sessionManager: await SessionManager.create(process.cwd(), customDir),
 // });
-// SessionManager.list(process.cwd(), customDir);
-// SessionManager.continueRecent(process.cwd(), customDir);
+// await SessionManager.list(process.cwd(), customDir);
+// await SessionManager.continueRecent(process.cwd(), customDir);

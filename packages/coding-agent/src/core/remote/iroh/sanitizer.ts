@@ -5,7 +5,24 @@ export const IROH_REMOTE_REDACTED_BASH_OUTPUT_PATH = "[redacted bash output path
 export const IROH_REMOTE_REDACTED_EXPORT_PATH = "[redacted export path]";
 export const IROH_REMOTE_REDACTED_SESSION_FILE = "[redacted session file]";
 
-const OMIT_REMOTE_PATH_FIELDS = new Set(["fullOutputPath", "sessionFile"]);
+// Match exact host-local locator fields; suffix matching would over-redact
+// unrelated public IDs.
+const OMIT_REMOTE_HOST_LOCAL_FIELDS = new Set([
+	"childSessionRef",
+	"fullOutputPath",
+	"parentSession",
+	"parentSessionDirectory",
+	"parentSessionGeneration",
+	"parentSessionRef",
+	"parentStoreId",
+	"previousSessionRef",
+	"sessionDirectory",
+	"sessionFile",
+	"sessionGeneration",
+	"sessionRef",
+	"storeId",
+	"targetSessionRef",
+]);
 const STRICT_REMOTE_PATH_FIELDS = new Set([
 	"cwd",
 	"exportPath",
@@ -103,7 +120,7 @@ function sanitizeValue(
 
 	const sanitized: Record<string, unknown> = Object.create(null);
 	for (const [key, entry] of Object.entries(value)) {
-		if (OMIT_REMOTE_PATH_FIELDS.has(key)) {
+		if (OMIT_REMOTE_HOST_LOCAL_FIELDS.has(key)) {
 			continue;
 		}
 		const sanitizedEntry =

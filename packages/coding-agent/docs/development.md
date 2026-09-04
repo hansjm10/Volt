@@ -61,6 +61,18 @@ npm test                          # Run all tests
 npm test -- test/specific.test.ts # Run specific test
 ```
 
+## Session discovery benchmark
+
+Run the observational SQLite listing/open/search benchmark from the repository root:
+
+```bash
+npm --prefix packages/coding-agent run benchmark:sessions
+```
+
+It reports elapsed time, main-thread heap delta, and sampled process-wide peak RSS delta for cold/warm cross-store listing, cold/warm exact open, and token/phrase/regex deep search. Scale dimensions independently with `VOLT_BENCH_SESSION_COUNT` (total), `VOLT_BENCH_STORE_COUNT`, `VOLT_BENCH_SESSION_SUMMARY_BYTES`, `VOLT_BENCH_SESSION_NON_SEARCHABLE_BYTES`, `VOLT_BENCH_SESSION_SEARCHABLE_BYTES`, `VOLT_BENCH_QUERY_TOKEN_COUNT`, `VOLT_BENCH_QUERY_TOKEN_BYTES`, `VOLT_BENCH_QUERY_PHRASE_COUNT`, `VOLT_BENCH_QUERY_PHRASE_BYTES`, and `VOLT_BENCH_QUERY_REGEX_BYTES`. The command rejects query terms that do not fit the requested per-session searchable payload instead of silently increasing it.
+
+Listing and exact lookup should remain independent of non-searchable transcript payload. Deep-search time still depends on total searchable text and query shape; stores are searched sequentially, and each worker accumulates at most its largest one-session document rather than all searchable text in that store. Process RSS sampling includes worker threads but is host-dependent, observational, and has no pass/fail threshold.
+
 ## Lifecycle memory benchmark
 
 Run the manual coding-agent memory benchmark from the repository root. It executes TypeScript source directly with Node strip-only mode and the `volt-source` export condition; it does not build or read `dist`:

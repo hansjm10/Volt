@@ -2441,8 +2441,8 @@
 				"conversationAuthority": {
 					"$ref": "#/$defs/RpcConversationAuthority"
 				},
-				"parentSession": {
-					"type": "string"
+				"parentSessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
 				},
 				"preserveReviewRunId": {
 					"$ref": "#/$defs/RpcConversationIdentifier"
@@ -3331,7 +3331,7 @@
 			"type": "object",
 			"required": [
 				"type",
-				"sessionPath"
+				"sessionId"
 			],
 			"properties": {
 				"id": {
@@ -3344,7 +3344,7 @@
 				"conversationAuthority": {
 					"$ref": "#/$defs/RpcConversationAuthority"
 				},
-				"sessionPath": {
+				"sessionId": {
 					"type": "string"
 				}
 			},
@@ -11415,9 +11415,6 @@
 				"followUpMode": {
 					"$ref": "#/$defs/RpcQueueMode"
 				},
-				"sessionFile": {
-					"type": "string"
-				},
 				"sessionId": {
 					"type": "string"
 				},
@@ -11472,9 +11469,6 @@
 				"model": {
 					"$ref": "#/$defs/RpcProjectionTruncation"
 				},
-				"sessionFile": {
-					"$ref": "#/$defs/RpcProjectionTruncation"
-				},
 				"sessionName": {
 					"$ref": "#/$defs/RpcProjectionTruncation"
 				},
@@ -11506,9 +11500,6 @@
 				"cost"
 			],
 			"properties": {
-				"sessionFile": {
-					"type": "string"
-				},
 				"sessionId": {
 					"type": "string"
 				},

@@ -3,7 +3,7 @@ import type { AgentHarnessStreamOptions, AgentMessage, StreamFn, ThinkingLevel }
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@hansjm10/volt-ai";
 import { getAgentDir } from "../config.ts";
 import { canonicalizePath, resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, AgentSessionConstructionCleanupError } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { AuthStorage } from "./auth-storage.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -126,7 +126,10 @@ export interface CreateAgentSessionOptions {
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
 
-	/** Session manager. Default: SessionManager.create(cwd) */
+	/**
+	 * Session manager. Default: SessionManager.create(cwd).
+	 * Ownership transfers to createAgentSession when the call begins.
+	 */
 	sessionManager?: SessionManager;
 	/** Shared cwd-bound Git context provider. A bounded provider is created when omitted. */
 	gitContextProvider?: GitContextProvider;
@@ -182,6 +185,7 @@ export type {
 	ToolDefinition,
 } from "./extensions/index.ts";
 export type { PromptTemplate } from "./prompt-templates.ts";
+export type { SessionReference } from "./session-manager.ts";
 export type { Skill } from "./skills.ts";
 export type { Tool } from "./tools/index.ts";
 
@@ -247,6 +251,77 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	let ownedSessionManager = options.sessionManager;
+	try {
+		return await createAgentSessionUnchecked(options, (sessionManager) => {
+			ownedSessionManager = sessionManager;
+		});
+	} catch (error) {
+		if (!ownedSessionManager) throw error;
+		try {
+			await ownedSessionManager.closePersistence();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[...getSessionSetupErrors(error), cleanupError],
+				"Agent session setup failed and its manager could not be closed",
+			);
+		}
+		throw error;
+	}
+}
+
+/** @internal The enclosing AgentSessionRuntime factory owns manager cleanup until this returns. */
+export async function createAgentSessionForRuntime(
+	options: CreateAgentSessionOptions & { sessionManager: SessionManager },
+): Promise<CreateAgentSessionResult> {
+	return createAgentSessionUnchecked(options, () => {});
+}
+
+type SessionSetupFinalizer = () => void | Promise<void>;
+
+class AgentSessionSetupCleanupError extends AggregateError {}
+
+function getSessionSetupErrors(error: unknown): unknown[] {
+	return error instanceof AgentSessionSetupCleanupError || error instanceof AgentSessionConstructionCleanupError
+		? [...error.errors]
+		: [error];
+}
+
+async function createAgentSessionUnchecked(
+	options: CreateAgentSessionOptions,
+	onDefaultSessionManagerCreated: (sessionManager: SessionManager) => void,
+): Promise<CreateAgentSessionResult> {
+	const untransferredFinalizers: SessionSetupFinalizer[] = [];
+	try {
+		return await createAgentSessionWithTrackedResources(
+			options,
+			onDefaultSessionManagerCreated,
+			untransferredFinalizers,
+		);
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
+		for (const finalize of untransferredFinalizers.splice(0).reverse()) {
+			try {
+				await finalize();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AgentSessionSetupCleanupError(
+				[...getSessionSetupErrors(error), ...cleanupErrors],
+				"Agent session setup cleanup did not complete",
+			);
+		}
+		throw error;
+	}
+}
+
+async function createAgentSessionWithTrackedResources(
+	options: CreateAgentSessionOptions,
+	onDefaultSessionManagerCreated: (sessionManager: SessionManager) => void,
+	untransferredFinalizers: SessionSetupFinalizer[],
+): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const lexicalProjectCwd = resolvePath(options.projectCwd ?? cwd);
 	const projectCwd = canonicalizePath(lexicalProjectCwd);
@@ -265,13 +340,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			profile: options.profile,
 			...(options.projectTrusted !== undefined ? { projectTrusted: options.projectTrusted } : {}),
 		});
-	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	let sessionManager = options.sessionManager;
+	if (!sessionManager) {
+		sessionManager = await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+		onDefaultSessionManagerCreated(sessionManager);
+	}
 	await sessionManager.flush();
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd: projectCwd, agentDir, settingsManager });
 		await resourceLoader.reload();
 		time("resourceLoader.reload");
+	}
+	const extensionsResult = resourceLoader.getExtensions();
+	const pendingProviderRegistrations = extensionsResult.runtime.pendingProviderRegistrations;
+	extensionsResult.runtime.pendingProviderRegistrations = [];
+	for (const { name, config, extensionPath } of pendingProviderRegistrations) {
+		try {
+			modelRegistry.registerProvider(name, config);
+		} catch (error) {
+			extensionsResult.errors.push({
+				path: extensionPath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	// Check if session has existing branch state to restore, including message-free durable policy.
@@ -383,6 +475,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		return manager;
 	};
 	const mcpManager = options.disableMcp ? undefined : (options.mcpManager ?? (await createDefaultMcpManager()));
+	if (!options.disableMcp && options.mcpManager === undefined && mcpManager !== undefined) {
+		untransferredFinalizers.push(() => mcpManager.dispose());
+	}
 
 	const defaultActiveToolNames: string[] = [...DEFAULT_ACTIVE_TOOL_NAMES];
 	const isSubagentRuntime = options.subagentToolManager?.isSubagentRuntime?.() === true;
@@ -494,7 +589,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	await sessionManager.flush();
 
 	const gitContextProvider = options.gitContextProvider ?? new GitContextProvider(cwd);
-	if (!options.gitContextProvider) void gitContextProvider.refresh();
+	if (options.gitContextProvider === undefined) {
+		untransferredFinalizers.push(() => gitContextProvider.dispose());
+		void gitContextProvider.refresh();
+	}
 	const session = new AgentSession({
 		sessionManager,
 		...(model === undefined ? {} : { model }),
@@ -524,12 +622,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		mcpManager,
 		mcpManagerFactory: options.disableMcp || options.mcpManager ? undefined : createDefaultMcpManager,
 	});
-	const registeredModel = model ? modelRegistry.find(model.provider, model.id) : undefined;
-	if (registeredModel && registeredModel !== session.model) {
-		await session.setModel(registeredModel, { persistDefault: false });
-	}
-	const extensionsResult = resourceLoader.getExtensions();
-
+	untransferredFinalizers.length = 0;
 	return {
 		session,
 		extensionsResult,

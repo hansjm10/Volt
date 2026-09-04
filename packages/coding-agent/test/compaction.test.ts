@@ -1,8 +1,6 @@
 import type { AgentMessage } from "@hansjm10/volt-agent-core";
 import type { AssistantMessage, Tool, Usage } from "@hansjm10/volt-ai";
 import { estimateToolDefinitionTokens, fauxToolCall, getModel, Type } from "@hansjm10/volt-ai";
-import { readFileSync } from "fs";
-import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type CompactionSettings,
@@ -20,8 +18,6 @@ import {
 	buildSessionContext,
 	type CompactionEntry,
 	type ModelChangeEntry,
-	migrateSessionEntries,
-	parseSessionEntries,
 	type SessionEntry,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
@@ -32,11 +28,20 @@ import {
 // ============================================================================
 
 function loadLargeSessionEntries(): SessionEntry[] {
-	const sessionPath = join(__dirname, "fixtures/large-session.jsonl");
-	const content = readFileSync(sessionPath, "utf-8");
-	const entries = parseSessionEntries(content);
-	migrateSessionEntries(entries); // Add id/parentId for v1 fixtures
-	return entries.filter((e): e is SessionEntry => e.type !== "session");
+	resetEntryCounter();
+	const entries: SessionEntry[] = [];
+	for (let index = 0; index < 120; index++) {
+		entries.push(createMessageEntry(createUserMessage(`User request ${index}: ${"context ".repeat(20)}`)));
+		entries.push(
+			createMessageEntry(
+				createAssistantMessage(
+					`Assistant response ${index}: ${"analysis ".repeat(20)}`,
+					createMockUsage(0, 100, (index + 1) * 1_000),
+				),
+			),
+		);
+	}
+	return entries;
 }
 
 function createMockUsage(input: number, output: number, cacheRead = 0, cacheWrite = 0): Usage {
@@ -589,11 +594,11 @@ describe("prepareCompaction with previous compaction", () => {
 });
 
 // ============================================================================
-// Integration tests with real session data
+// Integration tests with a large current-format session
 // ============================================================================
 
-describe("Large session fixture", () => {
-	it("should parse the large session", () => {
+describe("Large session", () => {
+	it("should build the large session", () => {
 		const entries = loadLargeSessionEntries();
 		expect(entries.length).toBeGreaterThan(100);
 

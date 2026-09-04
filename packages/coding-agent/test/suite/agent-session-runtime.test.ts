@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -10,7 +10,14 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import { SessionConversationStateUnavailableError, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	CURRENT_SESSION_SNAPSHOT_VERSION,
+	CURRENT_SESSION_VERSION,
+	SessionConversationStateUnavailableError,
+	SessionManager,
+	type SessionReference,
+	summarizeSessionEntries,
+} from "../../src/core/session-manager.ts";
 import type {
 	ExtensionAPI,
 	ExtensionFactory,
@@ -19,6 +26,7 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../../src/index.ts";
+import { createDirectorySymlinkSync } from "../symlink-utils.ts";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -37,7 +45,12 @@ describe("AgentSessionRuntime characterization", () => {
 
 	async function createRuntimeForTest(
 		extensionFactory: ExtensionFactory,
-		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean },
+		options?: {
+			cwd?: string;
+			bootstrapModel?: boolean;
+			bootstrapThinkingLevel?: boolean;
+			beforeCreateRuntime?: (sessionManager: SessionManager) => Promise<void> | void;
+		},
 	) {
 		const tempDir =
 			options?.cwd ?? join(tmpdir(), `volt-runtime-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -86,6 +99,7 @@ describe("AgentSessionRuntime characterization", () => {
 			},
 		};
 		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+			await options?.beforeCreateRuntime?.(sessionManager);
 			const services = await createAgentSessionServices({
 				...runtimeOptions,
 				cwd,
@@ -105,7 +119,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: await SessionManager.create(tempDir),
 		});
 		await runtime.session.bindExtensions({});
 
@@ -118,6 +132,42 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 
 		return { runtime, faux, tempDir };
+	}
+
+	const SNAPSHOT_TIMESTAMP = "2026-09-01T12:00:00.000Z";
+
+	function writeSessionSnapshot(
+		filePath: string,
+		cwd: string,
+		id: string,
+		entries: readonly Record<string, unknown>[] = [],
+	): void {
+		const lastEntryId = entries.at(-1)?.id;
+		const targetId = typeof lastEntryId === "string" ? lastEntryId : null;
+		writeFileSync(
+			filePath,
+			`${[
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+					id,
+					timestamp: SNAPSHOT_TIMESTAMP,
+					cwd,
+				},
+				...entries,
+				{
+					type: "leaf",
+					id: `${id}-leaf`,
+					parentId: targetId,
+					ordinal: entries.length + 1,
+					timestamp: SNAPSHOT_TIMESTAMP,
+					targetId,
+				},
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
 	}
 
 	it("persists message_end assistant replacements to the session manager", async () => {
@@ -331,7 +381,7 @@ describe("AgentSessionRuntime characterization", () => {
 		events.length = 0;
 
 		await runtime.session.prompt("hello");
-		const originalSessionFile = runtime.session.sessionFile;
+		const originalSessionRef = runtime.session.sessionRef;
 		const originalSession = runtime.session;
 
 		const newSessionResult = await runtime.newSession();
@@ -339,22 +389,22 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.session.bindExtensions({});
 		expect(runtime.session).not.toBe(originalSession);
 		expect(runtime.session.messages).toEqual([]);
-		const secondSessionFile = runtime.session.sessionFile;
+		const secondSessionRef = runtime.session.sessionRef;
 		expect(events).toEqual([
-			{ type: "session_before_switch", reason: "new", targetSessionFile: undefined },
-			{ type: "session_shutdown", reason: "new", targetSessionFile: secondSessionFile },
-			{ type: "session_start", reason: "new", previousSessionFile: originalSessionFile },
+			{ type: "session_before_switch", reason: "new", targetSessionRef: undefined },
+			{ type: "session_shutdown", reason: "new", targetSessionRef: secondSessionRef },
+			{ type: "session_start", reason: "new", previousSessionRef: originalSessionRef },
 		]);
 
 		events.length = 0;
 
-		const switchResult = await runtime.switchSession(originalSessionFile!);
+		const switchResult = await runtime.switchSession(originalSessionRef!);
 		expect(switchResult.cancelled).toBe(false);
 		await runtime.session.bindExtensions({});
 		expect(events).toEqual([
-			{ type: "session_before_switch", reason: "resume", targetSessionFile: originalSessionFile },
-			{ type: "session_shutdown", reason: "resume", targetSessionFile: originalSessionFile },
-			{ type: "session_start", reason: "resume", previousSessionFile: secondSessionFile },
+			{ type: "session_before_switch", reason: "resume", targetSessionRef: originalSessionRef },
+			{ type: "session_shutdown", reason: "resume", targetSessionRef: originalSessionRef },
+			{ type: "session_start", reason: "resume", previousSessionRef: secondSessionRef },
 		]);
 	});
 
@@ -403,6 +453,89 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.session.fastModeEnabled).toBe(true);
 	});
 
+	it("keeps live modified time aligned with stored message activity after metadata changes", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const manager = runtime.session.sessionManager;
+		const messageTime = Date.now() - 60_000;
+		manager.appendMessage({ role: "user", content: "activity baseline", timestamp: messageTime });
+		runtime.session.setSessionName("renamed after activity");
+		await manager.flush();
+
+		const stored = (await SessionManager.list(runtime.cwd, manager.getSessionDir())).find(
+			(session) => session.id === runtime.session.sessionId,
+		);
+		const live = runtime.getCurrentSessionSummary();
+
+		expect(stored).toBeDefined();
+		expect(live.modifiedAt).toBe(new Date(messageTime).toISOString());
+		expect(live.modifiedAt).toBe(stored?.modified.toISOString());
+	});
+
+	it("builds live summaries from the cached projection without materializing history", async () => {
+		const { runtime } = await createRuntimeForTest(() => {}, { bootstrapModel: false });
+		const manager = runtime.session.sessionManager;
+		const firstMessageTime = Date.now() - 3_000;
+		const lastMessageTime = firstMessageTime + 1_000;
+		manager.appendCustomMessageEntry(
+			"test.displayed",
+			"displayed fallback",
+			true,
+			undefined,
+			firstMessageTime - 1_000,
+		);
+		manager.appendMessage({ role: "user", content: "first user", timestamp: firstMessageTime });
+		manager.appendCustomMessageEntry("test.hidden", "hidden activity", false, undefined, lastMessageTime + 60_000);
+		manager.appendMessage({ role: "user", content: "second user", timestamp: lastMessageTime });
+		const expected = summarizeSessionEntries(manager.getEntries());
+		expect(expected).toEqual({
+			messageCount: 3,
+			firstMessage: "first user",
+			lastActivityTime: lastMessageTime,
+		});
+
+		const getEntries = vi.spyOn(manager, "getEntries").mockImplementation(() => {
+			throw new Error("Live summaries must not materialize session entries");
+		});
+		try {
+			expect(manager.getSessionEntrySummary()).toEqual(expected);
+			expect(runtime.getCurrentSessionSummary()).toMatchObject({
+				messageCount: 3,
+				firstMessage: "first user",
+				modifiedAt: new Date(lastMessageTime).toISOString(),
+			});
+			expect(getEntries).not.toHaveBeenCalled();
+		} finally {
+			getEntries.mockRestore();
+		}
+	});
+
+	it("keeps live planning-only modified time aligned with the stored header fallback", async () => {
+		const { runtime } = await createRuntimeForTest(() => {}, { bootstrapModel: false });
+		const manager = runtime.session.sessionManager;
+		const header = manager.getHeader();
+		if (!header) throw new Error("Expected current session header");
+		const createdAt = new Date(header.timestamp).toISOString();
+		manager.appendPlanningState({ mode: "plan", plan: null });
+		manager.appendCustomMessageEntry(
+			"test.hidden-after-planning",
+			"hidden activity",
+			false,
+			undefined,
+			new Date(header.timestamp).getTime() + 60_000,
+		);
+		await manager.flush();
+
+		const stored = (await SessionManager.list(runtime.cwd, manager.getSessionDir())).find(
+			(session) => session.id === runtime.session.sessionId,
+		);
+		const live = runtime.getCurrentSessionSummary();
+
+		expect(stored).toBeDefined();
+		expect(stored?.messageCount).toBe(0);
+		expect(live.modifiedAt).toBe(createdAt);
+		expect(live.modifiedAt).toBe(stored?.modified.toISOString());
+	});
+
 	it("lists current-workspace sessions and switches by session id", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
 
@@ -419,16 +552,11 @@ describe("AgentSessionRuntime characterization", () => {
 
 		const foreignCwd = join(tempDir, "foreign-workspace");
 		mkdirSync(foreignCwd, { recursive: true });
-		writeFileSync(
-			join(runtime.session.sessionManager.getSessionDir(), "2026-01-01T00-00-00-000Z_foreign-session.jsonl"),
-			`${JSON.stringify({
-				cwd: foreignCwd,
-				id: "foreign-session",
-				timestamp: "2026-01-01T00:00:00.000Z",
-				type: "session",
-				version: 3,
-			})}\n`,
-		);
+		const foreignSession = await SessionManager.create(foreignCwd, runtime.session.sessionManager.getSessionDir(), {
+			id: "foreign-session",
+		});
+		foreignSession.appendMessage({ role: "user", content: "foreign prompt", timestamp: Date.now() });
+		await foreignSession.flush();
 
 		const sessions = await runtime.listSessions();
 		expect(sessions).toEqual(
@@ -484,6 +612,31 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.session.thinkingLevel).toBe("high");
 	});
 
+	it("treats symlinked cwd aliases as the same workspace for listing and exact switching", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const aliasCwd = join(tempDir, "workspace-alias");
+		createDirectorySymlinkSync(tempDir, aliasCwd);
+		const target = await SessionManager.create(aliasCwd, runtime.session.sessionManager.getSessionDir(), {
+			id: "symlink-alias-session",
+		});
+		try {
+			target.appendMessage({ role: "user", content: "alias prompt", timestamp: Date.now() });
+			await target.flush();
+		} finally {
+			await target.closePersistence();
+		}
+
+		expect((await runtime.listSessions()).some((session) => session.sessionId === target.getSessionId())).toBe(true);
+		await expect(runtime.switchSessionById(target.getSessionId())).resolves.toEqual({
+			cancelled: false,
+			seeded: false,
+		});
+		await runtime.session.bindExtensions({});
+
+		expect(runtime.session.sessionId).toBe(target.getSessionId());
+		expect(realpathSync(runtime.cwd)).toBe(realpathSync(tempDir));
+	});
+
 	it("honors session_before_switch cancellation for new and resume", async () => {
 		const events: RecordedSessionEvent[] = [];
 		let cancelReason: "new" | "resume" | undefined;
@@ -500,23 +653,189 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 
 		await runtime.session.prompt("hello");
-		const originalSessionFile = runtime.session.sessionFile;
+		const originalSessionRef = runtime.session.sessionRef;
 
 		cancelReason = "new";
 		const newResult = await runtime.newSession();
 		expect(newResult.cancelled).toBe(true);
-		expect(runtime.session.sessionFile).toBe(originalSessionFile);
+		expect(runtime.session.sessionRef).toEqual(originalSessionRef);
 
 		events.length = 0;
 		const otherDir = join(tmpdir(), `volt-runtime-other-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(otherDir, { recursive: true });
-		const otherSession = SessionManager.create(otherDir);
+		const otherSession = await SessionManager.create(otherDir);
 		otherSession.appendMessage({ role: "user", content: [{ type: "text", text: "other" }], timestamp: Date.now() });
-		const otherSessionFile = otherSession.getSessionFile();
+		const otherSessionRef = otherSession.getSessionRef();
 		cancelReason = "resume";
-		const resumeResult = await runtime.switchSession(otherSessionFile!);
+		const resumeResult = await runtime.switchSession(otherSessionRef!);
 		expect(resumeResult.cancelled).toBe(true);
-		expect(runtime.session.sessionFile).toBe(originalSessionFile);
+		expect(runtime.session.sessionRef).toEqual(originalSessionRef);
+	});
+
+	it.each([
+		{
+			name: "Fast mode",
+			importedId: "invalid-fast-mode-import",
+			entry: { type: "fast_mode_change", id: "invalid-fast", enabled: "yes" },
+			error: "Fast mode entry invalid-fast has an invalid enabled state",
+		},
+		{
+			name: "thinking-level",
+			importedId: "invalid-thinking-level-import",
+			entry: { type: "thinking_level_change", id: "invalid-thinking", thinkingLevel: "turbo" },
+			error: "Thinking level entry invalid-thinking has an invalid thinking level",
+		},
+	])(
+		"rejects a malformed $name import without replacing or poisoning the current session",
+		async ({ importedId, entry, error }) => {
+			const { runtime, tempDir } = await createRuntimeForTest(() => {});
+			runtime.session.setThinkingLevel("high", { persistDefault: false });
+			runtime.session.setFastModeEnabled(true);
+			await runtime.session.sessionManager.flush();
+			const currentSessionRef = runtime.session.sessionRef;
+			if (!currentSessionRef) throw new Error("Expected current persisted session reference");
+			const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+			const sessionDir = runtime.session.sessionManager.getSessionDir();
+			writeSessionSnapshot(snapshotPath, tempDir, importedId, [
+				{
+					...entry,
+					parentId: null,
+					ordinal: 1,
+					timestamp: SNAPSHOT_TIMESTAMP,
+				},
+			]);
+
+			await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(error);
+
+			expect(runtime.session.sessionRef).toEqual(currentSessionRef);
+			expect(runtime.session.thinkingLevel).toBe("high");
+			expect(runtime.session.fastModeEnabled).toBe(true);
+			const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+				includeMessageFreeDurable: true,
+			});
+			expect(sessions.some((session) => session.id === importedId)).toBe(false);
+			const reopened = await SessionManager.open(currentSessionRef);
+			try {
+				expect(reopened.buildSessionContext()).toMatchObject({
+					thinkingLevel: "high",
+					fastMode: { enabled: true },
+				});
+			} finally {
+				await reopened.closePersistence();
+			}
+		},
+	);
+
+	it("rejects an invalid compaction boundary before creating an imported row", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const importedId = "failed-replay-import";
+		const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const currentSessionRef = runtime.session.sessionRef;
+		writeSessionSnapshot(snapshotPath, tempDir, importedId, [
+			{
+				type: "message",
+				id: "imported-message",
+				parentId: null,
+				ordinal: 1,
+				timestamp: SNAPSHOT_TIMESTAMP,
+				message: {
+					role: "user",
+					content: "partially replayed",
+					timestamp: Date.parse(SNAPSHOT_TIMESTAMP),
+				},
+			},
+			{
+				type: "compaction",
+				id: "bad-compaction",
+				parentId: "imported-message",
+				ordinal: 2,
+				timestamp: SNAPSHOT_TIMESTAMP,
+				summary: "summary",
+				firstKeptEntryId: "missing-entry",
+				tokensBefore: 1,
+			},
+		]);
+
+		await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(
+			"Compaction entry bad-compaction has an invalid first-kept boundary",
+		);
+
+		expect(runtime.session.sessionRef).toEqual(currentSessionRef);
+		const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+			includeMessageFreeDurable: true,
+		});
+		expect(sessions.some((session) => session.id === importedId)).toBe(false);
+	});
+
+	it("retains a persisted import when replacement creation fails before installation", async () => {
+		const importedId = "failed-preinstall-import";
+		let preparedRef: SessionReference | undefined;
+		const { runtime, tempDir } = await createRuntimeForTest(() => {}, {
+			beforeCreateRuntime: (sessionManager) => {
+				if (sessionManager.getSessionId() !== importedId) return;
+				preparedRef = sessionManager.getSessionRef();
+				throw new Error("injected import replacement creation failure");
+			},
+		});
+		const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const currentSessionRef = runtime.session.sessionRef;
+		writeSessionSnapshot(snapshotPath, tempDir, importedId);
+
+		await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(
+			"injected import replacement creation failure",
+		);
+
+		expect(runtime.session.sessionRef).toEqual(currentSessionRef);
+		if (!preparedRef) throw new Error("Expected the imported manager reference to be captured");
+		const reopened = await SessionManager.open(preparedRef);
+		try {
+			expect(reopened.getSessionRef()).toEqual(preparedRef);
+		} finally {
+			await reopened.closePersistence();
+		}
+		const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+			includeMessageFreeDurable: true,
+		});
+		expect(sessions.find((session) => session.id === importedId)?.ref).toEqual(preparedRef);
+	});
+
+	it("preserves a persisted import when replacement fails after installation", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		const importedId = "failed-postinstall-import";
+		const snapshotPath = join(tempDir, `${importedId}.jsonl`);
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const currentSessionRef = runtime.session.sessionRef;
+		writeSessionSnapshot(snapshotPath, tempDir, importedId);
+		const unsubscribe = runtime.subscribeSessionWillProject((session) => {
+			if (session.sessionId === importedId) {
+				throw new Error("injected installed import projection failure");
+			}
+		});
+
+		try {
+			await expect(runtime.importFromJsonl(snapshotPath)).rejects.toThrow(
+				"injected installed import projection failure",
+			);
+		} finally {
+			unsubscribe();
+		}
+
+		expect(runtime.session.sessionId).toBe(importedId);
+		expect(runtime.session.sessionRef).not.toEqual(currentSessionRef);
+		const importedRef = runtime.session.sessionRef;
+		if (!importedRef) throw new Error("Expected the installed import reference");
+		const sessions = await SessionManager.list(tempDir, sessionDir, undefined, {
+			includeMessageFreeDurable: true,
+		});
+		expect(sessions.find((session) => session.id === importedId)?.ref).toEqual(importedRef);
+		const reopened = await SessionManager.open(importedRef);
+		try {
+			expect(reopened.getSessionRef()).toEqual(importedRef);
+		} finally {
+			await reopened.closePersistence();
+		}
 	});
 
 	it("emits session_before_fork and session_start and honors cancellation", async () => {
@@ -541,7 +860,7 @@ describe("AgentSessionRuntime characterization", () => {
 		events.length = 0;
 		await runtime.session.prompt("hello");
 		const userMessage = runtime.session.getUserMessagesForForking()[0]!;
-		const previousSessionFile = runtime.session.sessionFile;
+		const previousSessionRef = runtime.session.sessionRef;
 
 		const successResult = await runtime.fork(userMessage.entryId);
 		expect(successResult.cancelled).toBe(false);
@@ -549,11 +868,10 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.session.bindExtensions({});
 		expect(events).toEqual([
 			{ type: "session_before_fork", entryId: userMessage.entryId, position: "before" },
-			{ type: "session_shutdown", reason: "fork", targetSessionFile: runtime.session.sessionFile },
-			{ type: "session_start", reason: "fork", previousSessionFile },
+			{ type: "session_shutdown", reason: "fork", targetSessionRef: runtime.session.sessionRef },
+			{ type: "session_start", reason: "fork", previousSessionRef },
 		]);
-		const sessionFileName = parse(runtime.session.sessionFile!).name;
-		expect(sessionFileName.endsWith(`_${runtime.session.sessionId}`)).toBe(true);
+		expect(runtime.session.sessionRef?.sessionId).toBe(runtime.session.sessionId);
 
 		events.length = 0;
 		cancelNextFork = true;
@@ -585,13 +903,13 @@ describe("AgentSessionRuntime characterization", () => {
 								.join("")
 					: undefined,
 		}));
-		const previousSessionFile = runtime.session.sessionFile;
+		const previousSessionRef = runtime.session.sessionRef;
 		const leafId = runtime.session.sessionManager.getLeafId();
 		expect(leafId).toBeTruthy();
 
 		const result = await runtime.fork(leafId!, { position: "at" });
 		expect(result).toEqual({ cancelled: false, seeded: false, selectedText: undefined });
-		expect(runtime.session.sessionFile).not.toBe(previousSessionFile);
+		expect(runtime.session.sessionRef).not.toEqual(previousSessionRef);
 		expect(
 			runtime.session.messages.map((message) => ({
 				role: message.role,
@@ -702,11 +1020,11 @@ describe("AgentSessionRuntime characterization", () => {
 		}));
 		const leafId = runtime.session.sessionManager.getLeafId();
 		expect(leafId).toBeTruthy();
-		expect(runtime.session.sessionFile).toBeUndefined();
+		expect(runtime.session.sessionRef).toBeUndefined();
 
 		const result = await runtime.fork(leafId!, { position: "at" });
 		expect(result).toEqual({ cancelled: false, seeded: false, selectedText: undefined });
-		expect(runtime.session.sessionFile).toBeUndefined();
+		expect(runtime.session.sessionRef).toBeUndefined();
 		expect(
 			runtime.session.messages.map((message) => ({
 				role: message.role,
@@ -786,16 +1104,16 @@ describe("AgentSessionRuntime characterization", () => {
 		const otherRuntime = await createAgentSessionRuntime(createOtherRuntime, {
 			cwd: secondDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(secondDir),
+			sessionManager: await SessionManager.create(secondDir),
 		});
 		cleanups.push(async () => {
 			await otherRuntime.dispose();
 		});
 		await otherRuntime.session.prompt("other");
 		await otherRuntime.session.sessionManager.flush();
-		const otherSessionFile = otherRuntime.session.sessionFile!;
+		const otherSessionRef = otherRuntime.session.sessionRef!;
 
-		await runtime.switchSession(otherSessionFile);
+		await runtime.switchSession(otherSessionRef);
 
 		expect(realpathSync(runtime.session.sessionManager.getCwd())).toBe(realpathSync(secondDir));
 		expect(realpathSync(runtime.cwd)).toBe(realpathSync(secondDir));
@@ -860,7 +1178,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const otherRuntime = await createAgentSessionRuntime(createOtherRuntime, {
 			cwd: otherDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(otherDir),
+			sessionManager: await SessionManager.create(otherDir),
 		});
 		cleanups.push(async () => {
 			await otherRuntime.dispose();
@@ -869,9 +1187,9 @@ describe("AgentSessionRuntime characterization", () => {
 		otherRuntime.session.setThinkingLevel("off");
 		await otherRuntime.session.prompt("hello");
 		await otherRuntime.session.sessionManager.flush();
-		const targetSessionFile = otherRuntime.session.sessionFile!;
+		const targetSessionRef = otherRuntime.session.sessionRef!;
 
-		await runtime.switchSession(targetSessionFile);
+		await runtime.switchSession(targetSessionRef);
 
 		expect(runtime.session.model?.id).toBe("faux-2");
 		expect(runtime.session.thinkingLevel).toBe("off");

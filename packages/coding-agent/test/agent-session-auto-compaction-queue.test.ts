@@ -18,6 +18,8 @@ import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createAgentSessionTestControl } from "./agent-session-test-control.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
+const compactionMockState = vi.hoisted(() => ({ firstKeptEntryId: undefined as string | undefined }));
+
 vi.mock("../src/core/compaction/index.js", () => ({
 	calculateContextTokens: (usage: {
 		input: number;
@@ -29,7 +31,7 @@ vi.mock("../src/core/compaction/index.js", () => ({
 	collectEntriesForBranchSummary: () => ({ entries: [], commonAncestorId: null }),
 	compact: async () => ({
 		summary: "compacted",
-		firstKeptEntryId: "entry-1",
+		firstKeptEntryId: compactionMockState.firstKeptEntryId ?? "missing-first-kept-entry",
 		tokensBefore: 100,
 		details: {},
 	}),
@@ -68,7 +70,10 @@ vi.mock("../src/core/compaction/index.js", () => ({
 		return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
 	},
 	generateBranchSummary: async () => ({ summary: "", aborted: false, readFiles: [], modifiedFiles: [] }),
-	prepareCompaction: () => ({ dummy: true }),
+	prepareCompaction: (branchEntries: Array<{ id: string }>) => {
+		compactionMockState.firstKeptEntryId = branchEntries.at(-1)?.id;
+		return { dummy: true };
+	},
 	shouldCompact: (
 		contextTokens: number,
 		contextWindow: number,
@@ -141,6 +146,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("should resume after threshold compaction when only agent-level queued messages exist", async () => {
+		sessionManager.appendMessage({ role: "user", content: "compaction seed", timestamp: Date.now() });
 		control.queueFollowUp({
 			role: "custom",
 			customType: "test",

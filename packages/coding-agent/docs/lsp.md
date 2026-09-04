@@ -23,7 +23,7 @@ Use `volt --lsp` to force-enable LSP for a run when settings disable it.
 - Servers are spawned lazily: the first `edit`/`write` to a file with a matching extension starts the server for that file's server root.
 - Volt has one canonical project workspace for LSP. It is normally the startup directory; remote and managed-worktree runtimes may run tools from a nested directory while retaining the registered workspace or checkout as the project workspace. Requested files are resolved through their existing path or nearest existing ancestor before lexical and canonical boundary checks, so valid case-variant spellings on case-insensitive filesystems are accepted while unregistered aliases and paths that resolve outside the workspace are rejected. The same boundary applies to diagnostics, navigation, refactoring, and server-initiated edits.
 - The server root is found by walking up from the requested file looking for the server's `rootMarkers`, but the search stops at the project workspace and falls back to it. Markers are priority-ordered entry names: for TypeScript, a `tsconfig.json` anywhere inside the workspace wins over a closer `package.json`, so monorepo subpackages resolve to the directory carrying the language configuration. Markers above the configured project workspace are intentionally ignored.
-- After each successful `edit`/`write`, volt syncs the new file content to the server and collects diagnostics, using pull diagnostics (`textDocument/diagnostic`) when the server supports them, otherwise waiting up to `settleMs` for the server to publish. The first collection on a freshly started server waits up to `firstSettleMs` instead, because servers like tsserver publish nothing until the project has loaded.
+- After each successful `edit`/`write`, volt syncs the new file content to the server and collects diagnostics, using pull diagnostics (`textDocument/diagnostic`) when the server supports them, otherwise waiting up to `settleMs` for the server to publish. The first collection on a freshly started server waits up to `firstSettleMs` instead, because some servers publish nothing until the project has loaded.
 - Before every diagnostics collection or navigation query, volt re-syncs any previously opened file whose on-disk content changed outside the `edit`/`write` tools (e.g. via `bash`: `git checkout`, codegen). Deleted files are closed on the server, and servers are notified via `workspace/didChangeWatchedFiles`.
 - Diagnostics at or above the configured `severity` are appended to the tool result and shown in the TUI. Other open files that go from clean to failing as a result of the change are reported in a `Newly failing in other open files` section (capped at 5 files; best-effort, depends on the server republishing within the settle window).
 - One client runs per canonical `(server, server root)` pair. A failure in one nested root does not disable that server in another root. Servers shut down when the session ends or reloads, and after `idleShutdownMs` without use (they respawn lazily on the next operation).
@@ -61,9 +61,11 @@ The matching server must be installed on the exact inherited `PATH`. Volt does n
 
 When a trusted built-in bare command is missing, interactive and capable RPC hosts can ask to install it automatically, then search PATH again and retry the LSP operation. Non-interactive hosts, clients that do not advertise host action support, overridden command argv, custom commands, explicit paths, and manual-install-only servers fall back to repair context or an install hint. Built-in defaults:
 
+The TypeScript default uses TypeScript 7's native language server, so it does not require the `typescript-language-server` bridge.
+
 | Name | Command | Extensions | Root markers | Install |
 |------|---------|------------|--------------|---------|
-| `typescript` | `typescript-language-server --stdio` | `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs` | `tsconfig.json`, `jsconfig.json`, `package.json` | `npm install -g typescript-language-server typescript` |
+| `typescript` | `tsc --lsp --stdio` | `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs` | `tsconfig.json`, `jsconfig.json`, `package.json` | `npm install -g typescript@7.0.2` |
 | `python` | `pyright-langserver --stdio` | `.py` `.pyi` | `pyrightconfig.json`, `pyproject.toml`, `setup.py`, `requirements.txt` | `npm install -g pyright` |
 | `go` | `gopls` | `.go` | `go.mod`, `go.work` | `go install golang.org/x/tools/gopls@latest` |
 | `rust` | `rust-analyzer` | `.rs` | `Cargo.toml` | `rustup component add rust-analyzer` |
@@ -84,7 +86,7 @@ All settings live under `lsp` in `settings.json`:
     "severity": "error",
     "servers": {
       "typescript": {
-        "command": ["bunx", "typescript-language-server", "--stdio"]
+        "command": ["tsc", "--lsp", "--stdio"]
       },
       "rust": {
         "enabled": false

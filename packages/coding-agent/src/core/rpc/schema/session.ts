@@ -143,7 +143,6 @@ export const RpcQueueUpdateProjectionSchema = Type.Object(
 export const RpcSessionStateProjectionSchema = Type.Object(
 	{
 		model: Type.Optional(RpcProjectionTruncationSchema),
-		sessionFile: Type.Optional(RpcProjectionTruncationSchema),
 		sessionName: Type.Optional(RpcProjectionTruncationSchema),
 		steeringQueue: Type.Optional(RpcProjectionCollectionTruncationSchema),
 		followUpQueue: Type.Optional(RpcProjectionCollectionTruncationSchema),
@@ -174,7 +173,6 @@ export const RpcSessionStateSchema = Type.Object(
 		isCompacting: Type.Boolean(),
 		steeringMode: stringEnum(["all", "one-at-a-time"]),
 		followUpMode: stringEnum(["all", "one-at-a-time"]),
-		sessionFile: Type.Optional(Type.String()),
 		sessionId: Type.String(),
 		sessionName: Type.Optional(Type.String()),
 		autoCompactionEnabled: Type.Boolean(),

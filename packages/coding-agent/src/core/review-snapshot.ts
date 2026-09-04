@@ -303,17 +303,28 @@ function runCommand(
 		let stderrBytes = 0;
 		let failure: CommandOutputLimitFailure | undefined;
 		let processError: string | undefined;
+		let terminationPromise: Promise<void> | undefined;
+		let finishing = false;
 		let settled = false;
 		const onAbort = (): void => {
 			proc.stdin?.destroy();
-			if (proc.pid) void terminateProcessTree(proc.pid);
-			else proc.kill();
+			terminationPromise ??= proc.pid
+				? terminateProcessTree(proc.pid, () => proc.exitCode !== null || proc.signalCode !== null)
+				: Promise.resolve().then(() => {
+						proc.kill();
+					});
 		};
 		const finish = (result: CommandResult): void => {
-			if (settled) return;
-			settled = true;
-			options.signal?.removeEventListener("abort", onAbort);
-			resolveResult(result);
+			if (settled || finishing) return;
+			finishing = true;
+			const settle = (): void => {
+				if (settled) return;
+				settled = true;
+				options.signal?.removeEventListener("abort", onAbort);
+				resolveResult(result);
+			};
+			if (terminationPromise) void terminationPromise.then(settle);
+			else settle();
 		};
 		const exceed = (stream: CommandOutputLimitFailure["stream"], limit: number): void => {
 			if (failure) return;

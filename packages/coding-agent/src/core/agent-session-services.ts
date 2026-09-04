@@ -15,7 +15,7 @@ import {
 	type ResourceLoader,
 	type ResourceLoaderReloadOptions,
 } from "./resource-loader.ts";
-import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
+import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSessionForRuntime } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import type { SubagentToolManager } from "./tools/index.ts";
@@ -183,40 +183,56 @@ export async function createAgentSessionServices(
 	});
 	void gitContextProvider.refresh();
 
-	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
-	const extensionsResult = resourceLoader.getExtensions();
-	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
-		try {
-			modelRegistry.registerProvider(name, config);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
+	try {
+		const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+		const extensionsResult = resourceLoader.getExtensions();
+		for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+			try {
+				modelRegistry.registerProvider(name, config);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				diagnostics.push({
+					type: "error",
+					message: `Extension "${extensionPath}" error: ${message}`,
+				});
+			}
 		}
-	}
-	extensionsResult.runtime.pendingProviderRegistrations = [];
-	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+		extensionsResult.runtime.pendingProviderRegistrations = [];
+		diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
-	return {
-		cwd,
-		projectCwd,
-		lexicalProjectCwd,
-		agentDir,
-		authStorage,
-		settingsManager,
-		modelRegistry,
-		resourceLoader,
-		gitContextProvider,
-		workspaceName: options.workspaceName,
-		baseRef: options.baseRef,
-		diagnostics,
-	};
+		return {
+			cwd,
+			projectCwd,
+			lexicalProjectCwd,
+			agentDir,
+			authStorage,
+			settingsManager,
+			modelRegistry,
+			resourceLoader,
+			gitContextProvider,
+			workspaceName: options.workspaceName,
+			baseRef: options.baseRef,
+			diagnostics,
+		};
+	} catch (error) {
+		try {
+			gitContextProvider.dispose();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[error, cleanupError],
+				"Agent session service creation failed and its Git context provider could not be disposed",
+			);
+		}
+		throw error;
+	}
 }
 
 /**
  * Create an AgentSession from previously created services.
+ *
+ * This helper is intended for a CreateAgentSessionRuntimeFactory callback. The
+ * enclosing runtime operation owns manager cleanup until this returns; this
+ * function therefore does not close the manager on pre-session failure.
  *
  * This keeps session creation separate from service creation so callers can
  * resolve model, thinking, tools, and other session inputs against the target
@@ -225,7 +241,7 @@ export async function createAgentSessionServices(
 export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
-	return createAgentSession({
+	return createAgentSessionForRuntime({
 		cwd: options.services.cwd,
 		projectCwd: options.services.lexicalProjectCwd,
 		agentDir: options.services.agentDir,

@@ -1,0 +1,641 @@
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CURRENT_SESSION_VERSION, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	acquireSharedSQLiteSessionStore,
+	SESSION_STORE_DATABASE_FILENAME,
+	SESSION_STORE_SCHEMA_VERSION,
+	type SQLiteSessionStoreLease,
+} from "../../src/core/session-store/index.ts";
+import { createHarness } from "../suite/harness.ts";
+import { createDirectorySymlinkSync } from "../symlink-utils.ts";
+
+const roots: string[] = [];
+const managers: SessionManager[] = [];
+const storeLeases: SQLiteSessionStoreLease[] = [];
+
+async function own(manager: Promise<SessionManager>): Promise<SessionManager> {
+	const resolved = await manager;
+	managers.push(resolved);
+	return resolved;
+}
+
+function fixture(): { root: string; cwd: string; sessionDir: string } {
+	const root = mkdtempSync(join(tmpdir(), "volt-session-manager-sqlite-"));
+	roots.push(root);
+	const cwd = join(root, "workspace");
+	const sessionDir = join(root, "sessions");
+	mkdirSync(cwd, { recursive: true });
+	return { root, cwd, sessionDir };
+}
+
+function seedIncompatibleStore(sessionDirectory: string): void {
+	mkdirSync(sessionDirectory, { recursive: true });
+	const database = new DatabaseSync(join(sessionDirectory, SESSION_STORE_DATABASE_FILENAME));
+	try {
+		database.exec(`PRAGMA user_version = ${SESSION_STORE_SCHEMA_VERSION + 1}`);
+	} finally {
+		database.close();
+	}
+}
+
+afterEach(async () => {
+	for (const manager of managers.splice(0)) await manager.drainPersistence();
+	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
+	for (const lease of storeLeases.splice(0)) await lease.release();
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe("SQLite-backed SessionManager", () => {
+	it("keeps new sessions hidden until visible content and reopens by stable reference", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		const ref = manager.getSessionRef();
+		expect(ref).toBeDefined();
+		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
+		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toHaveLength(
+			1,
+		);
+
+		manager.appendMessage({ role: "user", content: "hello sqlite", timestamp: Date.now() });
+		await manager.flush();
+
+		const listed = await SessionManager.list(cwd, sessionDir);
+		expect(listed).toMatchObject([{ id: manager.getSessionId(), firstMessage: "hello sqlite", messageCount: 1 }]);
+		expect(listed[0]?.ref).toEqual(ref);
+
+		const reopened = await own(SessionManager.open(ref!));
+		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "hello sqlite" }]);
+	});
+
+	it("rejects a non-boolean host-only column without poisoning healthy sessions", async () => {
+		const { cwd, sessionDir } = fixture();
+		const corrupted = await own(SessionManager.create(cwd, sessionDir, { id: "corrupted-envelope" }));
+		corrupted.appendMessage({ role: "user", content: "corrupt me", timestamp: Date.now() });
+		await corrupted.flush();
+		const corruptedRef = corrupted.getSessionRef();
+		if (!corruptedRef) throw new Error("Expected a corrupted-session reference");
+		const healthy = await own(SessionManager.create(cwd, sessionDir, { id: "healthy-envelope" }));
+		healthy.appendMessage({ role: "user", content: "keep me", timestamp: Date.now() });
+		await healthy.flush();
+		const healthyRef = healthy.getSessionRef();
+		if (!healthyRef) throw new Error("Expected a healthy-session reference");
+		await Promise.all([corrupted.closePersistence(), healthy.closePersistence()]);
+
+		const database = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME));
+		try {
+			database.exec("PRAGMA ignore_check_constraints = ON");
+			database
+				.prepare("UPDATE entries SET is_host_only = 2 WHERE session_id = ? AND ordinal = 1")
+				.run(corruptedRef.sessionId);
+		} finally {
+			database.close();
+		}
+
+		await expect(SessionManager.open(corruptedRef)).rejects.toMatchObject({
+			code: "session_store_entry_integrity",
+			message: "Session store canonical entries are invalid or inconsistent",
+		});
+		const reopened = await own(SessionManager.open(healthyRef));
+		expect(reopened.buildSessionContext().messages).toMatchObject([{ role: "user", content: "keep me" }]);
+	});
+
+	it.each([
+		{
+			component: "summary",
+			corrupt(database: DatabaseSync, sessionId: string) {
+				database.prepare("UPDATE sessions SET name = 'corrupt' WHERE id = ?").run(sessionId);
+			},
+		},
+		{
+			component: "client_inputs",
+			corrupt(database: DatabaseSync, sessionId: string) {
+				database.prepare("UPDATE client_inputs SET state = 'started' WHERE session_id = ?").run(sessionId);
+			},
+		},
+		{
+			component: "search_chunks",
+			corrupt(database: DatabaseSync, sessionId: string) {
+				database.prepare("UPDATE search_chunks SET text = 'corrupt' WHERE session_id = ?").run(sessionId);
+			},
+		},
+	])("rejects $component projection drift without repairing it", async ({ component, corrupt }) => {
+		const { cwd, sessionDir } = fixture();
+		const corrupted = await own(SessionManager.create(cwd, sessionDir, { id: `drift-${component}` }));
+		corrupted.appendMessage({ role: "user", content: "searchable", timestamp: Date.now() });
+		corrupted.reserveClientInput(`client-${component}`, "prompt", { message: "pending" });
+		await corrupted.flush();
+		const corruptedRef = corrupted.getSessionRef();
+		if (!corruptedRef) throw new Error("Expected a corrupted projection reference");
+		const healthy = await own(SessionManager.create(cwd, sessionDir, { id: `healthy-${component}` }));
+		healthy.appendMessage({ role: "user", content: "healthy", timestamp: Date.now() });
+		await healthy.flush();
+		const healthyRef = healthy.getSessionRef();
+		if (!healthyRef) throw new Error("Expected a healthy projection reference");
+		await Promise.all([corrupted.closePersistence(), healthy.closePersistence()]);
+
+		const database = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME));
+		try {
+			corrupt(database, corruptedRef.sessionId);
+		} finally {
+			database.close();
+		}
+
+		await expect(SessionManager.open(corruptedRef)).rejects.toMatchObject({
+			code: "session_store_projection_integrity",
+			message: `Session store ${component} projection does not match canonical entries`,
+		});
+		const reopenedHealthy = await own(SessionManager.open(healthyRef));
+		expect(reopenedHealthy.getSessionId()).toBe(healthyRef.sessionId);
+
+		const unchanged = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME), { readOnly: true });
+		try {
+			if (component === "summary") {
+				expect(unchanged.prepare("SELECT name FROM sessions WHERE id = ?").get(corruptedRef.sessionId)?.name).toBe(
+					"corrupt",
+				);
+			} else if (component === "client_inputs") {
+				expect(
+					unchanged.prepare("SELECT state FROM client_inputs WHERE session_id = ?").get(corruptedRef.sessionId)
+						?.state,
+				).toBe("started");
+			} else {
+				expect(
+					unchanged.prepare("SELECT text FROM search_chunks WHERE session_id = ?").get(corruptedRef.sessionId)
+						?.text,
+				).toBe("corrupt");
+			}
+		} finally {
+			unchanged.close();
+		}
+	});
+
+	it("continues a WAL-only accepted receipt for an exact client retry", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir, { id: "accepted-only-continuation" }));
+		manager.reserveClientInput("accepted-retry", "prompt", { message: "retry me" });
+		await manager.flush();
+
+		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+		expect(continued.getSessionRef()).toEqual(manager.getSessionRef());
+		expect(continued.getClientInput("accepted-retry")).toMatchObject({
+			state: "accepted",
+			input: { message: "retry me" },
+		});
+	});
+
+	it("continues newer queued WAL activity ahead of stale message recency", async () => {
+		const { cwd, sessionDir } = fixture();
+		const now = Date.now();
+		const pending = await own(SessionManager.create(cwd, sessionDir, { id: "queued-continuation" }));
+		pending.appendMessage({ role: "user", content: "older conversation", timestamp: now - 120_000 });
+		pending.reserveClientInput("queued-recovery", "steer", { message: "recover me" });
+		pending.markClientInputQueued("queued-recovery", { delivery: "steer", message: "recover me" });
+		await pending.flush();
+
+		const visible = await own(SessionManager.create(cwd, sessionDir, { id: "newer-visible-conversation" }));
+		visible.appendMessage({ role: "user", content: "newer visible", timestamp: now - 60_000 });
+		await visible.flush();
+
+		expect((await SessionManager.list(cwd, sessionDir)).map((session) => session.id)).toEqual([
+			"newer-visible-conversation",
+			"queued-continuation",
+		]);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+		expect(continued.getSessionRef()).toEqual(pending.getSessionRef());
+		expect(continued.getClientInputRecoveryPlan()).toMatchObject({
+			kind: "replay",
+			records: [{ clientMessageId: "queued-recovery", state: "accepted" }],
+		});
+	});
+
+	it("continues a WAL-only started input so its ambiguity fence remains authoritative", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir, { id: "started-continuation" }));
+		manager.reserveClientInput("started-recovery", "prompt", { message: "do not replay" });
+		manager.transitionClientInput("started-recovery", "started");
+		await manager.flush();
+
+		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+		expect(continued.getSessionRef()).toEqual(manager.getSessionRef());
+		expect(continued.getClientInputRecoveryPlan()).toMatchObject({
+			kind: "blocked",
+			blocker: { clientMessageId: "started-recovery", state: "started" },
+		});
+	});
+
+	it("matches custom-store sessions across equivalent cwd symlink or junction aliases", async (context) => {
+		const { root, cwd, sessionDir } = fixture();
+		const cwdAlias = join(root, "workspace-alias");
+		try {
+			createDirectorySymlinkSync(cwd, cwdAlias);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EPERM") {
+				context.skip("directory symlink or junction creation is not permitted");
+				return;
+			}
+			throw error;
+		}
+		expect(realpathSync(cwdAlias)).toBe(realpathSync(cwd));
+
+		const manager = await own(SessionManager.create(cwdAlias, sessionDir, { id: "filesystem-alias" }));
+		manager.appendMessage({ role: "user", content: "filesystem-alias-needle", timestamp: Date.now() });
+		await manager.flush();
+		expect(manager.getCwd()).toBe(cwdAlias);
+
+		const listed = await SessionManager.list(cwd, sessionDir);
+		const searched = await SessionManager.search(cwd, "filesystem-alias-needle", sessionDir);
+		const continued = await own(SessionManager.continueRecent(cwd, sessionDir));
+
+		expect(listed).toMatchObject([{ id: "filesystem-alias", cwd: cwdAlias }]);
+		expect(searched).toMatchObject([{ id: "filesystem-alias", cwd: cwdAlias }]);
+		expect(continued.getSessionRef()).toEqual(manager.getSessionRef());
+		expect(
+			(await SessionManager.listAll(sessionDir, undefined, { includeMessageFreeDurable: true })).map(
+				(session) => session.id,
+			),
+		).toEqual(["filesystem-alias"]);
+	});
+
+	it("publishes absolute custom session directories that survive caller cwd changes", async () => {
+		const { root, cwd } = fixture();
+		const originalCwd = process.cwd();
+		const creatorCwd = join(root, "caller-a");
+		const consumerCwd = join(root, "caller-b");
+		const relativeSessionDir = "relative-sessions";
+		mkdirSync(creatorCwd, { recursive: true });
+		mkdirSync(consumerCwd, { recursive: true });
+
+		try {
+			process.chdir(creatorCwd);
+			const absoluteSessionDir = join(process.cwd(), relativeSessionDir);
+			const manager = await own(SessionManager.create(cwd, relativeSessionDir, { id: "portable-session" }));
+			manager.appendMessage({ role: "user", content: "portableneedle", timestamp: Date.now() });
+			await manager.flush();
+			const createdRef = manager.getSessionRef();
+			if (!createdRef) throw new Error("Expected a persisted session reference");
+
+			const opened = await own(
+				SessionManager.open({
+					...createdRef,
+					sessionDirectory: relativeSessionDir,
+				}),
+			);
+			const continued = await own(SessionManager.continueRecent(cwd, relativeSessionDir));
+			const listedRef = (await SessionManager.list(cwd, relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const searchedRef = (await SessionManager.search(cwd, "portableneedle", relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const searchedAllRef = (await SessionManager.searchAll("portableneedle", relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const listedAllRef = (await SessionManager.listAll(relativeSessionDir)).find(
+				(session) => session.id === createdRef.sessionId,
+			)?.ref;
+			const references = {
+				create: createdRef,
+				open: opened.getSessionRef(),
+				continueRecent: continued.getSessionRef(),
+				findForResume: await SessionManager.findForResume(relativeSessionDir, createdRef.sessionId),
+				list: listedRef,
+				search: searchedRef,
+				searchAll: searchedAllRef,
+				listAll: listedAllRef,
+			};
+			for (const ref of Object.values(references)) {
+				expect(ref).toBeDefined();
+				expect(ref?.sessionDirectory).toBe(absoluteSessionDir);
+			}
+			expect(manager.getSessionDir()).toBe(absoluteSessionDir);
+
+			process.chdir(consumerCwd);
+			const reopened = await own(SessionManager.open(createdRef));
+			expect(reopened.getSessionId()).toBe(createdRef.sessionId);
+			expect(reopened.getSessionDir()).toBe(absoluteSessionDir);
+		} finally {
+			process.chdir(originalCwd);
+		}
+	});
+
+	it("lists valid sessions without auditing unrelated foreign-key violations", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		manager.appendMessage({ role: "user", content: "valid session", timestamp: Date.now() });
+		await manager.flush();
+		const sessionId = manager.getSessionId();
+		await manager.closePersistence();
+
+		const db = new DatabaseSync(join(sessionDir, SESSION_STORE_DATABASE_FILENAME));
+		try {
+			db.exec("PRAGMA foreign_keys = OFF");
+			db.prepare(
+				`INSERT INTO entries (
+					session_id, entry_id, ordinal, parent_entry_id, entry_type, timestamp, is_host_only, payload_json
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run("missing-session", "orphan-entry", 1, null, "message", "2026-09-02T00:00:00.000Z", 0, "{}");
+		} finally {
+			db.close();
+		}
+
+		expect((await SessionManager.list(cwd, sessionDir)).map((session) => session.id)).toEqual([sessionId]);
+		const auditLease = await acquireSharedSQLiteSessionStore(sessionDir);
+		storeLeases.push(auditLease);
+		const audit = await auditLease.client.verifyForeignKeys();
+		expect(audit).toMatchObject({
+			status: "violation",
+			table: "entries",
+			rowId: null,
+			parentTable: "sessions",
+		});
+		if (audit.status !== "violation") throw new Error("Expected a foreign-key violation");
+		expect(Number.isSafeInteger(audit.constraintIndex)).toBe(true);
+	});
+
+	it("searches indexed history beyond the first message without loading transcript payloads", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		manager.appendMessage({ role: "user", content: "first message", timestamp: Date.now() });
+		manager.appendCustomEntry("large-private-payload", { payload: "x".repeat(128 * 1024) });
+		manager.appendMessage({ role: "user", content: "deep-only-needle", timestamp: Date.now() + 1 });
+		await manager.flush();
+
+		const matches = await SessionManager.search(cwd, "deep-only-needle", sessionDir);
+		expect(matches).toMatchObject([{ id: manager.getSessionId(), firstMessage: "first message" }]);
+	});
+
+	it("globally ranks deep-text matches across session stores", async () => {
+		const root = mkdtempSync(join(tmpdir(), "volt-session-search-all-"));
+		roots.push(root);
+		const olderCwd = join(root, "work-a");
+		const newerCwd = join(root, "work-b");
+		mkdirSync(olderCwd, { recursive: true });
+		mkdirSync(newerCwd, { recursive: true });
+		vi.stubEnv("VOLT_CODING_AGENT_DIR", join(root, "agent"));
+
+		const older = await own(SessionManager.create(olderCwd, undefined, { id: "rank-old" }));
+		older.appendMessage({ role: "user", content: "summary a", timestamp: 1_700_000_000_000 });
+		older.appendMessage({ role: "user", content: "rankneedle tail", timestamp: 1_700_000_000_001 });
+		await older.flush();
+
+		const newer = await own(SessionManager.create(newerCwd, undefined, { id: "rank-new" }));
+		newer.appendMessage({ role: "user", content: "summary b", timestamp: 1_700_000_001_000 });
+		newer.appendMessage({ role: "user", content: "xxxx rankneedle", timestamp: 1_700_000_001_001 });
+		await newer.flush();
+
+		const matches = await SessionManager.searchAll('"rankneedle"');
+		expect(matches.map((session) => session.id)).toEqual(["rank-old", "rank-new"]);
+		expect(matches.map((session) => session.firstMessage)).toEqual(["summary a", "summary b"]);
+	});
+
+	it("isolates an incompatible store while preserving global list and search results", async () => {
+		const { root } = fixture();
+		const agentDir = join(root, "agent");
+		const olderCwd = join(root, "work-a");
+		const newerCwd = join(root, "work-b");
+		mkdirSync(olderCwd, { recursive: true });
+		mkdirSync(newerCwd, { recursive: true });
+		vi.stubEnv("VOLT_CODING_AGENT_DIR", agentDir);
+
+		const older = await own(SessionManager.create(olderCwd, undefined, { id: "isolation-old" }));
+		older.appendMessage({ role: "user", content: "summary a", timestamp: 1_700_000_000_000 });
+		older.appendMessage({ role: "user", content: "isolationneedle tail", timestamp: 1_700_000_000_001 });
+		await older.flush();
+
+		const newer = await own(SessionManager.create(newerCwd, undefined, { id: "isolation-new" }));
+		newer.appendMessage({ role: "user", content: "summary b", timestamp: 1_700_000_001_000 });
+		newer.appendMessage({ role: "user", content: "xxxx isolationneedle", timestamp: 1_700_000_001_001 });
+		await newer.flush();
+
+		const incompatibleStore = join(agentDir, "sessions", "incompatible");
+		seedIncompatibleStore(incompatibleStore);
+
+		const progress = vi.fn();
+		const listed = await SessionManager.listAll(progress);
+		expect(listed.map((session) => session.id)).toEqual(["isolation-new", "isolation-old"]);
+		expect(progress.mock.calls).toEqual([
+			[1, 3],
+			[2, 3],
+			[3, 3],
+		]);
+
+		const matches = await SessionManager.searchAll('"isolationneedle"');
+		expect(matches.map((session) => session.id)).toEqual(["isolation-old", "isolation-new"]);
+
+		await expect(SessionManager.listAll(incompatibleStore)).rejects.toMatchObject({
+			code: "store_schema_mismatch",
+		});
+		await expect(SessionManager.searchAll("isolationneedle", incompatibleStore)).rejects.toMatchObject({
+			code: "store_schema_mismatch",
+		});
+	});
+
+	it("rejects global enumeration when every database-bearing store fails", async () => {
+		const { root } = fixture();
+		const agentDir = join(root, "agent");
+		const sessionsRoot = join(agentDir, "sessions");
+		vi.stubEnv("VOLT_CODING_AGENT_DIR", agentDir);
+		seedIncompatibleStore(join(sessionsRoot, "incompatible"));
+		mkdirSync(join(sessionsRoot, "no-database"));
+
+		await expect(SessionManager.listAll()).rejects.toThrow("Could not list sessions from any project store");
+		await expect(SessionManager.searchAll("needle")).rejects.toThrow(
+			"Could not search sessions in any project store",
+		);
+	});
+
+	it("fails stale managers closed after delete and same-id recreation", async () => {
+		const { cwd, sessionDir } = fixture();
+		const original = await own(SessionManager.create(cwd, sessionDir, { id: "reused-id" }));
+		original.appendMessage({ role: "user", content: "original", timestamp: Date.now() });
+		await original.flush();
+		const originalRef = original.getSessionRef()!;
+		expect(await SessionManager.delete(originalRef, 1)).toBe(true);
+
+		const replacement = await own(SessionManager.create(cwd, sessionDir, { id: "reused-id" }));
+		expect(replacement.getSessionRef()?.sessionGeneration).not.toBe(originalRef.sessionGeneration);
+		original.appendSessionInfo("stale write");
+		await expect(original.flush()).rejects.toThrow(/ambiguous|reconcil/i);
+		expect(original.getConversationAuthorityStatus().status).toBe("reconciliation_required");
+	});
+
+	it("preserves complete parent references across stores", async () => {
+		const first = fixture();
+		const second = fixture();
+		const parent = await own(SessionManager.create(first.cwd, first.sessionDir));
+		parent.appendMessage({ role: "user", content: "parent", timestamp: Date.now() });
+		await parent.flush();
+		const child = await own(SessionManager.forkFrom(parent.getSessionRef()!, second.cwd, second.sessionDir));
+		const childInfo = (await SessionManager.list(second.cwd, second.sessionDir))[0]!;
+		expect(childInfo.parentSessionRef).toEqual(parent.getSessionRef());
+		const reopenedParent = await own(SessionManager.open(childInfo.parentSessionRef!));
+		expect(reopenedParent).toBeInstanceOf(SessionManager);
+		expect(child.getSessionId()).toBe(childInfo.id);
+
+		const snapshotPath = join(second.root, "child-snapshot.jsonl");
+		const snapshot = await SessionManager.exportJsonlSnapshot(childInfo.ref, snapshotPath);
+		expect(await SessionManager.delete(childInfo.ref, snapshot.revision)).toBe(true);
+		const restored = await own(SessionManager.importFromJsonl(snapshotPath, second.cwd, second.sessionDir));
+		expect(restored.getHeader()?.parentSession).toEqual(parent.getSessionRef());
+	});
+
+	it("keeps another manager usable when reconciliation replaces a same-store lease", async () => {
+		const { cwd, sessionDir } = fixture();
+		const first = await own(SessionManager.create(cwd, sessionDir));
+		const second = await own(SessionManager.open(first.getSessionRef()!));
+		const faultLease = await acquireSharedSQLiteSessionStore(sessionDir);
+		storeLeases.push(faultLease);
+		vi.spyOn(faultLease.client, "applyTransaction").mockRejectedValueOnce(
+			new Error("injected pre-commit response failure"),
+		);
+
+		first.appendSessionInfo("rolled back");
+		await expect(first.flush()).rejects.toThrow("transaction was rolled back");
+		second.appendSessionInfo("surviving owner");
+		await second.flush();
+		expect(second.getSessionName()).toBe("surviving owner");
+	});
+
+	it("releases a replacement lease installed while shutdown awaits reconciliation", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		const faultLease = await acquireSharedSQLiteSessionStore(sessionDir);
+		storeLeases.push(faultLease);
+		const close = vi.spyOn(faultLease.client, "close");
+		vi.spyOn(faultLease.client, "applyTransaction").mockRejectedValueOnce(
+			new Error("injected pre-commit response failure"),
+		);
+
+		manager.appendSessionInfo("rolled back during shutdown");
+		await expect(manager.drainPersistence()).resolves.toMatchObject({ status: "reconciliation_required" });
+		await faultLease.release();
+		expect(close).toHaveBeenCalledOnce();
+	});
+
+	it("shares one idempotent shutdown drain and seals writes synchronously", async () => {
+		const { cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		manager.appendSessionInfo("before close");
+
+		const firstDrain = manager.drainPersistence();
+		expect(manager.drainPersistence()).toBe(firstDrain);
+		expect(() => manager.appendSessionInfo("after close")).toThrow("Session persistence is closed");
+		expect(() => manager.newSession()).toThrow("Session persistence is closed");
+		await expect(firstDrain).resolves.toEqual({ status: "closed" });
+		await expect(manager.closePersistence()).resolves.toBeUndefined();
+	});
+
+	it("preserves a session when explicit deletion uses a stale revision", async () => {
+		const { cwd, sessionDir } = fixture();
+		const stale = await own(SessionManager.create(cwd, sessionDir));
+		stale.appendPlanningState({ mode: "plan", plan: null });
+		await stale.flush();
+		const ref = stale.getSessionRef();
+		expect(ref).toBeDefined();
+
+		const advancing = await own(SessionManager.open(ref!));
+		advancing.appendSessionInfo("advanced owner");
+		await advancing.flush();
+
+		await expect(SessionManager.delete(ref!, 1)).rejects.toThrow("Session changed before deletion (revision 2)");
+		const reopened = await own(SessionManager.open(ref!));
+		expect(reopened.getSessionRef()).toEqual(ref);
+		expect(reopened.getSessionName()).toBe("advanced owner");
+	});
+
+	it("keeps another manager usable and permits immediate deletion after the final close", async () => {
+		const { root, cwd, sessionDir } = fixture();
+		const first = await own(SessionManager.create(cwd, sessionDir));
+		first.appendMessage({ role: "user", content: "shared owner", timestamp: Date.now() });
+		await first.flush();
+		const second = await own(SessionManager.open(first.getSessionRef()!));
+
+		await first.closePersistence();
+		second.appendSessionInfo("still open");
+		await second.flush();
+		await second.closePersistence();
+
+		rmSync(root, { recursive: true });
+		roots.splice(roots.indexOf(root), 1);
+	});
+
+	it("releases the final manager when awaited AgentSession shutdown completes", async () => {
+		const { root, cwd, sessionDir } = fixture();
+		const manager = await own(SessionManager.create(cwd, sessionDir));
+		const harness = await createHarness({ sessionManager: manager });
+
+		await harness.cleanupAsync();
+		rmSync(root, { recursive: true });
+		roots.splice(roots.indexOf(root), 1);
+	});
+
+	it("rejects invalid imported parent ordering without retaining a hidden row", async () => {
+		const { cwd, sessionDir, root } = fixture();
+		const jsonl = join(root, "cycle.jsonl");
+		const timestamp = "2026-08-31T12:00:00.000Z";
+		writeFileSync(
+			jsonl,
+			`${[
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					snapshotVersion: 1,
+					id: "cycle",
+					timestamp,
+					cwd,
+				},
+				{
+					type: "message",
+					id: "a",
+					parentId: "b",
+					ordinal: 1,
+					timestamp,
+					message: { role: "user", content: "first", timestamp: Date.now() },
+				},
+				{
+					type: "message",
+					id: "b",
+					parentId: "a",
+					ordinal: 2,
+					timestamp,
+					message: { role: "user", content: "second", timestamp: Date.now() },
+				},
+				{ type: "leaf", id: "leaf", parentId: "b", ordinal: 3, timestamp, targetId: "b" },
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n")}\n`,
+		);
+		await expect(SessionManager.importFromJsonl(jsonl, cwd, sessionDir)).rejects.toThrow(/invalid or forward parent/);
+		expect(await SessionManager.list(cwd, sessionDir, undefined, { includeMessageFreeDurable: true })).toEqual([]);
+	});
+
+	it("ignores unmarked JSONL beside the store and rejects it as an explicit snapshot", async () => {
+		const { cwd, sessionDir } = fixture();
+		mkdirSync(sessionDir, { recursive: true });
+		const jsonl = join(sessionDir, "unmarked.jsonl");
+		const timestamp = "2026-08-31T12:00:00.000Z";
+		writeFileSync(
+			jsonl,
+			`${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "unmarked",
+				timestamp,
+				cwd,
+			})}\n`,
+		);
+
+		expect(await SessionManager.list(cwd, sessionDir)).toEqual([]);
+		expect(existsSync(jsonl)).toBe(true);
+		await expect(SessionManager.importFromJsonl(jsonl, cwd, sessionDir)).rejects.toThrow(
+			"Session snapshot version must be 1",
+		);
+	});
+});

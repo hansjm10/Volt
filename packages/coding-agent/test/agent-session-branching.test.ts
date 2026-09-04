@@ -46,7 +46,7 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 
 	async function createSession(noSession: boolean = false) {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
-		sessionManager = noSession ? SessionManager.inMemory(tempDir) : SessionManager.create(tempDir);
+		sessionManager = noSession ? SessionManager.inMemory(tempDir) : await SessionManager.create(tempDir);
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", API_KEY!);
 
@@ -103,14 +103,13 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 		expect(result.selectedText).toBe("Say hello");
 
 		expect(session.messages.length).toBe(0);
-		expect(session.sessionFile).not.toBeNull();
-		expect(existsSync(session.sessionFile!)).toBe(false);
+		expect(session.sessionRef).toBeDefined();
 	});
 
 	it("should support in-memory forking in --no-session mode", async () => {
 		await createSession(true);
 
-		expect(session.sessionFile).toBeUndefined();
+		expect(session.sessionRef).toBeUndefined();
 
 		await session.prompt("Say hi");
 		await session.waitForIdle();
@@ -125,7 +124,7 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 		expect(result.selectedText).toBe("Say hi");
 
 		expect(session.messages.length).toBe(0);
-		expect(session.sessionFile).toBeUndefined();
+		expect(session.sessionRef).toBeUndefined();
 	});
 
 	it("should fork from middle of conversation", async () => {

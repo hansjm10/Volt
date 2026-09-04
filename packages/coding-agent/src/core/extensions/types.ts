@@ -60,6 +60,7 @@ import type {
 	ReadonlySessionManager,
 	SessionEntry,
 	SessionManager,
+	SessionReference,
 } from "../session-manager.ts";
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
@@ -363,12 +364,12 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	 * recovered durable client input failed to replay.
 	 */
 	newSession(options?: {
-		parentSession?: string;
+		parentSessionRef?: SessionReference;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean; seeded: boolean }>;
 
-	/** Fork from a specific entry, creating a new session file. See `newSession` for `seeded`. */
+	/** Fork from a specific entry, creating a new persisted session. See `newSession` for `seeded`. */
 	fork(
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
@@ -380,9 +381,9 @@ export interface ExtensionCommandContext extends ExtensionContext {
 		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<{ cancelled: boolean }>;
 
-	/** Switch to a different session file. See `newSession` for `seeded`. */
+	/** Switch to a different persisted session. See `newSession` for `seeded`. */
 	switchSession(
-		sessionPath: string,
+		sessionRef: SessionReference,
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	): Promise<{ cancelled: boolean; seeded: boolean }>;
 
@@ -574,15 +575,15 @@ export interface SessionStartEvent {
 	type: "session_start";
 	/** Why this session start happened. */
 	reason: "startup" | "reload" | "new" | "resume" | "fork";
-	/** Previously active session file. Present for "new", "resume", and "fork". */
-	previousSessionFile?: string;
+	/** Previously active persisted session. Present for "new", "resume", and "fork". */
+	previousSessionRef?: SessionReference;
 }
 
 /** Fired before switching to another session (can be cancelled) */
 export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
 	reason: "new" | "resume";
-	targetSessionFile?: string;
+	targetSessionRef?: SessionReference;
 }
 
 /** Fired before forking a session (can be cancelled) */
@@ -612,8 +613,8 @@ export interface SessionCompactEvent {
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
 	reason: "quit" | "reload" | "new" | "resume" | "fork";
-	/** Destination session file when shutting down due to session replacement. */
-	targetSessionFile?: string;
+	/** Destination persisted session when shutting down due to session replacement. */
+	targetSessionRef?: SessionReference;
 }
 
 /** Preparation data for tree navigation */
@@ -1619,7 +1620,7 @@ export interface ExtensionContextActions {
 export interface ExtensionCommandContextActions {
 	waitForIdle: () => Promise<void>;
 	newSession: (options?: {
-		parentSession?: string;
+		parentSessionRef?: SessionReference;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}) => Promise<{ cancelled: boolean; seeded: boolean }>;
@@ -1632,7 +1633,7 @@ export interface ExtensionCommandContextActions {
 		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	) => Promise<{ cancelled: boolean }>;
 	switchSession: (
-		sessionPath: string,
+		sessionRef: SessionReference,
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	) => Promise<{ cancelled: boolean; seeded: boolean }>;
 	reload: () => Promise<void>;

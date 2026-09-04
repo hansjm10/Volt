@@ -1,5 +1,7 @@
 # Iroh Remote Access Design
 
+> **Current session-storage note:** live sessions are addressed by stable IDs in per-workspace SQLite stores. Historical references below to session files mean authoritative SQLite session rows/`SessionReference` values; host store paths never cross the remote protocol.
+
 > **Superseded.** The foreground `volt remote host` process described here has been replaced by the persistent background daemon (`voltd`) with conversation leases and live shared sessions. See [Live shared session daemon design](live-shared-session-daemon-design.md) for the current architecture and [Background daemon](daemon.md) for user-facing docs. The wire contract in [Iroh Remote Protocol v1](iroh-remote-protocol.md) is preserved by the daemon. This document is kept for historical context.
 
 ## Status

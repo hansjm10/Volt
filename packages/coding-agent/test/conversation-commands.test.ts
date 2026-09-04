@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -28,6 +28,8 @@ import {
 	type RemoteSessionRuntimeState,
 	TURN_INITIATING_RPC_TYPES,
 } from "../src/daemon/conversation-commands.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
+import { loadPersistedSessionSnapshot } from "./utilities.ts";
 
 const STARTING_GIT_CONTEXT: RpcGitContext = {
 	repository: "volt-app",
@@ -552,8 +554,10 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		const sessionDir = join(root, "sessions");
 		mkdirSync(workspacePath, { recursive: true });
 		mkdirSync(sessionDir, { recursive: true });
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
-			const manager = SessionManager.create(workspacePath, sessionDir);
+			const manager = await SessionManager.create(workspacePath, sessionDir);
 			manager.reserveClientInput("client-message-42", "prompt", {
 				message: `Read ${workspacePath}/fixture.txt`,
 			});
@@ -585,8 +589,10 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			});
 			expect(bootstrap?.items).toEqual([live]);
 			await manager.flush();
-			expect(readFileSync(manager.getSessionFile()!, "utf8")).toContain('"clientMessageId":"client-message-42"');
+			const persisted = await loadPersistedSessionSnapshot(manager);
+			expect(JSON.stringify(persisted.entries)).toContain('"clientMessageId":"client-message-42"');
 		} finally {
+			await managerOwner.drain();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -1426,22 +1432,18 @@ describe("handleIntegratedConversationRpcCommand", () => {
 
 	it("includes parent workspace sessions when the active runtime cwd is a subfolder", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-conversation-list-"));
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
 			const workspacePath = join(tempDir, "repo");
 			const subfolderPath = join(workspacePath, "packages", "app");
 			const agentDir = join(tempDir, "agent");
 			mkdirSync(subfolderPath, { recursive: true });
 			const sessionDir = getDefaultSessionDir(workspacePath, agentDir);
-			writeFileSync(
-				join(sessionDir, "root-session.jsonl"),
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "s-root",
-					timestamp: new Date(1).toISOString(),
-					cwd: workspacePath,
-				})}\n`,
-			);
+			const rootManager = await SessionManager.create(workspacePath, sessionDir, { id: "s-root" });
+			rootManager.appendMessage({ role: "user", content: "root session", timestamp: 1 });
+			rootManager.appendCustomMessageEntry("test.persist", "persist root session", false);
+			await rootManager.flush();
 			const runtime = createRuntime("s-subfolder");
 			runtime.listSessions = async () => [
 				{
@@ -1467,6 +1469,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			expect(bySessionId.get("s-root")).toBeDefined();
 			expect(bySessionId.get("s-subfolder")?.workingDirectory).toBe("packages/app");
 		} finally {
+			await managerOwner.drain();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

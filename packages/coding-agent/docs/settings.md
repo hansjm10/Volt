@@ -62,13 +62,15 @@ Profiles do not isolate auth or sessions yet. `sessionDir` and reserved profile 
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `personality` | string | `"default"` | Communication style for Volt's built-in system prompt: `"default"` for a collaborative, adaptive voice or `"pragmatic"` for direct recommendations focused on simple, maintainable solutions. Ignored when a custom `SYSTEM.md` replaces the built-in prompt |
+| `personality` | string | `"default"` | Communication style for Volt's built-in system prompt: `"default"` for a collaborative, adaptive voice, `"pragmatic"` for direct recommendations focused on simple, maintainable solutions, or `"simplified-technical"` for ASD-STE100-inspired Simplified Technical English in user-facing prose. Ignored when a custom `SYSTEM.md` replaces the built-in prompt |
 
 In interactive mode, run `/settings` and change **Personality**. The selection applies to the next turn.
 
+The `"simplified-technical"` personality keeps source code, identifiers, commands, configuration, quoted text, and repository artifacts in their normal technical form. It follows project conventions for code comments and documentation unless the user requests Simplified Technical English. It is a writing aid and does not certify full ASD-STE100 compliance.
+
 ```json
 {
-  "personality": "pragmatic"
+  "personality": "simplified-technical"
 }
 ```
 
@@ -253,7 +255,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `sessionDir` | string | - | Directory where session files are stored. Accepts absolute or relative paths, plus `~`. |
+| `sessionDir` | string | - | Directory containing the authoritative `sessions.sqlite` store. Accepts absolute or relative paths, plus `~`. |
 
 ```json
 { "sessionDir": ".volt/sessions" }

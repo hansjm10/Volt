@@ -84,10 +84,10 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 		};
 	}
 
-	function createSession(extensions: Extension[]) {
+	async function createSession(extensions: Extension[]) {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 
-		const sessionManager = SessionManager.create(tempDir);
+		const sessionManager = await SessionManager.create(tempDir);
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = ModelRegistry.create(authStorage);
@@ -116,7 +116,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 	it("should emit before_compact and compact events", async () => {
 		const extension = createExtension();
-		createSession([extension]);
+		await createSession([extension]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();
@@ -152,7 +152,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 	it("should allow extensions to cancel compaction", async () => {
 		const extension = createExtension(() => ({ cancel: true }));
-		createSession([extension]);
+		await createSession([extension]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();
@@ -178,7 +178,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			}
 			return undefined;
 		});
-		createSession([extension]);
+		await createSession([extension]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();
@@ -202,7 +202,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 	it("should include entries in compact event after compaction is saved", async () => {
 		const extension = createExtension();
-		createSession([extension]);
+		await createSession([extension]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();
@@ -253,7 +253,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			shortcuts: new Map(),
 		};
 
-		createSession([throwingExtension]);
+		await createSession([throwingExtension]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();
@@ -333,7 +333,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			shortcuts: new Map(),
 		};
 
-		createSession([extension1, extension2]);
+		await createSession([extension1, extension2]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();
@@ -350,7 +350,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			capturedBeforeEvent = event;
 			return undefined;
 		});
-		createSession([extension]);
+		await createSession([extension]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();
@@ -397,7 +397,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			}
 			return undefined;
 		});
-		createSession([extension]);
+		await createSession([extension]);
 
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.waitForIdle();

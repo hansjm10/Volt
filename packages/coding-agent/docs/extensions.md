@@ -278,7 +278,7 @@ Persisted values and public `AgentSession` events use one lossless JSON data gra
 
 Volt rejects explicit `undefined`, non-finite numbers, negative zero, bigint, symbols, functions, cycles, sparse arrays, accessors, symbol-keyed or non-enumerable properties, custom or null prototypes, and rich objects such as `Map`, `Set`, `Date`, `Error`, `RegExp`, `Buffer`, typed arrays, `ArrayBuffer`, `SharedArrayBuffer`, and platform objects. Convert rich values to plain JSON representations, such as an ISO string for a date or an array of entries for a map.
 
-Admission errors are path-specific `TypeError`s. Volt validates and owns accepted data before it mutates session state, writes JSONL, or publishes an event. The on-disk session version is unchanged because every accepted value already round-trips through JSON exactly.
+Admission errors are path-specific `TypeError`s. Volt validates and owns accepted data before it mutates session state, commits to SQLite, or publishes an event. The session format version is unchanged because every accepted value already round-trips through JSON exactly.
 
 ## Events
 
@@ -324,13 +324,13 @@ user sends another prompt ◄─────────────────
 /clear (new session) or /resume (switch session)
   ├─► session_before_switch (can cancel)
   ├─► session_shutdown
-  ├─► session_start { reason: "new" | "resume", previousSessionFile? }
+  ├─► session_start { reason: "new" | "resume", previousSessionRef? }
   └─► resources_discover { reason: "startup" }
 
 /fork or /clone
   ├─► session_before_fork (can cancel)
   ├─► session_shutdown
-  ├─► session_start { reason: "fork", previousSessionFile }
+  ├─► session_start { reason: "fork", previousSessionRef? }
   └─► resources_discover { reason: "startup" }
 
 /compact or auto-compaction
@@ -392,7 +392,18 @@ volt.on("resources_discover", async (event, _ctx) => {
 
 ### Session Events
 
-See [Session Format](session-format.md) for session storage internals and the SessionManager API.
+Persisted sessions live in `sessions.sqlite` and are identified by stable references:
+
+```typescript
+interface SessionReference {
+  readonly sessionDirectory: string;
+  readonly storeId: string;
+  readonly sessionId: string;
+  readonly sessionGeneration: string;
+}
+```
+
+Obtain references from `ctx.sessionManager.getSessionRef()` or indexed `SessionManager.list()` results; do not reconstruct them from a session ID. See [Session Format](session-format.md) for storage and the `SessionManager` API.
 
 #### session_start
 
@@ -401,8 +412,9 @@ Fired when a session is started, loaded, or reloaded.
 ```typescript
 volt.on("session_start", async (event, ctx) => {
   // event.reason - "startup" | "reload" | "new" | "resume" | "fork"
-  // event.previousSessionFile - present for "new", "resume", and "fork"
-  ctx.ui.notify(`Session: ${ctx.sessionManager.getSessionFile() ?? "ephemeral"}`, "info");
+  // event.previousSessionRef - previous persisted session, when one exists
+  const ref = ctx.sessionManager.getSessionRef();
+  ctx.ui.notify(ref ? `Session: ${ref.sessionId}` : "Ephemeral session", "info");
 });
 ```
 
@@ -413,7 +425,7 @@ Fired before starting a new session (`/clear`) or switching sessions (`/resume`)
 ```typescript
 volt.on("session_before_switch", async (event, ctx) => {
   // event.reason - "new" or "resume"
-  // event.targetSessionFile - session we're switching to (only for "resume")
+  // event.targetSessionRef - destination reference (only for "resume")
 
   if (event.reason === "new") {
     const ok = await ctx.ui.confirm("Clear?", "Delete all messages?");
@@ -422,10 +434,10 @@ volt.on("session_before_switch", async (event, ctx) => {
 });
 ```
 
-After a successful switch or new-session action, volt emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "new" | "resume"` and `previousSessionFile`.
+After a successful switch or new-session action, volt emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "new" | "resume"` and optional `previousSessionRef`.
 Do cleanup work in `session_shutdown`, then reestablish any in-memory state in `session_start`.
 
-A live-shared-session handoff between the background daemon and a desktop TUI (see [Background daemon](daemon.md)) looks like an ordinary quit + resume from an extension's perspective: the losing owner emits `session_shutdown` (reason `"quit"`), and the gaining owner loads the session from file and emits `session_start` (reason `"resume"`). Extensions need zero code changes for handoffs; keep `session_shutdown` idempotent and rebuild in-memory state on `session_start` as usual.
+A live-shared-session handoff between the background daemon and a desktop TUI (see [Background daemon](daemon.md)) looks like an ordinary quit + resume from an extension's perspective: the losing owner emits `session_shutdown` (reason `"quit"`), and the gaining owner opens the same session ID from the authoritative store and emits `session_start` (reason `"resume"`). Extensions need zero code changes for handoffs; keep `session_shutdown` idempotent and rebuild in-memory state on `session_start` as usual.
 
 #### session_before_fork
 
@@ -441,7 +453,7 @@ volt.on("session_before_fork", async (event, ctx) => {
 });
 ```
 
-After a successful fork or clone, volt emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "fork"` and `previousSessionFile`.
+After a successful fork or clone, volt emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "fork"` and optional `previousSessionRef`.
 Do cleanup work in `session_shutdown`, then reestablish any in-memory state in `session_start`.
 
 #### session_before_compact / session_compact
@@ -497,7 +509,7 @@ Fired before a started session runtime is torn down. Use this to clean up resour
 ```typescript
 volt.on("session_shutdown", async (event, ctx) => {
   // event.reason - "quit" | "reload" | "new" | "resume" | "fork"
-  // event.targetSessionFile - destination session for session replacement flows
+  // event.targetSessionRef - destination reference for session replacement flows
   // Cleanup, save state, etc.
 });
 ```
@@ -1062,11 +1074,11 @@ volt.registerCommand("my-cmd", {
 Create a new session:
 
 ```typescript
-const parentSession = ctx.sessionManager.getSessionFile();
+const parentSessionRef = ctx.sessionManager.getSessionRef();
 const kickoff = "Continue in the replacement session";
 
 const result = await ctx.newSession({
-  parentSession,
+  ...(parentSessionRef ? { parentSessionRef } : {}),
   setup: async (sm) => {
     sm.appendMessage({
       role: "user",
@@ -1090,7 +1102,7 @@ if (result.cancelled) {
 ```
 
 Options:
-- `parentSession`: parent session file to record in the new session header
+- `parentSessionRef`: persisted parent identity to record for the new session
 - `setup`: mutate the new session's `SessionManager` before `withSession` runs
 - `withSession`: run post-switch work against a fresh replacement-session context. Do not use captured old `volt` / command `ctx`; see [Session replacement lifecycle and footguns](#session-replacement-lifecycle-and-footguns).
 
@@ -1100,7 +1112,7 @@ Result:
 
 ### ctx.fork(entryId, options?)
 
-Fork from a specific entry, creating a new session file:
+Fork from a specific entry, creating a new persisted session:
 
 ```typescript
 const result = await ctx.fork("entry-id-123", {
@@ -1143,12 +1155,13 @@ Options:
 - `replaceInstructions`: If true, `customInstructions` replaces the default prompt instead of being appended
 - `label`: Label to attach to the branch summary entry (or target entry if not summarizing)
 
-### ctx.switchSession(sessionPath, options?)
+### ctx.switchSession(sessionRef, options?)
 
-Switch to a different session file:
+Switch to a persisted session by `SessionReference`:
 
 ```typescript
-const result = await ctx.switchSession("/path/to/session.jsonl", {
+// Obtain sessionRef from SessionManager.list(), search(), or getSessionRef().
+const result = await ctx.switchSession(sessionRef, {
   withSession: async (ctx) => {
     await ctx.sendUserMessage("Resume work in the replacement session");
   },
@@ -1161,22 +1174,24 @@ if (result.cancelled) {
 Options:
 - `withSession`: run post-switch work against a fresh replacement-session context. Do not use captured old `volt` / command `ctx`; see [Session replacement lifecycle and footguns](#session-replacement-lifecycle-and-footguns).
 
-To discover available sessions, use the static `SessionManager.list()` or `SessionManager.listAll()` methods:
+`SessionManager.list()` and `listAll()` read materialized SQLite summaries; `search()` scans extracted searchable text one session at a time. All return `SessionInfo` objects whose `ref` field can be passed directly to `ctx.switchSession()`:
 
 ```typescript
 import { SessionManager } from "@hansjm10/volt-coding-agent";
 
 volt.registerCommand("switch", {
   description: "Switch to another session",
-  handler: async (args, ctx) => {
+  handler: async (_args, ctx) => {
     const sessions = await SessionManager.list(ctx.cwd);
     if (sessions.length === 0) return;
-    const choice = await ctx.ui.select(
-      "Pick session:",
-      sessions.map(s => s.file),
+
+    const labels = sessions.map((session) =>
+      `${session.name ?? session.firstMessage} — ${session.id}`
     );
-    if (choice) {
-      await ctx.switchSession(choice, {
+    const choice = await ctx.ui.select("Pick session:", labels);
+    const selected = choice ? sessions[labels.indexOf(choice)] : undefined;
+    if (selected) {
+      await ctx.switchSession(selected.ref, {
         withSession: async (ctx) => {
           ctx.ui.notify("Switched session", "info");
         },
@@ -1222,7 +1237,7 @@ volt.registerCommand("handoff", {
     await ctx.newSession({
       withSession: async (_ctx) => {
         // stale old objects: do not do this
-        oldSessionManager.getSessionFile();
+        oldSessionManager.getSessionRef();
         volt.sendUserMessage("wrong");
       },
     });

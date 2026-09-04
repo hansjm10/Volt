@@ -4,20 +4,24 @@ Volt saves conversations as sessions so you can continue work, branch from earli
 
 ## Session Storage
 
-Sessions auto-save to `~/.volt/agent/sessions/`, organized by working directory. Each session is a JSONL file with a tree structure.
+Volt stores each workspace's sessions in `sessions.sqlite` under its directory in `~/.volt/agent/sessions/`. A custom `--session-dir` contains its own `sessions.sqlite`. This SQLite database is the live authoritative store; sessions are addressed by stable IDs instead of live files.
 
 ```bash
 volt -c                  # Continue most recent session
 volt -r                  # Browse and select from past sessions
 volt --no-session        # Ephemeral mode; do not save
 volt --name "my task"    # Set session display name at startup
-volt --session <path|id> # Use a specific session file or partial session ID
-volt --fork <path|id>    # Fork a session file or partial session ID into a new session
+volt --session <id|path> # Resume by partial ID, or import a JSONL snapshot by path
+volt --fork <id|path>    # Fork by partial ID, or import a JSONL snapshot as a new session
 ```
 
-Use `/session` in interactive mode to see the current session file, session ID, message count, tokens, and cost.
+Use `/session` in interactive mode to see the current store directory, session ID, message count, tokens, and cost.
 
-For the JSONL file format and SessionManager API, see [Session Format](session-format.md).
+JSONL is not live storage. It is used only for explicit snapshot import and export; passing a path to `--session` or `--fork` imports a current `snapshotVersion: 1` snapshot into SQLite.
+
+Session listing, exact-ID resolution, continuation candidate selection, and remote discovery read materialized summaries without loading transcript entries. Picker search is a deep scan over extracted user, assistant, and displayed custom-message text. It processes one session document at a time, but latency still grows with searchable history and query complexity; JavaScript regex searches have no general runtime bound.
+
+For storage, snapshots, and the `SessionManager` API, see [Session Format](session-format.md).
 
 ## Session Commands
 
@@ -47,7 +51,7 @@ In the picker you can:
 - rename with Ctrl+R
 - delete with Ctrl+D, then confirm
 
-When available, volt uses the `trash` CLI for deletion instead of permanently removing files.
+When available, volt exports a JSONL snapshot to the system trash before deleting the session from SQLite.
 
 ## Naming Sessions
 
@@ -68,7 +72,7 @@ Named sessions are easier to find in `/resume` and `volt -r`.
 
 ## Branching with `/tree`
 
-Sessions are stored as trees. Every entry has an `id` and `parentId`, and the current position is the active leaf. `/tree` lets you jump to any previous point and continue from there without creating a new file.
+Sessions are stored as trees. Every entry has an `id` and `parentId`, and the current position is the active leaf. `/tree` lets you jump to any previous point and continue from there without creating another session.
 
 <p align="center"><img src="images/tree-view.png" alt="Tree View" width="600"></p>
 
@@ -119,12 +123,12 @@ Selecting the root user message resets the leaf to an empty conversation and pla
 
 | Feature | `/tree` | `/fork` | `/clone` |
 |---------|---------|---------|----------|
-| Output | Same session file | New session file | New session file |
+| Output | Same session | New session | New session |
 | View | Full tree | User-message selector | Current active branch |
 | Typical use | Explore alternatives in place | Start a new session from an earlier prompt | Duplicate current work before continuing |
 | Summary | Optional branch summary | None | None |
 
-Use `/tree` when you want to keep alternatives together. Use `/fork` or `/clone` when you want a separate session file.
+Use `/tree` when you want to keep alternatives together. Use `/fork` or `/clone` when you want a separate session ID.
 
 ## Branch Summaries
 
@@ -140,6 +144,6 @@ See [Compaction](compaction.md) for branch summarization internals and extension
 
 ## Session Format
 
-Session files are JSONL and contain message entries, model changes, thinking-level changes, labels, compactions, branch summaries, and extension entries.
+The SQLite store contains message entries, model changes, thinking-level changes, labels, compactions, branch summaries, and extension entries. Explicit JSONL snapshots serialize the same public session tree for interchange; they are not reopened as live storage.
 
-For parsers, extensions, SDK usage, and the full SessionManager API, see [Session Format](session-format.md).
+For snapshot parsers, extensions, SDK usage, and the full `SessionManager` API, see [Session Format](session-format.md).

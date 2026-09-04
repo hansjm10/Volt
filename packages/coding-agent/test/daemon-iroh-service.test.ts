@@ -57,6 +57,18 @@ const native = loadIrohModule();
 const nativeAvailable = native.iroh !== undefined;
 const nativeRequired = process.env.VOLT_TEST_REQUIRE_NATIVE_IROH === "1";
 
+beforeAll(() => {
+	// Fixtures own their relay config and persisted credentials. Inherited canary
+	// URLs or shared tokens must not override that authority in in-process daemons.
+	vi.stubEnv("VOLT_IROH_RELAY_MODE", undefined);
+	vi.stubEnv("VOLT_IROH_RELAY_URLS", undefined);
+	vi.stubEnv("VOLT_IROH_RELAY_AUTH_TOKEN", undefined);
+});
+
+afterAll(() => {
+	vi.unstubAllEnvs();
+});
+
 describe("native Iroh test prerequisite", () => {
 	it("reports an injected missing native binding without taking down local daemon control", async () => {
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-missing-iroh-"));
@@ -644,7 +656,7 @@ async function readJsonLineMatching(
 
 describe("relay config resolution", () => {
 	it("defaults to the Volt production relays", () => {
-		expect(resolveIrohRelayConfig({}, {})).toEqual({
+		expect(resolveIrohRelayConfig({})).toEqual({
 			relayMode: "production",
 			relayUrls: VOLT_PRODUCTION_RELAY_URLS,
 		});
@@ -1074,10 +1086,11 @@ describe.skipIf(!nativeAvailable)("TUI Work observation receipt revisions", () =
 		writeFileSync(join(unresolvedWorkspaceDir, ".git", "HEAD"), "ref: refs/heads/main\n");
 		const workspaceDir = realpathSync(unresolvedWorkspaceDir);
 		const sessionId = randomUUID();
-		const session = SessionManager.create(workspaceDir, getDefaultSessionDir(workspaceDir, agentDir), {
+		const session = await SessionManager.create(workspaceDir, getDefaultSessionDir(workspaceDir, agentDir), {
 			id: sessionId,
 		});
 		await session.materialize();
+		await session.closePersistence();
 
 		const oldPositiveGate = createDeferred();
 		const oldNullGate = createDeferred();
@@ -1230,9 +1243,10 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 		const sourceSessionId = randomUUID();
 		const replacementSessionId = randomUUID();
 		const sessionDir = getDefaultSessionDir(workspaceDir, agentDir);
-		const sourceSession = SessionManager.create(workspaceDir, sessionDir, { id: sourceSessionId });
-		const replacementSession = SessionManager.create(workspaceDir, sessionDir, { id: replacementSessionId });
+		const sourceSession = await SessionManager.create(workspaceDir, sessionDir, { id: sourceSessionId });
+		const replacementSession = await SessionManager.create(workspaceDir, sessionDir, { id: replacementSessionId });
 		await Promise.all([sourceSession.materialize(), replacementSession.materialize()]);
+		await Promise.all([sourceSession.closePersistence(), replacementSession.closePersistence()]);
 
 		const faux = registerFauxProvider();
 		const model = faux.getModel();

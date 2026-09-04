@@ -383,9 +383,20 @@ export async function handleRpcCommand(
 			if (command.preserveReviewRunId && !preservedReviewRun) {
 				return createRpcErrorResponse(id, "new_session", `Unknown review run: ${command.preserveReviewRunId}`);
 			}
+			let parentSessionRef =
+				command.parentSessionId === session.sessionId ? session.sessionManager.getSessionRef() : undefined;
+			if (command.parentSessionId && !parentSessionRef) {
+				const candidates = await SessionManager.listAll(session.sessionManager.getSessionDir(), undefined, {
+					includeMessageFreeDurable: true,
+				});
+				parentSessionRef = candidates.find((candidate) => candidate.id === command.parentSessionId)?.ref;
+				if (!parentSessionRef) {
+					return createRpcErrorResponse(id, "new_session", `Unknown parent session: ${command.parentSessionId}`);
+				}
+			}
 			const newSessionOptions = {
 				rebindRequestId: id,
-				...(command.parentSession ? { parentSession: command.parentSession } : {}),
+				...(parentSessionRef ? { parentSessionRef } : {}),
 				...(preservedReviewRun
 					? {
 							setup: async (sessionManager: SessionManager) => {
@@ -634,13 +645,27 @@ export async function handleRpcCommand(
 			}
 			if (result.seeded && command.findingIds === undefined) {
 				if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
-				const sourceSessionFile = sourceSessionManager.getSessionFile();
-				const acknowledgmentManager = sourceSessionFile
-					? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+				const sourceSessionRef = sourceSessionManager.getSessionRef();
+				const acknowledgmentManager = sourceSessionRef
+					? await SessionManager.open(sourceSessionRef)
 					: sourceSessionManager;
-				acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
-				await acknowledgmentManager.flush();
-				if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
+				try {
+					acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
+					await acknowledgmentManager.flush();
+				} catch (error) {
+					if (sourceSessionRef) {
+						try {
+							await acknowledgmentManager.closePersistence();
+						} catch (closeError) {
+							throw new AggregateError(
+								[error, closeError],
+								"Review acknowledgment failed and its source manager could not be closed",
+							);
+						}
+					}
+					throw error;
+				}
+				if (sourceSessionRef) await acknowledgmentManager.closePersistence();
 			}
 			return createRpcSuccessResponse(id, "open_review_session", { cancelled: result.cancelled });
 		}
@@ -1129,7 +1154,7 @@ export async function handleRpcCommand(
 		// =================================================================
 
 		case "get_session_stats": {
-			const stats = session.getSessionStats();
+			const { sessionRef: _sessionRef, ...stats } = session.getSessionStats();
 			return createRpcSuccessResponse(id, "get_session_stats", stats);
 		}
 
@@ -1152,7 +1177,9 @@ export async function handleRpcCommand(
 		}
 
 		case "switch_session": {
-			const result = await runtimeHost.switchSession(command.sessionPath);
+			const result = await runtimeHost.switchSessionById(command.sessionId, {
+				assertConversationGenerationCurrent: context.assertConversationGenerationCurrent,
+			});
 			if (!result.cancelled) {
 				await context.rebindSession();
 			}

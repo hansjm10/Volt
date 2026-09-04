@@ -162,7 +162,7 @@ interface SubagentStartRequest {
   model?: string;
   thinkingLevel?: string;
   persistSession?: boolean;
-  parentSession?: string;
+  parentSessionRef?: SessionReference;
 }
 
 interface SubagentHandle {
@@ -185,7 +185,7 @@ The implementation uses exported RPC types for state and transcript access.
 A child runtime is a normal Volt runtime with narrowed configuration:
 
 - **Session**: in-memory when the parent is in-memory; persisted beside a persisted parent so child transcripts remain attachable and auditable.
-- **Parent tracking**: persisted children set `parentSession` to the parent session file.
+- **Parent tracking**: persisted children store the parent's stable `SessionReference`.
 - **cwd**: default to parent cwd. Remote visible agents use the stream-bound workspace cwd.
 - **Resource loader**: inherit normal user/project resources for the child cwd, subject to project trust.
 - **System prompt**: use Volt's normal base prompt plus the selected agent definition appended as extra context.
@@ -325,7 +325,7 @@ Later TUI commands can add:
 
 - `/agents` to list available definitions.
 - `/agent <name> <prompt>` to run a visible child session.
-- Session tree links from parent tool result to child session file.
+- Session tree links from parent tool result to the child session ID.
 
 ## App behavior
 
@@ -350,7 +350,7 @@ Required rules:
 - Remote paired-client `allowedTools` continues to apply to any child or visible agent in that workspace.
 - Child cwd defaults to parent cwd; remote children stay within the host-selected workspace model.
 - Agent definitions are prompts and can contain prompt injection. Treat project definitions like other project resources. Built-in names are reserved so trusted projects cannot silently replace built-in role semantics.
-- Do not expose definition file paths, host session file paths, provider credentials, or raw tool output through remote-safe discovery.
+- Do not expose definition file paths, host session store paths/references, provider credentials, or raw tool output through remote-safe discovery.
 - Explicit cancellation is `abort`; stream/transport close should not silently cancel retained remote work.
 
 ## Persistence model
@@ -358,9 +358,9 @@ Required rules:
 MVP defaults:
 
 - Tool-style child subagents follow parent persistence: in-memory parents create in-memory children, while persisted parents create persisted child sessions with parent linkage.
-- App-visible agents are persistent normal sessions, because reconnect and transcript recovery depend on session files.
-- Persistent child sessions record `parentSession` when a parent session file exists.
-- Parent tool results include child `sessionId` but do not rely on child session files for correctness.
+- App-visible agents are persistent normal sessions, because reconnect and transcript recovery depend on durable SQLite session rows.
+- Persistent child sessions record the parent `SessionReference` when the parent is persisted.
+- Parent tool results include child `sessionId` and do not expose host-local store references.
 
 Deferred options:
 

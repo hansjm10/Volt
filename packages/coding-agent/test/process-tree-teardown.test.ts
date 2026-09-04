@@ -11,10 +11,14 @@
  * leader's status alone will skip SIGKILL and leak the descendant.
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { terminateProcessTree } from "../src/utils/shell.ts";
 
 const isPosix = process.platform !== "win32";
+const isWindows = process.platform === "win32";
 const hasPerl = (() => {
 	if (!isPosix) return false;
 	try {
@@ -98,6 +102,41 @@ function spawnStubbornTree(marker: string, escapeGroup: boolean): ChildProcess {
 		stdio: "ignore",
 	});
 }
+
+describe.runIf(isWindows)("terminateProcessTree on Windows", () => {
+	test("waits for taskkill to release the process working directory", async () => {
+		const directory = join(
+			tmpdir(),
+			`volt-process-tree-windows-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(directory, { recursive: true });
+		const startedPath = join(directory, "started");
+		const child = spawn(
+			process.execPath,
+			[
+				"-e",
+				`require("node:fs").writeFileSync(${JSON.stringify(startedPath)}, "started"); setInterval(() => {}, 1000);`,
+			],
+			{ cwd: directory, stdio: "ignore", windowsHide: true },
+		);
+		try {
+			expect(await poll(() => existsSync(startedPath), 5_000)).toBe(true);
+			await terminateProcessTree(child.pid as number);
+			expect(pidAlive(child.pid as number)).toBe(false);
+			rmSync(directory, { recursive: true });
+			expect(existsSync(directory)).toBe(false);
+		} finally {
+			if (child.pid && pidAlive(child.pid)) {
+				try {
+					execFileSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
+				} catch {
+					// already gone
+				}
+			}
+			if (existsSync(directory)) rmSync(directory, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
 
 describe.runIf(isPosix)("terminateProcessTree", () => {
 	test.runIf(hasPerl)(

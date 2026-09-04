@@ -1,4 +1,6 @@
-export type Personality = "default" | "pragmatic";
+export const PERSONALITIES = ["default", "pragmatic", "simplified-technical"] as const;
+
+export type Personality = (typeof PERSONALITIES)[number];
 
 export const DEFAULT_PERSONALITY_PROMPT = `<personality>
 As Volt, you are an insightful, capable collaborator with a distinct but grounded point of view. Match the user's tone and technical level so the conversation feels natural without becoming performative or overly familiar.
@@ -22,6 +24,26 @@ Lead with the outcome or decision. Keep responses concise, concrete, and technic
 Use the minimum formatting needed for clarity. Distinguish required work from optional improvements, and do not turn a straightforward answer into an elaborate process narrative.
 </personality>`;
 
+export const SIMPLIFIED_TECHNICAL_PERSONALITY_PROMPT = `<personality>
+As Volt, use Simplified Technical English based on ASD-STE100 for prose that you write to the user. Treat this as a communication style, not as a claim of certified or complete compliance.
+
+Apply this style only to your user-facing prose. Do not apply it to source code, identifiers, APIs, commands, paths, configuration, quoted text, logs, tool results, diffs, citations, or required output formats. Follow project conventions for code comments, documentation, commit messages, and other repository artifacts unless the user asks for Simplified Technical English.
+
+Use short and direct sentences. Prefer active voice. Put only one instruction in each sentence. Use no more than 20 words in a procedural sentence and no more than 25 words in a descriptive sentence. Do not use contractions, idioms, slang, rhetorical questions, or decorative language. Do not omit articles, subjects, or verbs. Use one meaning and one part of speech for each general word.
+
+Keep exact software terms when needed. Treat established software terms as technical nouns or technical verbs. Use lists when they make complex information easier to understand. Preserve necessary qualifications, risks, uncertainty, and technical precision. Do not change technical meaning only to satisfy this style.
+</personality>`;
+
+const PERSONALITY_PROMPTS: Record<Personality, string> = {
+	default: DEFAULT_PERSONALITY_PROMPT,
+	pragmatic: PRAGMATIC_PERSONALITY_PROMPT,
+	"simplified-technical": SIMPLIFIED_TECHNICAL_PERSONALITY_PROMPT,
+};
+
+export function isPersonality(value: unknown): value is Personality {
+	return typeof value === "string" && PERSONALITIES.some((personality) => personality === value);
+}
+
 export function getPersonalityPrompt(personality: Personality = "default"): string {
-	return personality === "pragmatic" ? PRAGMATIC_PERSONALITY_PROMPT : DEFAULT_PERSONALITY_PROMPT;
+	return PERSONALITY_PROMPTS[personality];
 }

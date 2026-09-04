@@ -169,11 +169,11 @@ describe("subagent recovery notice", () => {
 
 	it("end to end: reopened transcript hydrates, offers, and follow returns the report", async () => {
 		const sessionDir = mkdtempSync(join(tmpdir(), "issue-129-e2e-"));
-		const parent = SessionManager.create(tmpdir(), sessionDir);
+		const parent = await SessionManager.create(tmpdir(), sessionDir);
 		parent.appendMessage(
 			fauxAssistantMessage([fauxToolCall("subagent", {}, { id: "call_e2e" })], { stopReason: "toolUse" }),
 		);
-		const child = SessionManager.create(tmpdir(), sessionDir);
+		const child = await SessionManager.create(tmpdir(), sessionDir);
 		child.appendMessage({ role: "user", content: "audit the daemon", timestamp: Date.now() });
 		child.appendMessage(fauxAssistantMessage("daemon audit report"));
 		await child.flush();
@@ -182,7 +182,7 @@ describe("subagent recovery notice", () => {
 			subagentId: "sa_e2e",
 			agent: "researcher",
 			childSessionId: child.getSessionId(),
-			childSessionFile: child.getSessionFile()!,
+			childSessionRef: child.getSessionRef()!,
 			requestKey: "rk-e2e",
 		});
 		// The incident shape: dispose synthesized an abort marker, which is not
@@ -212,7 +212,7 @@ describe("subagent recovery notice", () => {
 			...createTestResourceLoader(),
 			getSubagents: () => ({ definitions: [definition], diagnostics: [] }),
 		};
-		const reopened = SessionManager.open(parent.getSessionFile()!);
+		const reopened = await SessionManager.open(parent.getSessionRef()!);
 		const manager = new SubagentManager({
 			createRuntime: async () => {
 				throw new Error("Hydration must not create runtimes");

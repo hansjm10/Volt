@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import type { AgentAbortSource, AgentMessage, ThinkingLevel } from "@hansjm10/volt-agent-core";
 import type { AssistantMessage, Message, TextContent } from "@hansjm10/volt-ai";
 import { createInProcessRpcClient, type InProcessRpcClient } from "../../modes/rpc/in-process-rpc-client.ts";
@@ -15,7 +14,7 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import { parseModelPattern } from "../model-resolver.ts";
 import type { ResourceLoader } from "../resource-loader.ts";
 import type { RpcSessionState, RpcTranscriptResponse } from "../rpc/types.ts";
-import { SessionManager } from "../session-manager.ts";
+import { SessionManager, type SessionReference } from "../session-manager.ts";
 import type {
 	SubagentCapacityLimitSnapshot,
 	SubagentSpawnCapacityConstraint,
@@ -88,11 +87,11 @@ export interface SubagentHandle {
 	id: string;
 	sessionId: string;
 	/**
-	 * Send a message to the child. A rejection before the start is published
+	 * Send a message to the child. A rejection before the run is published
 	 * (prompt preflight, cancellation, or the host's runtime registration commit)
-	 * rolls back the unpublished start (daemon hosts dispose the prepared child
-	 * runtime) and disposes this handle, so it cannot be retried. Cancellation
-	 * remains authoritative when requested before the first prompt.
+	 * rolls back registry/activity publication and disposes this handle. The
+	 * already committed child session row is retained. Cancellation remains
+	 * authoritative when requested before the first prompt.
 	 */
 	prompt(message: string): Promise<void>;
 	abort(source?: AgentAbortSource): Promise<void>;
@@ -110,7 +109,7 @@ export interface SubagentRuntimeCreatedEvent {
 	runtime: AgentSessionRuntime;
 	definition?: SubagentDefinition;
 	parentSessionId?: string;
-	parentSessionFile?: string;
+	parentSessionRef?: SessionReference;
 }
 
 /** Host-owned registration prepared before prompting and committed only after prompt preflight succeeds. */
@@ -274,6 +273,15 @@ interface MutableSubagentActivity {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+async function closeConsumedSessionManager(manager: SessionManager, error: unknown, message: string): Promise<never> {
+	try {
+		await manager.closePersistence();
+	} catch (closeError) {
+		throw new AggregateError([error, closeError], message);
+	}
+	throw error;
 }
 
 function capacityLimitSnapshot(
@@ -527,6 +535,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	readonly id: string;
 	readonly sessionId: string;
 	private readonly client: InProcessRpcClient;
+	private readonly sessionRef: SessionReference | undefined;
 	private readonly abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 	private readonly removeFromManager: (id: string) => void;
 	private readonly onPromptAccepted: (message: string) => void;
@@ -555,6 +564,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	constructor(options: {
 		id: string;
 		sessionId: string;
+		sessionRef: SessionReference | undefined;
 		client: InProcessRpcClient;
 		abortRuntime: (source?: AgentAbortSource) => Promise<void>;
 		removeFromManager: (id: string) => void;
@@ -569,6 +579,7 @@ class LocalSubagentHandle implements SubagentHandle {
 	}) {
 		this.id = options.id;
 		this.sessionId = options.sessionId;
+		this.sessionRef = options.sessionRef;
 		this.client = options.client;
 		this.abortRuntime = options.abortRuntime;
 		this.removeFromManager = options.removeFromManager;
@@ -614,14 +625,26 @@ class LocalSubagentHandle implements SubagentHandle {
 			// admission is authoritative.
 			if (this.promptSettlementObserved) this.startSettlementWatcher();
 		} catch (error) {
-			await this.onPromptFailed(error).catch(() => undefined);
+			const cleanupErrors: unknown[] = [];
+			try {
+				await this.onPromptFailed(error);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
 			this.settleOwnership();
 			if (!this.promptAccepted) {
 				// An unpublished prompt failure rolled the start back; daemon hosts
 				// dispose the prepared child runtime, so the handle cannot be
 				// retried. Dispose it so later calls fail with a clear
 				// disposed-handle error instead of generic disposed-session errors.
-				await this.dispose().catch(() => undefined);
+				try {
+					await this.dispose();
+				} catch (cleanupError) {
+					if (!cleanupErrors.includes(cleanupError)) cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Subagent prompt failed and cleanup did not complete");
 			}
 			throw error;
 		}
@@ -647,7 +670,7 @@ class LocalSubagentHandle implements SubagentHandle {
 
 	async getSessionStats(): Promise<SessionStats> {
 		this.assertOpen();
-		return this.client.getSessionStats();
+		return { ...(await this.client.getSessionStats()), sessionRef: this.sessionRef };
 	}
 
 	waitForEnd(): Promise<SubagentResult> {
@@ -689,15 +712,23 @@ class LocalSubagentHandle implements SubagentHandle {
 			this.rejectEnd(new Error(`Subagent ${this.id} was disposed before completion`));
 		}
 		this.disposePromise = Promise.resolve().then(async () => {
+			const cleanupErrors: unknown[] = [];
 			try {
 				await this.client.stop();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				await this.onDispose();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
 			} finally {
-				try {
-					await this.onDispose();
-				} finally {
-					this.eventListeners.clear();
-					this.removeFromManager(this.id);
-				}
+				this.eventListeners.clear();
+				this.removeFromManager(this.id);
+			}
+			if (cleanupErrors.length === 1) throw cleanupErrors[0];
+			if (cleanupErrors.length > 1) {
+				throw new AggregateError(cleanupErrors, `Subagent ${this.id} cleanup did not complete`);
 			}
 		});
 		return this.disposePromise;
@@ -987,11 +1018,14 @@ export class SubagentManager {
 		}
 		let handle: SubagentHandle;
 		try {
-			if (!existsSync(claim.childSessionFile)) {
+			let resumedManager: SessionManager;
+			try {
+				resumedManager = await SessionManager.open(claim.childSessionRef);
+			} catch {
 				throw new Error("The interrupted run's transcript no longer exists; it cannot be resumed.");
 			}
 			handle = await this.startByName(claim.agentName, {
-				sessionManager: SessionManager.open(claim.childSessionFile),
+				sessionManager: resumedManager,
 				resumeSubagentId: subagentId,
 				...(claim.task !== undefined ? { resumeTaskLabel: claim.task } : {}),
 				...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
@@ -1004,6 +1038,8 @@ export class SubagentManager {
 			void handle.abort().catch(() => undefined);
 		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
+		let resumeError: unknown;
+		let hasResumeError = false;
 		try {
 			// An abort that landed while the runtime was being prepared no-ops
 			// against the idle session; honor it before spending a turn.
@@ -1020,12 +1056,24 @@ export class SubagentManager {
 			// and surface the real cause instead of an unknown-id follow error.
 			if (this.getRegistry().get(subagentId) === undefined) {
 				claim.rollback();
-				throw error;
+				resumeError = error;
+				hasResumeError = true;
 			}
-		} finally {
-			options.signal?.removeEventListener("abort", onAbort);
-			await handle.dispose().catch(() => undefined);
 		}
+		options.signal?.removeEventListener("abort", onAbort);
+		let disposeError: unknown;
+		let hasDisposeError = false;
+		try {
+			await handle.dispose();
+		} catch (error) {
+			disposeError = error;
+			hasDisposeError = true;
+		}
+		if (hasResumeError && hasDisposeError) {
+			throw new AggregateError([resumeError, disposeError], "Subagent resume failed and cleanup did not complete");
+		}
+		if (hasResumeError) throw resumeError;
+		if (hasDisposeError) throw disposeError;
 		return this.followDelegation(subagentId, options);
 	}
 
@@ -1038,14 +1086,17 @@ export class SubagentManager {
 	}
 
 	async start(options: SubagentStartOptions = {}): Promise<SubagentHandle> {
-		const finishStart = this.beginStart();
+		let finishStart = (): void => undefined;
 		let releaseReservation = (): void => undefined;
 		let scopeLease: SubagentDelegationScopeLease | undefined;
 		let treeReservation: SubagentDelegationReservation | undefined;
+		let managerTransferred = false;
 		try {
+			finishStart = this.beginStart();
 			releaseReservation = this.reserveChildStart(undefined);
 			scopeLease = this.resolveDelegationScope(options.delegationScope);
 			treeReservation = scopeLease.scope.reserve("subagent", (this.subagentContext?.depth ?? 0) + 1);
+			managerTransferred = true;
 			return await this.startRuntime(options, undefined, {
 				scopeLease,
 				reservation: treeReservation,
@@ -1054,6 +1105,13 @@ export class SubagentManager {
 			releaseReservation();
 			treeReservation?.rollback();
 			if (scopeLease?.owned) scopeLease.scope.dispose();
+			if (options.sessionManager && !managerTransferred) {
+				return await closeConsumedSessionManager(
+					options.sessionManager,
+					error,
+					"Subagent start failed and its consumed manager could not be closed",
+				);
+			}
 			throw error;
 		} finally {
 			finishStart();
@@ -1118,11 +1176,13 @@ export class SubagentManager {
 	}
 
 	async startByName(agentName: string, options: SubagentStartByNameOptions = {}): Promise<SubagentHandle> {
-		const finishStart = this.beginStart();
+		let finishStart = (): void => undefined;
 		let releaseReservation = (): void => undefined;
 		let scopeLease: SubagentDelegationScopeLease | undefined;
 		let treeReservation: SubagentDelegationReservation | undefined;
+		let managerTransferred = false;
 		try {
+			finishStart = this.beginStart();
 			const definition = this.getDefinition(agentName, { resourceLoader: options.resourceLoader });
 			if (options.spawnBatchLease) {
 				const admission = this.batchAdmissions.get(options.spawnBatchLease);
@@ -1137,6 +1197,7 @@ export class SubagentManager {
 				scopeLease = this.resolveDelegationScope(options.delegationScope);
 				treeReservation = scopeLease.scope.reserve(definition.name, (this.subagentContext?.depth ?? 0) + 1);
 			}
+			managerTransferred = true;
 			return await this.startRuntime(
 				options,
 				{
@@ -1152,6 +1213,13 @@ export class SubagentManager {
 			releaseReservation();
 			treeReservation?.rollback();
 			if (scopeLease?.owned) scopeLease.scope.dispose();
+			if (options.sessionManager && !managerTransferred) {
+				return await closeConsumedSessionManager(
+					options.sessionManager,
+					error,
+					"Named subagent start failed and its consumed manager could not be closed",
+				);
+			}
 			throw error;
 		} finally {
 			finishStart();
@@ -1164,7 +1232,11 @@ export class SubagentManager {
 				await this.waitForPendingStarts();
 				const handles = Array.from(this.handles.values());
 				try {
-					await Promise.allSettled(handles.map((handle) => handle.dispose()));
+					const results = await Promise.allSettled(handles.map(async (handle) => handle.dispose()));
+					const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+					if (errors.length > 0) {
+						throw new AggregateError(errors, "Subagent manager cleanup did not complete");
+					}
 				} finally {
 					this.activityListeners.clear();
 				}
@@ -1394,143 +1466,184 @@ export class SubagentManager {
 	): Promise<SubagentHandle> {
 		const cwd = options.cwd ?? this.cwd;
 		const agentDir = options.agentDir ?? this.agentDir;
-		const sessionManager = options.sessionManager ?? this.createDefaultChildSessionManager(cwd);
-		const id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
 		if (!delegation) {
 			throw new Error("Subagent delegation scope is required");
 		}
-		const subagentContext = this.createChildSubagentContext(
-			id,
-			definitionOptions?.definition,
-			delegation.scopeLease.scope,
-		);
-		const runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
+		let sessionManager = options.sessionManager;
+		let managerTransferred = false;
+		let id: string;
+		let subagentContext: SubagentRuntimeContext;
+		let runtime: AgentSessionRuntime;
+		try {
+			id = options.resumeSubagentId ?? `sa_${randomUUID()}`;
+			subagentContext = this.createChildSubagentContext(
+				id,
+				definitionOptions?.definition,
+				delegation.scopeLease.scope,
+			);
+			sessionManager ??= await this.createDefaultChildSessionManager(cwd);
+			managerTransferred = true;
+			runtime = await this.createChildRuntime({ cwd, agentDir, sessionManager, subagentContext });
+		} catch (error) {
+			if (sessionManager && !managerTransferred) {
+				return await closeConsumedSessionManager(
+					sessionManager,
+					error,
+					"Subagent runtime preparation failed and its manager could not be closed",
+				);
+			}
+			throw error;
+		}
+		let published = false;
 		let abortRequested = false;
 		const markRunAbortRequested = (): void => {
 			if (abortRequested) return;
 			abortRequested = true;
 			this.markActivityAbortRequested(id);
 		};
-		const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
-		let requiresFinalTurnReport = false;
-		let stopAfterTurnForBudget = false;
-		let pendingBudgetDelivery: string | undefined;
-		let finalResponseSatisfiedBudget = false;
-		const abortForTurnBudget = (): void => {
-			stopAfterTurnForBudget = true;
-			markRunAbortRequested();
-			void runtime.session.abort().catch(() => undefined);
-		};
-		const unregisterBudgetPolicy = runtime.session.registerTurnPolicy({
-			beforeToolCall: async () => {
-				if (!requiresFinalTurnReport) return undefined;
-				return {
-					block: true,
-					reason: "This subagent's turn budget is exhausted. Do not use tools; return your best final report now.",
-				};
-			},
-			nextAction: async (context) => {
-				if (context.requestAuthority === "final_response") {
-					pendingBudgetDelivery = undefined;
-					finalResponseSatisfiedBudget = requiresFinalTurnReport;
-					return context.defaultAction;
-				}
-				if (pendingBudgetDelivery !== undefined) {
-					const content = pendingBudgetDelivery;
-					pendingBudgetDelivery = undefined;
-					return {
-						type: "request",
-						reason: "delivery",
-						deliveries: [
-							{
-								messages: [
-									{
-										role: "user",
-										content: [{ type: "text", text: content }],
-										timestamp: Date.now(),
-									},
-								],
-							},
-						],
-					};
-				}
-				if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
-				return context.defaultAction;
-			},
-		});
-		const unsubscribeSessionAccounting = runtime.session.subscribe(
-			(event) => {
-				if (event.type === "turn_end") {
-					// turn_end also fires for error/aborted turns; those deliberately
-					// consume budget so a flaky child still converges on its report
-					// stage instead of retrying without bound.
-					delegation.scopeLease.scope.recordTurn();
-					if (finalResponseSatisfiedBudget) {
-						finalResponseSatisfiedBudget = false;
-						return;
-					}
-					const requestedTool =
-						event.message.role === "assistant" &&
-						event.message.content.some((content) => content.type === "toolCall");
-					if (requiresFinalTurnReport) {
-						stopAfterTurnForBudget = true;
-						if (requestedTool) abortForTurnBudget();
-						return;
-					}
-					const turnBudgetEvent = turnBudget.recordTurn();
-					if (!turnBudgetEvent) return;
-					if (turnBudgetEvent.stage === "exceeded") {
-						// Defensive backstop only: both final-report branches below keep
-						// requiresFinalTurnReport set, which short-circuits before
-						// recordTurn, so this handler never advances the budget past
-						// maxTurns itself.
-						abortForTurnBudget();
-						return;
-					}
-					if (turnBudgetEvent.stage === "warning") {
-						if (!requestedTool) return;
-						pendingBudgetDelivery = `This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`;
-						return;
-					}
-					if (!requestedTool) {
-						// The child finished naturally at its limit. Keep the report-only
-						// posture so a later re-prompt yields tool-blocked one-turn
-						// replies instead of burning a turn into the exceeded backstop.
-						requiresFinalTurnReport = true;
-						stopAfterTurnForBudget = true;
-						return;
-					}
-					requiresFinalTurnReport = true;
-					pendingBudgetDelivery = `This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`;
-					return;
-				}
-				if (event.type !== "message_end" || event.message.role !== "assistant") return;
-				const usage = event.message.usage;
-				delegation.scopeLease.scope.recordUsage(
-					usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
-					usage.cost.total,
-				);
-			},
-			{ monitorGitContext: false },
-		);
+		const budgetFinalizers: Array<() => void> = [];
 		const teardownBudgetWiring = (): void => {
-			unsubscribeSessionAccounting();
-			unregisterBudgetPolicy();
+			const cleanupErrors: unknown[] = [];
+			for (const finalize of budgetFinalizers.splice(0).reverse()) {
+				try {
+					finalize();
+				} catch (error) {
+					cleanupErrors.push(error);
+				}
+			}
+			if (cleanupErrors.length === 1) throw cleanupErrors[0];
+			if (cleanupErrors.length > 1) {
+				throw new AggregateError(cleanupErrors, "Subagent turn-budget cleanup did not complete");
+			}
 		};
 		let client: InProcessRpcClient | undefined;
+		let runtimeFinalizerTransferredToRpc = false;
 		let runtimeRegistration: SubagentRuntimeRegistration | undefined;
 		let rollbackRuntimeRegistrationPromise: Promise<void> | undefined;
-		let published = false;
-		const rollbackRuntimeRegistration = (): Promise<void> => {
-			if (published) return Promise.resolve();
+		let rollbackRuntimeRegistrationErrorReported = false;
+		const rollbackRuntimeRegistration = async (): Promise<void> => {
+			if (published) return;
 			if (!rollbackRuntimeRegistrationPromise) {
 				const registration = runtimeRegistration;
 				runtimeRegistration = undefined;
-				rollbackRuntimeRegistrationPromise = registration?.rollback().catch(() => undefined) ?? Promise.resolve();
+				rollbackRuntimeRegistrationPromise = Promise.resolve().then(async () => {
+					await registration?.rollback();
+				});
 			}
-			return rollbackRuntimeRegistrationPromise;
+			try {
+				await rollbackRuntimeRegistrationPromise;
+			} catch (error) {
+				if (rollbackRuntimeRegistrationErrorReported) return;
+				rollbackRuntimeRegistrationErrorReported = true;
+				throw error;
+			}
 		};
 		try {
+			const turnBudget = new SubagentTurnBudget(delegation.scopeLease.scope.turnLimits);
+			let requiresFinalTurnReport = false;
+			let stopAfterTurnForBudget = false;
+			let pendingBudgetDelivery: string | undefined;
+			let finalResponseSatisfiedBudget = false;
+			const abortForTurnBudget = (): void => {
+				stopAfterTurnForBudget = true;
+				markRunAbortRequested();
+				void runtime.session.abort().catch(() => undefined);
+			};
+			const unregisterBudgetPolicy = runtime.session.registerTurnPolicy({
+				beforeToolCall: async () => {
+					if (!requiresFinalTurnReport) return undefined;
+					return {
+						block: true,
+						reason:
+							"This subagent's turn budget is exhausted. Do not use tools; return your best final report now.",
+					};
+				},
+				nextAction: async (context) => {
+					if (context.requestAuthority === "final_response") {
+						pendingBudgetDelivery = undefined;
+						finalResponseSatisfiedBudget = requiresFinalTurnReport;
+						return context.defaultAction;
+					}
+					if (pendingBudgetDelivery !== undefined) {
+						const content = pendingBudgetDelivery;
+						pendingBudgetDelivery = undefined;
+						return {
+							type: "request",
+							reason: "delivery",
+							deliveries: [
+								{
+									messages: [
+										{
+											role: "user",
+											content: [{ type: "text", text: content }],
+											timestamp: Date.now(),
+										},
+									],
+								},
+							],
+						};
+					}
+					if (stopAfterTurnForBudget && context.completedTurn) return { type: "stop" };
+					return context.defaultAction;
+				},
+			});
+			budgetFinalizers.push(unregisterBudgetPolicy);
+			const unsubscribeSessionAccounting = runtime.session.subscribe(
+				(event) => {
+					if (event.type === "turn_end") {
+						// turn_end also fires for error/aborted turns; those deliberately
+						// consume budget so a flaky child still converges on its report
+						// stage instead of retrying without bound.
+						delegation.scopeLease.scope.recordTurn();
+						if (finalResponseSatisfiedBudget) {
+							finalResponseSatisfiedBudget = false;
+							return;
+						}
+						const requestedTool =
+							event.message.role === "assistant" &&
+							event.message.content.some((content) => content.type === "toolCall");
+						if (requiresFinalTurnReport) {
+							stopAfterTurnForBudget = true;
+							if (requestedTool) abortForTurnBudget();
+							return;
+						}
+						const turnBudgetEvent = turnBudget.recordTurn();
+						if (!turnBudgetEvent) return;
+						if (turnBudgetEvent.stage === "exceeded") {
+							// Defensive backstop only: both final-report branches below keep
+							// requiresFinalTurnReport set, which short-circuits before
+							// recordTurn, so this handler never advances the budget past
+							// maxTurns itself.
+							abortForTurnBudget();
+							return;
+						}
+						if (turnBudgetEvent.stage === "warning") {
+							if (!requestedTool) return;
+							pendingBudgetDelivery = `This subagent has used ${turnBudgetEvent.turnsUsed} of its ${turnBudgetEvent.maxTurns} allowed turns. Stop broad exploration, finish the current line of inquiry, and begin synthesizing a report.`;
+							return;
+						}
+						if (!requestedTool) {
+							// The child finished naturally at its limit. Keep the report-only
+							// posture so a later re-prompt yields tool-blocked one-turn
+							// replies instead of burning a turn into the exceeded backstop.
+							requiresFinalTurnReport = true;
+							stopAfterTurnForBudget = true;
+							return;
+						}
+						requiresFinalTurnReport = true;
+						pendingBudgetDelivery = `This subagent has reached its ${turnBudgetEvent.maxTurns}-turn limit. Do not call any more tools. Return your best final report now, including useful findings, evidence, and any unresolved gaps.`;
+						return;
+					}
+					if (event.type !== "message_end" || event.message.role !== "assistant") return;
+					const usage = event.message.usage;
+					delegation.scopeLease.scope.recordUsage(
+						usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+						usage.cost.total,
+					);
+				},
+				{ monitorGitContext: false },
+			);
+			budgetFinalizers.push(unsubscribeSessionAccounting);
 			if (definitionOptions) {
 				await this.applyDefinitionToRuntime(
 					runtime,
@@ -1541,14 +1654,19 @@ export class SubagentManager {
 			}
 
 			let handle: LocalSubagentHandle | undefined;
-			client = await createInProcessRpcClient(runtime, {
-				disposeRuntimeOnClose: !this.retainRuntimeOnDispose,
+			const disposeRuntimeOnClose = !this.retainRuntimeOnDispose;
+			const pendingClient = createInProcessRpcClient(runtime, {
+				disposeRuntimeOnClose,
 				requestTimeoutMs: options.requestTimeoutMs ?? this.requestTimeoutMs,
 				onEvent: (event) => {
 					this.recordActivityEvent(id, event);
 					handle?.handleEvent(event);
 				},
 			});
+			// The in-process RPC mode consumes finalizer ownership at invocation,
+			// including when its asynchronous startup later rejects.
+			runtimeFinalizerTransferredToRpc = disposeRuntimeOnClose;
+			client = await pendingClient;
 			runtimeRegistration = await this.notifyRuntimeCreated({
 				id,
 				runtime,
@@ -1575,6 +1693,7 @@ export class SubagentManager {
 			handle = new LocalSubagentHandle({
 				id,
 				sessionId: runtime.session.sessionId,
+				sessionRef: runtime.session.sessionRef,
 				client,
 				abortRuntime: (source) => runtime.session.abort(source),
 				removeFromManager: (handleId) => {
@@ -1634,10 +1753,34 @@ export class SubagentManager {
 			);
 			return handle;
 		} catch (error) {
-			teardownBudgetWiring();
-			await client?.stop().catch(() => undefined);
-			await rollbackRuntimeRegistration();
-			await runtime.dispose().catch(() => undefined);
+			const cleanupErrors: unknown[] = [];
+			try {
+				teardownBudgetWiring();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (client) {
+				try {
+					await client.stop();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			try {
+				await rollbackRuntimeRegistration();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (!runtimeFinalizerTransferredToRpc) {
+				try {
+					await runtime.dispose();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Subagent startup failed and cleanup did not complete");
+			}
 			throw error;
 		}
 	}
@@ -1772,14 +1915,17 @@ export class SubagentManager {
 		}
 	}
 
-	private createDefaultChildSessionManager(cwd: string): SessionManager {
+	private async createDefaultChildSessionManager(cwd: string): Promise<SessionManager> {
 		if (!this.parentSessionManager?.isPersisted()) {
 			return SessionManager.inMemory(cwd);
 		}
-		const parentSession = this.parentSessionManager.getSessionFile();
+		const parentSession = this.parentSessionManager.getSessionRef();
+		if (!parentSession) {
+			throw new Error("Persisted parent session is missing its session reference");
+		}
 		return SessionManager.create(cwd, this.parentSessionManager.getSessionDir(), {
 			origin: "subagent",
-			...(parentSession ? { parentSession } : {}),
+			parentSession,
 		});
 	}
 
@@ -1791,10 +1937,10 @@ export class SubagentManager {
 	): void {
 		if (!spawnRecord || !this.parentSessionManager?.isPersisted()) return;
 		// Both identity fields come from the runtime's own session manager: a
-		// factory that swaps managers must not produce an edge whose id and file
-		// disagree.
+		// factory that swaps managers must not produce an edge whose id and
+		// reference disagree.
 		const childSessionManager = runtime.session.sessionManager;
-		const childSessionFile = childSessionManager.getSessionFile();
+		const childSessionRef = childSessionManager.getSessionRef();
 		try {
 			this.parentSessionManager.appendSubagentSpawn({
 				toolCallId: spawnRecord.toolCallId,
@@ -1802,7 +1948,7 @@ export class SubagentManager {
 				subagentId: id,
 				agent: definition?.name ?? "subagent",
 				childSessionId: childSessionManager.getSessionId(),
-				...(childSessionFile !== undefined ? { childSessionFile } : {}),
+				...(childSessionRef !== undefined ? { childSessionRef } : {}),
 			});
 		} catch {
 			// The child is already running: losing the recovery edge must not turn
@@ -1823,12 +1969,18 @@ export class SubagentManager {
 		if (this.subagentContext || !this.parentSessionManager?.isPersisted()) {
 			return;
 		}
+		const parentSessionRef = this.parentSessionManager.getSessionRef();
+		if (!parentSessionRef) {
+			return;
+		}
 		this.hydrationPromise ??= this.hydrateSpawnEdges(
 			this.getRegistry(),
 			this.parentSessionManager,
 			[],
 			undefined,
-			new Set([this.parentSessionManager.getSessionFile() ?? ""]),
+			new Set([
+				JSON.stringify([parentSessionRef.storeId, parentSessionRef.sessionId, parentSessionRef.sessionGeneration]),
+			]),
 		).catch((error) => {
 			// Per-edge failures are contained inside the walk; an unexpected
 			// rejection here must not brick every later registry read on a
@@ -1844,7 +1996,7 @@ export class SubagentManager {
 		sessionManager: SessionManager,
 		ancestorPath: string[],
 		parentRegistryId: string | undefined,
-		visitedFiles: Set<string>,
+		visitedSessions: Set<string>,
 	): Promise<void> {
 		const settledToolCallIds = collectSettledToolCallIds(sessionManager);
 		const presentToolCallIds = collectToolCallIds(sessionManager);
@@ -1873,7 +2025,8 @@ export class SubagentManager {
 				...(presentToolCallIds.has(edge.toolCallId) ? {} : { stranded: true }),
 				startedAt,
 			};
-			if (typeof edge.childSessionFile !== "string") {
+			const childSessionRef = edge.childSessionRef;
+			if (!childSessionRef) {
 				if (!settled) {
 					registry.hydrate({
 						...base,
@@ -1884,7 +2037,12 @@ export class SubagentManager {
 				}
 				continue;
 			}
-			if (visitedFiles.has(edge.childSessionFile)) {
+			const childSessionKey = JSON.stringify([
+				childSessionRef.storeId,
+				childSessionRef.sessionId,
+				childSessionRef.sessionGeneration,
+			]);
+			if (visitedSessions.has(childSessionKey)) {
 				if (!settled) {
 					registry.hydrate({
 						...base,
@@ -1895,18 +2053,13 @@ export class SubagentManager {
 				}
 				continue;
 			}
-			visitedFiles.add(edge.childSessionFile);
+			visitedSessions.add(childSessionKey);
 			// One macrotask per child keeps multi-megabyte transcript loads from
 			// monopolizing the event loop (the #46/#123 lesson).
 			await new Promise((resolve) => setImmediate(resolve));
 			let child: SessionManager;
 			try {
-				// open() treats a missing path as a fresh session, so absence needs
-				// an explicit check to classify the edge as unrecoverable.
-				if (!existsSync(edge.childSessionFile)) {
-					throw new Error("child transcript file does not exist");
-				}
-				child = SessionManager.open(edge.childSessionFile);
+				child = await SessionManager.open(childSessionRef);
 			} catch {
 				if (!settled) {
 					registry.hydrate({
@@ -1918,19 +2071,23 @@ export class SubagentManager {
 				}
 				continue;
 			}
-			if (!settled) {
-				const state = deriveHydratedChildState(child, startedAt);
-				registry.hydrate({
-					...base,
-					status: state.status,
-					...(state.task !== undefined ? { task: state.task } : {}),
-					...(state.output !== undefined ? { output: state.output } : {}),
-					...(state.error !== undefined ? { error: state.error } : {}),
-					childSessionFile: edge.childSessionFile,
-					finishedAt: state.finishedAt,
-				});
+			try {
+				if (!settled) {
+					const state = deriveHydratedChildState(child, startedAt);
+					registry.hydrate({
+						...base,
+						status: state.status,
+						...(state.task !== undefined ? { task: state.task } : {}),
+						...(state.output !== undefined ? { output: state.output } : {}),
+						...(state.error !== undefined ? { error: state.error } : {}),
+						childSessionRef,
+						finishedAt: state.finishedAt,
+					});
+				}
+				await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedSessions);
+			} finally {
+				await child.closePersistence();
 			}
-			await this.hydrateSpawnEdges(registry, child, path, edge.subagentId, visitedFiles);
 		}
 	}
 
@@ -1942,6 +2099,7 @@ export class SubagentManager {
 		if (!this.onRuntimeCreated) {
 			return undefined;
 		}
+		const parentSessionRef = this.parentSessionManager?.getSessionRef();
 		return (
 			(await this.onRuntimeCreated({
 				id: options.id,
@@ -1949,9 +2107,7 @@ export class SubagentManager {
 				runtime: options.runtime,
 				...(options.definition ? { definition: options.definition } : {}),
 				...(this.parentSessionManager ? { parentSessionId: this.parentSessionManager.getSessionId() } : {}),
-				...(this.parentSessionManager?.getSessionFile()
-					? { parentSessionFile: this.parentSessionManager.getSessionFile() }
-					: {}),
+				...(parentSessionRef ? { parentSessionRef } : {}),
 			})) ?? undefined
 		);
 	}
