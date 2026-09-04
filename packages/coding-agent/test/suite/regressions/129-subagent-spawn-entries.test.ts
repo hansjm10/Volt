@@ -49,13 +49,15 @@ async function createTestContext(options: {
 		...createTestResourceLoader(),
 		getSubagents: () => ({ definitions: [definition], diagnostics: [] }),
 	};
-	const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager }) => {
+	const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager }) => {
 		const child = await createHarness({ withConfiguredAuth: options.withConfiguredAuth });
 		children.push(child);
 		child.setResponses([fauxAssistantMessage("researched the task"), fauxAssistantMessage("second turn")]);
 		const services = await createAgentSessionServices({
 			cwd,
-			agentDir,
+			// RPC watches this directory for catalog changes; shared tmpdir churn
+			// would refresh the registry and unregister the harness's faux API.
+			agentDir: child.tempDir,
 			authStorage: child.authStorage,
 			resourceLoaderOptions: {
 				noExtensions: true,
@@ -304,7 +306,9 @@ describe("issue #129", () => {
 			handleId = handle.id;
 			const completion = handle.waitForEnd();
 			await handle.prompt("inspect the incident");
-			await completion;
+			const result = await completion;
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe("completed");
 			await handle.dispose();
 			await parent.flush();
 		} finally {
@@ -318,6 +322,7 @@ describe("issue #129", () => {
 		try {
 			await restarted.ensureRegistryHydrated();
 			const records = restarted.listDelegations();
+			expect(records[0]?.error).toBeUndefined();
 			expect(records).toMatchObject([
 				{
 					id: handleId,
