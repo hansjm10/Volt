@@ -81,4 +81,8 @@ unset AWS_WEB_IDENTITY_TOKEN_FILE
 unset BEDROCK_EXTENSIVE_MODEL_TEST
 
 echo "Running tests without API keys..."
-npm test
+# Default to the full suite; CI can pass npm arguments to select suites or shards.
+if [[ $# -eq 0 ]]; then
+    set -- test
+fi
+npm "$@"
