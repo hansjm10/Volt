@@ -53,7 +53,7 @@ import {
 	type IrohRemotePushNotificationDeliveryStatus,
 	IrohRemotePushNotificationDispatcher,
 	type IrohRemotePushNotificationIntent,
-	IrohRemotePushRelayHttpClient,
+	type IrohRemotePushRelayHttpClient,
 	revokeIrohRemoteClientPushTargets,
 } from "../core/remote/iroh/push.ts";
 import {
@@ -146,6 +146,7 @@ import {
 } from "./iroh-stream-lifecycle.ts";
 import { type DaemonAttachClaim, LeaseBroker, type LeaseRecord, type LeaseState } from "./lease-broker.ts";
 import type { VoltdRuntimeServices, VoltdServiceExtension } from "./main.ts";
+import { createDaemonPushRelayClient } from "./push-relay-client.ts";
 import {
 	activateIrohManagedRelayCredential,
 	createIrohManagedRelayCredentialClaim,
@@ -957,13 +958,7 @@ class IrohDaemonService {
 		this.log = services.logger.child("iroh");
 		this.stateManager = services.stateManager;
 		this.trustStore = new ProjectTrustStore(services.agentDir);
-		this.pushRelayClient = new IrohRemotePushRelayHttpClient({
-			authToken: () =>
-				this.managedRelayCredential?.accessToken ??
-				config.pushRelayAuthToken ??
-				process.env.VOLT_PUSH_RELAY_AUTH_TOKEN,
-			baseUrl: config.pushRelayUrl ?? process.env.VOLT_PUSH_RELAY_URL,
-		});
+		this.pushRelayClient = createDaemonPushRelayClient(config, () => this.managedRelayCredential?.accessToken);
 		this.runtimes = new IntegratedRuntimeRegistry({
 			agentDir: services.agentDir,
 			profile: config.profile,
