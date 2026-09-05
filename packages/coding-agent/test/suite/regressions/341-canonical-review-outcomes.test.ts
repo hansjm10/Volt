@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Compile } from "typebox/compile";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -133,7 +134,7 @@ async function fixture() {
 			authStorage: harness.authStorage,
 			resourceLoader: harness.session.resourceLoader,
 			settingsManager: harness.settingsManager,
-			tools: [],
+			tools: ["read", "write", "bash"],
 			disableMcp: true,
 		});
 		return {
@@ -215,6 +216,35 @@ function expectErrorEnvelope(response: unknown, errorCode: string) {
 }
 
 describe("Regression #341 canonical finding hydration and outcomes", () => {
+	it("applies discussion code fixes without granting canonical outcome authority", async () => {
+		const { source, directory, root, own, dispatch, harness } = await fixture();
+		const started = await source.reviewDiscussions!.start("review:341", ["f1"], "start");
+		const ref = await SessionManager.findForResume(directory, started.results[0]!.discussion!.sessionId);
+		const child = await own(await SessionManager.open(ref!));
+		const path = join(root, "fix.txt");
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("write", { path, content: "fixed" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Fixed"),
+		]);
+		await child.session.prompt("Fix this finding");
+		expect(readFileSync(path, "utf8")).toBe("fixed");
+		const outcome = { runId: "review:341", findingId: "f1", status: "fixed" } as const;
+		await expect(recordReviewFindingOutcome(child.session.sessionManager, outcome)).rejects.toThrow(
+			"Canonical finding outcomes belong to the source review",
+		);
+		await expect(child.reviewDiscussions!.recordOutcome(outcome)).rejects.toThrow("requires the source review");
+		expect(await dispatch(child, { type: "record_review_finding_outcome", ...outcome })).toMatchObject({
+			success: false,
+			error: expect.stringContaining("source review"),
+		});
+		expect(
+			(await getCanonicalReviewRun(source.session.sessionManager, "review:341"))!.result!.findings[0]!.status,
+		).toBe("open");
+		expect(exportReviewFeedback(child.session.sessionManager).outcomes).toEqual([]);
+		expect(await dispatch(source, { type: "record_review_finding_outcome", ...outcome })).toMatchObject({
+			success: true,
+		});
+	});
 	it("converges source and persisted aliases after every manual outcome, including reopened readers", async () => {
 		const { source, aliases, managers, dispatch } = await fixture();
 		const sourceManager = source.session.sessionManager;

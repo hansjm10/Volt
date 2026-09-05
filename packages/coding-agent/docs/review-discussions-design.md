@@ -16,9 +16,13 @@ The daemon's review service creates siblings without rekeying the source. Broker
 
 Client revocation, access changes and workspace removal synchronously fence pending review effects before waiting for stream retirement. Ordinary app detach does not revoke that fence. Pending source control work pins normal detached-runtime retention until it settles.
 
-Each child inherits authorized placement, effective model/thinking/Fast configuration and a saved tool ceiling. Its context contains only the selected immutable finding, target revision and evidence. It does not own mutable finding outcomes.
+Each child inherits authorized placement and effective model/thinking/Fast configuration. Tool permissions come from normal runtime grants, not the source's temporary Plan-mode filter. Its context contains only the selected immutable finding, target revision and evidence. It does not own mutable finding outcomes.
 
-A persisted finding discussion applies research operation capabilities minus plan authoring, independently of Plan/Build mode. Argument checks run after extension hooks and at execution. Structural/host-action/raw MCP paths cannot widen it. Automatic LSP installation is unavailable. Supplied MCP managers are left untouched; the discussion creates its own restricted manager with current project trust instead.
+Finding discussions are normal coding sessions: requested fixes can use Build tools, shell commands, LSP mutations, granted MCP operations, extensions and subagents. Current SDK/host/client grants and exclusions apply; obsolete tool lists in saved finding context do not impose an additional ceiling. Plan mode retains its ordinary research profile, research-before-submit gate, authoring and approval rules; approved plans execute in the current discussion context. MCP startup, supplied managers, direct tools and LSP installation follow ordinary session policy.
+
+Source-linked identity/reset and canonical outcome authority are domain lifecycle boundaries, not read-only permissions. Generic replacement, fork/clone and clear-context plan handoff remain unavailable to avoid orphaning the discussion. Review lifecycle actions and canonical outcome recording belong to the source review; they do not prevent applying or testing code fixes here.
+
+The initial kickoff requests analysis and possible fixes, not automatic editing. Later explicit fix requests are actionable. On every runtime construction and prompt-policy refresh, trusted host policy supersedes obsolete persisted read-only context, kickoff guidance or compaction summaries. Transcripts and stored context snapshots are not rewritten, and no wire compatibility fallback is used.
 
 ## RPC contract
 
@@ -40,7 +44,6 @@ type Link = {
   findingId: string;
   sourceSessionId: string;
   sessionId: string;
-  readOnly: true;
 };
 type Discussion = Link & {
   currentSessionId: string;
@@ -51,7 +54,7 @@ type Discussion = Link & {
 };
 ```
 
-State/bootstrap/session-list metadata has optional `reviewDiscussion: Link`. `sessionId` identifies the described child; `currentSessionId` identifies the current reset generation. Older children remain linked and read-only, and their ordinary session-list metadata permits history discovery. Source lookup on a historical child preserves its requested `sessionId` while returning the group's current pointer. List/source status is a snapshot; live conversation events remain authoritative for an attached turn.
+State/bootstrap/session-list metadata has optional `reviewDiscussion: Link`. `sessionId` identifies the described child; `currentSessionId` identifies the current reset generation. Linkage makes no permission claim. Older children remain linked and retain normal coding permissions, and their ordinary session-list metadata permits history discovery. Source lookup on a historical child preserves its requested `sessionId` while returning the group's current pointer. List/source status is a snapshot; live conversation events remain authoritative for an attached turn.
 
 ## Retry and reset
 
@@ -63,7 +66,7 @@ Recovered finding inputs are terminalized as failed, with an interrupted explana
 
 ## Validation and rollout
 
-Use the faux-provider suite harness and disposable stores. Regression coverage includes four overlapping discussions, canonical aliases, independent cancellation, duplicate starts/resets, exact-generation lookup, cold-source writes, TUI/phone competitors, publication rollback, revocation, detach retention, interrupted input recovery, and read-only operation gates.
+Use the faux-provider suite harness and disposable stores. Regression coverage includes four overlapping discussions, canonical aliases, independent cancellation, duplicate starts/resets, exact-generation lookup, cold-source writes, TUI/phone competitors, publication rollback, revocation, detach retention, interrupted input recovery, actual persisted-session writes/shell execution, normal tool grants, and Plan-mode research restrictions.
 
 `test.sh` temporarily moves `$HOME/.volt/agent/auth.json`; run it with an isolated HOME when a developer daemon/session is active. Fresh worktrees need ignored local package compiler outputs for package-level typechecks/browser smoke; no dependency changes are required.
 

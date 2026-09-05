@@ -761,6 +761,16 @@ Review invocations return `accepted` with a `workflowId` and run detached from t
 - `cancel_workflow` aborts a running review; the workflow ends with `workflow_end` status `cancelled`. Cancelling an unknown or finished workflow fails with a normal RPC error.
 - `open_review_session` starts a fresh session seeded with a completed review's findings (the client-driven replacement for the old forced session switch) and responds with `{ "cancelled": boolean }`. It fails for unknown or non-completed workflows. It also fails when the replacement session was created but the seed was skipped because recovered durable client input failed to replay; in that case the review stays retained (still listed and fetchable) so the open can be retried.
 
+#### Review finding discussions
+
+Daemon-backed hosts expose `start_review_discussions` (`runId`, 1–50 unique `findingIds`, semantic `requestId`), `list_review_discussions` (`runId`, optional `cursor`/`limit` up to 50), `reset_review_discussion` (`discussionId`, `expectedSessionId`, `requestId`) and `get_review_discussion_source`. Start/list/reset are source-owned; source lookup is available from a child. A host without the sibling service returns `review_discussions_unavailable`.
+
+State, bootstrap and session-list metadata may contain `reviewDiscussion` with `discussionId`, `runId`, `findingId`, `sourceSessionId` and `sessionId`. This link describes identity, not permissions; it has no `readOnly` field. Discussion descriptors additionally include `currentSessionId`, `sourceAvailable`, `available` and `status`.
+
+Discussions have normal Build permissions under existing workspace/client/tool grants, including requested code fixes, shell, LSP mutations, MCP and delegation. Normal Plan research restrictions and approval rules still apply; Plan authoring, change/discard and `plan_execute` with `retain_context` work in the discussion. Source-owned identity replacement, fork/clone, clear-context plan execution and canonical outcome/lifecycle actions remain unavailable there; use the source review for those actions. Direct RPC and host actions add no discussion-specific tool restrictions.
+
+Starting discussions requests analysis, not automatic edits. Subsequent fix requests are actionable. Resumed sessions receive current trusted policy that supersedes older read-only context without rewriting transcripts. Reset retains history and creates idle context without inference; interrupted inputs require a fresh explicit retry rather than automatic replay.
+
 #### Native UI Action Security
 
 Descriptors must not expose host-local paths, extension source paths, prompt template bodies, skill content, provider secrets, environment values, auth internals, raw model/provider metadata, raw transcript payloads, or host session store paths. Iroh remote discovery responses pass through the remote outbound redaction layer in addition to descriptor-level sanitization. Remote invocation is allowlist-based and re-checks action availability, remote safety, authorization, streaming policy, and argument validity at invocation time.

@@ -1,13 +1,15 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage } from "@hansjm10/volt-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
+import { Compile } from "typebox/compile";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type AgentSessionRuntime,
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionRuntime,
 } from "../../../src/core/agent-session-runtime.ts";
+import { BUILTIN_HOST_ACTION_REGISTRY, type HostActionInvocationContext } from "../../../src/core/host-actions.ts";
 import { registerReviewHandoffAliases } from "../../../src/core/review-anchors.ts";
 import { assertReviewDiscussionRpcAllowed } from "../../../src/core/review-discussion-policy.ts";
 import { HostReviewDiscussionService, type ReviewDiscussionService } from "../../../src/core/review-discussions.ts";
@@ -17,6 +19,7 @@ import {
 	getReviewRun,
 	type ReviewRunRecord,
 } from "../../../src/core/review-state.ts";
+import { RpcReviewDiscussionLinkSchema } from "../../../src/core/rpc/schema/review-discussions.ts";
 import { buildRpcSessionState } from "../../../src/core/rpc/session-state.ts";
 import { createAgentSession } from "../../../src/core/sdk.ts";
 import { SessionManager } from "../../../src/core/session-manager.ts";
@@ -173,6 +176,101 @@ function successful(result: Awaited<ReturnType<ReviewDiscussionService["start"]>
 }
 
 describe("Regression #341 host sibling lifecycle", () => {
+	it("projects identity without permission claims and executes RPC bash and current-context plans", async () => {
+		const { api, harness, runtimes, root, source } = await fixture();
+		await source.session.setAgentMode("plan");
+		expect(source.session.getActiveToolNames()).not.toContain("write");
+		harness.setResponses([fauxAssistantMessage("Analysis only")]);
+		await api.start("review-341", ["f1"], "start");
+		const child = runtimes[1]!;
+		await child.session.waitForIdle();
+		expect(child.session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "write", "bash", "lsp"]));
+		const link = buildRpcSessionState(child.session).reviewDiscussion!;
+		expect(Compile(RpcReviewDiscussionLinkSchema).Errors(link)).toEqual([]);
+		expect(link).not.toHaveProperty("readOnly");
+		const hostContext: HostActionInvocationContext = {
+			session: child.session,
+			abortRun: () => child.session.abort(),
+			compactContext: (instructions) => child.session.compact(instructions),
+			newSession: (options) => child.newSession(options),
+			renameSession: (name) => child.session.setSessionName(name),
+			executePlan: (id, revision, strategy) => child.executePlan(id, revision, strategy),
+			changePlan: (id, revision) => child.session.changePlan(id, revision),
+			discardPlan: (id, revision) => child.session.discardPlan(id, revision),
+		};
+		const context = {
+			session: child.session,
+			runtimeHost: child,
+			options: { allowUiActionInvocation: true },
+			assertConversationGenerationCurrent: () => {},
+			createHostActionContext: () => hostContext,
+		} as RpcCommandDispatcherContext;
+		expect(await handleRpcCommand({ type: "bash", command: "printf rpc-fixed > rpc.txt" }, context)).toMatchObject({
+			success: true,
+			data: { exitCode: 0 },
+		});
+		expect(readFileSync(join(root, "rpc.txt"), "utf8")).toBe("rpc-fixed");
+		await child.session.setAgentMode("plan");
+		let plan = child.session.updatePlan({ steps: [{ text: "Apply fix" }] });
+		plan = child.session.submitPlan({
+			planId: plan.id,
+			expectedRevision: plan.revision,
+			title: "Fix",
+			summary: "Fix the selected finding",
+		});
+		expect(BUILTIN_HOST_ACTION_REGISTRY.getDescriptor("plan.execute", hostContext)?.enabled).toBe(true);
+		await expect(
+			BUILTIN_HOST_ACTION_REGISTRY.invoke("plan.execute", hostContext, {
+				planId: plan.id,
+				expectedRevision: plan.revision,
+				strategy: "new_session",
+			}),
+		).rejects.toThrow("source review");
+		expect(
+			await handleRpcCommand({ type: "plan_change", planId: plan.id, expectedRevision: plan.revision }, context),
+		).toMatchObject({ success: true, data: { plan: { phase: "draft" } } });
+		plan = child.session.planningState.plan!;
+		plan = child.session.submitPlan({
+			planId: plan.id,
+			expectedRevision: plan.revision,
+			title: "Fix",
+			summary: "Fix the selected finding",
+		});
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("write", { path: join(root, "plan-fix.txt"), content: "fixed" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Fix applied"),
+		]);
+		const command = {
+			type: "plan_execute",
+			planId: plan.id,
+			expectedRevision: plan.revision,
+			strategy: "retain_context",
+		} as const;
+		expect(
+			await handleRpcCommand(
+				{
+					id: "execute",
+					type: "invoke_ui_action",
+					action: "plan.execute",
+					args: { planId: plan.id, expectedRevision: plan.revision, strategy: "retain_context" },
+				},
+				context,
+			),
+		).toMatchObject({ success: true, data: { status: "completed", stateChanged: true } });
+		await child.session.waitForIdle();
+		expect(readFileSync(join(root, "plan-fix.txt"), "utf8")).toBe("fixed");
+		expect(await handleRpcCommand(command, context)).toMatchObject({
+			success: true,
+			data: { started: false, selectedSessionId: link.sessionId },
+		});
+		plan = child.session.planningState.plan!;
+		expect(
+			await handleRpcCommand({ type: "plan_discard", planId: plan.id, expectedRevision: plan.revision }, context),
+		).toMatchObject({ success: true, data: { plan: null } });
+		expect(child.session.sessionId).toBe(link.sessionId);
+	});
 	it("dispatches co-client create/list and returns explicit unavailable without a sibling service", async () => {
 		const { source, harness, runtimes } = await fixture();
 		harness.setResponses([fauxAssistantMessage("answer")]);
@@ -195,7 +293,7 @@ describe("Regression #341 host sibling lifecycle", () => {
 		expect(second).toMatchObject({ id: "two", success: true, data: { results: [{ outcome: "existing" }] } });
 		expect(await handleRpcCommand({ type: "list_review_discussions", runId: "review-341" }, context)).toMatchObject({
 			success: true,
-			data: { discussions: [{ status: "completed", readOnly: true }] },
+			data: { discussions: [{ status: "completed" }] },
 		});
 		source.reviewDiscussions = undefined;
 		expect(await handleRpcCommand({ type: "list_review_discussions", runId: "review-341" }, context)).toMatchObject({
@@ -226,7 +324,6 @@ describe("Regression #341 host sibling lifecycle", () => {
 		const child = runtimes[1]!;
 		expect(buildRpcSessionState(child.session).reviewDiscussion).toMatchObject({
 			sourceSessionId: source.session.sessionId,
-			readOnly: true,
 		});
 		expect((await child.reviewDiscussions!.source())?.sourceSessionId).toBe(source.session.sessionId);
 		const abort = child.session.abort();
@@ -290,8 +387,8 @@ describe("Regression #341 host sibling lifecycle", () => {
 		expect(await api.reset(first!.discussionId, first!.sessionId, "a")).toEqual(a);
 		expect(runtimes).toHaveLength(3);
 		expect(runtimes[2]!.session.isBusy).toBe(false);
-		await expect(runtimes[1]!.newSession()).rejects.toThrow("read-only");
-		await expect(runtimes[1]!.importFromJsonl("missing")).rejects.toThrow("read-only");
+		await expect(runtimes[1]!.newSession()).rejects.toThrow("source-linked");
+		await expect(runtimes[1]!.importFromJsonl("missing")).rejects.toThrow("source-linked");
 	});
 
 	it("source handoff aliases converge and copied/forked metadata cannot grant authority", async () => {
@@ -371,21 +468,30 @@ describe("Regression #341 host sibling lifecycle", () => {
 		expect(reset).toMatchObject({ status: "reset", discussion: { available: true, status: "idle" } });
 	});
 
-	it("denies mutating RPC and raw MCP paths, bounds requests and preserves general conversations", async () => {
+	it("limits source-owned RPC lifecycle only, bounds requests and preserves general conversations", async () => {
 		const { api, harness, runtimes, source } = await fixture();
 		harness.setResponses([fauxAssistantMessage("answer")]);
 		await api.start("review-341", ["f1"], "start");
 		const child = runtimes[1]!.session;
 		for (const command of [
 			{ type: "new_session" },
-			{ type: "subagent_start", agent: "worker", prompt: "mutate" },
-			{ type: "get_mcp_prompt", server: "x", prompt: "x" },
-			{ type: "connect_mcp_server", server: "x" },
+			{ type: "record_review_finding_outcome", runId: "review-341", findingId: "f1", status: "fixed" },
+			{ type: "plan_execute", planId: "p", expectedRevision: 1, strategy: "new_session" },
 			{ type: "invoke_ui_action", id: "action", action: "review.fix" },
 		] as const) {
-			expect(() => assertReviewDiscussionRpcAllowed(child, command)).toThrow("read-only");
+			expect(() => assertReviewDiscussionRpcAllowed(child, command)).toThrow("requires the source review");
 			expect(() => assertReviewDiscussionRpcAllowed(source.session, command)).not.toThrow();
 		}
+		for (const command of [
+			{ type: "subagent_start", agent: "general", prompt: "fix" },
+			{ type: "subagent_abort", subagentId: "sa_1" },
+			{ type: "get_mcp_prompt", server: "x", prompt: "x" },
+			{ type: "connect_mcp_server", server: "x" },
+			{ type: "bash", command: "echo allowed" },
+			{ type: "plan_execute", planId: "p", expectedRevision: 1, strategy: "retain_context" },
+			{ type: "invoke_ui_action", id: "action", action: "custom.fix" },
+		] as const)
+			expect(() => assertReviewDiscussionRpcAllowed(child, command)).not.toThrow();
 		expect(
 			validateRpcCommandPayload({
 				type: "start_review_discussions",

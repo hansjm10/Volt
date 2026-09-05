@@ -659,7 +659,9 @@ export class AgentSessionRuntime {
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<T> {
 		if (this.session.isReviewDiscussion) {
-			return Promise.reject(new Error("Review discussions are read-only; reset context from the source review"));
+			return Promise.reject(
+				new Error("Finding discussion identity is source-linked; reset context from the source review"),
+			);
 		}
 		if (!this.acceptingStructuralOperations) {
 			return Promise.reject(new Error("Agent session runtime is no longer accepting structural operations"));
@@ -1266,7 +1268,9 @@ export class AgentSessionRuntime {
 		strategy: PlanExecutionStrategy,
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<{ planning: PlanningState; selectedSessionId: string; started: boolean }> {
-		if (this.session.isReviewDiscussion) throw new Error("Review discussions are read-only");
+		if (this.session.isReviewDiscussion && strategy === "new_session") {
+			throw new Error("Finding discussions execute plans in the current context; reset through the source review");
+		}
 		const sourceSession = this.session;
 		const sourcePlanning = sourceSession.planningState;
 		const sourcePlan = sourcePlanning.plan;

@@ -143,6 +143,8 @@ await runtime.executePlan(plan.id, plan.revision, "new_session");
 
 All user plan actions are fenced by the exact plan ID and revision. Repeating an already-approved execution request is idempotent.
 
+Persisted review finding discussions use normal Build tools and Plan-mode research/authoring under the session's grants. Fix requests can be implemented in the discussion, including approved `retain_context` plan execution. Their source-linked identity cannot be replaced, forked/cloned or handed off with `new_session`; reset through the source review instead. Canonical finding outcomes also belong to the source review. These lifecycle boundaries do not restrict code fixes. Trusted host policy supersedes obsolete read-only guidance in resumed discussion context without rewriting history.
+
 ### createAgentSessionRuntime() and AgentSessionRuntime
 
 Use the runtime API when you need to replace the active session and rebuild cwd-bound runtime state.

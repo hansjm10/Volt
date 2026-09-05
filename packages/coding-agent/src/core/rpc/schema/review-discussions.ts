@@ -9,7 +9,6 @@ export const RpcReviewDiscussionLinkSchema = Type.Object(
 		findingId: Identifier,
 		sourceSessionId: Identifier,
 		sessionId: Identifier,
-		readOnly: Type.Literal(true),
 	},
 	{ additionalProperties: false },
 );

@@ -281,6 +281,12 @@ describe("Regression #341 real daemon sibling broker admission", () => {
 			expect(entry.runtime.session.sessionManager.getSessionName()).toBe(
 				`Review: Finding ${row.findingId.slice(1)}`,
 			);
+			await entry.runtime.session.waitForIdle();
+			expect(entry.runtime.session.getActiveToolNames()).toEqual(["read"]);
+			await entry.runtime.session.setAgentMode("plan");
+			await entry.runtime.session.setAgentMode("build");
+			expect(entry.runtime.session.getActiveToolNames()).toEqual(["read"]);
+			expect(entry.runtime.getCurrentSessionSummary().reviewDiscussion).not.toHaveProperty("readOnly");
 			expect(entry.leaseOwner).toBeDefined();
 			expect(f.broker.isDaemonRuntimeOwnerCurrent(entry.leaseOwner!, "ws", entry.sessionId)).toBe(true);
 			await entry.runtime.session.waitForIdle();

@@ -471,16 +471,12 @@ async function createAgentSessionWithTrackedResources(
 		});
 		await manager
 			.startEagerServers(undefined, {
-				trustedReadsOnly:
-					sessionManager.getReviewDiscussion() !== null ||
-					sessionManager.buildSessionContext().planning.mode === "plan",
+				trustedReadsOnly: sessionManager.buildSessionContext().planning.mode === "plan",
 			})
 			.catch(() => undefined);
 		return manager;
 	};
-	// A persisted discussion must not borrow another session's mutable MCP trust/startup state.
-	// Leave the supplied manager untouched and create a session-owned restricted manager instead.
-	const suppliedMcpManager = sessionManager.getReviewDiscussion() ? undefined : options.mcpManager;
+	const suppliedMcpManager = options.mcpManager;
 	const mcpManager = options.disableMcp ? undefined : (suppliedMcpManager ?? (await createDefaultMcpManager()));
 	if (!options.disableMcp && suppliedMcpManager === undefined && mcpManager !== undefined) {
 		untransferredFinalizers.push(() => mcpManager.dispose());
@@ -501,26 +497,7 @@ async function createAgentSessionWithTrackedResources(
 	if (resolveLspConfig(settingsManager.getLspSettings()).enabled) {
 		defaultActiveToolNames.push("lsp");
 	}
-	const discussionContext = sessionManager.getReviewDiscussion()?.discussion.contextSnapshot;
-	const savedTools =
-		discussionContext &&
-		typeof discussionContext === "object" &&
-		!Array.isArray(discussionContext) &&
-		"tools" in discussionContext
-			? discussionContext.tools
-			: undefined;
-	if (
-		savedTools !== undefined &&
-		(!Array.isArray(savedTools) || !savedTools.every((name) => typeof name === "string"))
-	)
-		throw new Error("Invalid persisted review discussion tool ceiling");
-	const requestedTools = options.tools ?? (options.noTools === "all" ? [] : undefined);
-	const allowedToolNames = Array.isArray(savedTools)
-		? savedTools.filter(
-				(name): name is string =>
-					typeof name === "string" && (requestedTools === undefined || requestedTools.includes(name)),
-			)
-		: requestedTools;
+	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const excludedToolNames = options.excludeTools;
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
 	const initialActiveToolNames: string[] = (
@@ -641,7 +618,7 @@ async function createAgentSessionWithTrackedResources(
 		modelRegistry,
 		initialActiveToolNames,
 		allowedToolNames,
-		allowUnlistedExtensionTools: sessionManager.getReviewDiscussion() ? false : options.allowUnlistedExtensionTools,
+		allowUnlistedExtensionTools: options.allowUnlistedExtensionTools,
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,

@@ -1357,7 +1357,7 @@ export class SessionManager {
 	newSession(options?: NewSessionOptions): SessionReference | undefined {
 		this._assertPersistenceHealthy();
 		if (this.reviewDiscussion) {
-			throw new Error("Review discussions are read-only; reset through the source session instead");
+			throw new Error("Finding discussion identity is source-linked; reset through the source session instead");
 		}
 		if (this.atomicAppendInFlight) throw new Error("Cannot create a new session during an atomic append");
 		if (this.unsettledPersistenceTasks > 0) {
@@ -1475,7 +1475,7 @@ export class SessionManager {
 		return this.sessionId;
 	}
 
-	/** Binding loaded before a persisted manager is published; historical children remain restricted. */
+	/** Binding loaded before a persisted manager is published; historical children remain source-linked. */
 	getReviewDiscussion(): SessionStoreReviewDiscussionLookup | null {
 		return this.reviewDiscussion;
 	}
@@ -3316,7 +3316,9 @@ export class SessionManager {
 		let target: SessionManager | undefined;
 		try {
 			if (source.getReviewDiscussion()) {
-				throw new Error("Review discussions are read-only; cannot fork into an unrestricted session");
+				throw new Error(
+					"Finding discussions cannot fork their source-linked identity; reset through the source review instead",
+				);
 			}
 			const sourceLeafId = source.getLeafId();
 			target = await SessionManager.create(targetCwd, sessionDir, {

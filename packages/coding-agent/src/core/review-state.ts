@@ -575,7 +575,8 @@ export async function recordReviewFindingOutcome(
 	} = {},
 ): Promise<ReviewFindingTransitionRecord> {
 	const assertCurrent = reviewConversationGuard(manager);
-	if (manager.getReviewDiscussion()) throw new Error("Review discussions are read-only; use the source review.");
+	if (manager.getReviewDiscussion())
+		throw new Error("Canonical finding outcomes belong to the source review; record the outcome there.");
 	const run = await getCanonicalReviewRun(manager, transition.runId);
 	if (!run?.result?.findings.some((finding) => finding.id === transition.findingId))
 		throw new Error(`Unknown finding ${transition.findingId} in review run ${transition.runId}`);

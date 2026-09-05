@@ -915,11 +915,7 @@ export async function handleRpcCommand(
 			if (!manager) {
 				return createRpcErrorResponse(id, "list_mcp_tools", "MCP is not configured");
 			}
-			return createRpcSuccessResponse(
-				id,
-				"list_mcp_tools",
-				await manager.listTools(command.server, undefined, { restrictedTrustedRead: session.isReviewDiscussion }),
-			);
+			return createRpcSuccessResponse(id, "list_mcp_tools", await manager.listTools(command.server));
 		}
 
 		case "get_mcp_tool": {
@@ -927,9 +923,7 @@ export async function handleRpcCommand(
 			if (!manager) {
 				return createRpcErrorResponse(id, "get_mcp_tool", "MCP is not configured");
 			}
-			const tools = await manager.listTools(command.server, undefined, {
-				restrictedTrustedRead: session.isReviewDiscussion,
-			});
+			const tools = await manager.listTools(command.server);
 			const tool = tools.tools.find((entry) => entry.name === command.tool);
 			if (!tool) {
 				return createRpcErrorResponse(id, "get_mcp_tool", `MCP tool not found: ${command.server}.${command.tool}`);
@@ -954,10 +948,7 @@ export async function handleRpcCommand(
 			if (!manager) {
 				return createRpcErrorResponse(id, "read_mcp_resource", "MCP is not configured");
 			}
-			const result = await manager.readResource(command.server, command.resourceUri, {
-				...createRpcMcpExecutionContext(),
-				restrictedTrustedRead: session.isReviewDiscussion,
-			});
+			const result = await manager.readResource(command.server, command.resourceUri, createRpcMcpExecutionContext());
 			return createRpcSuccessResponse(id, "read_mcp_resource", { result });
 		}
 
