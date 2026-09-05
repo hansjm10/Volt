@@ -213,6 +213,14 @@ export const RESEARCH_OPERATION_GRANT_PROFILE: OperationGrantProfile = Object.fr
 	]),
 });
 
+/** Persisted review discussions may research, but never author or execute plans. */
+export const REVIEW_DISCUSSION_OPERATION_GRANT_PROFILE: OperationGrantProfile = Object.freeze({
+	id: "review-discussion",
+	capabilities: new Set<OperationCapability>(
+		[...RESEARCH_OPERATION_GRANT_PROFILE.capabilities].filter((capability) => capability !== "session.plan"),
+	),
+});
+
 export function getTrustedToolOperationResolver(
 	toolName: string,
 	options: { integrationReadAuthority?: IntegrationReadAuthority } = {},

@@ -1,32 +1,25 @@
-import { REVIEW_DISCUSSION_SCHEMA_SQL } from "./discussion-schema.ts";
+// Frozen exact v1 DDL. Used only to validate the explicitly supported one-time upgrade.
+export const SESSION_STORE_V1_SCHEMA_ID = "volt-session-store-v1";
 
-export const SESSION_STORE_SCHEMA_ID = "volt-session-store-v2";
-
-export const SESSION_STORE_TABLE_NAMES = [
+export const SESSION_STORE_V1_TABLE_NAMES = [
 	"store_metadata",
 	"sessions",
 	"entries",
 	"client_inputs",
 	"search_chunks",
 	"transaction_commits",
-	"review_anchors",
-	"review_anchor_aliases",
-	"review_discussions",
-	"review_discussion_children",
 ] as const;
 
-export const SESSION_STORE_INDEX_NAMES = [
+export const SESSION_STORE_V1_INDEX_NAMES = [
 	"sessions_visible_updated_idx",
 	"entries_parent_idx",
 	"entries_type_idx",
 	"client_inputs_state_idx",
 	"search_chunks_entry_idx",
 	"transaction_commits_session_revision_idx",
-	"review_anchors_source_idx",
-	"review_discussions_run_idx",
 ] as const;
 
-export const SESSION_STORE_SCHEMA_SQL = `
+export const SESSION_STORE_V1_SCHEMA_SQL = `
 CREATE TABLE store_metadata (
 	key TEXT PRIMARY KEY NOT NULL,
 	value_json TEXT NOT NULL CHECK (json_valid(value_json) = 1)
@@ -148,5 +141,4 @@ CREATE TABLE transaction_commits (
 
 CREATE UNIQUE INDEX transaction_commits_session_revision_idx
 	ON transaction_commits (session_id, session_generation, after_revision DESC);
-${REVIEW_DISCUSSION_SCHEMA_SQL}
 `;

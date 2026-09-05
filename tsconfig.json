@@ -9,6 +9,7 @@
 			"@hansjm10/volt-ai/*": ["./packages/ai/src/*.ts", "./packages/ai/src/providers/*.ts"],
 			"@hansjm10/volt-ai/dist/*": ["./packages/ai/src/*"],
 			"@hansjm10/volt-agent-core": ["./packages/agent/src/index.ts"],
+			"@hansjm10/volt-agent-core/node": ["./packages/agent/src/node.ts"],
 			"@hansjm10/volt-agent-core/*": ["./packages/agent/src/*"],
 			"@hansjm10/volt-coding-agent": ["./packages/coding-agent/src/index.ts"],
 			"@hansjm10/volt-coding-agent/hooks": ["./packages/coding-agent/src/core/hooks/index.ts"],

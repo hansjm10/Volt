@@ -5,6 +5,8 @@ import {
 } from "../session-entry-codec.ts";
 import { cloneCanonicalSessionStoreJson, isSessionStoreCommitDigest } from "./canonical-json.ts";
 import {
+	SESSION_STORE_REVIEW_CONTEXT_MAX_BYTES,
+	SESSION_STORE_REVIEW_LIST_MAX,
 	SESSION_STORE_SCHEMA_VERSION,
 	type SessionStoreApplyTransactionInput,
 	type SessionStoreClientInput,
@@ -13,6 +15,7 @@ import {
 	type SessionStoreClientInputWrite,
 	type SessionStoreCommitEvidence,
 	type SessionStoreCommitReconciliation,
+	type SessionStoreCreateReviewDiscussionInput,
 	type SessionStoreCreateSessionInput,
 	type SessionStoreDeleteSessionInput,
 	type SessionStoreDeleteSessionResult,
@@ -25,9 +28,18 @@ import {
 	type SessionStoreJsonValue,
 	type SessionStoreOrigin,
 	type SessionStoreReconcileCommitInput,
+	type SessionStoreRegisterReviewAnchorInput,
+	type SessionStoreResetReviewDiscussionInput,
+	type SessionStoreResetReviewDiscussionResult,
+	type SessionStoreReviewAnchor,
+	type SessionStoreReviewDiscussion,
+	type SessionStoreReviewDiscussionChild,
+	type SessionStoreReviewDiscussionLookup,
+	type SessionStoreReviewSource,
 	type SessionStoreSearchChunk,
 	type SessionStoreSearchChunkWrite,
 	type SessionStoreSearchResult,
+	type SessionStoreSessionIdentity,
 	type SessionStoreSessionProjection,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
@@ -40,6 +52,32 @@ export interface SessionStoreWorkerData {
 }
 
 export type SessionStoreWorkerOperation =
+	| {
+			readonly kind: "register_review_alias";
+			readonly runId: string;
+			readonly member: SessionStoreReviewSource;
+			readonly alias: SessionStoreReviewSource;
+	  }
+	| { readonly kind: "resolve_review_anchor"; readonly runId: string; readonly member: SessionStoreReviewSource }
+	| { readonly kind: "register_review_anchor"; readonly input: SessionStoreRegisterReviewAnchorInput }
+	| { readonly kind: "find_review_anchor"; readonly runId: string }
+	| { readonly kind: "create_review_discussion"; readonly input: SessionStoreCreateReviewDiscussionInput }
+	| { readonly kind: "reset_review_discussion"; readonly input: SessionStoreResetReviewDiscussionInput }
+	| { readonly kind: "find_review_discussion_by_id"; readonly discussionId: string }
+	| { readonly kind: "find_review_discussion"; readonly runId: string; readonly findingId: string }
+	| { readonly kind: "find_review_discussion_by_child"; readonly child: SessionStoreSessionIdentity }
+	| {
+			readonly kind: "list_review_discussions";
+			readonly runId: string;
+			readonly limit: number;
+			readonly offset: number;
+	  }
+	| {
+			readonly kind: "list_review_discussion_history";
+			readonly discussionId: string;
+			readonly limit: number;
+			readonly offset: number;
+	  }
 	| { readonly kind: "initialize" }
 	| { readonly kind: "verify_foreign_keys" }
 	| { readonly kind: "create_session"; readonly input: SessionStoreCreateSessionInput }
@@ -86,6 +124,11 @@ const ERROR_CODES: ReadonlySet<string> = new Set<SessionStoreErrorCode>([
 	"store_busy",
 	"store_io_error",
 	"store_full",
+	"review_anchor_not_found",
+	"review_identity_conflict",
+	"review_source_unavailable",
+	"review_cwd_mismatch",
+	"review_discussion_not_found",
 	"session_already_exists",
 	"session_not_found",
 	"commit_identity_conflict",
@@ -397,6 +440,157 @@ function parseDeleteInput(value: unknown, path: string): SessionStoreDeleteSessi
 	};
 }
 
+function parseIdentity(value: unknown, path: string): SessionStoreSessionIdentity {
+	const input = record(value, path);
+	exactKeys(input, path, ["sessionId", "sessionGeneration"]);
+	return {
+		sessionId: idValue(input.sessionId, `${path}.sessionId`),
+		sessionGeneration: idValue(input.sessionGeneration, `${path}.sessionGeneration`),
+	};
+}
+
+function parseReviewSource(value: unknown, path: string): SessionStoreReviewSource {
+	const input = record(value, path);
+	exactKeys(input, path, ["sessionId", "sessionGeneration", "cwd"]);
+	return {
+		sessionId: idValue(input.sessionId, `${path}.sessionId`),
+		sessionGeneration: idValue(input.sessionGeneration, `${path}.sessionGeneration`),
+		cwd: nonEmptyString(input.cwd, `${path}.cwd`),
+	};
+}
+
+function reviewContext(value: unknown, path: string): SessionStoreJsonValue {
+	const result = jsonValue(value, path);
+	if (Buffer.byteLength(JSON.stringify(result), "utf8") > SESSION_STORE_REVIEW_CONTEXT_MAX_BYTES) {
+		fail(path, "review context exceeds the canonical JSON byte limit");
+	}
+	return result;
+}
+
+function reviewLimit(value: unknown, path: string): number {
+	const result = safeInteger(value, path, 1);
+	if (result > SESSION_STORE_REVIEW_LIST_MAX) fail(path, "review list limit exceeds maximum");
+	return result;
+}
+
+function parseReviewAnchorInput(value: unknown, path: string): SessionStoreRegisterReviewAnchorInput {
+	const input = record(value, path);
+	exactKeys(input, path, ["runId", "source", "createdAt"]);
+	return {
+		runId: idValue(input.runId, `${path}.runId`),
+		source: parseReviewSource(input.source, `${path}.source`),
+		createdAt: timestampValue(input.createdAt, `${path}.createdAt`),
+	};
+}
+
+function parseCreateReviewDiscussion(value: unknown, path: string): SessionStoreCreateReviewDiscussionInput {
+	const input = record(value, path);
+	exactKeys(input, path, [
+		"source",
+		"runId",
+		"findingId",
+		"discussionId",
+		"child",
+		"contextSnapshot",
+		"createdAt",
+		"requestId",
+		"kickoffClientMessageId",
+	]);
+	return {
+		source: parseReviewSource(input.source, `${path}.source`),
+		runId: idValue(input.runId, `${path}.runId`),
+		findingId: idValue(input.findingId, `${path}.findingId`),
+		discussionId: idValue(input.discussionId, `${path}.discussionId`),
+		child: parseCreateSession(input.child, `${path}.child`),
+		contextSnapshot: reviewContext(input.contextSnapshot, `${path}.contextSnapshot`),
+		createdAt: timestampValue(input.createdAt, `${path}.createdAt`),
+		requestId: idValue(input.requestId, `${path}.requestId`),
+		kickoffClientMessageId: idValue(input.kickoffClientMessageId, `${path}.kickoffClientMessageId`),
+	};
+}
+
+function parseResetReviewDiscussion(value: unknown, path: string): SessionStoreResetReviewDiscussionInput {
+	const input = record(value, path);
+	exactKeys(input, path, [
+		"source",
+		"discussionId",
+		"expectedChild",
+		"child",
+		"createdAt",
+		"requestId",
+		"kickoffClientMessageId",
+	]);
+	return {
+		source: parseReviewSource(input.source, `${path}.source`),
+		discussionId: idValue(input.discussionId, `${path}.discussionId`),
+		expectedChild: parseIdentity(input.expectedChild, `${path}.expectedChild`),
+		child: parseCreateSession(input.child, `${path}.child`),
+		createdAt: timestampValue(input.createdAt, `${path}.createdAt`),
+		requestId: idValue(input.requestId, `${path}.requestId`),
+		kickoffClientMessageId: idValue(input.kickoffClientMessageId, `${path}.kickoffClientMessageId`),
+	};
+}
+
+function parseReviewAnchor(value: unknown, path: string): SessionStoreReviewAnchor {
+	const input = record(value, path);
+	exactKeys(input, path, ["runId", "source", "createdAt", "sourceAvailable"]);
+	return {
+		runId: idValue(input.runId, `${path}.runId`),
+		source: parseReviewSource(input.source, `${path}.source`),
+		createdAt: timestampValue(input.createdAt, `${path}.createdAt`),
+		sourceAvailable: booleanValue(input.sourceAvailable, `${path}.sourceAvailable`),
+	};
+}
+
+function parseReviewChild(value: unknown, path: string): SessionStoreReviewDiscussionChild {
+	const input = record(value, path);
+	exactKeys(input, path, [
+		"discussionId",
+		"ordinal",
+		"child",
+		"createdAt",
+		"requestId",
+		"kickoffClientMessageId",
+		"available",
+	]);
+	return {
+		discussionId: idValue(input.discussionId, `${path}.discussionId`),
+		ordinal: safeInteger(input.ordinal, `${path}.ordinal`, 1),
+		child: parseIdentity(input.child, `${path}.child`),
+		createdAt: timestampValue(input.createdAt, `${path}.createdAt`),
+		requestId: idValue(input.requestId, `${path}.requestId`),
+		kickoffClientMessageId: idValue(input.kickoffClientMessageId, `${path}.kickoffClientMessageId`),
+		available: booleanValue(input.available, `${path}.available`),
+	};
+}
+
+function parseReviewDiscussion(value: unknown, path: string): SessionStoreReviewDiscussion {
+	const input = record(value, path);
+	exactKeys(input, path, [
+		"discussionId",
+		"runId",
+		"findingId",
+		"source",
+		"sourceAvailable",
+		"contextSnapshot",
+		"createdAt",
+		"current",
+	]);
+	const discussionId = idValue(input.discussionId, `${path}.discussionId`);
+	const current = parseReviewChild(input.current, `${path}.current`);
+	if (current.discussionId !== discussionId) fail(path, "current child belongs to a different discussion");
+	return {
+		discussionId,
+		runId: idValue(input.runId, `${path}.runId`),
+		findingId: idValue(input.findingId, `${path}.findingId`),
+		source: parseReviewSource(input.source, `${path}.source`),
+		sourceAvailable: booleanValue(input.sourceAvailable, `${path}.sourceAvailable`),
+		contextSnapshot: reviewContext(input.contextSnapshot, `${path}.contextSnapshot`),
+		createdAt: timestampValue(input.createdAt, `${path}.createdAt`),
+		current,
+	};
+}
+
 export function parseSessionStoreWorkerData(value: unknown): SessionStoreWorkerData {
 	const input = record(value, "$workerData");
 	exactKeys(input, "$workerData", ["sessionDirectory"]);
@@ -407,6 +601,62 @@ export function parseSessionStoreWorkerOperation(value: unknown): SessionStoreWo
 	const input = record(value, "$operation");
 	const kind = stringValue(input.kind, "$operation.kind");
 	switch (kind) {
+		case "register_review_alias":
+			exactKeys(input, "$operation", ["kind", "runId", "member", "alias"]);
+			return {
+				kind,
+				runId: idValue(input.runId, "$operation.runId"),
+				member: parseReviewSource(input.member, "$operation.member"),
+				alias: parseReviewSource(input.alias, "$operation.alias"),
+			};
+		case "resolve_review_anchor":
+			exactKeys(input, "$operation", ["kind", "runId", "member"]);
+			return {
+				kind,
+				runId: idValue(input.runId, "$operation.runId"),
+				member: parseReviewSource(input.member, "$operation.member"),
+			};
+		case "register_review_anchor":
+			exactKeys(input, "$operation", ["kind", "input"]);
+			return { kind, input: parseReviewAnchorInput(input.input, "$operation.input") };
+		case "find_review_anchor":
+			exactKeys(input, "$operation", ["kind", "runId"]);
+			return { kind, runId: idValue(input.runId, "$operation.runId") };
+		case "create_review_discussion":
+			exactKeys(input, "$operation", ["kind", "input"]);
+			return { kind, input: parseCreateReviewDiscussion(input.input, "$operation.input") };
+		case "reset_review_discussion":
+			exactKeys(input, "$operation", ["kind", "input"]);
+			return { kind, input: parseResetReviewDiscussion(input.input, "$operation.input") };
+		case "find_review_discussion_by_id":
+			exactKeys(input, "$operation", ["kind", "discussionId"]);
+			return { kind, discussionId: idValue(input.discussionId, "$operation.discussionId") };
+		case "find_review_discussion":
+			exactKeys(input, "$operation", ["kind", "runId", "findingId"]);
+			return {
+				kind,
+				runId: idValue(input.runId, "$operation.runId"),
+				findingId: idValue(input.findingId, "$operation.findingId"),
+			};
+		case "find_review_discussion_by_child":
+			exactKeys(input, "$operation", ["kind", "child"]);
+			return { kind, child: parseIdentity(input.child, "$operation.child") };
+		case "list_review_discussions":
+			exactKeys(input, "$operation", ["kind", "runId", "limit", "offset"]);
+			return {
+				kind,
+				runId: idValue(input.runId, "$operation.runId"),
+				limit: reviewLimit(input.limit, "$operation.limit"),
+				offset: safeInteger(input.offset, "$operation.offset"),
+			};
+		case "list_review_discussion_history":
+			exactKeys(input, "$operation", ["kind", "discussionId", "limit", "offset"]);
+			return {
+				kind,
+				discussionId: idValue(input.discussionId, "$operation.discussionId"),
+				limit: reviewLimit(input.limit, "$operation.limit"),
+				offset: safeInteger(input.offset, "$operation.offset"),
+			};
 		case "initialize":
 		case "verify_foreign_keys":
 		case "close":
@@ -711,6 +961,12 @@ export function parseSessionStoreOperationResult(
 	kind: SessionStoreWorkerOperation["kind"],
 	value: unknown,
 ):
+	| SessionStoreReviewAnchor
+	| SessionStoreReviewDiscussion
+	| SessionStoreReviewDiscussion[]
+	| SessionStoreReviewDiscussionChild[]
+	| SessionStoreReviewDiscussionLookup
+	| SessionStoreResetReviewDiscussionResult
 	| SessionStoreInfo
 	| SessionStoreForeignKeyVerificationResult
 	| SessionStoreSessionSummary
@@ -722,6 +978,40 @@ export function parseSessionStoreOperationResult(
 	| SessionStoreDeleteSessionResult
 	| null {
 	switch (kind) {
+		case "register_review_alias":
+		case "register_review_anchor":
+			return parseReviewAnchor(value, "$result");
+		case "resolve_review_anchor":
+		case "find_review_anchor":
+			return value === null ? null : parseReviewAnchor(value, "$result");
+		case "create_review_discussion":
+			return parseReviewDiscussion(value, "$result");
+		case "find_review_discussion_by_id":
+		case "find_review_discussion":
+			return value === null ? null : parseReviewDiscussion(value, "$result");
+		case "list_review_discussions":
+		case "list_review_discussion_history": {
+			if (!Array.isArray(value) || value.length > SESSION_STORE_REVIEW_LIST_MAX)
+				fail("$result", "unbounded review list");
+			return kind === "list_review_discussions"
+				? arrayValue(value, "$result", parseReviewDiscussion)
+				: arrayValue(value, "$result", parseReviewChild);
+		}
+		case "find_review_discussion_by_child": {
+			if (value === null) return null;
+			const input = record(value, "$result");
+			exactKeys(input, "$result", ["discussion", "child"]);
+			const discussion = parseReviewDiscussion(input.discussion, "$result.discussion");
+			const child = parseReviewChild(input.child, "$result.child");
+			if (discussion.discussionId !== child.discussionId) fail("$result", "child belongs to a different discussion");
+			return { discussion, child };
+		}
+		case "reset_review_discussion": {
+			const input = record(value, "$result");
+			exactKeys(input, "$result", ["status", "child"]);
+			if (input.status !== "reset" && input.status !== "conflict") fail("$result.status", "invalid reset status");
+			return { status: input.status, child: parseReviewChild(input.child, "$result.child") };
+		}
 		case "initialize":
 			return parseInfo(value, "$result");
 		case "verify_foreign_keys":

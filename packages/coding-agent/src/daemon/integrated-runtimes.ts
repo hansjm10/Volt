@@ -24,7 +24,8 @@ import {
 } from "../core/remote/iroh/protocol.ts";
 import type { IrohRemoteWorkspace, IrohRemoteWorkspaceWorktree } from "../core/remote/iroh/state.ts";
 import type { IrohRemoteHostStateManager } from "../core/remote/iroh/state-manager.ts";
-import { getDefaultSessionDir } from "../core/session-manager.ts";
+import { HostReviewDiscussionService } from "../core/review-discussions.ts";
+import { getDefaultSessionDir, SessionManager, type SessionReference } from "../core/session-manager.ts";
 import type { SubagentRuntimeRegistration } from "../core/subagents/index.ts";
 import {
 	createIrohRemoteAgentRuntimeWithSessionSelection,
@@ -44,6 +45,7 @@ import {
 } from "./conversation-coordinator.ts";
 import type { IntegratedConversationSessionSelection } from "./handshake-responses.ts";
 import type { DaemonRuntimeOwnerCapability } from "./lease-broker.ts";
+import type { ReviewSiblingAdmission } from "./review-sibling-admission.ts";
 import { isPathInside, resolveWorkspaceDirectory, type WorkspaceDirectoryResolution } from "./workspace-directory.ts";
 import { getRegisteredWorkingDirectoryForWorktree, type WorktreeRuntimePreparation } from "./worktree-manager.ts";
 
@@ -149,6 +151,13 @@ export interface IntegratedRuntimeRegistryOptions {
 	) => { commit(): void; rollback(): void };
 	/** Retire and await every stream/subscriber owner before low-level runtime disposal. */
 	beforeRuntimeStop?: (entry: IntegratedRuntimeEntry, reason: string) => Promise<void>;
+	/** Host-owned broker/shutdown admission for sibling creation without a phone attach. */
+	beginReviewSiblingAdmission?: (parent: IntegratedRuntimeEntry, sessionId: string) => ReviewSiblingAdmission;
+	withReviewSourceWrite?: <T>(
+		parent: IntegratedRuntimeEntry,
+		source: SessionReference,
+		write: () => Promise<T>,
+	) => Promise<T>;
 	/** Called exactly once after a newly-created runtime is published in the registry. */
 	onRuntimePublished?: (entry: IntegratedRuntimeEntry) => void;
 	/** Called after a published runtime's coordinator and registry key move atomically. */
@@ -316,6 +325,10 @@ export class IntegratedRuntimeRegistry {
 	private readonly options: IntegratedRuntimeRegistryOptions;
 	readonly coordinators: ConversationCoordinatorRegistry;
 	private readonly entries = new Map<string, IntegratedRuntimeEntry>();
+	private readonly reviewDiscussions: HostReviewDiscussionService;
+	private readonly reviewSiblingCreations = new Map<string, Promise<AgentSessionRuntime>>();
+	private readonly reviewSourceWrites = new Map<string, Promise<unknown>>();
+	private readonly revokedReviewAuthorities = new WeakSet<AgentSessionRuntime>();
 	private readonly namedSessionCreations = new Map<
 		string,
 		{
@@ -331,6 +344,224 @@ export class IntegratedRuntimeRegistry {
 	constructor(options: IntegratedRuntimeRegistryOptions) {
 		this.options = options;
 		this.coordinators = options.coordinators ?? new ConversationCoordinatorRegistry();
+		const exactOwner = (runtime: AgentSessionRuntime) =>
+			this.revokedReviewAuthorities.has(runtime)
+				? undefined
+				: this.values().find((entry) => entry.runtime === runtime && entry.lifecycle === "active");
+		this.reviewDiscussions = new HostReviewDiscussionService({
+			findRuntime: (ref, requester) => {
+				const source = exactOwner(requester);
+				if (!source) throw new Error("Review requester runtime is unavailable");
+				return this.values().find((entry) => {
+					const current = entry.runtime.session.sessionRef;
+					return (
+						entry.lifecycle === "active" &&
+						entry.workspaceName === source.workspaceName &&
+						entry.workspaceGeneration === source.workspaceGeneration &&
+						current?.storeId === ref.storeId &&
+						current.sessionId === ref.sessionId &&
+						current.sessionGeneration === ref.sessionGeneration
+					);
+				})?.runtime;
+			},
+			assertCurrent: (runtime) => {
+				if (!exactOwner(runtime)) throw new Error("Review runtime ownership changed");
+			},
+			withSourceWrite: <T>(requester: AgentSessionRuntime, ref: SessionReference, write: () => Promise<T>) => {
+				const parent = exactOwner(requester);
+				if (!parent || !this.options.withReviewSourceWrite)
+					return Promise.reject(new Error("Canonical source writer is unavailable"));
+				const generation = parent.generation;
+				const key = this.getRegistryKey(parent.workspaceName, ref.sessionId);
+				const operation = (this.reviewSourceWrites.get(key) ?? Promise.resolve())
+					.catch(() => undefined)
+					.then(() => {
+						if (exactOwner(requester) !== parent || parent.generation !== generation)
+							throw new Error("Review source writer authority changed");
+						return this.options.withReviewSourceWrite!(parent, ref, write);
+					});
+				this.reviewSourceWrites.set(key, operation);
+				void operation
+					.finally(() => {
+						if (this.reviewSourceWrites.get(key) === operation) this.reviewSourceWrites.delete(key);
+					})
+					.catch(() => undefined);
+				return operation;
+			},
+			createSibling: (runtime, manager, assertCurrent) => this.createReviewSibling(runtime, manager, assertCurrent),
+		});
+	}
+
+	private async createReviewSibling(
+		runtime: AgentSessionRuntime,
+		ref: SessionReference,
+		assertCurrent: () => void,
+	): Promise<AgentSessionRuntime> {
+		const parent = this.values().find((entry) => entry.runtime === runtime && entry.lifecycle === "active");
+		if (!parent) throw new Error("Review source runtime unavailable");
+		const key = this.getRegistryKey(parent.workspaceName, ref.sessionId);
+		const pending = this.reviewSiblingCreations.get(key);
+		if (pending) {
+			const child = await pending;
+			assertCurrent();
+			return child;
+		}
+		const operation = this.publishReviewSibling(parent, ref, assertCurrent);
+		this.reviewSiblingCreations.set(key, operation);
+		void operation
+			.finally(() => {
+				if (this.reviewSiblingCreations.get(key) === operation) this.reviewSiblingCreations.delete(key);
+			})
+			.catch(() => undefined);
+		return operation;
+	}
+
+	private async publishReviewSibling(
+		parent: IntegratedRuntimeEntry,
+		ref: SessionReference,
+		assertCurrent: () => void,
+	): Promise<AgentSessionRuntime> {
+		const generation = parent.generation;
+		let manager: SessionManager | undefined;
+		let coordinator: ConversationCoordinator | undefined;
+		let admission: ReviewSiblingAdmission | undefined;
+		let preparation: WorktreeRuntimePreparation | undefined;
+		let child: AgentSessionRuntime | undefined;
+		let entry: IntegratedRuntimeEntry | undefined;
+		let claim: IntegratedRuntimeAttachClaim | undefined;
+		let transferred = false;
+		let published = false;
+		const assertParent = () => {
+			assertCurrent();
+			admission?.assertCurrent();
+			if (
+				parent.generation !== generation ||
+				parent.lifecycle !== "active" ||
+				this.entries.get(parent.key) !== parent
+			) {
+				throw new Error("Review source ownership changed");
+			}
+		};
+		try {
+			assertParent();
+			const existing = this.findOwner(parent.workspaceName, ref.sessionId);
+			if (existing) {
+				const current = existing.runtime.session.sessionRef;
+				if (
+					existing.lifecycle !== "active" ||
+					existing.workspaceGeneration !== parent.workspaceGeneration ||
+					current?.storeId !== ref.storeId ||
+					current.sessionId !== ref.sessionId ||
+					current.sessionGeneration !== ref.sessionGeneration
+				) {
+					throw new Error("Review child runtime identity changed");
+				}
+				return existing.runtime;
+			}
+			admission = this.options.beginReviewSiblingAdmission?.(parent, ref.sessionId);
+			if (parent.coordinator.hasLeaseBroker && !admission)
+				throw new Error("Review sibling daemon lease admission is unavailable");
+			// Hold exclusive producer admission before any manager is opened or SDK context is seeded.
+			coordinator = this.coordinators.reserveRuntime(parent.workspaceName, ref.sessionId);
+			claim = coordinator.createAttachClaim(parent.clientNodeId);
+			admission?.commit(coordinator);
+			await admission?.validate();
+			assertParent();
+			if (parent.worktreeId) {
+				if (!this.options.bindWorktreeSession || !this.options.prepareWorktreeRuntime)
+					throw new Error("Review worktree service unavailable");
+				preparation = await waitForAttachAdmission(
+					this.options.prepareWorktreeRuntime(parent.workspaceName, parent.worktreeId),
+					admission?.signal,
+					(late) => late.release(),
+				);
+				assertParent();
+				await waitForAttachAdmission(
+					this.options.bindWorktreeSession(parent.workspaceName, parent.worktreeId, ref.sessionId),
+					admission?.signal,
+				);
+				assertParent();
+			}
+			manager = await SessionManager.open(ref);
+			assertParent();
+			transferred = true;
+			// Keep the provisional lease until initialization settles, including on cancellation;
+			// releasing it early would let a new owner race late SDK persistence.
+			child = await parent.runtime.createReviewDiscussionSibling(manager);
+			assertParent();
+			await admission?.validate();
+			assertParent();
+			if (this.findOwner(parent.workspaceName, child.session.sessionId))
+				throw new Error("Review child runtime already active");
+			const childRef = child.session.sessionRef;
+			if (
+				childRef?.storeId !== ref.storeId ||
+				childRef.sessionId !== ref.sessionId ||
+				childRef.sessionGeneration !== ref.sessionGeneration
+			)
+				throw new Error("Review child initialization changed identity");
+			entry = this.createEntryRecord({
+				coordinator,
+				clientNodeId: parent.clientNodeId,
+				workspaceName: parent.workspaceName,
+				workspaceGeneration: parent.workspaceGeneration,
+				projectTrusted: parent.projectTrusted,
+				sessionId: child.session.sessionId,
+				runtime: child,
+				worktreePreparation: preparation,
+				worktreeId: parent.worktreeId,
+				worktreePath: parent.worktreePath,
+				worktreeSourceRootRelativePath: parent.worktreeSourceRootRelativePath,
+				workingDirectory: parent.workingDirectory,
+				toolPolicy: parent.toolPolicy,
+			});
+			preparation = undefined;
+			const candidate = entry;
+			const publish = () => {
+				assertParent();
+				this.assertAttachClaimCurrent(candidate, claim!);
+				if (this.findOwner(candidate.workspaceName, candidate.sessionId))
+					throw new Error("Review publication lost ownership");
+				candidate.coordinator.activateRuntime();
+				candidate.coordinator.markDetached();
+				this.entries.set(candidate.key, candidate);
+				published = true;
+				admission?.finalize();
+				this.options.onRuntimePublished?.(candidate);
+			};
+			if (entry.worktreePreparation) await entry.worktreePreparation.publish(publish);
+			else publish();
+			delete entry.worktreePreparation;
+			assertParent();
+			this.scheduleRetention(entry, "review_discussion_created");
+			return child;
+		} catch (error) {
+			try {
+				await preparation?.release();
+				if (entry && published) await this.stopEntry(entry, "review_sibling_publication_failed");
+				else if (entry && claim) await this.abortPreparedEntry(entry, undefined, claim);
+				else if (coordinator)
+					await coordinator.beginRuntimeRetirement("review_initialization_failed", async () => {
+						if (child) await cleanupUncommittedRuntime(child);
+						else if (!transferred) await manager?.closePersistence();
+					}).settled;
+				else if (child) await cleanupUncommittedRuntime(child);
+				else if (!transferred) await manager?.closePersistence();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "Review sibling admission and cleanup failed");
+			} finally {
+				admission?.rollback();
+			}
+			throw error;
+		} finally {
+			claim?.release();
+			admission?.release();
+		}
+	}
+
+	/** Revoke pending review effects before waiting for affected stream lifecycles to drain. */
+	fenceReviewOperations(entries: Iterable<IntegratedRuntimeEntry>): void {
+		for (const entry of entries) this.revokedReviewAuthorities.add(entry.runtime);
 	}
 
 	/** The conversation runtime key: one runtime per (workspaceName, sessionId). */
@@ -426,6 +657,16 @@ export class IntegratedRuntimeRegistry {
 		const targetSessionId = getResolvedTargetSessionId(handshake.hello, authorization);
 		if (targetSessionId !== undefined) {
 			const targetKey = this.getRegistryKey(authorization.workspace.name, targetSessionId);
+			const sourceWrite = this.reviewSourceWrites.get(targetKey);
+			if (sourceWrite) {
+				await waitForAttachAdmission(sourceWrite, options.signal);
+				return this.getOrCreateEntry(handshake, authorization, options);
+			}
+			const siblingCreation = this.reviewSiblingCreations.get(targetKey);
+			if (siblingCreation) {
+				await waitForAttachAdmission(siblingCreation, options.signal);
+				return this.getOrCreateEntry(handshake, authorization, options);
+			}
 			const reservedEntry = this.getSessionRekeyReservation(targetKey);
 			if (reservedEntry) {
 				throw this.createAttachRetryError(reservedEntry, "conversation runtime replacement is still publishing");
@@ -766,6 +1007,7 @@ export class IntegratedRuntimeRegistry {
 	}
 
 	private createEntryRecord(options: {
+		coordinator?: ConversationCoordinator;
 		clientNodeId: string;
 		workspaceName: string;
 		workspaceGeneration?: number;
@@ -781,7 +1023,14 @@ export class IntegratedRuntimeRegistry {
 		workingDirectory?: string;
 		toolPolicy: IrohRemoteRuntimeToolPolicy;
 	}): IntegratedRuntimeEntry {
-		const coordinator = this.coordinators.reserveRuntime(options.workspaceName, options.sessionId);
+		const coordinator =
+			options.coordinator ?? this.coordinators.reserveRuntime(options.workspaceName, options.sessionId);
+		if (
+			coordinator.workspaceName !== options.workspaceName ||
+			coordinator.sessionId !== options.sessionId ||
+			coordinator.runtimeLifecycle !== "prepared"
+		)
+			throw new Error("Runtime coordinator reservation changed");
 		const entry: IntegratedRuntimeEntry = {
 			coordinator,
 			get key() {
@@ -839,6 +1088,7 @@ export class IntegratedRuntimeRegistry {
 				allowUnlistedExtensionTools: options.toolPolicy.allowUnlistedExtensionTools,
 			},
 		};
+		entry.runtime.reviewDiscussions = this.reviewDiscussions.forRuntime(entry.runtime);
 		if (entry.parentSessionId === undefined) {
 			entry.runtime.setPrepareSessionReplacement?.((target) => this.prepareEntrySessionReplacement(entry, target));
 		}
@@ -1364,6 +1614,7 @@ export class IntegratedRuntimeRegistry {
 		entry: IntegratedRuntimeEntry,
 		target: AgentSessionReplacementTarget,
 	): Promise<AgentSessionReplacementTransaction> {
+		if (entry.runtime.session.isReviewDiscussion) throw new Error("Review discussion identity is immutable");
 		if (entry.sessionId !== target.previousSessionId || this.entries.get(entry.key) !== entry) {
 			throw new Error("daemon runtime ownership changed before session replacement preflight");
 		}
@@ -1617,6 +1868,7 @@ export class IntegratedRuntimeRegistry {
 		activeStreamEntry: IntegratedRuntimeStreamWriter | undefined,
 		nextSessionId: string,
 	): Promise<void> {
+		if (entry.runtime.session.isReviewDiscussion) throw new Error("Review discussion identity is immutable");
 		const previousSessionId = entry.sessionId;
 		const previousKey = entry.key;
 		const nextKey = this.getRegistryKey(entry.workspaceName, nextSessionId);
@@ -1758,10 +2010,13 @@ export class IntegratedRuntimeRegistry {
 		// Detached review workflows count as activity: a backgrounded client's
 		// running review must pin the runtime until it reaches a terminal state.
 		const isEntryActive = () =>
-			entry.runtime.session.isBusy || entry.runtime.reviewWorkflows?.hasActiveWorkflows === true;
+			entry.runtime.session.isBusy ||
+			entry.runtime.reviewWorkflows?.hasActiveWorkflows === true ||
+			this.reviewDiscussions.hasPendingWork(entry.runtime);
 		const waitForEntryIdle = async () => {
 			await entry.runtime.session.waitForIdle();
 			await entry.runtime.reviewWorkflows?.waitForIdle();
+			await this.reviewDiscussions.waitForIdle(entry.runtime);
 		};
 		const handle = scheduleDetachedRuntimeRetention({
 			ttlMs,

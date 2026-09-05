@@ -17,6 +17,7 @@ import { readonlyArrayOf, stringEnum } from "./helpers.ts";
 import { RpcPlanningStateSchema } from "./planning.ts";
 import { RpcThinkingLevelSchema } from "./primitives.ts";
 import { RpcProjectionCollectionTruncationSchema, RpcProjectionTruncationSchema } from "./projections.ts";
+import { RpcReviewDiscussionLinkSchema } from "./review-discussions.ts";
 
 export const RpcSessionWorkPullRequestSchema = Type.Object(
 	{
@@ -65,6 +66,7 @@ export const RpcSessionContextSchema = Type.Object(
 
 export const RpcSessionListItemSchema = Type.Object(
 	{
+		reviewDiscussion: Type.Optional(RpcReviewDiscussionLinkSchema),
 		sessionId: Type.String(),
 		sessionName: Type.Optional(Type.String()),
 		createdAt: Type.String(),
@@ -155,6 +157,7 @@ export const RpcSessionStateProjectionSchema = Type.Object(
 
 export const RpcSessionStateSchema = Type.Object(
 	{
+		reviewDiscussion: Type.Optional(RpcReviewDiscussionLinkSchema),
 		model: Type.Optional(RpcModelSchema),
 		thinkingLevel: RpcThinkingLevelSchema,
 		availableThinkingLevels: Type.Array(RpcThinkingLevelSchema),

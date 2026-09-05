@@ -162,6 +162,22 @@ export const RPC_COMMAND_SCHEMAS = {
 	),
 
 	// Detached review workflows
+	start_review_discussions: commandSchema("start_review_discussions", {
+		runId: RpcConversationIdentifierSchema,
+		findingIds: Type.Array(RpcConversationIdentifierSchema, { minItems: 1, maxItems: 50, uniqueItems: true }),
+		requestId: RpcConversationIdentifierSchema,
+	}),
+	list_review_discussions: commandSchema("list_review_discussions", {
+		runId: RpcConversationIdentifierSchema,
+		cursor: Type.Optional(Type.String({ maxLength: 32, pattern: "^[0-9]+$" })),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+	}),
+	reset_review_discussion: commandSchema("reset_review_discussion", {
+		discussionId: RpcConversationIdentifierSchema,
+		expectedSessionId: RpcConversationIdentifierSchema,
+		requestId: RpcConversationIdentifierSchema,
+	}),
+	get_review_discussion_source: commandSchema("get_review_discussion_source", {}),
 	cancel_workflow: commandSchema("cancel_workflow", { workflowId: RpcConversationIdentifierSchema }),
 	get_review_result: commandSchema("get_review_result", { runId: RpcConversationIdentifierSchema }),
 	list_review_workflows: commandSchema("list_review_workflows", {

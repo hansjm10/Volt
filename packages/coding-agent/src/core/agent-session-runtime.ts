@@ -20,9 +20,16 @@ import {
 	type PlanningState,
 	StalePlanRevisionError,
 } from "./planning.ts";
-import { captureReviewStateForHandoff, restoreReviewStateFromHandoff } from "./review-state.ts";
+import { registerReviewHandoffAliases } from "./review-anchors.ts";
+import {
+	getReviewDiscussionLink,
+	projectReviewDiscussionLink,
+	type ReviewDiscussionService,
+} from "./review-discussions.ts";
+import { captureReviewStateForHandoff, listReviewRuns, restoreReviewStateFromHandoff } from "./review-state.ts";
 import { ReviewWorkflowManager } from "./review-workflows.ts";
 import { ConversationProjectionFeed, type ConversationProjectionSource } from "./rpc/conversation-projection-feed.ts";
+import type { RpcReviewDiscussionLink } from "./rpc/schema/review-discussions.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists, MissingSessionCwdError } from "./session-cwd.ts";
@@ -69,6 +76,7 @@ export interface SubagentRuntimeContext {
 }
 
 export interface WorkspaceSessionSummary {
+	reviewDiscussion?: RpcReviewDiscussionLink;
 	sessionId: string;
 	sessionName?: string;
 	createdAt: string;
@@ -311,6 +319,27 @@ export class AgentSessionRuntime {
 	private readonly clientInputAdmissions = new Map<Promise<void>, AgentSession>();
 	private _reviewWorkflows?: ReviewWorkflowManager;
 	readonly conversationProjectionFeed: ConversationProjectionFeed;
+	/** Installed only by a daemon with sibling runtime ownership. */
+	reviewDiscussions?: ReviewDiscussionService;
+
+	/** Host-only creation: does not replace or rekey the selected source runtime. */
+	async createReviewDiscussionSibling(manager: SessionManager): Promise<AgentSessionRuntime> {
+		if (
+			this.session.isReviewDiscussion ||
+			!manager.getReviewDiscussion() ||
+			!sameFilesystemLocation(manager.getCwd(), this.cwd)
+		) {
+			await manager.closePersistence();
+			throw new Error("Review sibling requires an exact source cwd and a durable child binding");
+		}
+		return createAgentSessionRuntime(this.createRuntime, {
+			cwd: this.cwd,
+			agentDir: this.services.agentDir,
+			sessionManager: manager,
+			profile: this.getReplacementProfile(),
+			...this.getReplacementGitContextOptions(this.cwd),
+		});
+	}
 
 	constructor(
 		_session: AgentSession,
@@ -629,6 +658,9 @@ export class AgentSessionRuntime {
 		operation: (context: AgentSessionStructuralOperation) => Promise<T>,
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<T> {
+		if (this.session.isReviewDiscussion) {
+			return Promise.reject(new Error("Review discussions are read-only; reset context from the source review"));
+		}
 		if (!this.acceptingStructuralOperations) {
 			return Promise.reject(new Error("Agent session runtime is no longer accepting structural operations"));
 		}
@@ -1053,7 +1085,9 @@ export class AgentSessionRuntime {
 		const header = this.session.sessionManager.getHeader();
 		const startingGitContext = this.session.sessionManager.getStartingGitContext();
 		const summary = this.session.sessionManager.getSessionEntrySummary();
+		const discussion = this.session.sessionManager.getReviewDiscussion();
 		return {
+			...(discussion ? { reviewDiscussion: projectReviewDiscussionLink(discussion) } : {}),
 			sessionId: this.session.sessionId,
 			sessionName: this.session.sessionName,
 			createdAt: toSessionTimestamp(header?.timestamp),
@@ -1072,8 +1106,14 @@ export class AgentSessionRuntime {
 
 	async listSessions(): Promise<WorkspaceSessionSummary[]> {
 		const current = this.getCurrentSessionSummary();
-		const summaries = (await this.listWorkspaceSessionInfos()).map((info) =>
-			sessionInfoToSummary(info, this.session.sessionId),
+		const summaries = await Promise.all(
+			(await this.listWorkspaceSessionInfos()).map(async (info) => {
+				const reviewDiscussion = await getReviewDiscussionLink(info.ref);
+				return {
+					...sessionInfoToSummary(info, this.session.sessionId),
+					...(reviewDiscussion ? { reviewDiscussion } : {}),
+				};
+			}),
 		);
 		const currentIndex = summaries.findIndex((summary) => summary.sessionId === current.sessionId);
 		if (currentIndex === -1) {
@@ -1226,6 +1266,7 @@ export class AgentSessionRuntime {
 		strategy: PlanExecutionStrategy,
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<{ planning: PlanningState; selectedSessionId: string; started: boolean }> {
+		if (this.session.isReviewDiscussion) throw new Error("Review discussions are read-only");
 		const sourceSession = this.session;
 		const sourcePlanning = sourceSession.planningState;
 		const sourcePlan = sourcePlanning.plan;
@@ -1421,6 +1462,12 @@ export class AgentSessionRuntime {
 				this.assertStructuralOperationCurrent(operation);
 			}
 			await sessionManager.flush();
+			await registerReviewHandoffAliases(
+				this.session.sessionManager,
+				sessionManager,
+				listReviewRuns(sessionManager, { limit: 50 }).runs.map((run) => run.runId),
+			);
+			this.assertStructuralOperationCurrent(operation);
 
 			managerTransferred = true;
 			const replacement = await this.replaceCurrentSession({

@@ -53,6 +53,7 @@ import {
 	type SessionStoreApplyTransactionInput,
 	type SessionStoreEntryWrite,
 	type SessionStoreJsonValue,
+	type SessionStoreReviewDiscussionLookup,
 	type SessionStoreSessionProjection,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
@@ -1234,6 +1235,8 @@ let importSessionFromJsonlInMemoryImpl: (inputPath: string, targetCwd?: string) 
 export class SessionManager {
 	private sessionId: string = "";
 	private sessionGeneration: string = "";
+	/** Host-owned exact-identity binding, never reconstructed from transcript data. */
+	private reviewDiscussion: SessionStoreReviewDiscussionLookup | null = null;
 	private sessionDir: string;
 	private cwd: string;
 	private persist: boolean;
@@ -1301,6 +1304,7 @@ export class SessionManager {
 		newSessionOptions?: NewSessionOptions,
 		sessionStoreLease?: SQLiteSessionStoreLease,
 		snapshot?: SessionStoreSnapshot,
+		reviewDiscussion: SessionStoreReviewDiscussionLookup | null = null,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = sessionDir;
@@ -1308,8 +1312,10 @@ export class SessionManager {
 		this.sessionStoreLease = sessionStoreLease;
 		this.storeId = sessionStoreLease?.client.info.storeId;
 		if (persist && this.sessionDir) ensurePrivateDirectorySync(this.sessionDir);
-		if (snapshot) this._loadStoreSnapshot(snapshot, cwd);
-		else this.newSession(newSessionOptions);
+		if (snapshot) {
+			this._loadStoreSnapshot(snapshot, cwd);
+			this.reviewDiscussion = deepFreezeCanonicalData(reviewDiscussion);
+		} else this.newSession(newSessionOptions);
 	}
 
 	private _loadStoreSnapshot(snapshot: SessionStoreSnapshot, cwdOverride?: string): void {
@@ -1350,6 +1356,9 @@ export class SessionManager {
 
 	newSession(options?: NewSessionOptions): SessionReference | undefined {
 		this._assertPersistenceHealthy();
+		if (this.reviewDiscussion) {
+			throw new Error("Review discussions are read-only; reset through the source session instead");
+		}
 		if (this.atomicAppendInFlight) throw new Error("Cannot create a new session during an atomic append");
 		if (this.unsettledPersistenceTasks > 0) {
 			throw new Error("Cannot create a new session while persistence is pending; await flush() first");
@@ -1364,6 +1373,7 @@ export class SessionManager {
 				: parseSessionReference(options.parentSession, "Parent session reference");
 		this.sessionId = options?.id ?? createSessionId();
 		this.sessionGeneration = randomUUID();
+		this.reviewDiscussion = null;
 		const timestamp = new Date().toISOString();
 		const header: SessionHeader = {
 			type: "session",
@@ -1463,6 +1473,11 @@ export class SessionManager {
 
 	getSessionId(): string {
 		return this.sessionId;
+	}
+
+	/** Binding loaded before a persisted manager is published; historical children remain restricted. */
+	getReviewDiscussion(): SessionStoreReviewDiscussionLookup | null {
+		return this.reviewDiscussion;
 	}
 
 	getSessionRef(): SessionReference | undefined {
@@ -2265,6 +2280,28 @@ export class SessionManager {
 
 	getRecoverableQueuedClientInputs(): ClientInputRecord[] {
 		return this.getClientInputRecoveryPlan().records;
+	}
+
+	/** A finding conversation never automatically replays inputs left behind by a prior process. */
+	async terminalizeInterruptedReviewInputs(): Promise<string[]> {
+		this._assertPersistenceHealthy();
+		if (!this.reviewDiscussion) throw new Error("Only finding discussions use explicit-only input recovery");
+		const ids = [...this.clientInputsById.values()]
+			.filter((record) => record.state === "accepted" || record.state === "started")
+			.map((record) => record.clientMessageId);
+		if (ids.length === 0) return [];
+		await this.appendAtomically(
+			() => {
+				for (const id of ids)
+					this.transitionClientInput(
+						id,
+						"failed",
+						"Review discussion interrupted; submit a new prompt to retry explicitly.",
+					);
+			},
+			() => {},
+		);
+		return ids;
 	}
 
 	reserveClientInput(
@@ -3071,7 +3108,19 @@ export class SessionManager {
 			}
 			const snapshot = await lease.client.loadSession(canonicalRef.sessionId, canonicalRef.sessionGeneration);
 			if (!snapshot) throw new Error(`Session not found: ${canonicalRef.sessionId}`);
-			return new SessionManager(cwdOverride ?? snapshot.session.cwd, dir, true, undefined, lease, snapshot);
+			const discussion = await lease.client.findReviewDiscussionByChild({
+				sessionId: snapshot.session.id,
+				sessionGeneration: snapshot.session.sessionGeneration,
+			});
+			return new SessionManager(
+				cwdOverride ?? snapshot.session.cwd,
+				dir,
+				true,
+				undefined,
+				lease,
+				snapshot,
+				discussion,
+			);
 		} catch (error) {
 			return await SessionManager._releaseLeaseAfterFailure(
 				lease,
@@ -3095,7 +3144,11 @@ export class SessionManager {
 			}
 			const snapshot = await lease.client.loadSession(latest.id, latest.sessionGeneration);
 			if (!snapshot) throw new Error(`Session not found: ${latest.id}`);
-			return new SessionManager(snapshot.session.cwd, dir, true, undefined, lease, snapshot);
+			const discussion = await lease.client.findReviewDiscussionByChild({
+				sessionId: snapshot.session.id,
+				sessionGeneration: snapshot.session.sessionGeneration,
+			});
+			return new SessionManager(snapshot.session.cwd, dir, true, undefined, lease, snapshot, discussion);
 		} catch (error) {
 			return await SessionManager._releaseLeaseAfterFailure(
 				lease,
@@ -3262,6 +3315,9 @@ export class SessionManager {
 		const source = await SessionManager.open(sourceRef);
 		let target: SessionManager | undefined;
 		try {
+			if (source.getReviewDiscussion()) {
+				throw new Error("Review discussions are read-only; cannot fork into an unrestricted session");
+			}
 			const sourceLeafId = source.getLeafId();
 			target = await SessionManager.create(targetCwd, sessionDir, {
 				...options,

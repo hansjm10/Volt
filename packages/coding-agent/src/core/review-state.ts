@@ -1,6 +1,11 @@
 import { Buffer } from "node:buffer";
 import { minimatch } from "minimatch";
 import type { ReviewRunControls } from "./review.ts";
+import {
+	ReviewSourceUnavailableError,
+	registerDurableReviewAnchor,
+	resolveCanonicalReviewSource,
+} from "./review-anchors.ts";
 import type { ParsedReview, ReviewFinding, ReviewFindingOutcomeReason, ReviewFindingStatus } from "./review-report.ts";
 import type {
 	ReviewBranchBase,
@@ -9,7 +14,7 @@ import type {
 	ReviewSnapshotIdentity,
 	ReviewSnapshotTreeEntry,
 } from "./review-snapshot.ts";
-import type { CustomEntry, SessionEntry, SessionManager } from "./session-manager.ts";
+import { type CustomEntry, type SessionEntry, SessionManager } from "./session-manager.ts";
 
 export const REVIEW_RUN_CUSTOM_ENTRY_TYPE = "volt.review.run";
 export const REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE = "volt.review.acknowledgment";
@@ -478,6 +483,125 @@ export function getReviewRun(sessionManager: SessionManager, runId: string): Hyd
 	return undefined;
 }
 
+function reviewConversationGuard(manager: SessionManager): () => void {
+	const sessionId = manager.getSessionId();
+	const generation = manager.getSessionRef()?.sessionGeneration;
+	const cwd = manager.getCwd();
+	return () => {
+		if (
+			manager.getSessionId() !== sessionId ||
+			manager.getSessionRef()?.sessionGeneration !== generation ||
+			manager.getCwd() !== cwd
+		)
+			throw new ReviewSourceUnavailableError("The review conversation changed during lookup.");
+		manager.assertConversationAuthorityAvailable();
+	};
+}
+
+/** Snapshot readers above intentionally stay local for persistence replay and handoff copying. */
+async function readCanonicalReviewState<T>(
+	manager: SessionManager,
+	runId: string,
+	read: (source: SessionManager) => T,
+): Promise<T> {
+	const assertCurrent = reviewConversationGuard(manager);
+	const ref = await resolveCanonicalReviewSource(manager, runId);
+	assertCurrent();
+	if (!ref) return read(manager);
+	let source: SessionManager;
+	try {
+		source = await SessionManager.open(ref);
+	} catch (cause) {
+		throw new ReviewSourceUnavailableError(undefined, { cause });
+	}
+	try {
+		if (!getReviewRun(source, runId))
+			throw new ReviewSourceUnavailableError("The canonical review run is no longer retained.");
+		const result = read(source);
+		const current = await resolveCanonicalReviewSource(manager, runId);
+		assertCurrent();
+		if (
+			current?.storeId !== ref.storeId ||
+			current.sessionDirectory !== ref.sessionDirectory ||
+			current.sessionId !== ref.sessionId ||
+			current.sessionGeneration !== ref.sessionGeneration
+		)
+			throw new ReviewSourceUnavailableError();
+		return result;
+	} finally {
+		await source.closePersistence();
+		assertCurrent();
+	}
+}
+
+/** Live review consumers must not use the copied finding statuses on a handoff alias. */
+export async function getCanonicalReviewRun(
+	manager: SessionManager,
+	runId: string,
+): Promise<HydratedReviewRunRecord | undefined> {
+	const assertCurrent = reviewConversationGuard(manager);
+	const record = await readCanonicalReviewState(manager, runId, (source) => getReviewRun(source, runId));
+	assertCurrent();
+	// Acknowledgment is conversation-local UI state, unlike canonical finding outcomes.
+	const acknowledgedAt = getReviewRun(manager, runId)?.acknowledgedAt;
+	return record && acknowledgedAt !== undefined ? { ...record, acknowledgedAt } : record;
+}
+
+export async function listCanonicalReviewRuns(
+	manager: SessionManager,
+	options: { cursor?: string; limit?: number } = {},
+): Promise<ReviewRunPage> {
+	const assertCurrent = reviewConversationGuard(manager);
+	const page = listReviewRuns(manager, options);
+	const runs: HydratedReviewRunRecord[] = [];
+	for (const run of page.runs) {
+		const current = await getCanonicalReviewRun(manager, run.runId);
+		assertCurrent();
+		if (!current) throw new ReviewSourceUnavailableError("The review run changed during listing.");
+		runs.push(current);
+	}
+	return { ...page, runs };
+}
+
+/** Use the runtime-owned writer for canonical aliases; never open a second unfenced writer. */
+export async function recordReviewFindingOutcome(
+	manager: SessionManager,
+	transition: Omit<ReviewFindingTransitionRecord, "schemaVersion" | "createdAt">,
+	options: {
+		recordCanonicalOutcome?: (
+			transition: Omit<ReviewFindingTransitionRecord, "schemaVersion" | "createdAt">,
+		) => Promise<ReviewFindingTransitionRecord>;
+		assertCurrent?: () => void;
+	} = {},
+): Promise<ReviewFindingTransitionRecord> {
+	const assertCurrent = reviewConversationGuard(manager);
+	if (manager.getReviewDiscussion()) throw new Error("Review discussions are read-only; use the source review.");
+	const run = await getCanonicalReviewRun(manager, transition.runId);
+	if (!run?.result?.findings.some((finding) => finding.id === transition.findingId))
+		throw new Error(`Unknown finding ${transition.findingId} in review run ${transition.runId}`);
+	if (transition.status === "dismissed" && !transition.reason)
+		throw new Error("Dismissed findings require an explicit reason.");
+	assertCurrent();
+	const source = await resolveCanonicalReviewSource(manager, transition.runId);
+	assertCurrent();
+	options.assertCurrent?.();
+	if (source) {
+		if (options.recordCanonicalOutcome) {
+			try {
+				return await options.recordCanonicalOutcome(transition);
+			} catch (cause) {
+				throw new ReviewSourceUnavailableError("The canonical review outcome could not be recorded.", { cause });
+			}
+		}
+		const ref = manager.getSessionRef();
+		if (ref?.sessionId !== source.sessionId || ref.sessionGeneration !== source.sessionGeneration)
+			throw new ReviewSourceUnavailableError("Open the canonical source review to record this outcome.");
+	}
+	const result = appendReviewFindingTransition(manager, transition);
+	await manager.flush();
+	return result;
+}
+
 export function appendReviewRun(sessionManager: SessionManager, record: ReviewRunRecord): void {
 	const persistedRecord = structuredClone(record) as HydratedReviewRunRecord;
 	delete persistedRecord.acknowledgedAt;
@@ -488,6 +612,7 @@ export function appendReviewRun(sessionManager: SessionManager, record: ReviewRu
 export async function appendReviewRunDurably(sessionManager: SessionManager, record: ReviewRunRecord): Promise<void> {
 	appendReviewRun(sessionManager, record);
 	await sessionManager.materialize();
+	await registerDurableReviewAnchor(sessionManager, record.runId);
 }
 
 export function acknowledgeReviewRun(
@@ -702,6 +827,28 @@ export function planIncrementalReview(
 	const previousRun = options.parentRunId
 		? getReviewRun(sessionManager, options.parentRunId)
 		: listReviewRuns(sessionManager, { limit: 1 }).runs[0];
+	return planReviewFromPreviousRun(previousRun, snapshot, controls, options);
+}
+
+export async function planCanonicalIncrementalReview(
+	sessionManager: SessionManager | undefined,
+	snapshot: ReviewSnapshot,
+	controls: ReviewRunControls,
+	options: { parentRunId?: string } = {},
+): Promise<ReviewIncrementalPlan> {
+	if (controls.scopeMode === "full" || !sessionManager) return fullReviewPlan(snapshot);
+	const previousRun = options.parentRunId
+		? await getCanonicalReviewRun(sessionManager, options.parentRunId)
+		: (await listCanonicalReviewRuns(sessionManager, { limit: 1 })).runs[0];
+	return planReviewFromPreviousRun(previousRun, snapshot, controls, options);
+}
+
+function planReviewFromPreviousRun(
+	previousRun: ReviewRunRecord | undefined,
+	snapshot: ReviewSnapshot,
+	controls: ReviewRunControls,
+	options: { parentRunId?: string },
+): ReviewIncrementalPlan {
 	if (!previousRun) {
 		return fullReviewPlan(
 			snapshot,
@@ -812,6 +959,28 @@ export function reconcileFindingIdentities(
 		const previous = previousByFingerprint.get(finding.fingerprint);
 		return [{ ...structuredClone(finding), ...(previous ? { id: previous.id, status: previous.status } : {}) }];
 	});
+}
+
+export async function exportCanonicalReviewFeedback(
+	manager: SessionManager,
+): Promise<ReturnType<typeof exportReviewFeedback>> {
+	const assertCurrent = reviewConversationGuard(manager);
+	const feedback = exportReviewFeedback(manager);
+	const runIds = new Set([
+		...listReviewRuns(manager, { limit: 50 }).runs.map((run) => run.runId),
+		...feedback.outcomes.map((outcome) => outcome.runId),
+	]);
+	let outcomes = feedback.outcomes;
+	for (const runId of runIds) {
+		const canonical = await readCanonicalReviewState(manager, runId, (source) =>
+			source === manager
+				? undefined
+				: exportReviewFeedback(source).outcomes.filter((outcome) => outcome.runId === runId),
+		);
+		assertCurrent();
+		if (canonical) outcomes = [...outcomes.filter((outcome) => outcome.runId !== runId), ...canonical];
+	}
+	return { ...feedback, outcomes };
 }
 
 export function exportReviewFeedback(sessionManager: SessionManager): {

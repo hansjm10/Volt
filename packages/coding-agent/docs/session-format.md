@@ -24,6 +24,24 @@ A directory passed through `--session-dir`, `VOLT_CODING_AGENT_SESSION_DIR`, or 
 
 Listing, exact-ID resolution, continuation candidate selection, and RPC session discovery use materialized SQLite summaries rather than scanning canonical entries or JSONL. Custom-session-directory cwd filters compare canonical filesystem identities after reading summaries so symlink and junction aliases match the same workspace. Tree loading opens and verifies one selected session. Deep search scans extracted searchable chunks one session at a time; those chunks are not a full-text index.
 
+## Session Store Upgrade
+
+The current SQLite schema is v2. Before opening an existing store with this
+version, stop older Volt CLI and daemon processes that own that store. Do not run
+old and new host versions against the same live store.
+
+The first open upgrades only the exact supported v1 schema, in one serialized
+transaction. It preserves the store ID, session IDs and generations, transcripts,
+parent references, input receipts and commit evidence. New stores initialize at
+v2 directly. Concurrent new-version opens converge on the same upgrade; an
+upgrade failure rolls back rather than partially changing the store.
+
+Unknown versions, altered schema objects, invalid metadata and failed integrity
+checks are rejected without repair or deletion. Older binaries cannot reopen a
+v2 store; downgrading the executable does not downgrade storage. The upgrade
+adds host-only review anchors, discussion links and child-session history. These
+records do not grant authority through portable JSONL snapshots.
+
 ## JSONL Snapshots
 
 For explicit interchange:

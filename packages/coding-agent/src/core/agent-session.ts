@@ -132,9 +132,11 @@ import {
 	authorizeToolOperation,
 	getTrustedToolOperationResolver,
 	isToolVisibleUnderGrant,
+	type OperationGrantProfile,
 	type OperationResolution,
 	operationProvidesResearchEvidence,
 	RESEARCH_OPERATION_GRANT_PROFILE,
+	REVIEW_DISCUSSION_OPERATION_GRANT_PROFILE,
 	resolverCanProvideResearchEvidence,
 	type ToolOperationResolver,
 } from "./operation-authorization.ts";
@@ -934,7 +936,7 @@ export class AgentSession {
 
 	/** Enable or disable LSP protocol tracing at runtime. */
 	setLspTraceFile(filePath: string | undefined): Promise<void> {
-		this._assertConversationAuthorityAvailable();
+		this._assertNotReviewDiscussion("setLspTraceFile");
 		return this._trackAdmittedAncillaryWork(this._lspManager?.setTraceFile(filePath) ?? Promise.resolve());
 	}
 
@@ -945,7 +947,7 @@ export class AgentSession {
 
 	/** Stop all running language servers; they respawn lazily on next use. Returns the number stopped. */
 	restartLspServers(): number {
-		this._assertConversationAuthorityAvailable();
+		this._assertNotReviewDiscussion("restartLspServers");
 		return this._lspManager?.restart() ?? 0;
 	}
 
@@ -1029,6 +1031,7 @@ export class AgentSession {
 		};
 		const queueEntries = deliverySnapshot.queueEntries.map(({ kind, entry }) => ({ kind, entry: { ...entry } }));
 		const canOwnReadyPlanTransition =
+			!this.isReviewDiscussion &&
 			deliverySnapshot.messages.some((message) => message.role === "user") &&
 			(context.kind !== "prompt" || this._sessionPromptOwnsInitialDelivery) &&
 			this._deliveryOwnsReadyPlanTransition(context.kind, queueEntries) &&
@@ -1138,10 +1141,9 @@ export class AgentSession {
 		if (!this.getActiveToolNames().includes(event.toolName)) {
 			return {
 				block: true,
-				reason:
-					this._planningState.mode === "plan"
-						? `The active research capability profile does not expose ${event.toolName}.`
-						: `Tool ${event.toolName} is no longer active for this session.`,
+				reason: this._getOperationGrantProfile()
+					? `The active read-only capability profile does not expose ${event.toolName}.`
+					: `Tool ${event.toolName} is no longer active for this session.`,
 			};
 		}
 		let extensionDecision: { block?: boolean; reason?: string } | undefined;
@@ -1149,16 +1151,17 @@ export class AgentSession {
 			extensionDecision = await this._extensionRunner.emitToolCall({ type: "tool_call", ...event });
 			if (extensionDecision?.block) return extensionDecision;
 		}
-		if (this._planningState.mode === "plan") {
+		const profile = this._getOperationGrantProfile();
+		if (profile) {
 			const decision = authorizeToolOperation(
 				this._getTrustedOperationResolver(event.toolName),
 				event.input,
-				RESEARCH_OPERATION_GRANT_PROFILE,
+				profile,
 			);
 			if (!decision.allowed) {
 				return {
 					block: true,
-					reason: `The research capability profile blocked ${event.toolName}: ${decision.reason ?? "operation denied"}.`,
+					reason: `The ${profile.id} capability profile blocked ${event.toolName}: ${decision.reason ?? "operation denied"}.`,
 				};
 			}
 			if (
@@ -2575,6 +2578,43 @@ export class AgentSession {
 		return this._fastModeEnabled;
 	}
 
+	/** Host-owned persisted policy, independent of branch-local Plan/Build mode. */
+	get isReviewDiscussion(): boolean {
+		return this.sessionManager.getReviewDiscussion() !== null;
+	}
+
+	private _getOperationGrantProfile(): OperationGrantProfile | undefined {
+		return this.isReviewDiscussion
+			? REVIEW_DISCUSSION_OPERATION_GRANT_PROFILE
+			: this._planningState.mode === "plan"
+				? RESEARCH_OPERATION_GRANT_PROFILE
+				: undefined;
+	}
+
+	private _assertNotReviewDiscussion(action: string): void {
+		this._assertConversationAuthorityAvailable();
+		if (this.isReviewDiscussion) {
+			throw new Error(`Review discussions are read-only; ${action} is unavailable`);
+		}
+	}
+
+	/** Final execution gate also covers direct SDK calls and later argument-rewriting hooks. */
+	private _assertReviewDiscussionToolOperation(name: string, args: unknown): void {
+		if (!this.isReviewDiscussion) return;
+		this._assertConversationAuthorityAvailable();
+		if (!this.getActiveToolNames().includes(name)) {
+			throw new Error(`Review discussions are read-only; tool ${name} is not active`);
+		}
+		const decision = authorizeToolOperation(
+			this._getTrustedOperationResolver(name),
+			args,
+			REVIEW_DISCUSSION_OPERATION_GRANT_PROFILE,
+		);
+		if (!decision.allowed) {
+			throw new Error(`Review discussions are read-only; blocked ${name}: ${decision.reason ?? "operation denied"}`);
+		}
+	}
+
 	get agentMode(): AgentMode {
 		this._assertConversationAuthorityAvailable();
 		return this._planningState.mode;
@@ -2728,7 +2768,18 @@ export class AgentSession {
 		if (!this._isToolVisibleToCurrentMode(name)) {
 			return undefined;
 		}
-		return this._toolDefinitions.get(name)?.definition;
+		const definition = this._toolDefinitions.get(name)?.definition;
+		if (!definition) return undefined;
+		return {
+			...definition,
+			execute: async (...args) => {
+				if (this.isReviewDiscussion && this._toolDefinitions.get(name)?.definition !== definition) {
+					throw new Error("Review discussion tool definition is stale after a registry change");
+				}
+				this._assertReviewDiscussionToolOperation(name, args[1]);
+				return definition.execute(...args);
+			},
+		};
 	}
 
 	private _getTrustedOperationResolver(name: string): ToolOperationResolver | undefined {
@@ -2749,7 +2800,7 @@ export class AgentSession {
 		if (!this._isToolAvailableToCurrentModel(name)) {
 			return false;
 		}
-		if (this._planningState.mode === "plan" || NATIVE_PLAN_TOOL_NAMES.has(name)) {
+		if (this._getOperationGrantProfile() || NATIVE_PLAN_TOOL_NAMES.has(name)) {
 			return this.getActiveToolNames().includes(name);
 		}
 		return true;
@@ -2776,7 +2827,15 @@ export class AgentSession {
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
 			const tool = this._toolRegistry.get(name);
-			if (tool && this._isToolAvailableToCurrentModel(name)) {
+			if (
+				tool &&
+				this._isToolAvailableToCurrentModel(name) &&
+				(!this.isReviewDiscussion ||
+					isToolVisibleUnderGrant(
+						this._getTrustedOperationResolver(name),
+						REVIEW_DISCUSSION_OPERATION_GRANT_PROFILE,
+					))
+			) {
 				tools.push(tool);
 				validToolNames.push(name);
 			}
@@ -2795,13 +2854,23 @@ export class AgentSession {
 		}
 		const effective = [
 			...new Set(
-				this._planningState.mode === "plan"
-					? Array.from(this._toolRegistry.keys()).filter((name) =>
-							isToolVisibleUnderGrant(this._getTrustedOperationResolver(name), RESEARCH_OPERATION_GRANT_PROFILE),
+				this.isReviewDiscussion
+					? this._requestedBuildToolNames.filter((name) =>
+							isToolVisibleUnderGrant(
+								this._getTrustedOperationResolver(name),
+								REVIEW_DISCUSSION_OPERATION_GRANT_PROFILE,
+							),
 						)
-					: this._planningState.plan?.phase === "active"
-						? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
-						: [...this._requestedBuildToolNames],
+					: this._planningState.mode === "plan"
+						? Array.from(this._toolRegistry.keys()).filter((name) =>
+								isToolVisibleUnderGrant(
+									this._getTrustedOperationResolver(name),
+									RESEARCH_OPERATION_GRANT_PROFILE,
+								),
+							)
+						: this._planningState.plan?.phase === "active"
+							? [...this._requestedBuildToolNames, "update_plan_progress", "request_replan"]
+							: [...this._requestedBuildToolNames],
 			),
 		];
 		const availableEffective = effective.filter(
@@ -2819,7 +2888,7 @@ export class AgentSession {
 
 	private async _prepareUnrestrictedMcpForBuild(): Promise<void> {
 		this._assertConversationAuthorityAvailable();
-		if (!this._mcpManager) {
+		if (!this._mcpManager || this.isReviewDiscussion) {
 			return;
 		}
 		await this._mcpManager.startEagerServers();
@@ -2855,7 +2924,9 @@ export class AgentSession {
 	}
 
 	private _applyTrustedPlanningInstructionsToSystemPrompt(systemPrompt = this._baseSystemPrompt): void {
-		const policy = formatPlanPolicy(this._planningState.mode, this._planningState.plan?.phase);
+		const policy = this.isReviewDiscussion
+			? "[VOLT REVIEW DISCUSSION — TRUSTED HOST POLICY]\nThis persisted finding discussion is read-only in every mode. Research and discuss the finding; do not modify files, execute shell commands, mutate integrations, delegate, or author/execute plans. Request implementation in the source session instead."
+			: formatPlanPolicy(this._planningState.mode, this._planningState.plan?.phase);
 		const next = policy ? [systemPrompt, policy].filter(Boolean).join("\n\n") : systemPrompt;
 		this._effectiveSystemPrompt = next;
 	}
@@ -2960,6 +3031,9 @@ export class AgentSession {
 		if (mode === this._planningState.mode) {
 			return this.planningState;
 		}
+		if (this.isReviewDiscussion) {
+			return this._commitPlanningState({ ...clonePlanningState(this._planningState), mode });
+		}
 		const plan = this._planningState.plan;
 		if (mode === "plan") {
 			this._planResearchGeneration = undefined;
@@ -2990,6 +3064,7 @@ export class AgentSession {
 		summary?: string;
 		steps: PlanStepInput[];
 	}): PlanState {
+		this._assertNotReviewDiscussion("update_plan");
 		this._assertNoPlanningTransitionInFlight("update_plan");
 		if (this._planningState.mode !== "plan") {
 			throw new Error("update_plan is available only in Plan mode");
@@ -3036,6 +3111,7 @@ export class AgentSession {
 		expectedRevision: number;
 		updates: Array<{ id: string; status: PlanStepStatus; note?: string }>;
 	}): PlanState {
+		this._assertNotReviewDiscussion("update_plan_progress");
 		this._assertNoPlanningTransitionInFlight("update_plan_progress");
 		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
 			throw new Error("update_plan_progress is available only during approved plan execution");
@@ -3095,6 +3171,7 @@ export class AgentSession {
 	}
 
 	requestReplan(input: { planId: string; expectedRevision: number; reason: string }): PlanningState {
+		this._assertNotReviewDiscussion("request_replan");
 		this._assertNoPlanningTransitionInFlight("request_replan");
 		if (this._planningState.mode !== "build" || this._planningState.plan?.phase !== "active") {
 			throw new Error("request_replan is available only during approved plan execution");
@@ -3111,6 +3188,7 @@ export class AgentSession {
 	}
 
 	submitPlan(input: { planId: string; expectedRevision: number; title: string; summary: string }): PlanState {
+		this._assertNotReviewDiscussion("submit_plan");
 		this._assertNoPlanningTransitionInFlight("submit_plan");
 		if (this._planningState.mode !== "plan") {
 			throw new Error("submit_plan is available only in Plan mode");
@@ -3145,6 +3223,7 @@ export class AgentSession {
 		expectedRevision: number,
 		deliverCheckpoint: boolean,
 	): PlanningState {
+		this._assertNotReviewDiscussion("changePlan");
 		this._assertNoPlanningTransitionInFlight("changePlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
 		if (this._planningState.plan.phase !== "ready") {
@@ -3173,6 +3252,7 @@ export class AgentSession {
 	}
 
 	discardPlan(planId: string, expectedRevision: number): PlanningState {
+		this._assertNotReviewDiscussion("discardPlan");
 		this._assertNoPlanningTransitionInFlight("discardPlan");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
 		this._planResearchGeneration = undefined;
@@ -3192,6 +3272,7 @@ export class AgentSession {
 		expectedRevision: number,
 		execution: PlanExecution,
 	): Promise<{ planning: PlanningState; activated: boolean }> {
+		this._assertNotReviewDiscussion("activatePlan");
 		let currentPlan = this._planningState.plan;
 		if (
 			currentPlan?.id === planId &&
@@ -3242,6 +3323,7 @@ export class AgentSession {
 		expectedRevision: number,
 		execution: PlanExecution,
 	): Promise<PlanningState> {
+		this._assertNotReviewDiscussion("markPlanHandedOff");
 		assertPlanRevision(this._planningState, planId, expectedRevision);
 		if (this._planningState.plan.phase !== "ready") {
 			throw new Error("Only a ready plan can be handed off");
@@ -3613,9 +3695,27 @@ export class AgentSession {
 			return Promise.reject(new Error("Cannot resume recovered client input while the agent runtime is busy"));
 		}
 		const abortGeneration = this._abortGeneration;
+		if (this.isReviewDiscussion) this._recoveredClientInputReplayPending = true;
 		const resume = (async () => {
 			if (this._disposed || abortGeneration !== this._abortGeneration) {
 				throw new Error("Recovered client input resume was aborted before it started");
+			}
+			if (this.isReviewDiscussion) {
+				const interrupted = await this.sessionManager.terminalizeInterruptedReviewInputs();
+				this._assertConversationAuthorityAvailable();
+				if (this._disposed || abortGeneration !== this._abortGeneration)
+					throw new Error("Review recovery was aborted");
+				await this._clearAgentQueues();
+				this._steeringMessages = [];
+				this._followUpMessages = [];
+				this._queueDeliveryIds.clear();
+				for (const id of interrupted) {
+					this._liveClientInputs.delete(id);
+					this._emitClientInputOutcome(id, "failed", "dispatch_failed");
+				}
+				this._recoveredClientInputReplayPending = false;
+				this._emitQueueUpdate();
+				return;
 			}
 			const recovery = this.sessionManager.getClientInputRecoveryPlan();
 			if (recovery.kind === "blocked") {
@@ -3709,6 +3809,9 @@ export class AgentSession {
 
 	private _assertRecoveredClientInputOrdering(clientMessageId: string | undefined): void {
 		if (!this._recoveredClientInputReplayPending) return;
+		if (this.isReviewDiscussion && this._resumeRecoveredClientInputsPromise) {
+			throw new Error("Review discussion input recovery must settle before another prompt is admitted");
+		}
 		const recovery = this.sessionManager.getClientInputRecoveryPlan();
 		if (recovery.kind === "idle") {
 			// Queue cancellation/terminalization is authoritative and releases the
@@ -4405,6 +4508,7 @@ export class AgentSession {
 
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
+		this._assertNotReviewDiscussion(`extension command /${commandName}`);
 		// A command handler is an arbitrary side-effect boundary with no canonical
 		// user append. Persist `started` first so a crash can only replay an
 		// explicit ambiguous outcome, never execute the handler twice.
@@ -6252,9 +6356,19 @@ export class AgentSession {
 			runner,
 		);
 
-		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
-		for (const tool of wrappedExtensionTools as AgentTool<any, any>[]) {
-			toolRegistry.set(tool.name, tool);
+		const toolRegistry = new Map<string, AgentTool>();
+		for (const tool of [...wrappedBuiltInTools, ...wrappedExtensionTools]) {
+			const guardedTool: AgentTool = {
+				...tool,
+				execute: async (...args) => {
+					if (this.isReviewDiscussion && this._toolRegistry.get(tool.name) !== guardedTool) {
+						throw new Error("Review discussion tool is stale after a registry change");
+					}
+					this._assertReviewDiscussionToolOperation(tool.name, args[1]);
+					return tool.execute(...args);
+				},
+			};
+			toolRegistry.set(tool.name, guardedTool);
 		}
 		this._toolRegistry = toolRegistry;
 
@@ -6358,7 +6472,8 @@ export class AgentSession {
 				cwd: this._cwd,
 				projectCwd: this._lexicalProjectCwd,
 				config: lspConfig,
-				hostInteraction: this._hostInteraction,
+				// Missing-server installation is a write even when triggered by a read request.
+				hostInteraction: this.isReviewDiscussion ? undefined : this._hostInteraction,
 			});
 		}
 
@@ -6480,7 +6595,7 @@ export class AgentSession {
 						? {
 								mcp: {
 									manager: this._mcpManager,
-									isRestrictedTrustedRead: () => this._planningState.mode === "plan",
+									isRestrictedTrustedRead: () => this._getOperationGrantProfile() !== undefined,
 								},
 							}
 						: {}),
@@ -6774,7 +6889,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; operations?: BashOperations },
 	): Promise<BashResult> {
-		this._assertConversationAuthorityAvailable();
+		this._assertNotReviewDiscussion("executeBash");
 		if (this._disposed) {
 			throw new Error("Cannot execute bash on a disposed session");
 		}
@@ -6811,7 +6926,7 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
-		this._assertConversationAuthorityAvailable();
+		this._assertNotReviewDiscussion("recordBashResult");
 		if (this._disposed) return;
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
@@ -7367,6 +7482,7 @@ export class AgentSession {
 	 * @returns Path to exported file
 	 */
 	async exportToHtml(outputPath?: string): Promise<string> {
+		this._assertNotReviewDiscussion("exportToHtml");
 		await this.sessionManager.flush();
 		const configuredThemeName = this.settingsManager.getTheme();
 		const themeName = configuredThemeName && getThemeByName(configuredThemeName) ? configuredThemeName : undefined;
@@ -7392,6 +7508,7 @@ export class AgentSession {
 	 * @returns The resolved output file path.
 	 */
 	exportToJsonl(outputPath?: string): string {
+		this._assertNotReviewDiscussion("exportToJsonl");
 		const filePath = resolvePath(
 			outputPath ?? `session-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
 			process.cwd(),

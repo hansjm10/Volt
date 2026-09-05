@@ -32,6 +32,7 @@ import {
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
+import { seedReviewDiscussionSession } from "./review-discussions.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "./subagents/tool-names.ts";
@@ -345,6 +346,7 @@ async function createAgentSessionWithTrackedResources(
 		sessionManager = await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 		onDefaultSessionManagerCreated(sessionManager);
 	}
+	seedReviewDiscussionSession(sessionManager);
 	await sessionManager.flush();
 
 	if (!resourceLoader) {
@@ -469,13 +471,18 @@ async function createAgentSessionWithTrackedResources(
 		});
 		await manager
 			.startEagerServers(undefined, {
-				trustedReadsOnly: sessionManager.buildSessionContext().planning.mode === "plan",
+				trustedReadsOnly:
+					sessionManager.getReviewDiscussion() !== null ||
+					sessionManager.buildSessionContext().planning.mode === "plan",
 			})
 			.catch(() => undefined);
 		return manager;
 	};
-	const mcpManager = options.disableMcp ? undefined : (options.mcpManager ?? (await createDefaultMcpManager()));
-	if (!options.disableMcp && options.mcpManager === undefined && mcpManager !== undefined) {
+	// A persisted discussion must not borrow another session's mutable MCP trust/startup state.
+	// Leave the supplied manager untouched and create a session-owned restricted manager instead.
+	const suppliedMcpManager = sessionManager.getReviewDiscussion() ? undefined : options.mcpManager;
+	const mcpManager = options.disableMcp ? undefined : (suppliedMcpManager ?? (await createDefaultMcpManager()));
+	if (!options.disableMcp && suppliedMcpManager === undefined && mcpManager !== undefined) {
 		untransferredFinalizers.push(() => mcpManager.dispose());
 	}
 
@@ -494,12 +501,33 @@ async function createAgentSessionWithTrackedResources(
 	if (resolveLspConfig(settingsManager.getLspSettings()).enabled) {
 		defaultActiveToolNames.push("lsp");
 	}
-	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
+	const discussionContext = sessionManager.getReviewDiscussion()?.discussion.contextSnapshot;
+	const savedTools =
+		discussionContext &&
+		typeof discussionContext === "object" &&
+		!Array.isArray(discussionContext) &&
+		"tools" in discussionContext
+			? discussionContext.tools
+			: undefined;
+	if (
+		savedTools !== undefined &&
+		(!Array.isArray(savedTools) || !savedTools.every((name) => typeof name === "string"))
+	)
+		throw new Error("Invalid persisted review discussion tool ceiling");
+	const requestedTools = options.tools ?? (options.noTools === "all" ? [] : undefined);
+	const allowedToolNames = Array.isArray(savedTools)
+		? savedTools.filter(
+				(name): name is string =>
+					typeof name === "string" && (requestedTools === undefined || requestedTools.includes(name)),
+			)
+		: requestedTools;
 	const excludedToolNames = options.excludeTools;
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
 	const initialActiveToolNames: string[] = (
 		options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames
-	).filter((name) => !excludedToolNameSet?.has(name));
+	).filter(
+		(name) => !excludedToolNameSet?.has(name) && (allowedToolNames === undefined || allowedToolNames.includes(name)),
+	);
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -613,14 +641,14 @@ async function createAgentSessionWithTrackedResources(
 		modelRegistry,
 		initialActiveToolNames,
 		allowedToolNames,
-		allowUnlistedExtensionTools: options.allowUnlistedExtensionTools,
+		allowUnlistedExtensionTools: sessionManager.getReviewDiscussion() ? false : options.allowUnlistedExtensionTools,
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 		hostInteraction: options.hostInteraction,
 		subagentToolManager: options.subagentToolManager,
 		mcpManager,
-		mcpManagerFactory: options.disableMcp || options.mcpManager ? undefined : createDefaultMcpManager,
+		mcpManagerFactory: options.disableMcp || suppliedMcpManager ? undefined : createDefaultMcpManager,
 	});
 	untransferredFinalizers.length = 0;
 	return {

@@ -218,6 +218,13 @@ import {
 	RpcTranscriptEntryTextResponseSchema,
 } from "./responses.ts";
 import {
+	RpcListReviewDiscussionsSchema,
+	RpcResetReviewDiscussionSchema,
+	RpcReviewDiscussionLinkSchema,
+	RpcReviewDiscussionSchema,
+	RpcStartReviewDiscussionsSchema,
+} from "./review-discussions.ts";
+import {
 	RpcActiveAgentRunSchema,
 	RpcActiveCompactionSchema,
 	RpcActiveRetrySchema,
@@ -408,6 +415,11 @@ const SHARED_SCHEMAS: Record<string, TSchema> = {
 	RpcUiActionStateChangedEvent: RpcUiActionStateChangedEventSchema,
 
 	// Projection metadata + workflows + review
+	RpcReviewDiscussionLink: RpcReviewDiscussionLinkSchema,
+	RpcReviewDiscussion: RpcReviewDiscussionSchema,
+	RpcStartReviewDiscussions: RpcStartReviewDiscussionsSchema,
+	RpcListReviewDiscussions: RpcListReviewDiscussionsSchema,
+	RpcResetReviewDiscussion: RpcResetReviewDiscussionSchema,
 	RpcWorkflowKind: RpcWorkflowKindSchema,
 	RpcWorkflowStatus: RpcWorkflowStatusSchema,
 	RpcProjectionTruncation: RpcProjectionTruncationSchema,
