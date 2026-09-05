@@ -278,6 +278,9 @@ describe("Regression #341 real daemon sibling broker admission", () => {
 		for (const row of result.results) {
 			const entry = f.registry.findOwner("ws", row.discussion!.sessionId)!;
 			expect(entry.lifecycle).toBe("active");
+			expect(entry.runtime.session.sessionManager.getSessionName()).toBe(
+				`Review: Finding ${row.findingId.slice(1)}`,
+			);
 			expect(entry.leaseOwner).toBeDefined();
 			expect(f.broker.isDaemonRuntimeOwnerCurrent(entry.leaseOwner!, "ws", entry.sessionId)).toBe(true);
 			await entry.runtime.session.waitForIdle();
