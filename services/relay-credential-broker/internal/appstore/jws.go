@@ -117,7 +117,7 @@ type transactionPayload struct {
 
 type renewalPayload struct {
 	AppTransactionID       string `json:"appTransactionId"`
-	AutoRenewProductID     string `json:"autoRenewProductId"`
+	OriginalTransactionID  string `json:"originalTransactionId"`
 	Environment            string `json:"environment"`
 	GracePeriodExpiresDate int64  `json:"gracePeriodExpiresDate"`
 	SignedDate             int64  `json:"signedDate"`
@@ -263,7 +263,8 @@ func (v *signedDataVerifier) verifyRenewal(
 	if payload.Environment != environment || !v.allowedEnvironments[payload.Environment] {
 		return renewalPayload{}, ErrEnvironmentInvalid
 	}
-	if !identifierPattern.MatchString(payload.AppTransactionID) {
+	if !identifierPattern.MatchString(payload.AppTransactionID) ||
+		!identifierPattern.MatchString(payload.OriginalTransactionID) {
 		return renewalPayload{}, ErrProofInvalid
 	}
 	return payload, nil

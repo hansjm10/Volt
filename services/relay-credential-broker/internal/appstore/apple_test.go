@@ -104,6 +104,120 @@ func TestAppleVerifierAcceptsDeviceBoundActiveSubscription(t *testing.T) {
 	}
 }
 
+func TestAppleVerifierGracePeriodRenewal(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	authority := newAppleTestAuthority(t, now)
+	appTransactionID := "app-transaction-grace"
+	deviceID := "11111111-1111-4111-8111-111111111111"
+	nonce := "22222222-2222-4222-8222-222222222222"
+	deviceDigest := sha512.Sum384([]byte(nonce + deviceID))
+	proof := Proof{
+		SignedAppTransaction: authority.sign(t, map[string]any{
+			"receiptType":             "Sandbox",
+			"appAppleId":              testAppAppleID,
+			"bundleId":                testBundleID,
+			"appTransactionId":        appTransactionID,
+			"deviceVerification":      base64.StdEncoding.EncodeToString(deviceDigest[:]),
+			"deviceVerificationNonce": nonce,
+			"receiptCreationDate":     now.UnixMilli(),
+		}),
+		DeviceVerificationID: deviceID,
+	}
+	graceExpiry := now.Add(24 * time.Hour)
+	for _, test := range []struct {
+		name    string
+		field   string
+		value   any
+		wantErr error
+	}{
+		{name: "same renewal product"},
+		{name: "different renewal product", field: "autoRenewProductId", value: "com.hansjm10.volt.pro.monthly"},
+		{name: "missing subscription identity", field: "originalTransactionId", wantErr: ErrProofInvalid},
+		{name: "mismatched subscription identity", field: "originalTransactionId", value: "original-other", wantErr: ErrProofInvalid},
+		{name: "missing app identity", field: "appTransactionId", wantErr: ErrProofInvalid},
+		{name: "mismatched app identity", field: "appTransactionId", value: "app-transaction-other", wantErr: ErrProofInvalid},
+		{name: "mismatched environment", field: "environment", value: "Production", wantErr: ErrEnvironmentInvalid},
+		{name: "missing grace expiry", field: "gracePeriodExpiresDate", wantErr: ErrProofInvalid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transaction := authority.sign(t, map[string]any{
+				"appTransactionId":            appTransactionID,
+				"originalTransactionId":       "original-grace",
+				"transactionId":               "transaction-grace",
+				"bundleId":                    testBundleID,
+				"productId":                   testAnnualProductID,
+				"subscriptionGroupIdentifier": testSubscriptionGroupID,
+				"environment":                 "Sandbox",
+				"inAppOwnershipType":          "PURCHASED",
+				"expiresDate":                 now.Add(-time.Hour).UnixMilli(),
+				"signedDate":                  now.Add(-time.Minute).UnixMilli(),
+			})
+			renewalPayload := map[string]any{
+				"appTransactionId":       appTransactionID,
+				"originalTransactionId":  "original-grace",
+				"productId":              testAnnualProductID,
+				"autoRenewProductId":     testAnnualProductID,
+				"environment":            "Sandbox",
+				"gracePeriodExpiresDate": graceExpiry.UnixMilli(),
+				"signedDate":             now.UnixMilli(),
+			}
+			if test.field != "" {
+				if test.value == nil {
+					delete(renewalPayload, test.field)
+				} else {
+					renewalPayload[test.field] = test.value
+				}
+			}
+			renewal := authority.sign(t, renewalPayload)
+			statusServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(writer).Encode(map[string]any{
+					"environment": "Sandbox",
+					"bundleId":    testBundleID,
+					"appAppleId":  testAppAppleID,
+					"data": []any{map[string]any{
+						"subscriptionGroupIdentifier": testSubscriptionGroupID,
+						"lastTransactions": []any{map[string]any{
+							"status":                4,
+							"originalTransactionId": "original-grace",
+							"signedTransactionInfo": transaction,
+							"signedRenewalInfo":     renewal,
+						}},
+					}},
+				})
+			}))
+			defer statusServer.Close()
+			verifier := authority.verifier(t, now, statusServer.URL)
+			for _, reconcile := range []bool{false, true} {
+				var entitlement Entitlement
+				var err error
+				if reconcile {
+					entitlement, err = verifier.ReconcileEntitlement(context.Background(), appTransactionID, "Sandbox")
+				} else {
+					entitlement, err = verifier.VerifyEntitlement(context.Background(), proof)
+				}
+				if err != test.wantErr {
+					t.Fatalf("reconcile=%t: error = %v, want %v", reconcile, err, test.wantErr)
+				}
+				if test.wantErr != nil {
+					if entitlement != (Entitlement{}) {
+						t.Fatalf("reconcile=%t: rejected renewal returned entitlement: %+v", reconcile, entitlement)
+					}
+					continue
+				}
+				if entitlement.AppTransactionID != appTransactionID ||
+					entitlement.ProductID != testAnnualProductID ||
+					entitlement.Status != StatusGrace ||
+					!entitlement.EntitledUntil.Equal(graceExpiry) ||
+					!entitlement.SourceSignedAt.Equal(now) ||
+					!entitlement.Active(now) || entitlement.Active(graceExpiry) {
+					t.Fatalf("reconcile=%t: unexpected grace entitlement: %+v", reconcile, entitlement)
+				}
+			}
+		})
+	}
+}
+
 func TestAppleVerifierRejectsProofFromAnotherDevice(t *testing.T) {
 	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
 	authority := newAppleTestAuthority(t, now)

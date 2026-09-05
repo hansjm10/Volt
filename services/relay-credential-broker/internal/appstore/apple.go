@@ -304,8 +304,10 @@ func (v *AppleVerifier) entitlementFromStatus(
 		if err != nil {
 			return Entitlement{}, err
 		}
+		// The next renewal product may differ after a scheduled product change.
+		// Bind the grace period to the subscription, not its future product.
 		if renewal.AppTransactionID != transaction.AppTransactionID ||
-			renewal.AutoRenewProductID != transaction.ProductID {
+			renewal.OriginalTransactionID != transaction.OriginalTransactionID {
 			return Entitlement{}, ErrProofInvalid
 		}
 		graceExpiry, valid := millisecondsDate(renewal.GracePeriodExpiresDate)
