@@ -67,6 +67,8 @@ const (
 	endpointCapacityLockID        int64 = 8_606_146_524_991_413_123
 )
 
+const entitlementReconcileAttemptMinInterval = time.Hour
+
 type SecretHash [sha256.Size]byte
 
 type Config struct {
@@ -697,6 +699,36 @@ func (b *Broker) EntitlementForRefresh(
 		return EntitlementRefreshState{}, fmt.Errorf("read refresh entitlement: %w", err)
 	}
 	return state, nil
+}
+
+// TryReserveEntitlementReconciliation admits one refresh-triggered Apple attempt.
+// The identity must come from EntitlementForRefresh, after its transaction ends:
+// approval locks entitlement before grant, so do not retain refresh lookup locks.
+func (b *Broker) TryReserveEntitlementReconciliation(
+	ctx context.Context,
+	appTransactionID string,
+	environment string,
+	reconcileInterval time.Duration,
+) (bool, error) {
+	if reconcileInterval <= 0 {
+		return false, errors.New("entitlement reconciliation interval must be positive")
+	}
+	now := b.now().UTC()
+	// This standalone UPDATE commits before Apple I/O. Never refund an attempt,
+	// including on cancellation or failure, or change successful verification time.
+	result, err := b.pool.Exec(ctx, `
+		UPDATE app_store_entitlements
+		SET last_reconcile_attempt_at = $3
+		WHERE app_transaction_id = $1 AND environment = $2
+		  AND (status NOT IN ('active', 'grace') OR entitled_until <= $3
+		       OR last_verified_at <= $4)
+		  AND (last_reconcile_attempt_at IS NULL OR last_reconcile_attempt_at <= $5)
+	`, appTransactionID, environment, now, now.Add(-reconcileInterval),
+		now.Add(-entitlementReconcileAttemptMinInterval))
+	if err != nil {
+		return false, fmt.Errorf("reserve App Store reconciliation: %w", err)
+	}
+	return result.RowsAffected() == 1, nil
 }
 
 func (b *Broker) ApplyEntitlementReconciliation(

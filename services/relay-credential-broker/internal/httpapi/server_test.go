@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/appstore"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
@@ -91,10 +92,16 @@ func (testAppStoreVerifier) VerifyNotification(
 type testService struct {
 	handler *Server
 	signer  *credential.Signer
+	pool    *pgxpool.Pool
 	now     time.Time
 }
 
 func newTestService(t *testing.T) *testService {
+	t.Helper()
+	return newTestServiceWithPool(t, testdatabase.Open(t))
+}
+
+func newTestServiceWithPool(t *testing.T, pool *pgxpool.Pool) *testService {
 	t.Helper()
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -106,9 +113,9 @@ func newTestService(t *testing.T) *testService {
 	}
 	service := &testService{
 		signer: signer,
+		pool:   pool,
 		now:    time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC),
 	}
-	pool := testdatabase.Open(t)
 	brokerService, err := broker.New(pool, signer, broker.Config{
 		ClaimTTL:                10 * time.Minute,
 		AccessTokenTTL:          15 * time.Minute,

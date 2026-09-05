@@ -417,8 +417,21 @@ func (s *Server) handleRefresh(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	now := s.now().UTC()
-	if !refreshEntitlement.Active(now) ||
-		now.Sub(refreshEntitlement.LastVerifiedAt) >= s.entitlementReconcileInterval {
+	shouldReconcile := !refreshEntitlement.Active(now) ||
+		now.Sub(refreshEntitlement.LastVerifiedAt) >= s.entitlementReconcileInterval
+	if shouldReconcile {
+		shouldReconcile, err = s.broker.TryReserveEntitlementReconciliation(
+			request.Context(),
+			refreshEntitlement.AppTransactionID,
+			refreshEntitlement.Environment,
+			s.entitlementReconcileInterval,
+		)
+		if err != nil {
+			s.internalError(writer, "reserve App Store reconciliation", err)
+			return
+		}
+	}
+	if shouldReconcile {
 		entitlement, reconcileErr := s.appStore.ReconcileEntitlement(
 			request.Context(),
 			refreshEntitlement.AppTransactionID,
