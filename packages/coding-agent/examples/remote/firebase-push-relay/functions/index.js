@@ -6,6 +6,8 @@ const { getMessaging } = require("firebase-admin/messaging");
 const { onRequest } = require("firebase-functions/v2/https");
 const { createPushTargetRegistrationHandler } = require("./registration.js");
 const {
+	RelayAccessVerificationError,
+	RelayKeyServiceUnavailableError,
 	createRelayAccessVerifier,
 	requireMatchingRelayGrant,
 } = require("./relay-auth.js");
@@ -195,8 +197,14 @@ async function sendNotification(request, response) {
 			getHeader(request, "authorization"),
 			notification.hostNodeId,
 		);
-	} catch {
-		throw new RequestError(401, "managed_relay_authorization_invalid");
+	} catch (error) {
+		if (error instanceof RelayKeyServiceUnavailableError) {
+			throw new RequestError(503, "managed_relay_keys_unavailable");
+		}
+		if (error instanceof RelayAccessVerificationError) {
+			throw new RequestError(401, "managed_relay_authorization_invalid");
+		}
+		throw error;
 	}
 	const authorizedTarget = await reserveAuthorizedPushTarget(
 		notification,

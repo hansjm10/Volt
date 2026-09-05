@@ -85,4 +85,6 @@ volt remote host --mobile --workspace volt=/path/to/Volt
 
 ## Error behavior
 
+Notification authorization returns `401` for invalid credentials. JWKS retrieval failures or invalid key-service responses return `503 { error: "managed_relay_keys_unavailable" }`, allowing the host's bounded retry loop to retry without reserving a target or sending an unverified notification. Fresh cached keys remain usable; expired keys are never used after a failed refresh.
+
 Invalid or expired targets return `410`, prompting host-side target disabling. Other FCM send failures return `502 { error: "fcm_send_failed", code }`. Cloud Logging receives the server error plus event id and kind, never the FCM token or target credential.

@@ -27,6 +27,7 @@ const knownDeployments = new Map([
 const deployments = configuredDeployments(process.env.ALLOWED_RELAY_CREDENTIAL_ISSUERS);
 
 class RelayAccessVerificationError extends Error {}
+class RelayKeyServiceUnavailableError extends Error {}
 
 function configuredDeployments(value) {
 	const issuers = value === undefined || value.trim() === ""
@@ -125,48 +126,48 @@ function createRelayAccessVerifier(options = {}) {
 async function resolveKey(cache, fetcher, now, deployment, keyId) {
 	let cached = cache.get(deployment.jwksUrl);
 	if (cached === undefined || cached.expiresAtMs <= now()) {
-		const response = await fetcher(deployment.jwksUrl, {
-			headers: { accept: "application/json" },
-			method: "GET",
-			redirect: "error",
-			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-		});
-		if (!response.ok || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
-			throw new RelayAccessVerificationError("managed relay keys unavailable");
-		}
-		const bytes = Buffer.from(await response.arrayBuffer());
-		if (bytes.length > MAX_JWKS_BYTES) {
-			throw new RelayAccessVerificationError("managed relay keys invalid");
-		}
-		let decoded;
 		try {
-			decoded = JSON.parse(bytes.toString("utf8"));
-		} catch {
-			throw new RelayAccessVerificationError("managed relay keys invalid");
-		}
-		if (!isRecord(decoded) || !Array.isArray(decoded.keys) || decoded.keys.length < 1 || decoded.keys.length > 8) {
-			throw new RelayAccessVerificationError("managed relay keys invalid");
-		}
-		const keys = new Map();
-		for (const key of decoded.keys) {
-			if (
-				!isRecord(key) ||
-				key.kty !== "OKP" ||
-				key.crv !== "Ed25519" ||
-				key.alg !== "EdDSA" ||
-				key.use !== "sig" ||
-				typeof key.kid !== "string" ||
-				!identifierPattern.test(key.kid) ||
-				typeof key.x !== "string" ||
-				decodeBase64Url(key.x, 64).length !== 32 ||
-				keys.has(key.kid)
-			) {
-				throw new RelayAccessVerificationError("managed relay keys invalid");
+			const response = await fetcher(deployment.jwksUrl, {
+				headers: { accept: "application/json" },
+				method: "GET",
+				redirect: "error",
+				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			});
+			if (!response.ok || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+				throw new Error("managed relay keys unavailable");
 			}
-			keys.set(key.kid, createPublicKey({ format: "jwk", key }));
+			const bytes = Buffer.from(await response.arrayBuffer());
+			if (bytes.length > MAX_JWKS_BYTES) {
+				throw new Error("managed relay keys invalid");
+			}
+			const decoded = JSON.parse(bytes.toString("utf8"));
+			if (!isRecord(decoded) || !Array.isArray(decoded.keys) || decoded.keys.length < 1 || decoded.keys.length > 8) {
+				throw new Error("managed relay keys invalid");
+			}
+			const keys = new Map();
+			for (const key of decoded.keys) {
+				if (
+					!isRecord(key) ||
+					key.kty !== "OKP" ||
+					key.crv !== "Ed25519" ||
+					key.alg !== "EdDSA" ||
+					key.use !== "sig" ||
+					typeof key.kid !== "string" ||
+					!identifierPattern.test(key.kid) ||
+					typeof key.x !== "string" ||
+					decodeBase64Url(key.x, 64).length !== 32 ||
+					keys.has(key.kid)
+				) {
+					throw new Error("managed relay keys invalid");
+				}
+				keys.set(key.kid, createPublicKey({ format: "jwk", key }));
+			}
+			cached = { expiresAtMs: now() + JWKS_CACHE_MS, keys };
+			cache.set(deployment.jwksUrl, cached);
+		} catch (cause) {
+			// A failed refresh says nothing about the bearer. Never use expired keys.
+			throw new RelayKeyServiceUnavailableError("managed relay keys unavailable", { cause });
 		}
-		cached = { expiresAtMs: now() + JWKS_CACHE_MS, keys };
-		cache.set(deployment.jwksUrl, cached);
 	}
 	const key = cached.keys.get(keyId);
 	if (key === undefined) {
@@ -206,6 +207,7 @@ function isRecord(value) {
 
 module.exports = {
 	RelayAccessVerificationError,
+	RelayKeyServiceUnavailableError,
 	configuredDeployments,
 	createRelayAccessVerifier,
 	requireMatchingRelayGrant,
