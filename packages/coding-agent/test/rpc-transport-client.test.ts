@@ -47,6 +47,7 @@ import type { Skill } from "../src/core/skills.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import { createInProcessRpcClient } from "../src/modes/rpc/in-process-rpc-client.ts";
 import { createIrohRemoteCloseDeferringRpcTransport } from "../src/modes/rpc/iroh-remote-rpc-mode.ts";
+import { RpcClientBase } from "../src/modes/rpc/rpc-client-base.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { RpcTransportClient } from "../src/modes/rpc/rpc-transport-client.ts";
 import { createTestModel } from "./iroh-stream-doubles.ts";
@@ -1248,7 +1249,7 @@ describe("runRpcMode", () => {
 			);
 			expect(reviewPullRequestAction).toEqual(
 				expect.objectContaining({
-					description: expect.stringContaining("GitHub credentials and network"),
+					description: expect.stringContaining("GitHub CLI code-host provider"),
 					category: "review",
 					presentation: expect.objectContaining({ kind: "card", group: "Review" }),
 					requiresConfirmation: true,
@@ -2079,6 +2080,13 @@ describe("createInProcessRpcClient", () => {
 
 	test("serves git branch completions for the review.branch base argument", async () => {
 		const repo = createTestGitRepo(["feature/login", "zeta"]);
+		const remote = mkdtempSync(join(tmpdir(), "volt-rpc-branch-remote-"));
+		gitInTestRepo(remote, "init", "--bare", "--initial-branch=main");
+		gitInTestRepo(repo, "remote", "add", "origin", remote);
+		gitInTestRepo(repo, "branch", "remote-only");
+		gitInTestRepo(repo, "push", "-u", "origin", "main");
+		gitInTestRepo(repo, "push", "origin", "feature/login", "zeta", "remote-only");
+		gitInTestRepo(repo, "branch", "-D", "remote-only");
 		const noRepoDir = mkdtempSync(join(tmpdir(), "volt-rpc-norepo-"));
 		const runtimeHost = createRuntimeHost(
 			vi.fn(async () => {}),
@@ -2098,6 +2106,7 @@ describe("createInProcessRpcClient", () => {
 				{ value: "main" },
 				{ value: "feature/login" },
 				{ value: "zeta" },
+				{ value: "origin/remote-only" },
 			]);
 			await expect(client.getUiActionCompletions(REVIEW_BRANCH_ACTION_ID, "base", "FEAT")).resolves.toEqual([
 				{ value: "feature/login" },
@@ -2122,6 +2131,7 @@ describe("createInProcessRpcClient", () => {
 		} finally {
 			await noRepoClient.stop();
 			rmSync(repo, { recursive: true, force: true });
+			rmSync(remote, { recursive: true, force: true });
 			rmSync(noRepoDir, { recursive: true, force: true });
 		}
 	});
@@ -2316,6 +2326,51 @@ describe("createInProcessRpcClient", () => {
 		await expect(createInProcessRpcClient(runtimeHost)).rejects.toBe(bindError);
 		expect(dispose).toHaveBeenCalledOnce();
 	});
+
+	test("finalizes an owned runtime when client construction fails and preserves finalizer errors", async () => {
+		const constructionError = new Error("injected loopback client construction failure");
+		const finalizerError = new Error("injected runtime finalizer failure");
+		const dispose = vi.fn(async () => {
+			throw finalizerError;
+		});
+		const onEventSpy = vi.spyOn(RpcClientBase.prototype, "onEvent").mockImplementationOnce(() => {
+			throw constructionError;
+		});
+
+		try {
+			const thrown = await createInProcessRpcClient(createRuntimeHost(dispose), {
+				disposeRuntimeOnClose: true,
+				onEvent: () => undefined,
+			}).catch((error: unknown) => error);
+
+			expect(thrown).toBeInstanceOf(AggregateError);
+			if (!(thrown instanceof AggregateError)) throw new Error("expected aggregate construction cleanup failure");
+			expect(thrown.errors).toEqual([constructionError, finalizerError]);
+			expect(dispose).toHaveBeenCalledOnce();
+		} finally {
+			onEventSpy.mockRestore();
+		}
+	});
+
+	test("leaves caller-owned runtimes untouched when client construction fails", async () => {
+		const constructionError = new Error("injected loopback client construction failure");
+		const dispose = vi.fn(async () => {});
+		const onEventSpy = vi.spyOn(RpcClientBase.prototype, "onEvent").mockImplementationOnce(() => {
+			throw constructionError;
+		});
+
+		try {
+			await expect(
+				createInProcessRpcClient(createRuntimeHost(dispose), {
+					disposeRuntimeOnClose: false,
+					onEvent: () => undefined,
+				}),
+			).rejects.toBe(constructionError);
+			expect(dispose).not.toHaveBeenCalled();
+		} finally {
+			onEventSpy.mockRestore();
+		}
+	});
 });
 
 class ManualRpcTransport implements RpcTransport {
@@ -2496,6 +2551,7 @@ function createRuntimeHost(
 			sessionManager: {
 				flush: vi.fn(async () => {}),
 				getCwd: vi.fn(() => resources.cwd ?? tmpdir()),
+				getStartingGitContext: vi.fn(() => undefined),
 			},
 			promptTemplates: resources.prompts ?? [],
 			modelRegistry,

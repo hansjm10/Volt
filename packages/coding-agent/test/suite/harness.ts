@@ -3,6 +3,7 @@
  */
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@hansjm10/volt-agent-core";
@@ -89,6 +90,7 @@ export interface Harness {
 	eventsOfType<T extends AgentSessionEvent["type"]>(type: T): Extract<AgentSessionEvent, { type: T }>[];
 	tempDir: string;
 	cleanup: () => void;
+	cleanupAsync: () => Promise<void>;
 }
 
 function createTempDir(): string {
@@ -188,10 +190,24 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		},
 		tempDir,
 		cleanup() {
+			if (sessionManager.isPersisted()) {
+				throw new Error("Persisted harness cleanup must await cleanupAsync()");
+			}
 			session.dispose();
 			fauxProvider.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
+			if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
+		},
+		async cleanupAsync() {
+			session.dispose();
+			fauxProvider.unregister();
+			try {
+				await session.waitForClosed();
+			} finally {
+				await rm(tempDir, {
+					recursive: true,
+					force: true,
+					...(process.platform === "win32" ? { maxRetries: 10, retryDelay: 50 } : {}),
+				});
 			}
 		},
 	};

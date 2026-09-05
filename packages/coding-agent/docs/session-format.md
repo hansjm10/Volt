@@ -1,6 +1,8 @@
-# Session File Format
+# Session Storage and JSONL Snapshot Format
 
-Sessions are stored as JSONL (JSON Lines) files. Each line is a JSON object with a `type` field. Session entries form a tree structure via `id`/`parentId` fields, enabling in-place branching without creating new files.
+Persisted sessions live in SQLite. Each workspace session directory, or custom session directory, contains one authoritative `sessions.sqlite` store. Sessions are addressed by stable IDs and `SessionReference` values, not by live session file paths.
+
+JSONL (JSON Lines) is an interchange snapshot format. Each line is a JSON object with a `type` field, and entries form a tree through `id`/`parentId`. Volt imports a snapshot into SQLite once; it never reopens the JSONL file as live storage.
 
 ## Canonical JSON Data
 
@@ -8,33 +10,33 @@ Every admitted entry must round-trip through JSON without type or value loss. Ac
 
 Volt rejects explicit `undefined`, non-finite numbers, negative zero, bigint, symbols, functions, cycles, sparse arrays, accessors, symbol-keyed or non-enumerable properties, custom or null prototypes, and rich objects such as `Map`, `Set`, `Date`, `Error`, `RegExp`, `Buffer`, typed arrays, `ArrayBuffer`, and `SharedArrayBuffer`. Encode rich values as plain JSON, for example dates as ISO strings and maps as arrays of entries.
 
-`SessionManager` validates and clones each complete entry before assigning its ordinal or changing indexes, the active leaf, persistence queues, files, or observers. A rejected entry therefore leaves memory, disk, and branch position unchanged. This admission rule does not change the session format version: accepted values are ordinary JSONL.
+`SessionManager` validates and clones each complete entry before assigning its ordinal or changing indexes, the active leaf, persistence transactions, or observers. A rejected entry therefore leaves memory, the store, and branch position unchanged.
 
-## File Location
+## Store Location
 
+Default storage is organized by workspace:
+
+```text
+~/.volt/agent/sessions/--<encoded-workspace>--/sessions.sqlite
 ```
-~/.volt/agent/sessions/--<path>--/<timestamp>_<uuid>.jsonl
-```
 
-Where `<path>` is the working directory with `/` replaced by `-`.
+A directory passed through `--session-dir`, `VOLT_CODING_AGENT_SESSION_DIR`, or the SDK instead contains its own `sessions.sqlite`. SQLite may keep active `sessions.sqlite-wal` and `sessions.sqlite-shm` sidecars beside it. The directory is owner-only (`0700`), and the database and sidecars are owner-readable/writable only (`0600`). Treat all three SQLite files as one live store.
 
-## Deleting Sessions
+Listing, exact-ID resolution, continuation candidate selection, and RPC session discovery use materialized SQLite summaries rather than scanning canonical entries or JSONL. Custom-session-directory cwd filters compare canonical filesystem identities after reading summaries so symlink and junction aliases match the same workspace. Tree loading opens and verifies one selected session. Deep search scans extracted searchable chunks one session at a time; those chunks are not a full-text index.
 
-Sessions can be removed by deleting their `.jsonl` files under `~/.volt/agent/sessions/`.
+## JSONL Snapshots
 
-Volt also supports deleting sessions interactively from `/resume` (select a session and press `Ctrl+D`, then confirm). When available, volt uses the `trash` CLI to avoid permanent deletion.
+For explicit interchange:
 
-## Session Version
+- `SessionManager.importFromJsonl(path, ...)` imports a snapshot into SQLite.
+- CLI path arguments to `--session` and `--fork` perform the same one-time import.
+- `SessionManager.exportJsonlSnapshot(ref, outputPath)` writes a portable snapshot.
 
-Sessions have a version field in the header:
+Delete sessions through `/resume` or `SessionManager.delete(ref)`. When the `trash` CLI is available, `/resume` exports a JSONL snapshot to trash before deleting the SQLite record.
 
-- **Version 1**: Linear entry sequence (legacy, auto-migrated on load)
-- **Version 2**: Tree structure with `id`/`parentId` linking
-- **Version 3**: Renamed `hookMessage` role to `custom` (extensions unification)
-- **Version 4**: Added stable file-order commit ordinals
-- **Version 5**: Replaced unreplayable legacy client-input WAL state
+## Snapshot Version
 
-Existing sessions are automatically migrated to the current version (v5) when a writer next appends. Canonical JSON admission does not introduce another migration.
+The current header has `version: 5` for session entries and `snapshotVersion: 1` for the interchange envelope. Import requires both exact values and rejects unmarked or older JSONL. Snapshots contain public session entries plus exactly one final active-leaf record; malformed or truncated final lines are rejected. Client-input recovery state, starting Git context, subagent links, and transport-owned message identities are never accepted as interchange data.
 
 ## Source Files
 
@@ -197,19 +199,21 @@ interface SessionEntryBase {
 
 ## Entry Types
 
-### SessionHeader
+### Snapshot Header
 
-First line of the file. Metadata only, not part of the tree (no `id`/`parentId`).
-
-```json
-{"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project"}
-```
-
-For sessions with a parent (created via `/fork`, `/clone`, or `newSession({ parentSession })`):
+The first line of an exported snapshot is metadata only and is not part of the tree (no `parentId`). `SessionManager.getHeader()` exposes the live form as `SessionHeader`, whose optional `parentSession` is a `SessionReference`; export converts that reference to the host-local locator fields shown below.
 
 ```json
-{"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project","parentSession":"/path/to/original/session.jsonl"}
+{"type":"session","version":5,"snapshotVersion":1,"id":"uuid","timestamp":"2026-08-31T14:00:00.000Z","cwd":"/path/to/project"}
 ```
+
+A snapshot exported from a session with a persisted parent carries the complete host-local store locator needed to restore that relationship. `parentSessionDirectory` can identify the parent session's active SQLite store directory:
+
+```json
+{"type":"session","version":5,"snapshotVersion":1,"id":"uuid","timestamp":"2026-08-31T14:00:00.000Z","cwd":"/path/to/project","parentSessionDirectory":"/path/to/parent/store","parentStoreId":"store-uuid","parentSessionId":"parent-uuid","parentSessionGeneration":"parent-generation-uuid"}
+```
+
+Every snapshot header includes the session `cwd`, and a parent locator can include another host path. Treat snapshots as sensitive local interchange artifacts. These store locators are accepted only during local snapshot import and never cross the remote RPC surface.
 
 ### SessionMessageEntry
 
@@ -255,7 +259,7 @@ Created when context is compacted. Stores a summary of earlier messages.
 
 Optional fields:
 - `details`: JSON data (e.g., `{ readFiles: string[], modifiedFiles: string[] }` for default, or custom data for extensions)
-- `fromHook`: `true` if generated by an extension; omitted otherwise (legacy field name)
+- `fromHook`: `true` if generated by an extension; omitted otherwise
 
 ### BranchSummaryEntry
 
@@ -267,7 +271,7 @@ Created when switching branches via `/tree` with an LLM generated summary of the
 
 Optional fields:
 - `details`: JSON file-tracking data (`{ readFiles: string[], modifiedFiles: string[] }`) for default, or custom JSON data for extensions
-- `fromHook`: `true` if generated by an extension; omitted otherwise (legacy field name)
+- `fromHook`: `true` if generated by an extension; omitted otherwise
 
 ### CustomEntry
 
@@ -312,6 +316,29 @@ Session metadata (e.g., user-defined display name). Set via `/name`, `--name` / 
 
 The session name is displayed in the session selector (`/resume`) instead of the first message when set.
 
+### SessionStartGitContextEntry (host-only)
+
+A newly created current-format session records its first **definitive** path-free
+Git observation. `gitContext` is either the same bounded object used by RPC
+`gitContext`, or `null` when the cwd was definitively not a Git worktree.
+Transient Git command failures do not create this entry; a later successful
+observation may still do so. The expected session ID fences delayed scans from a
+replacement session.
+
+```json
+{"type":"session_start_git_context","id":"l2m3n4o5","parentId":null,"timestamp":"2026-08-29T16:00:00.000Z","ordinal":1,"gitContext":{"repository":"Volt","head":{"kind":"branch","name":"feature/work","oid":"0123456789abcdef0123456789abcdef01234567"},"upstream":null,"base":null,"status":{"staged":{"added":0,"modified":0,"deleted":0,"renamed":0},"unstaged":{"added":0,"modified":0,"deleted":0,"renamed":0},"untracked":0,"conflicted":0,"total":0,"clean":true},"operation":null,"revision":1,"observedAt":"2026-08-29T16:00:00.000Z","stale":false}}
+```
+
+Current-format readers validate this entry strictly and reject duplicates. It
+is host metadata only: it never advances the active leaf, enters model context,
+appears as a transcript item, copies into forks or explicit snapshots, or reaches
+extension message projection. Session listings and state responses may expose the validated
+path-free value as optional `startingGitContext`.
+
+### Other Host-Only Entries
+
+An explicit export appends a durable `leaf` entry so import can restore the active branch. Other host-only SQLite records, including client-input recovery data and subagent links, are not part of the public snapshot. Host-only records never enter model context, and `SessionManager.getEntries()` filters them.
+
 ## Tree Structure
 
 Entries form a tree:
@@ -337,20 +364,23 @@ Entries form a tree:
    - Then messages from `firstKeptEntryId` to compaction
    - Then messages after compaction
 4. Converts `BranchSummaryEntry` and `CustomMessageEntry` to appropriate message formats
+5. Ignores host-only entries such as `session_start_git_context`, client-input WAL records, durable leaf pointers, and subagent spawn edges
 
-## Parsing Example
+## Parsing an Exported Snapshot
+
+Parse JSONL only when consuming an explicitly exported snapshot. Do not read `sessions.sqlite` directly or treat arbitrary JSONL as session state.
 
 ```typescript
-import { readFileSync } from "fs";
+import { readFileSync } from "node:fs";
 
-const lines = readFileSync("session.jsonl", "utf8").trim().split("\n");
+const lines = readFileSync("session-snapshot.jsonl", "utf8").trim().split("\n");
 
 for (const line of lines) {
   const entry = JSON.parse(line);
 
   switch (entry.type) {
     case "session":
-      console.log(`Session v${entry.version ?? 1}: ${entry.id}`);
+      console.log(`Session v${entry.version}, snapshot v${entry.snapshotVersion}: ${entry.id}`);
       break;
     case "message":
       console.log(`[${entry.id}] ${entry.message.role}: ${JSON.stringify(entry.message.content)}`);
@@ -382,54 +412,72 @@ for (const line of lines) {
 
 ## SessionManager API
 
-Key methods for working with sessions programmatically.
+Persisted factories and store queries are asynchronous. `inMemory()` remains synchronous.
 
-### Static Creation Methods
-- `SessionManager.create(cwd, sessionDir?)` - New session
-- `SessionManager.open(path, sessionDir?)` - Open existing session file
-- `SessionManager.continueRecent(cwd, sessionDir?)` - Continue most recent or create new
-- `SessionManager.inMemory(cwd?)` - No file persistence
-- `SessionManager.forkFrom(sourcePath, targetCwd, sessionDir?)` - Fork session from another project
+```typescript
+interface SessionReference {
+  readonly sessionDirectory: string;
+  readonly storeId: string;
+  readonly sessionId: string;
+  readonly sessionGeneration: string; // immutable incarnation; prevents stale writes after ID reuse
+}
+```
 
-### Static Listing Methods
-- `SessionManager.list(cwd, sessionDir?, onProgress?)` - List sessions for a directory
-- `SessionManager.listAll(onProgress?)` - List all sessions across all projects
+Use references returned by `getSessionRef()`, `SessionInfo.ref`, or another `SessionManager` API. The `storeId` prevents a session ID from being opened against the wrong database; do not construct references from IDs alone.
 
-### Instance Methods - Session Management
-- `newSession(options?)` - Start a new session (options: `{ parentSession?: string }`)
-- `setSessionFile(path)` - Switch to a different session file
-- `createBranchedSession(leafId)` - Extract branch to new session file
+### Static Creation and Interchange
 
-### Instance Methods - Appending (all return entry ID)
-- `appendMessage(message)` - Add message
-- `appendThinkingLevelChange(level)` - Record thinking change
-- `appendFastModeChange(enabled)` - Record branch-local Fast mode change
-- `appendModelChange(provider, modelId)` - Record model change
-- `appendCompaction(summary, firstKeptEntryId, tokensBefore, details?, fromHook?)` - Add compaction
-- `appendCustomEntry(customType, data?)` - Extension state (not in context)
-- `appendSessionInfo(name)` - Set session display name
-- `appendCustomMessageEntry(customType, content, display, details?)` - Extension message (in context)
-- `appendLabelChange(targetId, label)` - Set/clear label
+- `await SessionManager.create(cwd, sessionDir?, options?)` - Create and durably reserve a persisted session.
+- `await SessionManager.open(ref, cwdOverride?)` - Open an authoritative `SessionReference`.
+- `await SessionManager.continueRecent(cwd, sessionDir?)` - Continue the most recent visible session or create one.
+- `SessionManager.inMemory(cwd?)` - Create a session without persistence.
+- `await SessionManager.forkFrom(sourceRef, targetCwd, sessionDir?, options?)` - Copy a stored session into a new persisted session.
+- `await SessionManager.importFromJsonl(inputPath, targetCwd?, sessionDir?, options?)` - Import one JSONL snapshot.
+- `await SessionManager.exportJsonlSnapshot(ref, outputPath)` - Export one JSONL snapshot.
+- `await SessionManager.delete(ref)` - Delete a persisted session.
 
-### Instance Methods - Tree Navigation
-- `getLeafId()` - Current position
-- `getLeafEntry()` - Get current leaf entry
-- `getEntry(id)` - Get entry by ID
-- `getBranch(fromId?)` - Walk from entry to root
-- `getTree()` - Get full tree structure
-- `getChildren(parentId)` - Get direct children
-- `getLabel(id)` - Get label for entry
-- `branch(entryId)` - Move leaf to earlier entry
-- `resetLeaf()` - Reset leaf to null (before any entries)
-- `branchWithSummary(entryId, summary, details?, fromHook?)` - Branch with context summary
+### Summary Discovery and Deep Search
 
-### Instance Methods - Context & Info
-- `buildSessionContext()` - Get messages, thinkingLevel, and model for LLM
-- `getEntries()` - All entries (excluding header)
-- `getHeader()` - Session header metadata
-- `getSessionName()` - Get display name from latest session_info entry
-- `getCwd()` - Working directory
-- `getSessionDir()` - Session storage directory
-- `getSessionId()` - Session UUID
-- `getSessionFile()` - Session file path (undefined for in-memory)
-- `isPersisted()` - Whether session is saved to disk
+- `await SessionManager.list(cwd, sessionDir?, onProgress?, options?)` - List materialized session summaries for a workspace or custom store.
+- `await SessionManager.search(cwd, query, sessionDir?, options?)` - Scan extracted searchable text for a workspace or custom store.
+- `await SessionManager.listAll(...)` - List summaries across known workspace stores, or within one custom store.
+- `await SessionManager.searchAll(query, sessionDir?)` - Scan extracted searchable text across known workspace stores, or within one custom store.
+- `await SessionManager.findForResume(sessionDir, sessionId)` - Resolve an exact ID to a checked reference.
+
+`SessionInfo` includes `ref`, `id`, `cwd`, timestamps, message count, first message, optional name, and optional `parentSessionRef`.
+
+### Instance Session Management
+
+- `newSession(options?)` - Start a new identity in the current manager. `options.parentSession` is a `SessionReference`.
+- `await createBranchedSession(leafId)` - Replace the manager with a new session containing the selected branch.
+- `await flush()` - Wait for queued persistence and surface store errors.
+
+Session replacement across cwd-bound runtime services belongs to `AgentSessionRuntime`, which accepts `SessionReference` values.
+
+### Appending (all return an entry ID)
+
+- `appendMessage(message)`
+- `appendThinkingLevelChange(level)`
+- `appendFastModeChange(enabled)`
+- `appendModelChange(provider, modelId)`
+- `appendCompaction(summary, firstKeptEntryId, tokensBefore, details?, fromHook?)`
+- `appendCustomEntry(customType, data?)`
+- `appendSessionInfo(name)`
+- `appendCustomMessageEntry(customType, content, display, details?)`
+- `appendLabelChange(targetId, label)`
+
+### Tree Navigation
+
+- `getLeafId()`, `getLeafEntry()`, `getEntry(id)`
+- `getBranch(fromId?)`, `getTree()`, `getChildren(parentId)`
+- `getLabel(id)`
+- `branch(entryId)`, `resetLeaf()`
+- `branchWithSummary(entryId, summary, details?, fromHook?)`
+
+### Context and Identity
+
+- `buildSessionContext()` - Build messages and branch-local model policy for the LLM.
+- `getEntries()`, `getHeader()`, `getSessionName()`
+- `getCwd()`, `getSessionDir()`, `getSessionId()`
+- `getSessionRef()` - Current persisted reference, or `undefined` in memory.
+- `isPersisted()` - Whether the session uses SQLite persistence.

@@ -24,6 +24,7 @@ import {
 	type HydratedReviewRunRecord,
 	listReviewRuns,
 } from "../../core/review-state.ts";
+import { createReviewFileMetadata, createReviewPullRequestMetadata } from "../../core/review-workflows.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
 import { buildRpcSessionState } from "../../core/rpc/session-state.ts";
 import { projectSessionTreePage } from "../../core/rpc/session-tree.ts";
@@ -226,8 +227,39 @@ export function createRpcErrorResponse(
 
 export { getRpcErrorResponseTarget };
 
+function projectReviewTargetIdentity(
+	identity: HydratedReviewRunRecord["target"]["identity"],
+	includePullRequestBody: boolean,
+): Record<string, unknown> {
+	const pullRequest = identity.pullRequest;
+	return {
+		kind: identity.kind,
+		baseTree: identity.baseTree,
+		headTree: identity.headTree,
+		...(identity.baseCommit ? { baseCommit: identity.baseCommit } : {}),
+		...(identity.mergeBaseCommit ? { mergeBaseCommit: identity.mergeBaseCommit } : {}),
+		...(identity.headCommit ? { headCommit: identity.headCommit } : {}),
+		...(pullRequest
+			? {
+					pullRequest: {
+						number: pullRequest.number,
+						title: pullRequest.title,
+						...(includePullRequestBody ? { body: pullRequest.body } : {}),
+						url: pullRequest.url,
+						baseRefName: pullRequest.baseRefName,
+						headRefName: pullRequest.headRefName,
+						baseRefOid: pullRequest.baseRefOid,
+						headRefOid: pullRequest.headRefOid,
+					},
+				}
+			: {}),
+	};
+}
+
 function projectReviewRun(record: HydratedReviewRunRecord, includeResult: boolean): Record<string, unknown> {
 	const result = record.result;
+	const pullRequest = createReviewPullRequestMetadata(record.target.identity);
+	const files = createReviewFileMetadata(record.target.files, record.target.fileSummary, includeResult);
 	return {
 		runId: record.runId,
 		workflowAction: record.workflowAction,
@@ -238,7 +270,9 @@ function projectReviewRun(record: HydratedReviewRunRecord, includeResult: boolea
 		target: {
 			description: record.target.description,
 			diffCommand: record.target.diffCommand,
-			identity: record.target.identity,
+			identity: projectReviewTargetIdentity(record.target.identity, includeResult),
+			...(pullRequest ? { pullRequest } : {}),
+			files,
 			...(record.target.context ? { context: record.target.context } : {}),
 		},
 		options: record.options,
@@ -349,23 +383,35 @@ export async function handleRpcCommand(
 			if (command.preserveReviewRunId && !preservedReviewRun) {
 				return createRpcErrorResponse(id, "new_session", `Unknown review run: ${command.preserveReviewRunId}`);
 			}
-			const newSessionOptions = preservedReviewRun
-				? {
-						...(command.parentSession ? { parentSession: command.parentSession } : {}),
-						setup: async (sessionManager: SessionManager) => {
-							appendReviewRun(sessionManager, preservedReviewRun);
-							if (preservedReviewRun.acknowledgedAt !== undefined) {
-								acknowledgeReviewRun(
-									sessionManager,
-									preservedReviewRun.runId,
-									preservedReviewRun.acknowledgedAt,
-								);
-							}
-						},
-					}
-				: command.parentSession
-					? { parentSession: command.parentSession }
-					: undefined;
+			let parentSessionRef =
+				command.parentSessionId === session.sessionId ? session.sessionManager.getSessionRef() : undefined;
+			if (command.parentSessionId && !parentSessionRef) {
+				const candidates = await SessionManager.listAll(session.sessionManager.getSessionDir(), undefined, {
+					includeMessageFreeDurable: true,
+				});
+				parentSessionRef = candidates.find((candidate) => candidate.id === command.parentSessionId)?.ref;
+				if (!parentSessionRef) {
+					return createRpcErrorResponse(id, "new_session", `Unknown parent session: ${command.parentSessionId}`);
+				}
+			}
+			const newSessionOptions = {
+				rebindRequestId: id,
+				...(parentSessionRef ? { parentSessionRef } : {}),
+				...(preservedReviewRun
+					? {
+							setup: async (sessionManager: SessionManager) => {
+								appendReviewRun(sessionManager, preservedReviewRun);
+								if (preservedReviewRun.acknowledgedAt !== undefined) {
+									acknowledgeReviewRun(
+										sessionManager,
+										preservedReviewRun.runId,
+										preservedReviewRun.acknowledgedAt,
+									);
+								}
+							},
+						}
+					: {}),
+			};
 			const result = await runSessionNewHostAction(context.createHostActionContext(), newSessionOptions);
 			return createRpcSuccessResponse(id, "new_session", { cancelled: result.cancelled });
 		}
@@ -599,13 +645,27 @@ export async function handleRpcCommand(
 			}
 			if (result.seeded && command.findingIds === undefined) {
 				if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
-				const sourceSessionFile = sourceSessionManager.getSessionFile();
-				const acknowledgmentManager = sourceSessionFile
-					? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+				const sourceSessionRef = sourceSessionManager.getSessionRef();
+				const acknowledgmentManager = sourceSessionRef
+					? await SessionManager.open(sourceSessionRef)
 					: sourceSessionManager;
-				acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
-				await acknowledgmentManager.flush();
-				if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
+				try {
+					acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
+					await acknowledgmentManager.flush();
+				} catch (error) {
+					if (sourceSessionRef) {
+						try {
+							await acknowledgmentManager.closePersistence();
+						} catch (closeError) {
+							throw new AggregateError(
+								[error, closeError],
+								"Review acknowledgment failed and its source manager could not be closed",
+							);
+						}
+					}
+					throw error;
+				}
+				if (sourceSessionRef) await acknowledgmentManager.closePersistence();
 			}
 			return createRpcSuccessResponse(id, "open_review_session", { cancelled: result.cancelled });
 		}
@@ -1094,7 +1154,7 @@ export async function handleRpcCommand(
 		// =================================================================
 
 		case "get_session_stats": {
-			const stats = session.getSessionStats();
+			const { sessionRef: _sessionRef, ...stats } = session.getSessionStats();
 			return createRpcSuccessResponse(id, "get_session_stats", stats);
 		}
 
@@ -1117,7 +1177,9 @@ export async function handleRpcCommand(
 		}
 
 		case "switch_session": {
-			const result = await runtimeHost.switchSession(command.sessionPath);
+			const result = await runtimeHost.switchSessionById(command.sessionId, {
+				assertConversationGenerationCurrent: context.assertConversationGenerationCurrent,
+			});
 			if (!result.cancelled) {
 				await context.rebindSession();
 			}

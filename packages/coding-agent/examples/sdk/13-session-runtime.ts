@@ -32,7 +32,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionMan
 const runtime = await createAgentSessionRuntime(createRuntime, {
 	cwd: process.cwd(),
 	agentDir: getAgentDir(),
-	sessionManager: SessionManager.create(process.cwd()),
+	sessionManager: await SessionManager.create(process.cwd()),
 });
 
 let unsubscribe: (() => void) | undefined;
@@ -50,17 +50,17 @@ async function bindSession() {
 }
 
 let session = await bindSession();
-const originalSessionFile = session.sessionFile;
-console.log("Initial session:", originalSessionFile);
+const originalSessionRef = session.sessionRef;
+console.log("Initial session:", originalSessionRef);
 
 await runtime.newSession();
 session = await bindSession();
-console.log("After newSession():", session.sessionFile);
+console.log("After newSession():", session.sessionRef);
 
-if (originalSessionFile) {
-	await runtime.switchSession(originalSessionFile);
+if (originalSessionRef) {
+	await runtime.switchSession(originalSessionRef);
 	session = await bindSession();
-	console.log("After switchSession():", session.sessionFile);
+	console.log("After switchSession():", session.sessionRef);
 }
 
 unsubscribe?.();

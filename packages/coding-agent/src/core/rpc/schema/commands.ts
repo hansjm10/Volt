@@ -97,7 +97,7 @@ export const RPC_COMMAND_SCHEMAS = {
 	}),
 	abort: commandSchema("abort", {}),
 	new_session: commandSchema("new_session", {
-		parentSession: Type.Optional(Type.String()),
+		parentSessionId: Type.Optional(RpcConversationIdentifierSchema),
 		preserveReviewRunId: Type.Optional(RpcConversationIdentifierSchema),
 	}),
 	set_agent_mode: commandSchema("set_agent_mode", {
@@ -207,6 +207,14 @@ export const RPC_COMMAND_SCHEMAS = {
 	get_web_search_status: commandSchema("get_web_search_status", {}),
 	get_agent_options: commandSchema("get_agent_options", {
 		workspaceName: workspaceNameSchema,
+	}),
+	get_session_contexts: commandSchema("get_session_contexts", {
+		workspaceName: workspaceNameSchema,
+		sessionIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
+			minItems: 1,
+			maxItems: 64,
+			uniqueItems: true,
+		}),
 	}),
 
 	// Device diagnostics
@@ -346,7 +354,7 @@ export const RPC_COMMAND_SCHEMAS = {
 		cursor: Type.Optional(Type.String({ minLength: 1, "x-volt-expected": "be a non-empty string" })),
 	}),
 	export_html: commandSchema("export_html", { outputPath: Type.Optional(Type.String()) }),
-	switch_session: commandSchema("switch_session", { sessionPath: Type.String() }),
+	switch_session: commandSchema("switch_session", { sessionId: Type.String() }),
 	switch_session_by_id: commandSchema("switch_session_by_id", { sessionId: Type.String() }),
 	fork: commandSchema("fork", { entryId: Type.String() }),
 	clone: commandSchema("clone", {}),

@@ -974,6 +974,7 @@ describe("Iroh remote core helpers", () => {
 			"rerun_review",
 			"publish_review",
 			"list_sessions",
+			"get_session_contexts",
 			"switch_session_by_id",
 			"register_push_target",
 			"unregister_workspace",
@@ -2019,6 +2020,13 @@ describe("Iroh remote core helpers", () => {
 			workspace: { name: "alpha", path: "/alpha" },
 		});
 
+		const authorized = await hostEngine.authorizeHello(makeHello("alpha"), "client-node");
+		if (!authorized.ok) {
+			throw new Error(authorized.error);
+		}
+		expect(authorized.workspaceNames).toEqual(["alpha"]);
+		expect(authorized.workspaces).toEqual([{ name: "alpha", status: "available" }]);
+
 		await expect(hostEngine.authorizeHello(makeHello("beta"), "client-node")).resolves.toEqual({
 			ok: false,
 			client: expect.objectContaining({
@@ -2032,7 +2040,7 @@ describe("Iroh remote core helpers", () => {
 			workspace: { name: "beta", path: "/beta" },
 		});
 		expect((await stateManager.getState()).clients).toEqual([
-			expect.objectContaining({ nodeId: "client-node", allowedWorkspaces: ["alpha"], lastSeenAt: 20 }),
+			expect.objectContaining({ nodeId: "client-node", allowedWorkspaces: ["alpha"], lastSeenAt: 200 }),
 		]);
 	});
 
@@ -2749,11 +2757,8 @@ describe("Iroh remote core helpers", () => {
 		if (!authorized.ok) {
 			throw new Error(authorized.error);
 		}
-		expect(authorized.workspaceNames).toEqual(["volt", "other-project"]);
-		expect(authorized.workspaces).toEqual([
-			{ name: "volt", status: "available" },
-			{ name: "other-project", status: "available" },
-		]);
+		expect(authorized.workspaceNames).toEqual(["volt"]);
+		expect(authorized.workspaces).toEqual([{ name: "volt", status: "available" }]);
 		authorized.client.allowedWorkspaces.push("mutated");
 		authorized.workspace.path = "/mutated-workspace";
 		authorized.workspaceNames.push("mutated");
@@ -2792,7 +2797,17 @@ describe("Iroh remote core helpers", () => {
 						{ name: "missing", path: missingPath },
 						{ name: "unavailable", path: unavailablePath },
 					],
-					clients: [],
+					clients: [
+						{
+							nodeId: "client-node",
+							label: "phone",
+							allowedWorkspaces: ["available", "missing"],
+							allowedTools: "read",
+							rpcGrant: CODING_RPC_GRANT,
+							pairedAt: 1,
+							lastSeenAt: 2,
+						},
+					],
 				},
 			});
 			const authorized = await stateManager.authorizeClient(makeHello("available", "secret"), "client-node", {
@@ -2809,7 +2824,6 @@ describe("Iroh remote core helpers", () => {
 			expect(authorized.workspaces).toEqual([
 				{ name: "available", status: "available" },
 				{ name: "missing", status: "missing" },
-				{ name: "unavailable", status: "unavailable" },
 			]);
 			const metadata = createIrohRemoteHostMetadata({
 				authorization: authorized,
@@ -2917,7 +2931,7 @@ describe("Iroh remote core helpers", () => {
 		expect(state.pendingPairingTickets).toEqual([expect.objectContaining({ workspace: "alphabet" })]);
 	});
 
-	test("captures workspace generations and fences identical re-registration and change-revert ABA", async () => {
+	test("repairs missing workspace generations and fences re-registration ABA", async () => {
 		const workspace = { name: "alpha", path: "/alpha", allowedTools: "read" };
 		const stateManager = new IrohRemoteHostStateManager({
 			initialState: {
@@ -2946,23 +2960,28 @@ describe("Iroh remote core helpers", () => {
 		if (!legacyAuthorization.ok) throw new Error(legacyAuthorization.error);
 		expect(legacyAuthorization).not.toHaveProperty("workspaceGeneration");
 		await stateManager.upsertWorkspace(workspace);
-		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(0);
+		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(1);
+		await expect(stateManager.isAuthorizationCurrent(legacyAuthorization)).resolves.toBe(false);
+		const repairedAuthorization = await authorize();
+		if (!repairedAuthorization.ok) throw new Error(repairedAuthorization.error);
+		expect(repairedAuthorization.workspaceGeneration).toBe(1);
+		await expect(stateManager.isAuthorizationCurrent(repairedAuthorization)).resolves.toBe(true);
 
 		await stateManager.unregisterWorkspace("alpha");
 		await stateManager.upsertWorkspace(workspace);
-		await expect(stateManager.isAuthorizationCurrent(legacyAuthorization)).resolves.toBe(false);
+		await expect(stateManager.isAuthorizationCurrent(repairedAuthorization)).resolves.toBe(false);
 		const replacementAuthorization = await authorize();
 		if (!replacementAuthorization.ok) throw new Error(replacementAuthorization.error);
-		expect(replacementAuthorization.workspaceGeneration).toBe(1);
+		expect(replacementAuthorization.workspaceGeneration).toBe(2);
 		await expect(stateManager.isAuthorizationCurrent(replacementAuthorization)).resolves.toBe(true);
 
 		await stateManager.upsertWorkspace({ ...workspace, path: "/replacement" });
 		await stateManager.upsertWorkspace(workspace);
-		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(3);
+		expect((await stateManager.getState()).workspaceGenerationCounter).toBe(4);
 		await expect(stateManager.isAuthorizationCurrent(replacementAuthorization)).resolves.toBe(false);
 		const revertedAuthorization = await authorize();
 		if (!revertedAuthorization.ok) throw new Error(revertedAuthorization.error);
-		expect(revertedAuthorization.workspaceGeneration).toBe(3);
+		expect(revertedAuthorization.workspaceGeneration).toBe(4);
 		await expect(stateManager.isAuthorizationCurrent(revertedAuthorization)).resolves.toBe(true);
 	});
 
@@ -3135,7 +3154,7 @@ describe("Iroh remote core helpers", () => {
 						{
 							nodeId: "client-node",
 							label: "phone",
-							allowedWorkspaces: [],
+							allowedWorkspaces: ["alpha", "beta"],
 							allowedTools: "read",
 							rpcGrant: CODING_RPC_GRANT,
 							pairedAt: 1,
@@ -3180,6 +3199,7 @@ describe("Iroh remote core helpers", () => {
 				{ id: "remove-beta", type: "unregister_workspace", workspaceName: "beta" },
 				{
 					classifyWorkspaceAvailability: getIrohRemoteWorkspaceAvailabilityStatus,
+					client: { allowedWorkspaces: ["alpha", "beta"] },
 					stateManager,
 				},
 			);
@@ -3188,10 +3208,7 @@ describe("Iroh remote core helpers", () => {
 				handled: true,
 				metadata: {
 					workspaceNames: ["alpha"],
-					workspaces: [
-						{ name: "alpha", status: "available" },
-						{ name: "missing", status: "missing" },
-					],
+					workspaces: [{ name: "alpha", status: "available" }],
 				},
 				response: {
 					id: "remove-beta",
@@ -3201,10 +3218,7 @@ describe("Iroh remote core helpers", () => {
 					data: {
 						removedWorkspace: "beta",
 						workspaceNames: ["alpha"],
-						workspaces: [
-							{ name: "alpha", status: "available" },
-							{ name: "missing", status: "missing" },
-						],
+						workspaces: [{ name: "alpha", status: "available" }],
 					},
 				},
 			});
@@ -3232,7 +3246,7 @@ describe("Iroh remote core helpers", () => {
 		await expect(
 			handleIrohRemoteWorkspaceUnregisterRpcCommand(
 				{ id: "remove-missing", type: "unregister_workspace", workspaceName: "missing" },
-				{ stateManager },
+				{ client: { allowedWorkspaces: [] }, stateManager },
 			),
 		).resolves.toEqual({
 			handled: true,
@@ -3248,7 +3262,7 @@ describe("Iroh remote core helpers", () => {
 		await expect(
 			handleIrohRemoteWorkspaceUnregisterRpcCommand(
 				{ id: "remove-path", type: "unregister_workspace", workspaceName: "alpha", path: "/alpha" },
-				{ stateManager },
+				{ client: { allowedWorkspaces: [] }, stateManager },
 			),
 		).resolves.toEqual({
 			handled: true,
@@ -4586,6 +4600,53 @@ describe("Iroh remote core helpers", () => {
 		});
 	});
 
+	test("omits host-local SQLite locator fields independently of session reference wrapper keys", () => {
+		const sessionReference = {
+			sessionDirectory: "/Users/jordan/.volt/agent/sessions/project",
+			storeId: "store",
+			sessionId: "session",
+			sessionGeneration: "generation",
+			parentSessionDirectory: "/Users/jordan/.volt/agent/sessions/parent",
+			parentStoreId: "parent-store",
+			parentSessionId: "parent-session",
+			parentSessionGeneration: "parent-generation",
+		};
+		const publicPayload = {
+			id: "public-record",
+			requestId: "request",
+			worktreeId: "worktree",
+			status: "completed",
+		};
+		const options = { workspacePath: "/Users/jordan/project" };
+		const values = [
+			sessionReference,
+			{ ...publicPayload, ref: sessionReference },
+			{ ...publicPayload, references: [sessionReference] },
+		];
+
+		for (const [index, value] of values.entries()) {
+			const sanitized = sanitizeIrohRemoteOutbound(value, options);
+			if (index > 0) expect(sanitized).toMatchObject(publicPayload);
+			const wire = JSON.stringify(sanitized);
+			for (const forbidden of [
+				"sessionDirectory",
+				sessionReference.sessionDirectory,
+				"storeId",
+				sessionReference.storeId,
+				"sessionGeneration",
+				sessionReference.sessionGeneration,
+				"parentSessionDirectory",
+				sessionReference.parentSessionDirectory,
+				"parentStoreId",
+				sessionReference.parentStoreId,
+				"parentSessionGeneration",
+				sessionReference.parentSessionGeneration,
+			]) {
+				expect(wire).not.toContain(forbidden);
+			}
+		}
+	});
+
 	test("sanitizes remote outbound structured paths and preserves free-form text", () => {
 		const workspacePath = "/Users/jordan/project";
 		const sessionFile = "/Users/jordan/.volt/agent/sessions/project/session.jsonl";
@@ -4599,6 +4660,12 @@ describe("Iroh remote core helpers", () => {
 				success: true,
 				data: {
 					sessionFile,
+					sessionRef: {
+						sessionDirectory: "/Users/jordan/.volt/agent/sessions/project",
+						storeId: "store",
+						sessionId: "session",
+						sessionGeneration: "generation",
+					},
 					sessionPath: sessionFile,
 					sourceInfo: { path: `${workspacePath}/src/index.ts` },
 					remotePathList: { path: "/workspace/bin:/Users/jordan/.volt/auth.json" },
@@ -4635,6 +4702,7 @@ describe("Iroh remote core helpers", () => {
 				keyedPaths: Record<string, string>;
 				remotePathList: { path: string };
 				sessionFile?: string;
+				sessionRef?: unknown;
 				sessionPath: string;
 				sourceInfo: { path: string };
 				tildeSessionPath: string;
@@ -4644,6 +4712,7 @@ describe("Iroh remote core helpers", () => {
 
 		expect(sanitized.id).toBe("/Users/jordan/private/request-id");
 		expect(sanitized.data.sessionFile).toBeUndefined();
+		expect(sanitized.data.sessionRef).toBeUndefined();
 		expect(sanitized.data.sessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
 		expect(sanitized.data.tildeSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);
 		expect(sanitized.data.tildeUserSessionPath).toBe(IROH_REMOTE_REDACTED_SESSION_FILE);

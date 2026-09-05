@@ -2150,6 +2150,7 @@ test("Unix binary installer verifies a pinned archive before installing its exac
 		for (const file of [
 			"package.json",
 			"image-resize-worker.cjs",
+			"session-store-worker.cjs",
 			"binary-metafile.json",
 			"binary-license-manifest.json",
 			"standalone-build-manifest.json",
@@ -2218,6 +2219,10 @@ uname() {
 		assert.deepEqual(
 			readFileSync(join(home, ".volt", "bin", "image-resize-worker.cjs")),
 			readFileSync(join(payload, "image-resize-worker.cjs")),
+		);
+		assert.deepEqual(
+			readFileSync(join(home, ".volt", "bin", "session-store-worker.cjs")),
+			readFileSync(join(payload, "session-store-worker.cjs")),
 		);
 		assert.deepEqual(
 			readFileSync(join(home, ".volt", "bin", "LICENSES", "node-v22.23.1-LICENSE.txt")),

@@ -150,7 +150,7 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 				options?.preflightResult?.({ success: true, outcome: "admitted" });
 			},
 		),
-		sessionFile: `/sessions/${sessionId}.jsonl`,
+		sessionRef: undefined,
 		sessionId,
 		sessionManager: {
 			flush: vi.fn(async () => {}),
@@ -181,6 +181,7 @@ export function createTestSession(sessionId: string, leafId: string | null) {
 			getLeafEntry: (): SessionEntry | undefined => (session.sessionManager.getBranch() as SessionEntry[]).at(-1),
 			getLeafId: (): string | null => session.leafId,
 			getSessionId: (): string => sessionId,
+			getStartingGitContext: () => undefined,
 		},
 		settingsManager: { flush: vi.fn(async () => {}) },
 		steeringMode: "all" as const,
@@ -247,7 +248,6 @@ export function createTestIrohConversationOptions(runtimeHost: AgentSessionRunti
 					isCompacting: session.isCompacting,
 					steeringMode: session.steeringMode,
 					followUpMode: session.followUpMode,
-					sessionFile: session.sessionFile,
 					sessionId: session.sessionId,
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,

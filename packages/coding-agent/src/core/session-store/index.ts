@@ -1,0 +1,39 @@
+export { digestSessionStoreTransactionPayload } from "./canonical-json.ts";
+export type { SQLiteSessionStoreLease } from "./client.ts";
+export { acquireSharedSQLiteSessionStore, SQLiteSessionStoreClient } from "./client.ts";
+export type {
+	SessionStoreApplyTransactionInput,
+	SessionStoreClientInput,
+	SessionStoreClientInputCommand,
+	SessionStoreClientInputState,
+	SessionStoreClientInputWrite,
+	SessionStoreCommitEvidence,
+	SessionStoreCommitReconciliation,
+	SessionStoreCreateSessionInput,
+	SessionStoreDeleteSessionInput,
+	SessionStoreDeleteSessionResult,
+	SessionStoreEntry,
+	SessionStoreEntryWrite,
+	SessionStoreErrorCode,
+	SessionStoreForeignKeyVerificationResult,
+	SessionStoreInfo,
+	SessionStoreJsonPrimitive,
+	SessionStoreJsonValue,
+	SessionStoreListOptions,
+	SessionStoreOrigin,
+	SessionStoreReconcileCommitInput,
+	SessionStoreSearchChunk,
+	SessionStoreSearchChunkWrite,
+	SessionStoreSearchResult,
+	SessionStoreSessionProjection,
+	SessionStoreSessionSummary,
+	SessionStoreSnapshot,
+	SessionStoreTransactionPayload,
+	SessionStoreTransactionResult,
+} from "./types.ts";
+export {
+	SESSION_STORE_BUSY_TIMEOUT_MS,
+	SESSION_STORE_DATABASE_FILENAME,
+	SESSION_STORE_SCHEMA_VERSION,
+	SessionStoreError,
+} from "./types.ts";

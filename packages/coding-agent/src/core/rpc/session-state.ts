@@ -595,8 +595,8 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 	const followUpQueue = projectRpcQueuedMessages(
 		typeof session.getFollowUpMessages === "function" ? session.getFollowUpMessages() : [],
 	);
-	const sessionFile = projectOptionalStateString(session.sessionFile);
 	const sessionName = projectOptionalStateString(session.sessionName);
+	const startingGitContext = session.sessionManager.getStartingGitContext();
 	const modelBytes =
 		session.model === undefined
 			? null
@@ -616,7 +616,6 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 			projectedBytes: 0,
 		};
 	}
-	if (sessionFile.projection) projection.sessionFile = sessionFile.projection;
 	if (sessionName.projection) projection.sessionName = sessionName.projection;
 	if (steeringQueue.projection) projection.steeringQueue = steeringQueue.projection;
 	if (followUpQueue.projection) projection.followUpQueue = followUpQueue.projection;
@@ -630,12 +629,12 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 		planning:
 			typeof session.getPlanningState === "function" ? session.getPlanningState() : { ...DEFAULT_PLANNING_STATE },
 		gitContext: session.gitContextProvider.getSnapshot(),
+		...(startingGitContext === undefined ? {} : { startingGitContext }),
 		isStreaming: session.isStreaming,
 		isBusy: session.isBusy,
 		isCompacting: session.isCompacting,
 		steeringMode: session.steeringMode,
 		followUpMode: session.followUpMode,
-		...(sessionFile.value === undefined ? {} : { sessionFile: sessionFile.value }),
 		sessionId: session.sessionId,
 		...(sessionName.value === undefined ? {} : { sessionName: sessionName.value }),
 		autoCompactionEnabled: session.autoCompactionEnabled,

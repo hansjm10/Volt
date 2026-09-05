@@ -1,4 +1,4 @@
-import { access, chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -724,6 +724,67 @@ describe("LSP WorkspaceEdit integration", () => {
 			]);
 		} finally {
 			client.dispose();
+		}
+	});
+
+	it("bounds WorkspaceEdits to projectCwd and distinguishes registered path aliases", async () => {
+		const tempRoot = await createTempDir();
+		const realProjectRoot = join(tempRoot, "real-project");
+		const projectRoot = join(tempRoot, "project-alias");
+		const serverRoot = join(projectRoot, "package");
+		await mkdir(realProjectRoot);
+		try {
+			await symlink(realProjectRoot, projectRoot, directorySymlinkType());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+			throw error;
+		}
+		await mkdir(serverRoot);
+		await writeFile(join(serverRoot, ".root"), "", "utf-8");
+		const manager = new LspManager({
+			cwd: serverRoot,
+			projectCwd: projectRoot,
+			config: resolveLspConfig({
+				servers: {
+					typescript: { enabled: false },
+					python: { enabled: false },
+					go: { enabled: false },
+					rust: { enabled: false },
+					fake: {
+						command: [process.execPath, FAKE_SERVER],
+						fileExtensions: [".foo"],
+						rootMarkers: [".root"],
+					},
+				},
+			}),
+		});
+		try {
+			const source = join(serverRoot, "source.foo");
+			const sibling = join(projectRoot, "sibling.foo");
+			await writeFile(source, `OUTSIDE_EDIT ${uri(sibling)}\n`, "utf-8");
+			await writeFile(sibling, "SECRET\n", "utf-8");
+
+			const result = await manager.codeFix(source, { line: 1 });
+
+			expect(result).toContain('Applied "Edit outside workspace"');
+			expect(await readFile(sibling, "utf-8")).toBe("PWNED\n");
+			expect(manager.getStatus()[0]).toMatchObject({
+				workspaceRoot: await realpath(projectRoot),
+				root: await realpath(serverRoot),
+			});
+
+			const externalAlias = join(tempRoot, "external-alias");
+			await symlink(realProjectRoot, externalAlias, directorySymlinkType());
+			const rejectedTarget = join(projectRoot, "rejected.foo");
+			await writeFile(source, `OUTSIDE_EDIT ${uri(join(externalAlias, "rejected.foo"))}\n`, "utf-8");
+			await writeFile(rejectedTarget, "SECRET\n", "utf-8");
+
+			const rejected = await manager.codeFix(source, { line: 1 });
+
+			expect(rejected).toContain("Refusing LSP access outside project workspace");
+			expect(await readFile(rejectedTarget, "utf-8")).toBe("SECRET\n");
+		} finally {
+			manager.dispose();
 		}
 	});
 

@@ -69,12 +69,88 @@ function durableRecord(runId = "review:test"): ReviewRunRecord {
 			description: "uncommitted changes",
 			diffCommand: "git diff exact-base..exact-head",
 			identity: { kind: "uncommitted", baseTree: "base-tree", headTree: "head-tree" },
+			fileSummary: { totalCount: 1, additions: 3, deletions: 1, inventoryComplete: true },
 			files: [
-				{ path: "src/value.ts", baseOid: "base-blob", headOid: "head-blob", hunkIds: ["hunk-1"], reviewable: true },
+				{
+					path: "src/value.ts",
+					status: "modified",
+					baseOid: "base-blob",
+					headOid: "head-blob",
+					hunkIds: ["hunk-1"],
+					reviewable: true,
+					additions: 3,
+					deletions: 1,
+				},
 			],
 		},
 		options: { scope: [], effort: "standard", includeOptional: false, scopeMode: "incremental" },
 		result: parsedReview(),
+	};
+}
+
+function durablePullRequestRecord(runId = "review:test"): ReviewRunRecord {
+	const record = durableRecord(runId);
+	return {
+		...record,
+		workflowAction: "review.pr",
+		target: {
+			...record.target,
+			description: "PR #243",
+			diffCommand: "gh pr diff 243",
+			identity: {
+				kind: "pr",
+				baseTree: "base-tree",
+				headTree: "head-tree",
+				pullRequest: {
+					providerId: "github",
+					number: 243,
+					title: "Compact width UI",
+					body: "PRIVATE_PULL_REQUEST_BODY",
+					url: "https://example.test/pull/243",
+					baseRefName: "main",
+					headRefName: "fix/compact-width-ui",
+					baseRefOid: "a".repeat(40),
+					headRefOid: "b".repeat(40),
+					author: {
+						login: "review-author",
+						avatarUrl: "https://example.test/review-author.png",
+					},
+					reviewState: "ready",
+					mergeability: "mergeable",
+					checks: {
+						state: "passing",
+						totalCount: 2,
+						passedCount: 2,
+						pendingCount: 0,
+						failedCount: 0,
+						neutralCount: 0,
+						unknownCount: 0,
+					},
+					observedAt: 1_782_470_400_000,
+				},
+			},
+		},
+	};
+}
+
+function durableBranchRecord(runId = "review:test"): ReviewRunRecord {
+	const record = durableRecord(runId);
+	return {
+		...record,
+		workflowAction: "review.branch",
+		target: {
+			...record.target,
+			description: "branch changes vs origin/main",
+			diffCommand: "git diff origin/main...HEAD",
+			identity: {
+				kind: "branch",
+				baseTree: "base-tree",
+				headTree: "head-tree",
+				baseCommit: "base-commit",
+				headCommit: "head-commit",
+			},
+			branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
+		},
 	};
 }
 
@@ -398,7 +474,7 @@ describe("RPC durable review actions", () => {
 	test("hydrates durable paginated results and exposes structured context coverage without raw GitHub text", async () => {
 		const manager = SessionManager.inMemory("/workspace");
 		appendReviewRun(manager, durableRecord("review:older"));
-		const newer = { ...durableRecord("review:newer"), endedAt: 3 };
+		const newer = { ...durablePullRequestRecord("review:newer"), endedAt: 3 };
 		newer.target.context = {
 			captureStatus: "complete",
 			linkedIssueCount: 2,
@@ -427,10 +503,37 @@ describe("RPC durable review actions", () => {
 		line(JSON.stringify({ id: "get", type: "get_review_result", runId: "review:newer" }));
 		await vi.waitFor(() => expect(response(collecting.writes, "get")).toBeDefined());
 		const listData = response(collecting.writes, "list")?.data as {
-			runs: Array<{ runId: string }>;
+			runs: Array<{
+				runId: string;
+				target: {
+					pullRequest?: { provider: string; number: number; title: string };
+					files: { totalCount: number; projectedCount: number; isComplete: boolean };
+				};
+			}>;
 			nextCursor?: string;
 		};
 		expect(listData.runs).toHaveLength(1);
+		expect(listData.runs[0]?.target).toMatchObject({
+			pullRequest: {
+				provider: "github",
+				number: 243,
+				title: "Compact width UI",
+				author: { login: "review-author", avatarUrl: "https://example.test/review-author.png" },
+				reviewState: "ready",
+				mergeability: "mergeable",
+				checks: { state: "passing", totalCount: 2 },
+			},
+			files: {
+				totalCount: 1,
+				projectedCount: 0,
+				omittedCount: 1,
+				additions: 3,
+				deletions: 1,
+				isComplete: false,
+				items: [],
+			},
+		});
+		expect(JSON.stringify(listData)).not.toContain("PRIVATE_PULL_REQUEST_BODY");
 		expect(listData.nextCursor).toBeTruthy();
 		line(JSON.stringify({ id: "next", type: "list_review_workflows", cursor: listData.nextCursor, limit: 1 }));
 		line(JSON.stringify({ id: "oversized", type: "list_review_workflows", limit: 101 }));
@@ -448,7 +551,16 @@ describe("RPC durable review actions", () => {
 			runId: "review:newer",
 			completionStatus: "complete",
 			overallCorrectness: "incorrect",
-			target: { context: { linkedIssueCount: 2, discussionEntryCount: 5, fingerprint: "c".repeat(64) } },
+			target: {
+				pullRequest: { provider: "github", number: 243, title: "Compact width UI" },
+				files: {
+					totalCount: 1,
+					projectedCount: 1,
+					isComplete: true,
+					items: [{ path: "src/value.ts", status: "modified", additions: 3, deletions: 1 }],
+				},
+				context: { linkedIssueCount: 2, discussionEntryCount: 5, fingerprint: "c".repeat(64) },
+			},
 			coverage: {
 				context: {
 					discoveryInspectionComplete: true,
@@ -457,6 +569,7 @@ describe("RPC durable review actions", () => {
 			},
 		});
 		expect(JSON.stringify(getData)).toContain("changeLocation");
+		expect(JSON.stringify(getData)).toContain("PRIVATE_PULL_REQUEST_BODY");
 		expect(JSON.stringify(getData)).not.toContain('"file"');
 		expect(JSON.stringify(getData)).not.toContain("filesReviewed");
 		expect(JSON.stringify(getData)).not.toContain("PRIVATE_LINKED_ISSUE_AND_REVIEW_TEXT");
@@ -699,6 +812,9 @@ describe("RPC durable review actions", () => {
 				data: { cancelled: false },
 			}),
 		);
+		expect(runtimeHost.newSession).toHaveBeenCalledWith(
+			expect.objectContaining({ rebindRequestId: "new-discussion" }),
+		);
 		expect(getReviewRun(replacementManagers[0]!, "review:test")).toMatchObject({
 			runId: "review:test",
 			acknowledgedAt,
@@ -730,15 +846,18 @@ describe("RPC durable review actions", () => {
 		await closeMode(collecting, modePromise);
 	});
 
-	test("accepts an incremental durable rerun and launches it after the response", async () => {
+	test("accepts an incremental durable branch rerun through its host-only locator", async () => {
 		const manager = SessionManager.inMemory("/workspace");
-		appendReviewRun(manager, durableRecord());
+		appendReviewRun(manager, durableBranchRecord());
 		const runtimeHost = makeRuntimeHost({ manager });
 		const collecting = createCollectingTransport();
 		const modePromise = await startMode(runtimeHost, collecting.transport);
-		collecting.getLineHandler()(
-			JSON.stringify({ id: "rerun", type: "rerun_review", runId: "review:test", mode: "incremental" }),
-		);
+		const line = collecting.getLineHandler();
+		line(JSON.stringify({ id: "list-branch", type: "list_review_workflows" }));
+		await vi.waitFor(() => expect(response(collecting.writes, "list-branch")).toBeDefined());
+		expect(JSON.stringify(response(collecting.writes, "list-branch"))).not.toContain("branchBase");
+
+		line(JSON.stringify({ id: "rerun", type: "rerun_review", runId: "review:test", mode: "incremental" }));
 		await vi.waitFor(() =>
 			expect(response(collecting.writes, "rerun")).toMatchObject({
 				success: true,
@@ -748,10 +867,32 @@ describe("RPC durable review actions", () => {
 		await vi.waitFor(() => expect(reviewMocks.executeReviewWorkflow).toHaveBeenCalled());
 		expect(reviewMocks.prepareReviewWorkflow).toHaveBeenCalledWith(
 			expect.objectContaining({
+				target: {
+					kind: "branch",
+					branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
+				},
 				parentRunId: "review:test",
 				controls: expect.objectContaining({ scopeMode: "incremental" }),
 			}),
 		);
+		await closeMode(collecting, modePromise);
+	});
+
+	test("rejects a durable branch rerun without a stored locator", async () => {
+		const manager = SessionManager.inMemory("/workspace");
+		const record = durableBranchRecord("review:missing-locator");
+		delete record.target.branchBase;
+		appendReviewRun(manager, record);
+		const runtimeHost = makeRuntimeHost({ manager });
+		const collecting = createCollectingTransport();
+		const modePromise = await startMode(runtimeHost, collecting.transport);
+		collecting.getLineHandler()(JSON.stringify({ id: "rerun-missing", type: "rerun_review", runId: record.runId }));
+		await vi.waitFor(() => expect(response(collecting.writes, "rerun-missing")).toBeDefined());
+		expect(response(collecting.writes, "rerun-missing")).toMatchObject({
+			success: false,
+			error: "Durable branch review run does not retain a base locator.",
+		});
+		expect(reviewMocks.prepareReviewWorkflow).not.toHaveBeenCalled();
 		await closeMode(collecting, modePromise);
 	});
 

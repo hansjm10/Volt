@@ -205,9 +205,12 @@ describe("responsive plan dimensions", () => {
 		});
 	});
 
-	it("requires Plan mode or canonical plan state", () => {
+	it("keeps research and working drafts compact until the plan is reviewable", () => {
 		expect(getResponsivePlanDimensions(160, 30, { mode: "build", plan: null })).toBeUndefined();
-		expect(getResponsivePlanDimensions(160, 30, { mode: "plan", plan: null })).toBeDefined();
+		expect(getResponsivePlanDimensions(160, 30, { mode: "plan", plan: null })).toBeUndefined();
+		expect(getResponsivePlanDimensions(160, 30, { mode: "plan", plan: plan("draft") })).toBeUndefined();
+		expect(getResponsivePlanDimensions(160, 30, { mode: "plan", plan: plan("ready") })).toBeDefined();
+		expect(getResponsivePlanDimensions(160, 30, { mode: "build", plan: plan("active") })).toBeDefined();
 	});
 });
 
@@ -223,6 +226,15 @@ describe("ResponsivePlanLayoutComponent", () => {
 			expect(rendered).toContain("COMPACT_PLAN_STATUS");
 			expect(rendered.at(-1)).toBe("F".repeat(columns));
 		}
+	});
+
+	it("keeps a working draft in compact flow even when the terminal can split", () => {
+		const compactOnly = new LinesComponent(["COMPACT_WORKING_DRAFT"]);
+		const planning: PlanningState = { mode: "plan", plan: plan("draft") };
+		const { layout } = createLayout({ columns: 160, rows: 30, planning, compact: [compactOnly] });
+		const rendered = layout.render(160).lines.map(stripAnsi).join("\n");
+		expect(rendered).toContain("COMPACT_WORKING_DRAFT");
+		expect(rendered).not.toContain("Responsive Plan");
 	});
 
 	it("pins controls and inspector while retaining older conversation rows in scrollback", () => {
@@ -333,7 +345,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 	it("keeps the fullscreen conversation dock aligned with the inspector footer", async () => {
 		const columns = 191;
 		const rows = 40;
-		const planning: PlanningState = { mode: "plan", plan: plan("draft") };
+		const planning: PlanningState = { mode: "plan", plan: plan("ready") };
 		const compactStatus = new LinesComponent(["COMPACT_STATUS_TOP", "COMPACT_STATUS_BOTTOM"]);
 		const editor = new LinesComponent(["EDITOR_TOP", "EDITOR_BOTTOM"]);
 		const conversationBody = new LinesComponent(["FULLSCREEN_CONVERSATION"]);
@@ -611,7 +623,7 @@ describe("ResponsivePlanLayoutComponent", () => {
 		const widget = new LinesComponent(["EXTENSION_WIDGET"]);
 		const editor = new LinesComponent(["EXTENSION_EDITOR"]);
 		const footer = new LinesComponent(["EXTENSION_FOOTER"]);
-		const planning: PlanningState = { mode: "plan", plan: plan("draft") };
+		const planning: PlanningState = { mode: "plan", plan: plan("ready") };
 		const inspector = new PlanInspectorComponent({
 			planning,
 			onAction: () => undefined,
@@ -865,19 +877,19 @@ describe("ResponsivePlanLayoutComponent", () => {
 	});
 
 	it("requests scrollback preservation for state-only layout transitions", () => {
-		const initial: PlanningState = { mode: "build", plan: null };
+		const compactPlanning: PlanningState = { mode: "plan", plan: plan("draft") };
 		const { layout, inspector, splitChanges, preserveScrollbackChanges } = createLayout({
 			columns: 160,
 			rows: 24,
-			planning: initial,
+			planning: compactPlanning,
 		});
 		layout.render(160).lines;
-		const splitPlanning: PlanningState = { mode: "plan", plan: null };
+		const splitPlanning: PlanningState = { mode: "plan", plan: plan("ready") };
 		layout.setPlanning(splitPlanning);
 		inspector.setPlanning(splitPlanning);
 		layout.render(160).lines;
-		layout.setPlanning(initial);
-		inspector.setPlanning(initial);
+		layout.setPlanning(compactPlanning);
+		inspector.setPlanning(compactPlanning);
 		layout.render(160).lines;
 		expect(splitChanges).toEqual([true, false]);
 		expect(preserveScrollbackChanges).toEqual([true, true]);

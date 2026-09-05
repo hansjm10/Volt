@@ -254,7 +254,8 @@ describe("AgentSession conversation generation commits", () => {
 		const firstAssistantId = manager.appendMessage(fauxAssistantMessage("first assistant", { timestamp: 2 }));
 		manager.appendMessage({ role: "user", content: "second user", timestamp: 3 });
 		manager.appendMessage(fauxAssistantMessage("second assistant", { timestamp: 4 }));
-		const targetManager = SessionManager.create(tempDir, tempDir);
+		const targetManager = await SessionManager.create(tempDir, tempDir);
+		cleanups.push(() => targetManager.drainPersistence().then(() => undefined));
 		targetManager.appendMessage({ role: "user", content: "target user", timestamp: 5 });
 		targetManager.appendMessage(fauxAssistantMessage("target assistant", { timestamp: 6 }));
 
@@ -285,7 +286,7 @@ describe("AgentSession conversation generation commits", () => {
 		);
 		const structuralError = "Cannot change sessions while an agent run is active; abort or wait for it to finish";
 		await expect(runtime.newSession()).rejects.toThrow(structuralError);
-		await expect(runtime.switchSession(targetManager.getSessionFile()!)).rejects.toThrow(structuralError);
+		await expect(runtime.switchSession(targetManager.getSessionRef()!)).rejects.toThrow(structuralError);
 		await expect(runtime.switchSessionById(targetManager.getSessionId())).rejects.toThrow(structuralError);
 		await expect(runtime.fork(firstAssistantId, { position: "at" })).rejects.toThrow(structuralError);
 		releaseUpdate();
@@ -577,13 +578,13 @@ describe("AgentSession conversation generation commits", () => {
 				diagnostics: services.diagnostics,
 			};
 		};
-		const activeManager = SessionManager.create(tempDir, tempDir);
+		const activeManager = await SessionManager.create(tempDir, tempDir);
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: activeManager,
 		});
-		const targetManager = SessionManager.create(tempDir, tempDir);
+		const targetManager = await SessionManager.create(tempDir, tempDir);
 		targetManager.appendMessage({ role: "user", content: "switch target", timestamp: 1 });
 		targetManager.appendMessage(fauxAssistantMessage("switch target assistant"));
 		const targetSessionId = targetManager.getSessionId();
@@ -593,6 +594,7 @@ describe("AgentSession conversation generation commits", () => {
 			endMode?.();
 			await modePromise;
 			await runtime.dispose();
+			await targetManager.closePersistence();
 			faux.unregister();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true, force: true });

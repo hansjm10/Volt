@@ -57,13 +57,28 @@ export class PlanStatusComponent implements Component {
 		const left = theme.bold(
 			theme.fg(plan.phase === "ready" ? "warning" : "accent", `${mark} ${planPhaseLabel(plan)}`),
 		);
-		const right = theme.fg("dim", `${completed}/${total} · ${percent}%`);
+		const hasSubsteps = plan.steps.some((step) => step.substeps !== undefined);
+		const right = theme.fg(
+			"dim",
+			plan.phase === "draft"
+				? hasSubsteps
+					? `${plan.steps.length} ${plan.steps.length === 1 ? "outcome" : "outcomes"} · ${total} ${total === 1 ? "task" : "tasks"}`
+					: `${total} proposed ${total === 1 ? "step" : "steps"}`
+				: `${completed}/${total} · ${percent}%`,
+		);
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 		const lines = [truncateToWidth(`${left}${gap}${right}`, width)];
 		if (width < 100) return createRenderFrame(lines);
 
 		const step = getCurrentPlanStep(plan);
-		if (plan.phase === "handed_off" && plan.execution) {
+		if (plan.phase === "draft") {
+			lines.push(
+				truncateToWidth(
+					theme.fg("muted", ` Working draft · revision ${plan.revision} · /plan-details to inspect`),
+					width,
+				),
+			);
+		} else if (plan.phase === "handed_off" && plan.execution) {
 			lines.push(truncateToWidth(theme.fg("muted", ` Execution session: ${plan.execution.targetSessionId}`), width));
 		} else if (step) {
 			lines.push(truncateToWidth(theme.fg("muted", ` Current · ${step}`), width));

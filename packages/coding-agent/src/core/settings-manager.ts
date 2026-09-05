@@ -11,7 +11,7 @@ import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { ensurePrivateDirectorySync, hardenPrivateRegularFileSync } from "../utils/private-files.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import type { LspSettings } from "./lsp/config.ts";
-import type { Personality } from "./personality.ts";
+import { isPersonality, type Personality } from "./personality.ts";
 
 const DEFAULT_CONTEXT_WARNING_TOKENS = 350_000;
 
@@ -177,6 +177,8 @@ export interface RemoteSettings {
 	detachedRuntimeTtlMs?: number;
 	/** Tool allowlist for daemon-owned headless runtimes only. */
 	allowTools?: string[];
+	/** Discover exact pull-request associations for trusted Work sessions. Default: true. */
+	pullRequestDiscovery?: boolean;
 }
 
 /** Deep merge records: overrides take precedence, nested objects merge recursively, arrays replace. */
@@ -1179,7 +1181,7 @@ export class SettingsManager {
 	}
 
 	getPersonality(): Personality {
-		return this.settings.personality === "pragmatic" ? "pragmatic" : "default";
+		return isPersonality(this.settings.personality) ? this.settings.personality : "default";
 	}
 
 	setPersonality(personality: Personality): void {

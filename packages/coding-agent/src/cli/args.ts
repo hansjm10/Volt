@@ -283,9 +283,9 @@ ${chalk.bold("Options:")}
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
-  --session <path|id>            Use specific session file or partial UUID
+  --session <path|id>            Resume by partial session ID, or import a JSONL snapshot by path
   --session-id <id>              Use exact project session ID, creating it if missing
-  --fork <path|id>               Fork specific session file or partial UUID into a new session
+  --fork <path|id>               Fork by partial session ID, or import a JSONL snapshot by path
   --session-dir <dir>            Directory for session storage and lookup
   --no-session                   Don't save session (ephemeral)
   --name, -n <name>              Set session display name
@@ -311,7 +311,7 @@ ${chalk.bold("Options:")}
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
   --lsp                          Force-enable LSP diagnostics for this run (see docs/lsp.md)
-  --export <file>                Export session file to HTML and exit
+  --export <snapshot>            Export a JSONL session snapshot to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --tui-mode <mode>              TUI mode: regular (default) or fullscreen
   --verbose                      Force verbose startup (overrides quietStartup setting)
@@ -372,8 +372,8 @@ ${chalk.bold("Examples:")}
   # Disable one tool while keeping the rest available
   ${APP_NAME} --exclude-tools ask_question
 
-  # Export a session file to HTML
-  ${APP_NAME} --export ~/${CONFIG_DIR_NAME}/agent/sessions/--path--/session.jsonl
+  # Export a JSONL session snapshot to HTML
+  ${APP_NAME} --export session.jsonl
   ${APP_NAME} --export session.jsonl output.html
 
 ${chalk.bold("Environment Variables:")}

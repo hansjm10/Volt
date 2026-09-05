@@ -576,7 +576,8 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 	registry.register({
 		id: REVIEW_BRANCH_ACTION_ID,
 		label: "Review branch",
-		description: "Review the current branch against its merge base.",
+		description:
+			"Review the current branch against a refreshed upstream merge base using host Git credentials and network; full refs use local cached state.",
 		category: "review",
 		presentation: {
 			kind: "card",
@@ -591,6 +592,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 				type: "string",
 				required: false,
 				placeholder: "main",
+				description: "Plain names refresh their upstream; refs/heads/* and refs/remotes/* use local cached state.",
 				completion: "gitBranches",
 			},
 			...REVIEW_OPTION_ARGUMENTS,
@@ -610,7 +612,7 @@ export function registerBuiltinHostActions(registry: HostActionRegistry): HostAc
 		id: REVIEW_PR_ACTION_ID,
 		label: "Review pull request",
 		description:
-			"Review a GitHub pull request using the host's GitHub credentials and network; its metadata, diff, authoritative linked issues, comments, submitted review summaries, and inline review threads are sent to discovery and verification, while retained finding prose is rendered separately without GitHub context.",
+			"Review a pull request using the built-in GitHub CLI code-host provider, host credentials, and network; its metadata, diff, authoritative linked issues, comments, submitted review summaries, and inline review threads are sent to discovery and verification, while retained finding prose is rendered separately without code-host context.",
 		category: "review",
 		presentation: { kind: "card", group: "Review", priority: 80, icon: "arrow.triangle.pull" },
 		args: [

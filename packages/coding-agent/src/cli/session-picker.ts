@@ -4,16 +4,16 @@
 
 import { ProcessTerminal, setKeybindings, TuiMainScreen } from "@hansjm10/volt-tui";
 import { KeybindingsManager } from "../core/keybindings.ts";
-import type { SessionInfo, SessionListProgress } from "../core/session-manager.ts";
+import type { SessionInfo, SessionListProgress, SessionReference } from "../core/session-manager.ts";
 import { SessionSelectorComponent } from "../modes/interactive/components/session-selector.ts";
 
-type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
+type SessionsLoader = (onProgress?: SessionListProgress, query?: string) => Promise<SessionInfo[]>;
 
-/** Show TUI session selector and return selected session path or null if cancelled */
+/** Show TUI session selector and return the selected stable reference or null if cancelled. */
 export async function selectSession(
 	currentSessionsLoader: SessionsLoader,
 	allSessionsLoader: SessionsLoader,
-): Promise<string | null> {
+): Promise<SessionReference | null> {
 	return new Promise((resolve) => {
 		const ui = new TuiMainScreen(new ProcessTerminal());
 		const keybindings = KeybindingsManager.create();
@@ -23,11 +23,11 @@ export async function selectSession(
 		const selector = new SessionSelectorComponent(
 			currentSessionsLoader,
 			allSessionsLoader,
-			(path: string) => {
+			(ref: SessionReference) => {
 				if (!resolved) {
 					resolved = true;
 					ui.stop();
-					resolve(path);
+					resolve(ref);
 				}
 			},
 			() => {

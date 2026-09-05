@@ -63,6 +63,12 @@ const RELAY_AUTHORIZATION = {
 	clientNodeId: "n-phone-a",
 	workspaceName: "ws",
 	workspacePath: "/tmp/ws",
+	workspaceNames: ["ws", "beta"],
+	workspaces: [
+		{ name: "ws", status: "available" as const },
+		{ name: "beta", status: "available" as const },
+		{ name: "offline", status: "missing" as const },
+	],
 	allowedTools: "read",
 	rpcGrant: createIrohRemotePresetAccess("full").rpcGrant,
 };
@@ -105,7 +111,6 @@ function mintTestRelay(
 			streamId: "st-1",
 			resolvedTarget: {
 				sessionId: "s-1",
-				sessionFilePath: "/tmp/ws/.sessions/s-1.jsonl",
 				selection: "resumed",
 				requestedSessionId: "s-1",
 				workspaceName: "ws",
@@ -149,7 +154,6 @@ describe("relay framing (§12.2.3)", () => {
 			streamId: "st-1",
 			resolvedTarget: {
 				sessionId: "s-1",
-				sessionFilePath: "/tmp/ws/.sessions/s-1.jsonl",
 				selection: "resumed",
 				requestedSessionId: "s-1",
 				workspaceName: "ws",

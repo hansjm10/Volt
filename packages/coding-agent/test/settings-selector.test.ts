@@ -143,6 +143,15 @@ describe("SettingsSelectorComponent", () => {
 			expect(session.settingsManager.getPersonality()).toBe("pragmatic");
 			expect(session.settingsManager.getGlobalSettings().profiles?.delivery?.personality).toBe("pragmatic");
 			expect(stripAnsi(settingsList.render(100).lines.join("\n"))).toContain("pragmatic");
+
+			settingsList.handleInput("\n");
+
+			expect(onPersonalityChange).toHaveBeenLastCalledWith("simplified-technical");
+			expect(session.settingsManager.getPersonality()).toBe("simplified-technical");
+			expect(session.settingsManager.getGlobalSettings().profiles?.delivery?.personality).toBe(
+				"simplified-technical",
+			);
+			expect(stripAnsi(settingsList.render(100).lines.join("\n"))).toContain("simplified-technical");
 		} finally {
 			cleanup();
 		}

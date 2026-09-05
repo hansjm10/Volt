@@ -53,6 +53,7 @@ import {
 	REMOTE_REVIEW_TOOL_NAMES,
 	type ReviewWorkflowEvent,
 	type ReviewWorkflowToolEvent,
+	reviewTargetForRerun,
 } from "../../core/review.ts";
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
@@ -66,7 +67,7 @@ import {
 } from "../../core/review-state.ts";
 import { type ProjectionDiagnostic, StreamProjector } from "../../core/rpc/stream-projection.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
-import { SessionManager } from "../../core/session-manager.ts";
+import { SessionManager, type SessionReference } from "../../core/session-manager.ts";
 import type { SubagentDefinition, SubagentHandle } from "../../core/subagents/index.ts";
 import { SubscriptionUsageService } from "../../core/subscription-usage.ts";
 import {
@@ -159,7 +160,7 @@ function parseHostActionResponseDecision(value: unknown): RpcHostActionResponse[
 }
 
 export interface RpcSessionChange {
-	sessionFile?: string;
+	sessionRef?: SessionReference;
 	sessionId: string;
 }
 
@@ -1009,7 +1010,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		// disposed one and silently stop delivering. Same-id consumers no-op safely.
 		if (options.onSessionChanged && session !== lastNotifiedSession) {
 			lastNotifiedSession = session;
-			await options.onSessionChanged({ sessionFile: session.sessionFile, sessionId: session.sessionId });
+			const sessionRef = session.sessionManager.getSessionRef();
+			await options.onSessionChanged({
+				...(sessionRef ? { sessionRef } : {}),
+				sessionId: session.sessionId,
+			});
 		}
 	};
 
@@ -1315,13 +1320,27 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					throw new Error("The review session opened without the selected findings.");
 				if (opened.seeded && requestedFindingIds === undefined) {
 					if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
-					const sourceSessionFile = sourceSessionManager.getSessionFile();
-					const acknowledgmentManager = sourceSessionFile
-						? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+					const sourceSessionRef = sourceSessionManager.getSessionRef();
+					const acknowledgmentManager = sourceSessionRef
+						? await SessionManager.open(sourceSessionRef)
 						: sourceSessionManager;
-					acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
-					await acknowledgmentManager.flush();
-					if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
+					try {
+						acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
+						await acknowledgmentManager.flush();
+					} catch (error) {
+						if (sourceSessionRef) {
+							try {
+								await acknowledgmentManager.closePersistence();
+							} catch (closeError) {
+								throw new AggregateError(
+									[error, closeError],
+									"Review acknowledgment failed and its source manager could not be closed",
+								);
+							}
+						}
+						throw error;
+					}
+					if (sourceSessionRef) await acknowledgmentManager.closePersistence();
 				}
 				return {
 					action,
@@ -1373,18 +1392,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			}
 			if (action === REVIEW_RERUN_ACTION_ID) {
 				if (!record) throw new Error(`Unknown durable review run: ${runId}`);
-				const identity = record.target.identity;
-				const target =
-					identity.kind === "uncommitted"
-						? { kind: "uncommitted" as const }
-						: identity.kind === "branch"
-							? { kind: "branch" as const, base: identity.baseCommit }
-							: identity.kind === "pr"
-								? {
-										kind: "pr" as const,
-										number: identity.pullRequest ? String(identity.pullRequest.number) : undefined,
-									}
-								: { kind: "commit" as const, sha: identity.headCommit };
+				const target = reviewTargetForRerun(record);
 				const rerun = await createHostActionContext(
 					commandSession,
 					assertConversationGenerationCurrent,
@@ -1522,39 +1530,50 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 
-	const cleanupStartupFailure = async (): Promise<void> => {
+	const cleanupStartupFailure = async (): Promise<unknown[]> => {
 		shuttingDown = true;
-		try {
-			restoreRebindSession();
-			stopModelCatalogWatcher();
-			cancelPendingExtensionRequests();
-			detachHostActionBridge();
-			detachReviewWorkflowSink();
-			await rpcSubagents.disposeAll();
-			pendingReviewWorkflows.clear();
-			if (shouldDisposeRuntimeOnClose) {
-				cancelPendingHostActionRequests();
+		const cleanupErrors: unknown[] = [];
+		const recordCleanupError = (error: unknown): void => {
+			if (error instanceof AggregateError) {
+				for (const nestedError of error.errors as unknown[]) recordCleanupError(nestedError);
+				return;
 			}
-			for (const cleanup of signalCleanupHandlers) {
-				cleanup();
-			}
-			unsubscribe?.();
-			endSessionProjector();
-			unsubscribeBackpressure?.();
-			if (shouldDisposeRuntimeOnClose) {
-				await runtimeHost.dispose();
-			}
-			detachInput();
-			detachClose();
-		} finally {
+			cleanupErrors.push(error);
+		};
+		const captureCleanupError = async (cleanup: () => void | Promise<void>): Promise<void> => {
 			try {
-				await transport.close();
-			} finally {
-				if (shouldRestoreStdout) {
-					restoreStdout();
-				}
+				await cleanup();
+			} catch (error) {
+				recordCleanupError(error);
 			}
+		};
+
+		await captureCleanupError(restoreRebindSession);
+		await captureCleanupError(stopModelCatalogWatcher);
+		await captureCleanupError(cancelPendingExtensionRequests);
+		await captureCleanupError(detachHostActionBridge);
+		await captureCleanupError(detachReviewWorkflowSink);
+		await captureCleanupError(() => rpcSubagents.disposeAll());
+		pendingReviewWorkflows.clear();
+		if (shouldDisposeRuntimeOnClose) {
+			await captureCleanupError(cancelPendingHostActionRequests);
 		}
+		for (const cleanup of signalCleanupHandlers) {
+			await captureCleanupError(cleanup);
+		}
+		await captureCleanupError(() => unsubscribe?.());
+		await captureCleanupError(endSessionProjector);
+		await captureCleanupError(() => unsubscribeBackpressure?.());
+		if (shouldDisposeRuntimeOnClose) {
+			await captureCleanupError(() => runtimeHost.dispose());
+		}
+		await captureCleanupError(detachInput);
+		await captureCleanupError(detachClose);
+		await captureCleanupError(() => transport.close());
+		if (shouldRestoreStdout) {
+			await captureCleanupError(restoreStdout);
+		}
+		return cleanupErrors;
 	};
 
 	let startupComplete = false;
@@ -1826,9 +1845,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			} catch {}
 			throw startupAbortError ?? startupError;
 		}
-		try {
-			await cleanupStartupFailure();
-		} catch {}
+		const cleanupErrors = await cleanupStartupFailure();
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError(
+				[startupError, ...cleanupErrors],
+				"RPC mode startup failed and cleanup did not complete",
+			);
+		}
 		throw startupError;
 	}
 	if (shuttingDown) {

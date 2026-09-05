@@ -143,10 +143,14 @@ import {
 	type AgentMode,
 	assertPlanRevision,
 	clonePlanningState,
+	clonePlanState,
+	derivePlanStepStatus,
 	formatPlanCheckpoint,
 	formatPlanPolicy,
+	getPlanLeafSteps,
 	PLAN_CHECKPOINT_CUSTOM_TYPE,
 	type PlanExecution,
+	type PlanItem,
 	type PlanningState,
 	type PlanState,
 	type PlanStepStatus,
@@ -165,12 +169,12 @@ import type {
 } from "./session-manager.ts";
 import {
 	CLIENT_INPUT_MAX_RECOVERABLE_QUEUE_ENTRIES,
-	CURRENT_SESSION_VERSION,
 	createClientInputSemanticDigest,
 	getLatestCompactionEntry,
 	RUNTIME_QUEUE_ENTRY_ID_PREFIX,
 	SessionAtomicAppendError,
-	type SessionHeader,
+	type SessionReference,
+	serializeSessionJsonlSnapshot,
 } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -189,7 +193,13 @@ import {
 	type SubagentToolManager,
 	type SubagentToolMode,
 } from "./tools/index.ts";
-import { canonicalizePlanSteps, createPlanningToolDefinitions, NATIVE_PLAN_TOOL_NAMES } from "./tools/planning.ts";
+import {
+	canonicalizePlanSteps,
+	createPlanningToolDefinitions,
+	NATIVE_PLAN_TOOL_NAMES,
+	type PlanStepInput,
+	planStepsSemanticallyEqual,
+} from "./tools/planning.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
@@ -358,6 +368,8 @@ export interface AgentSessionConfig {
 	settingsManager: SettingsManager;
 	gitContextProvider?: GitContextProvider;
 	cwd: string;
+	/** Project/config root and hard LSP workspace boundary. Defaults to cwd. */
+	projectCwd?: string;
 	/** Global config directory used for session-owned artifacts. Default: ~/.volt/agent */
 	agentDir?: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
@@ -457,7 +469,7 @@ export interface ModelCycleResult {
 
 /** Lifetime session statistics for /session and RPC consumers. */
 export interface SessionStats {
-	sessionFile: string | undefined;
+	sessionRef: SessionReference | undefined;
 	sessionId: string;
 	userMessages: number;
 	assistantMessages: number;
@@ -555,6 +567,9 @@ export class QueueClearPersistenceError extends Error {
 		this.followUp = queues.followUp;
 	}
 }
+
+/** @internal Preserves the primary constructor failure and every synchronous rollback failure. */
+export class AgentSessionConstructionCleanupError extends AggregateError {}
 
 // ============================================================================
 // Constants
@@ -667,6 +682,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition<any, any>[];
 	private _baseToolDefinitions: Map<string, ToolDefinition<any, any>> = new Map();
 	private _cwd: string;
+	private _lexicalProjectCwd: string;
 	private _agentDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -756,49 +772,130 @@ export class AgentSession {
 		});
 		this._streamOptions = this._harness.getStreamOptions();
 		this.settingsManager = config.settingsManager;
+		const ownsGitContextProvider = config.gitContextProvider === undefined;
 		this.gitContextProvider = config.gitContextProvider ?? new GitContextProvider(config.cwd);
-		if (!config.gitContextProvider) void this.gitContextProvider.refresh();
-		this._scopedModels = config.scopedModels ?? [];
-		this._resourceLoader = config.resourceLoader;
-		this._customTools = config.customTools ?? [];
-		this._cwd = config.cwd;
-		this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
-		this._modelRegistry = config.modelRegistry;
-		const restoredContext = this.sessionManager.buildSessionContext();
-		this._restoreFastModePolicy(restoredContext.fastMode);
-		this._planningState = clonePlanningState(restoredContext.planning);
-		this._extensionRunnerRef = config.extensionRunnerRef;
-		this._initialActiveToolNames = config.initialActiveToolNames;
-		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
-		this._allowUnlistedExtensionTools = config.allowUnlistedExtensionTools ?? false;
-		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
-		this._baseToolsOverride = config.baseToolsOverride;
-		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
-		this._hostInteraction = config.hostInteraction;
-		this._subagentToolManager = config.subagentToolManager;
-		this._mcpManager = config.mcpManager;
-		this._mcpManagerFactory = config.mcpManagerFactory;
-		this._attachMcpManagerEvents();
+		const gitContextSubscriptionFinalizers: Array<() => void> = [];
 
-		// Always subscribe to finalized Harness events for internal handling.
-		this._unsubscribeAgent = this._harness.subscribe(async (event) => {
-			if (isAgentEvent(event)) await this._handleAgentEvent(event);
-		});
-		this._unsubscribeGitContext = this.gitContextProvider.subscribe(
-			(gitContext) => {
-				this._emit({ type: "git_context_changed", gitContext });
-			},
-			{ monitor: false },
-		);
-		this._installAgentToolHooks();
+		try {
+			if (ownsGitContextProvider) void this.gitContextProvider.refresh();
+			this._scopedModels = config.scopedModels ?? [];
+			this._resourceLoader = config.resourceLoader;
+			this._customTools = config.customTools ?? [];
+			this._cwd = resolvePath(config.cwd);
+			this._lexicalProjectCwd = resolvePath(config.projectCwd ?? this._cwd);
+			this._agentDir = resolvePath(config.agentDir ?? getAgentDir());
+			this._modelRegistry = config.modelRegistry;
+			const restoredContext = this.sessionManager.buildSessionContext();
+			this._restoreFastModePolicy(restoredContext.fastMode);
+			this._planningState = clonePlanningState(restoredContext.planning);
+			this._extensionRunnerRef = config.extensionRunnerRef;
+			this._initialActiveToolNames = config.initialActiveToolNames;
+			this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
+			this._allowUnlistedExtensionTools = config.allowUnlistedExtensionTools ?? false;
+			this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
+			this._baseToolsOverride = config.baseToolsOverride;
+			this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+			this._hostInteraction = config.hostInteraction;
+			this._subagentToolManager = config.subagentToolManager;
+			this._mcpManager = config.mcpManager;
+			this._mcpManagerFactory = config.mcpManagerFactory;
+			this._attachMcpManagerEvents();
 
-		this._buildRuntime({
-			activeToolNames: this._initialActiveToolNames,
-			includeAllExtensionTools: true,
-		});
-		this._planningRuntimeInitialized = true;
-		this._syncPlanningRuntime();
-		this._recoverDurableQueuedClientInputs();
+			// Always subscribe to finalized Harness events for internal handling.
+			this._unsubscribeAgent = this._harness.subscribe(async (event) => {
+				if (isAgentEvent(event)) await this._handleAgentEvent(event);
+			});
+			this._unsubscribeGitContext = () => {
+				const cleanupErrors: unknown[] = [];
+				for (const unsubscribe of gitContextSubscriptionFinalizers.splice(0).reverse()) {
+					try {
+						unsubscribe();
+					} catch (error) {
+						cleanupErrors.push(error);
+					}
+				}
+				if (cleanupErrors.length === 1) throw cleanupErrors[0];
+				if (cleanupErrors.length > 1) {
+					throw new AggregateError(cleanupErrors, "Git context subscription cleanup did not complete");
+				}
+			};
+			const startingGitContextSessionId = this.sessionManager.getSessionId();
+			gitContextSubscriptionFinalizers.push(
+				this.gitContextProvider.subscribeObservations((observation) => {
+					if (observation.status !== "definitive") return;
+					try {
+						this.sessionManager.recordStartingGitContext(startingGitContextSessionId, observation.gitContext);
+					} catch {
+						// Git replacement delivery remains independent from metadata persistence.
+					}
+				}),
+			);
+			gitContextSubscriptionFinalizers.push(
+				this.gitContextProvider.subscribe((gitContext) => this._emit({ type: "git_context_changed", gitContext }), {
+					monitor: false,
+				}),
+			);
+			void this.gitContextProvider.refresh();
+			this._installAgentToolHooks();
+
+			this._buildRuntime({
+				activeToolNames: this._initialActiveToolNames,
+				includeAllExtensionTools: true,
+			});
+			this._planningRuntimeInitialized = true;
+			this._syncPlanningRuntime();
+			this._recoverDurableQueuedClientInputs();
+		} catch (error) {
+			this._disposed = true;
+			this._canonicalProducerRetired = true;
+			const cleanupErrors: unknown[] = [];
+			const cleanup = (finalize: () => void): void => {
+				try {
+					finalize();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			};
+
+			const extensionRunner = this._extensionRunner as ExtensionRunner | undefined;
+			if (extensionRunner) {
+				cleanup(() => extensionRunner.invalidate("AgentSession construction failed before ownership transfer"));
+			}
+			const extensionErrorUnsubscriber = this._extensionErrorUnsubscriber;
+			this._extensionErrorUnsubscriber = undefined;
+			if (extensionErrorUnsubscriber) cleanup(extensionErrorUnsubscriber);
+			if (extensionRunner && this._extensionRunnerRef) {
+				cleanup(() => {
+					if (this._extensionRunnerRef?.current === extensionRunner) {
+						this._extensionRunnerRef.current = undefined;
+					}
+				});
+			}
+
+			const lspManager = this._lspManager;
+			this._lspManager = undefined;
+			if (lspManager) cleanup(() => lspManager.dispose());
+			this._unsubscribeGitContext = undefined;
+			for (const unsubscribeGitContext of gitContextSubscriptionFinalizers.splice(0).reverse()) {
+				cleanup(unsubscribeGitContext);
+			}
+			const unsubscribeAgent = this._unsubscribeAgent;
+			this._unsubscribeAgent = undefined;
+			if (unsubscribeAgent) cleanup(unsubscribeAgent);
+			const unsubscribeMcpManager = this._unsubscribeMcpManager;
+			this._unsubscribeMcpManager = undefined;
+			if (unsubscribeMcpManager) cleanup(unsubscribeMcpManager);
+			if (ownsGitContextProvider) cleanup(() => this.gitContextProvider.dispose());
+			cleanup(() => this._harness.dispose("session_replacement"));
+
+			if (cleanupErrors.length > 0) {
+				throw new AgentSessionConstructionCleanupError(
+					[error, ...cleanupErrors],
+					"Agent session construction cleanup did not complete",
+				);
+			}
+			throw error;
+		}
 	}
 
 	private _assertConversationAuthorityAvailable(): void {
@@ -826,9 +923,10 @@ export class AgentSession {
 	}
 
 	/** LSP status for the /lsp command. */
-	getLspStatus(): { enabled: boolean; servers: LspServerStatus[]; traceFile?: string } {
+	getLspStatus(): { enabled: boolean; workspaceRoot?: string; servers: LspServerStatus[]; traceFile?: string } {
 		return {
 			enabled: this._lspManager !== undefined,
+			workspaceRoot: this._lspManager?.getWorkspaceRoot(),
 			servers: this._lspManager?.getStatus() ?? [],
 			traceFile: this._lspManager?.getTraceFile(),
 		};
@@ -2136,7 +2234,7 @@ export class AgentSession {
 		let subagentDrain: Promise<void>;
 		let mcpDrain: Promise<void>;
 		try {
-			subagentDrain = this._subagentToolManager?.dispose?.() ?? Promise.resolve();
+			subagentDrain = this.disposeSubagentToolManager();
 		} catch (error) {
 			subagentDrain = Promise.reject(error);
 		}
@@ -2196,8 +2294,14 @@ export class AgentSession {
 		cleanupSessionResources(this.sessionId);
 
 		const results = await Promise.allSettled([persistenceDrain, subagentDrain, mcpDrain, settingsDrain]);
-		const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-		if (rejected) throw rejected.reason;
+		const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+		if (rejected.length === 1) throw rejected[0].reason;
+		if (rejected.length > 1) {
+			throw new AggregateError(
+				rejected.map((result) => result.reason),
+				"Agent session cleanup did not complete",
+			);
+		}
 	}
 
 	private _fenceExtensionGeneration(): void {
@@ -2595,7 +2699,9 @@ export class AgentSession {
 	}
 
 	async disposeSubagentToolManager(): Promise<void> {
-		await this._subagentToolManager?.dispose?.();
+		const manager = this._subagentToolManager;
+		this._subagentToolManager = undefined;
+		await manager?.dispose?.();
 	}
 
 	getMcpManager(): McpManager | undefined {
@@ -2800,13 +2906,14 @@ export class AgentSession {
 	}
 
 	private _draftFromExecutedPlan(plan: PlanState): PlanState {
+		const cloned = clonePlanState(plan);
 		return {
-			id: plan.id,
-			revision: plan.revision + 1,
+			id: cloned.id,
+			revision: cloned.revision + 1,
 			phase: "draft",
-			...(plan.title ? { title: plan.title } : {}),
-			...(plan.summary ? { summary: plan.summary } : {}),
-			steps: plan.steps.map((step) => ({ ...step })),
+			...(cloned.title ? { title: cloned.title } : {}),
+			...(cloned.summary ? { summary: cloned.summary } : {}),
+			steps: cloned.steps,
 		};
 	}
 
@@ -2881,19 +2988,11 @@ export class AgentSession {
 		expectedRevision?: number;
 		title?: string;
 		summary?: string;
-		steps: Array<{ id?: string; text: string }>;
+		steps: PlanStepInput[];
 	}): PlanState {
 		this._assertNoPlanningTransitionInFlight("update_plan");
 		if (this._planningState.mode !== "plan") {
 			throw new Error("update_plan is available only in Plan mode");
-		}
-		if (input.steps.length > 64) {
-			throw new Error("Plans may contain at most 64 steps");
-		}
-		for (const step of input.steps) {
-			if (!step.text.trim()) {
-				throw new Error("Plan steps must have non-empty text");
-			}
 		}
 		const previous = this._planningState.plan;
 		if (previous) {
@@ -2914,16 +3013,9 @@ export class AgentSession {
 			previous &&
 			previous.title === title &&
 			previous.summary === summary &&
-			previous.steps.length === steps.length &&
-			// Ids are deliberately ignored: identical text/status/note in the same
-			// order is the same checklist, and rejecting it keeps a resend without
-			// canonical ids from churning step ids and burning a revision.
-			previous.steps.every((step, index) => {
-				const next = steps[index];
-				return (
-					next !== undefined && step.text === next.text && step.status === next.status && step.note === next.note
-				);
-			})
+			// Ids are deliberately ignored: identical content and progress in the
+			// same hierarchy is the same checklist, so id-less resends cannot churn.
+			planStepsSemanticallyEqual(previous.steps, steps)
 		) {
 			throw new Error("Plan update made no changes; continue research or submit the current draft");
 		}
@@ -2936,7 +3028,7 @@ export class AgentSession {
 			steps,
 		};
 		this._commitPlanningState({ mode: "plan", plan });
-		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+		return clonePlanState(plan);
 	}
 
 	updatePlanProgress(input: {
@@ -2953,21 +3045,27 @@ export class AgentSession {
 			throw new Error("At least one plan progress update is required");
 		}
 		const updates = new Map<string, { status: PlanStepStatus; note?: string }>();
-		const knownIds = new Set(this._planningState.plan.steps.map((step) => step.id));
+		const executableIds = new Set(getPlanLeafSteps(this._planningState.plan).map((step) => step.id));
+		const groupIds = new Set(
+			this._planningState.plan.steps.filter((step) => step.substeps !== undefined).map((step) => step.id),
+		);
 		for (const update of input.updates) {
 			const id = update.id.trim();
-			if (!id || !knownIds.has(id)) {
-				throw new Error(`Plan progress references an unknown step id: ${update.id}`);
+			if (groupIds.has(id)) {
+				throw new Error(`Plan progress cannot update group outcome id: ${id}`);
+			}
+			if (!id || !executableIds.has(id)) {
+				throw new Error(`Plan progress references an unknown executable leaf id: ${update.id}`);
 			}
 			if (updates.has(id)) {
-				throw new Error(`Plan progress duplicates step id: ${id}`);
+				throw new Error(`Plan progress duplicates executable leaf id: ${id}`);
 			}
 			updates.set(id, {
 				status: update.status,
 				...(update.note === undefined ? {} : { note: update.note }),
 			});
 		}
-		const steps = this._planningState.plan.steps.map((step) => {
+		const applyUpdate = (step: PlanItem): PlanItem => {
 			const update = updates.get(step.id);
 			if (!update) return { ...step };
 			const note = update.note === undefined ? step.note : update.note.trim() || undefined;
@@ -2977,23 +3075,23 @@ export class AgentSession {
 				status: update.status,
 				...(note ? { note } : {}),
 			};
+		};
+		const steps: PlanState["steps"] = this._planningState.plan.steps.map((step) => {
+			if (!step.substeps) return applyUpdate(step);
+			const substeps = step.substeps.map(applyUpdate);
+			return { id: step.id, text: step.text, status: derivePlanStepStatus(substeps), substeps };
 		});
-		if (
-			this._planningState.plan.steps.every((step, index) => {
-				const next = steps[index];
-				return next !== undefined && step.status === next.status && step.note === next.note;
-			})
-		) {
+		if (planStepsSemanticallyEqual(this._planningState.plan.steps, steps)) {
 			throw new Error("Plan progress update made no changes");
 		}
 		const plan: PlanState = {
 			...this._planningState.plan,
 			revision: this._planningState.plan.revision + 1,
-			phase: steps.every((step) => step.status === "completed") ? "completed" : "active",
+			phase: getPlanLeafSteps({ steps }).every((step) => step.status === "completed") ? "completed" : "active",
 			steps,
 		};
 		this._commitPlanningState({ mode: "build", plan });
-		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+		return clonePlanState(plan);
 	}
 
 	requestReplan(input: { planId: string; expectedRevision: number; reason: string }): PlanningState {
@@ -3035,7 +3133,7 @@ export class AgentSession {
 			summary: input.summary.trim(),
 		};
 		this._commitPlanningState({ mode: "plan", plan });
-		return { ...plan, steps: plan.steps.map((step) => ({ ...step })) };
+		return clonePlanState(plan);
 	}
 
 	changePlan(planId: string, expectedRevision: number): PlanningState {
@@ -3197,9 +3295,9 @@ export class AgentSession {
 		return this._harness.getFollowUpMode();
 	}
 
-	/** Current session file path, or undefined if sessions are disabled */
-	get sessionFile(): string | undefined {
-		return this.sessionManager.getSessionFile();
+	/** Current persisted session reference, or undefined for in-memory sessions. */
+	get sessionRef(): SessionReference | undefined {
+		return this.sessionManager.getSessionRef();
 	}
 
 	/** Current session ID */
@@ -5177,9 +5275,9 @@ export class AgentSession {
 	 * and assemble the CompactionResult.
 	 *
 	 * When continuation context is requested, auto-compaction supplies the rebuilt
-	 * projection to Harness. Overflow recovery also removes its trailing assistant
-	 * error message before the retry so it is
-	 * excluded from both the retained context and estimatedTokensAfter.
+	 * projection to Harness. Overflow recovery removes its trailing assistant
+	 * error before retry, and length continuation removes the tool-free truncated
+	 * assistant turn, so neither stale terminal is replayed into the next request.
 	 */
 	private async _finalizeCompaction(
 		summary: string,
@@ -5187,7 +5285,7 @@ export class AgentSession {
 		tokensBefore: number,
 		details: JsonValue | undefined,
 		fromExtension: boolean,
-		continuation?: { dropTrailingErrorMessage: boolean },
+		continuation?: { dropTrailingErrorMessage: boolean; dropTrailingLengthMessage?: boolean },
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<CompactionResult> {
 		assertConversationGenerationCurrent?.();
@@ -5195,16 +5293,19 @@ export class AgentSession {
 		const sessionContext = this.sessionManager.buildSessionContext();
 		const projectMessages = (source: readonly AgentMessage[]): AgentMessage[] => {
 			const messages = [...source];
-			if (!continuation?.dropTrailingErrorMessage) return messages;
+			if (!continuation?.dropTrailingErrorMessage && continuation?.dropTrailingLengthMessage !== true)
+				return messages;
 			const lastIndex =
 				messages.at(-1)?.role === "custom" &&
 				(messages.at(-1) as CustomMessage).customType === PLAN_CHECKPOINT_CUSTOM_TYPE
 					? messages.length - 2
 					: messages.length - 1;
 			const candidate = messages[lastIndex];
-			return candidate?.role === "assistant" && (candidate as AssistantMessage).stopReason === "error"
-				? [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)]
-				: messages;
+			const stopReason = candidate?.role === "assistant" ? (candidate as AssistantMessage).stopReason : undefined;
+			const shouldDrop =
+				(continuation.dropTrailingErrorMessage && stopReason === "error") ||
+				(continuation.dropTrailingLengthMessage === true && stopReason === "length");
+			return shouldDrop ? [...messages.slice(0, lastIndex), ...messages.slice(lastIndex + 1)] : messages;
 		};
 		const messages = projectMessages(sessionContext.messages);
 		if (continuation || this._harness.hasQueuedMessages()) {
@@ -5760,7 +5861,12 @@ export class AgentSession {
 				tokensBefore,
 				details,
 				fromExtension,
-				willRetry || continueAfterCompaction ? { dropTrailingErrorMessage: willRetry } : undefined,
+				willRetry || continueAfterCompaction
+					? {
+							dropTrailingErrorMessage: willRetry,
+							dropTrailingLengthMessage: continueAfterCompaction,
+						}
+					: undefined,
 				assertConversationCurrent,
 			);
 			this._emit({
@@ -6250,6 +6356,7 @@ export class AgentSession {
 		if (lspConfig.enabled) {
 			this._lspManager = new LspManager({
 				cwd: this._cwd,
+				projectCwd: this._lexicalProjectCwd,
 				config: lspConfig,
 				hostInteraction: this._hostInteraction,
 			});
@@ -7189,7 +7296,7 @@ export class AgentSession {
 		}
 
 		return {
-			sessionFile: this.sessionFile,
+			sessionRef: this.sessionRef,
 			sessionId: this.sessionId,
 			userMessages,
 			assistantMessages,
@@ -7289,26 +7396,17 @@ export class AgentSession {
 			outputPath ?? `session-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
 			process.cwd(),
 		);
-		const header: SessionHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: this.sessionManager.getSessionId(),
-			timestamp: new Date().toISOString(),
-			cwd: this.sessionManager.getCwd(),
-		};
+		const header = this.sessionManager.getHeader();
+		if (!header) throw new Error("Cannot export a session without a header");
+		let parentId: string | null = null;
+		const branchEntries = this.sessionManager.getBranch().map((entry) => {
+			const linear = { ...entry, parentId };
+			parentId = entry.id;
+			return linear;
+		});
+		const content = serializeSessionJsonlSnapshot(header, branchEntries, this.sessionManager.getLeafId());
 
-		const branchEntries = this.sessionManager.getBranch();
-		const lines = [JSON.stringify(header)];
-
-		// Re-chain parentIds to form a linear sequence
-		let prevId: string | null = null;
-		for (const entry of branchEntries) {
-			const linear = { ...entry, parentId: prevId };
-			lines.push(JSON.stringify(linear));
-			prevId = entry.id;
-		}
-
-		writeDurableAtomicFileSync(filePath, `${lines.join("\n")}\n`, {
+		writeDurableAtomicFileSync(filePath, content, {
 			directoryMode: PRIVATE_DIRECTORY_MODE,
 			fileMode: PRIVATE_FILE_MODE,
 		});

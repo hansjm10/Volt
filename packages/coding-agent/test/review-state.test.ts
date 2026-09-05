@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ParsedReview, ReviewFinding } from "../src/core/review-report.ts";
 import type { ReviewSnapshot } from "../src/core/review-snapshot.ts";
 import {
@@ -10,17 +10,23 @@ import {
 	appendReviewPublication,
 	appendReviewRun,
 	appendReviewRunDurably,
+	captureReviewStateForHandoff,
 	createReviewRunRecord,
 	exportReviewFeedback,
 	getReviewRun,
 	listReviewRuns,
+	MAX_HYDRATED_REVIEW_RUNS,
+	MAX_REVIEW_INVENTORY_FILES,
 	MAX_REVIEW_STATE_RECORD_BYTES,
 	planIncrementalReview,
 	REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE,
 	type ReviewRunRecord,
 	reconcileFindingIdentities,
+	restoreReviewStateFromHandoff,
 } from "../src/core/review-state.ts";
+import { createReviewFileMetadata } from "../src/core/review-workflows.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
 	return {
@@ -86,6 +92,7 @@ function record(runId: string, endedAt: number, findings: ReviewFinding[] = [fin
 				baseCommit: "base",
 				headCommit: `head-${runId}`,
 			},
+			branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
 			files: [
 				{
 					path: "src/value.ts",
@@ -117,6 +124,7 @@ function snapshot(headOid: string, hunkId = "hunk-1"): ReviewSnapshot {
 			baseCommit: "base",
 			headCommit: `commit-${headOid}`,
 		},
+		branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
 		changedFiles: [
 			{
 				path: "src/value.ts",
@@ -170,6 +178,7 @@ function prSnapshot(
 		...value.identity,
 		kind: "pr",
 		pullRequest: {
+			providerId: "github",
 			number: 7,
 			title: "Context",
 			body: "Bounded identity body",
@@ -180,7 +189,8 @@ function prSnapshot(
 			headRefOid: pullRequestHeadOid,
 		},
 	};
-	value.githubContext = {
+	delete value.branchBase;
+	value.codeHostContext = {
 		manifest: {
 			status: "complete",
 			capturedAt: "2026-01-01T00:00:00Z",
@@ -212,8 +222,12 @@ function prSnapshot(
 
 describe("durable review state", () => {
 	const directories: string[] = [];
+	const managerOwner = createSessionManagerTestOwner();
 
-	afterEach(() => {
+	beforeEach(() => managerOwner.start());
+
+	afterEach(async () => {
+		await managerOwner.drain();
 		for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 	});
 
@@ -248,24 +262,153 @@ describe("durable review state", () => {
 		expect(listReviewRuns(manager).runs.map((run) => run.runId)).toEqual(["run-2"]);
 	});
 
+	it("captures bounded effective review state without copying model context", () => {
+		const source = SessionManager.inMemory("/tmp/review-handoff-source");
+		source.appendMessage({ role: "user", content: "SOURCE_ONLY_DISCUSSION", timestamp: 1 });
+		for (let index = 0; index < MAX_HYDRATED_REVIEW_RUNS + 2; index++) {
+			appendReviewRun(source, record(`run-${index}`, index));
+		}
+		const retainedRunId = `run-${MAX_HYDRATED_REVIEW_RUNS + 1}`;
+		acknowledgeReviewRun(source, retainedRunId, 123);
+		appendReviewFindingTransition(source, {
+			runId: retainedRunId,
+			findingId: "finding-1",
+			status: "accepted",
+			createdAt: 10,
+		});
+		appendReviewFindingTransition(source, {
+			runId: retainedRunId,
+			findingId: "finding-1",
+			status: "dismissed",
+			reason: "false_positive",
+			note: "Verified against the current branch.",
+			createdAt: 20,
+		});
+		appendReviewFindingTransition(source, {
+			runId: "run-0",
+			findingId: "finding-1",
+			status: "fixed",
+			createdAt: 30,
+		});
+		source.appendCustomEntry(REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE, {
+			schemaVersion: 1,
+			runId: retainedRunId,
+			acknowledgedAt: "invalid",
+		});
+		const sourceBranch = structuredClone(source.getBranch());
+
+		const snapshot = captureReviewStateForHandoff(source);
+
+		expect(source.getBranch()).toEqual(sourceBranch);
+		expect(snapshot.runs).toHaveLength(MAX_HYDRATED_REVIEW_RUNS);
+		expect(snapshot.runs[0]?.runId).toBe(retainedRunId);
+		expect(snapshot.runs.at(-1)?.runId).toBe("run-2");
+		expect(snapshot.acknowledgments).toEqual([{ schemaVersion: 1, runId: retainedRunId, acknowledgedAt: 123 }]);
+		expect(snapshot.transitions).toEqual([
+			{
+				schemaVersion: 1,
+				runId: retainedRunId,
+				findingId: "finding-1",
+				status: "dismissed",
+				reason: "false_positive",
+				note: "Verified against the current branch.",
+				createdAt: 20,
+			},
+		]);
+
+		const target = SessionManager.inMemory("/tmp/review-handoff-target");
+		restoreReviewStateFromHandoff(target, snapshot);
+
+		expect(listReviewRuns(target, { limit: 50 }).runs).toHaveLength(MAX_HYDRATED_REVIEW_RUNS);
+		expect(getReviewRun(target, "run-0")).toBeUndefined();
+		expect(getReviewRun(target, retainedRunId)).toMatchObject({
+			acknowledgedAt: 123,
+			result: { findings: [{ id: "finding-1", status: "dismissed" }] },
+		});
+		expect(exportReviewFeedback(target).outcomes).toEqual(snapshot.transitions);
+		expect(target.buildSessionContext().messages).toEqual([]);
+		expect(JSON.stringify(target.getBranch())).not.toContain("SOURCE_ONLY_DISCUSSION");
+	});
+
 	it("durably records a review before any prompt and recovers it after restart", async () => {
 		const root = join(tmpdir(), `volt-review-state-empty-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(root, { recursive: true });
 		directories.push(root);
-		const manager = SessionManager.create(root, join(root, "sessions"));
+		const manager = await SessionManager.create(root, join(root, "sessions"));
 		await appendReviewRunDurably(manager, record("run-before-prompt", 1));
 
-		const file = manager.getSessionFile();
-		if (!file) throw new Error("Expected a persisted session file");
-		const reopened = SessionManager.open(file);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
 		expect(listReviewRuns(reopened).runs).toMatchObject([{ runId: "run-before-prompt", status: "completed" }]);
+	});
+
+	it.each([
+		{ limit: "file count", count: MAX_REVIEW_INVENTORY_FILES + 1, padding: 0 },
+		{ limit: "serialized bytes", count: 300, padding: 200 },
+	])("preserves totals after the $limit inventory limit and restart", async ({ count, padding }) => {
+		const root = join(tmpdir(), `volt-review-inventory-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(root, { recursive: true });
+		directories.push(root);
+		const manager = await SessionManager.create(root, join(root, "sessions"));
+		const source = snapshot("inventory-blob");
+		const file = source.changedFiles[0]!;
+		source.changedFiles = Array.from({ length: count }, (_, index) => ({
+			...file,
+			path: `src/${"x".repeat(padding)}file-${index}.ts`,
+			additions: 2,
+			deletions: 1,
+		}));
+		const controls = {
+			scope: [],
+			effort: "standard" as const,
+			includeOptional: false,
+			scopeMode: "incremental" as const,
+		};
+		await appendReviewRunDurably(
+			manager,
+			createReviewRunRecord({
+				workflowId: "review:inventory-limit",
+				workflowAction: "review.branch",
+				startedAt: 1,
+				snapshot: source,
+				controls,
+				status: "completed",
+				result: result(),
+			}),
+		);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
+		const restored = getReviewRun(reopened, "review:inventory-limit");
+		if (!restored) throw new Error("Expected a restored review run");
+		expect(restored.target.files).toEqual([]);
+		expect(restored.target.fileSummary).toEqual({
+			totalCount: count,
+			additions: count * 2,
+			deletions: count,
+			inventoryComplete: false,
+		});
+		expect(createReviewFileMetadata(restored.target.files, restored.target.fileSummary)).toEqual({
+			totalCount: count,
+			projectedCount: 0,
+			omittedCount: count,
+			additions: count * 2,
+			deletions: count,
+			isComplete: false,
+			items: [],
+		});
+		expect(planIncrementalReview(reopened, source, controls)).toMatchObject({
+			mode: "full",
+			fallbackReason: "The prior changed-file inventory exceeded its persistence bound.",
+		});
 	});
 
 	it("persists branch-local review acknowledgment idempotently and ignores malformed entries", async () => {
 		const root = join(tmpdir(), `volt-review-ack-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(root, { recursive: true });
 		directories.push(root);
-		const manager = SessionManager.create(root, join(root, "sessions"));
+		const manager = await SessionManager.create(root, join(root, "sessions"));
 		await appendReviewRunDurably(manager, record("run-acknowledged", 1));
 		const branchPoint = manager.appendCustomEntry("test.branch-point", { value: true });
 		manager.appendCustomEntry(REVIEW_ACKNOWLEDGMENT_CUSTOM_ENTRY_TYPE, {
@@ -293,9 +436,9 @@ describe("durable review state", () => {
 		).toBe(1);
 		await manager.flush();
 
-		const file = manager.getSessionFile();
-		if (!file) throw new Error("Expected a persisted session file");
-		const reopened = SessionManager.open(file);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
 		expect(getReviewRun(reopened, "run-acknowledged")).toMatchObject({
 			runId: "run-acknowledged",
 			acknowledgedAt: 123,
@@ -316,8 +459,9 @@ describe("durable review state", () => {
 		mkdirSync(root, { recursive: true });
 		directories.push(root);
 		mkdirSync(join(root, "sessions"), { recursive: true });
-		const manager = SessionManager.create(root, join(root, "sessions"));
-		manager.appendMessage({ role: "user", content: "Review the branch", timestamp: 1 });
+		const manager = await SessionManager.create(root, join(root, "sessions"));
+		const messageTimestamp = Date.now();
+		manager.appendMessage({ role: "user", content: "Review the branch", timestamp: messageTimestamp });
 		manager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "Starting review" }],
@@ -333,14 +477,14 @@ describe("durable review state", () => {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "stop",
-			timestamp: 2,
+			timestamp: messageTimestamp + 1,
 		});
 		appendReviewRun(manager, record("run-1", 1));
 		appendReviewRun(manager, record("run-2", 2));
 		await manager.flush();
-		const file = manager.getSessionFile();
-		if (!file) throw new Error("Expected a persisted session file");
-		const reopened = SessionManager.open(file);
+		const ref = manager.getSessionRef();
+		if (!ref) throw new Error("Expected a persisted session reference");
+		const reopened = await SessionManager.open(ref);
 		const first = listReviewRuns(reopened, { limit: 1 });
 		expect(first.runs[0]?.runId).toBe("run-2");
 		expect(first.nextCursor).toBeTruthy();
@@ -431,7 +575,7 @@ describe("durable review state", () => {
 			planIncrementalReview(manager, prSnapshot("blob-context", "2".repeat(64), "changed"), controls),
 		).toMatchObject({
 			mode: "full",
-			fallbackReason: "The pull request GitHub context changed since the prior review.",
+			fallbackReason: "The pull request code-host context changed since the prior review.",
 		});
 	});
 
@@ -583,6 +727,7 @@ describe("durable review state", () => {
 			runId: "review:test",
 			status: "completed",
 			target: {
+				branchBase: { kind: "remote", remote: "origin", remoteRef: "refs/heads/main" },
 				files: [
 					{
 						status: "modified",

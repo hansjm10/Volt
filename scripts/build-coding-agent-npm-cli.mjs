@@ -80,6 +80,7 @@ async function build() {
 	const entryPoints = [
 		{ in: join(codingAgentRoot, "dist", "cli.js"), out: "cli" },
 		{ in: join(codingAgentRoot, "dist", "utils", "image-resize-worker.js"), out: "image-resize-worker" },
+		{ in: join(codingAgentRoot, "dist", "core", "session-store", "worker.js"), out: "session-store-worker" },
 		{ in: join(repoRoot, "packages", "ai", "dist", "providers", "amazon-bedrock.js"), out: "amazon-bedrock" },
 	];
 	for (const entryPoint of entryPoints) assertRequiredFile(entryPoint.in);

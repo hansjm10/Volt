@@ -173,6 +173,8 @@ export {
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export {
 	detectGitOperation,
+	type GitContextObservation,
+	type GitContextObservationListener,
 	GitContextProvider,
 	type GitContextProviderOptions,
 	type GitContextSubscriptionOptions,
@@ -200,6 +202,8 @@ export {
 	type LspInstallCommandResult,
 	type LspInstallRecipe,
 	type LspInstallRunner,
+	type LspLaunchDescriptor,
+	type LspLaunchSource,
 	LspManager,
 	type LspManagerOptions,
 	type LspServerSettings,
@@ -211,7 +215,9 @@ export {
 	languageIdForExtension,
 	type ResolvedLspConfig,
 	type ResolvedLspServerConfig,
+	type ResolveLspLaunchOptions,
 	resolveLspConfig,
+	resolveLspLaunch,
 	runDefaultLspInstallCommand,
 } from "./core/lsp/index.ts";
 export {
@@ -611,18 +617,20 @@ export {
 	type SubagentRuntimeContext,
 } from "./core/sdk.ts";
 export {
+	assertCurrentSessionSnapshot,
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
+	CURRENT_SESSION_SNAPSHOT_VERSION,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
+	createSessionSnapshotHeader,
 	type FastModeChangeEntry,
 	type FileEntry,
 	getDefaultSessionDir,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,
-	migrateSessionEntries,
 	type NewSessionOptions,
 	parseSessionEntries,
 	type SessionContext,
@@ -634,6 +642,9 @@ export {
 	type SessionListOptions,
 	SessionManager,
 	type SessionMessageEntry,
+	type SessionReference,
+	type SessionSnapshotHeader,
+	serializeSessionJsonlSnapshot,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
 export {

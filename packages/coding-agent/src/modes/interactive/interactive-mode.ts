@@ -89,6 +89,7 @@ import type {
 	ToolInfo,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import { GitContextObservationBinding } from "../../core/git-context-provider.ts";
 import {
 	BUILTIN_HOST_ACTION_REGISTRY,
 	CONTEXT_COMPACT_SLASH_ALIAS,
@@ -109,8 +110,6 @@ import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
 import { type ConfiguredPackage, DefaultPackageManager } from "../../core/package-manager.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.ts";
-import { parseIrohRemoteRpcGrant } from "../../core/remote/iroh/access-grant.ts";
-import type { IrohRemoteClientAuthorizationSuccess } from "../../core/remote/iroh/authorization.ts";
 import type { IrohRemoteHandshakeSuccess, IrohRemoteHello } from "../../core/remote/iroh/handshake.ts";
 import { writeIrohRemoteHandshakeResponse } from "../../core/remote/iroh/handshake-reader.ts";
 import { createIrohRemoteRpcErrorResponse } from "../../core/remote/iroh/rpc-command-filter.ts";
@@ -128,6 +127,7 @@ import {
 	type ReviewRunControls,
 	type ReviewTarget,
 	type ReviewWorkflowHooks,
+	reviewTargetForRerun,
 	runReviewWorkflow,
 	stripReviewEnvelopeForDisplay,
 } from "../../core/review.ts";
@@ -141,7 +141,12 @@ import {
 	getReviewRun,
 } from "../../core/review-state.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
-import { getDefaultSessionDir, type SessionContext, SessionManager } from "../../core/session-manager.ts";
+import {
+	getDefaultSessionDir,
+	type SessionContext,
+	SessionManager,
+	type SessionReference,
+} from "../../core/session-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { SubscriptionUsageService } from "../../core/subscription-usage.ts";
@@ -196,7 +201,6 @@ import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipb
 import { writeDurableAtomicFileSync } from "../../utils/durable-atomic-write.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
-import { resolvePath } from "../../utils/paths.ts";
 import {
 	createPrivateTempDirectorySync,
 	ensurePrivateDirectorySync,
@@ -236,6 +240,7 @@ import {
 	createDaemonAttach,
 	createDisabledDaemonAttach,
 	createRelayWorkspaceUnregisterRetirement,
+	createTuiRelayAuthorization,
 	type DaemonAttach,
 	type DaemonRelayOffer,
 	type DaemonWorktreeControl,
@@ -384,8 +389,7 @@ export function formatResumeCommand(sessionManager: SessionManager): string | un
 	if (!process.stdout.isTTY) return undefined;
 	if (!sessionManager.isPersisted()) return undefined;
 
-	const sessionFile = sessionManager.getSessionFile();
-	if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
+	if (!sessionManager.getSessionRef()) return undefined;
 
 	const args = [APP_NAME];
 	if (!sessionManager.usesDefaultSessionDir()) {
@@ -613,11 +617,16 @@ export class InteractiveMode {
 	// Shutdown state
 	private shutdownRequested = false;
 	private turnDoneAlertTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	private runtimeDisposePromise: Promise<void> | undefined;
 
 	// Daemon integration (conversation leases + byte relay). Supported TUIs keep
 	// a reconnecting client even when auto-start is off, so a daemon started by
 	// another process can discover every already-running agent.
 	private daemonAttach: DaemonAttach = createDisabledDaemonAttach();
+	private readonly daemonWorkObservation = new GitContextObservationBinding((observation) => {
+		if (observation.status !== "definitive") return;
+		void this.daemonAttach.publishGitObservation(this.session.sessionId, observation.gitContext);
+	});
 	private daemonRelayServers = new Set<Promise<void>>();
 	/** list_sessions cursor state shared across relayed phone conversations. */
 	private readonly relaySessionListCursors = new Map<string, RemoteSessionListCursorEntry>();
@@ -1189,6 +1198,38 @@ export class InteractiveMode {
 	 * Initializes the UI, shows warnings, processes initial messages, and starts the interactive loop.
 	 */
 	async run(): Promise<void> {
+		try {
+			await this.runInteractiveLoop();
+		} catch (error) {
+			const cleanupErrors: unknown[] = [];
+			try {
+				this.stop();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				await this.disposeRuntimeHost();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				await this.releaseDaemonLeaseOnQuit();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				stopThemeWatcher();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError([error, ...cleanupErrors], "Interactive mode failed and cleanup did not complete");
+			}
+			throw error;
+		}
+	}
+
+	private async runInteractiveLoop(): Promise<void> {
 		await this.init();
 
 		// Start version check asynchronously
@@ -1902,8 +1943,8 @@ export class InteractiveMode {
 					void this.flushCompactionQueue({ willRetry: false });
 					return { cancelled: false };
 				},
-				switchSession: async (sessionPath, options) => {
-					return this.handleResumeSession(sessionPath, options);
+				switchSession: async (sessionRef, options) => {
+					return this.handleResumeSession(sessionRef, options);
 				},
 				reload: async () => {
 					await this.handleReloadCommand();
@@ -1968,6 +2009,7 @@ export class InteractiveMode {
 		});
 		await this.daemonAttach.start();
 		const acquireOutcome = await this.acquireCurrentSessionLease();
+		this.bindDaemonWorkObservation(this.session);
 		this.runtimeHost.setPrepareSessionReplacement(async ({ previousSessionId, sessionId, cwd }) => {
 			const rekey = await this.daemonAttach.prepareRekey(previousSessionId, sessionId, cwd);
 			if (!rekey) {
@@ -1977,6 +2019,7 @@ export class InteractiveMode {
 				commit: async () => {
 					await rekey.commit();
 					this.daemonLeaseSessionId = sessionId;
+					this.bindDaemonWorkObservation(this.session);
 				},
 				rollback: () => rekey.rollback(),
 				dispose: async () => {
@@ -2025,6 +2068,7 @@ export class InteractiveMode {
 		}
 		if (outcome.kind === "granted") {
 			await this.runtimeHost.startRecoveredClientInputs().catch(() => undefined);
+			void this.session.gitContextProvider.refresh();
 		}
 	}
 
@@ -2077,13 +2121,13 @@ export class InteractiveMode {
 	 * or the re-open is cancelled.
 	 */
 	private async absorbRemoteSessionChangesFromDisk(): Promise<void> {
-		const sessionFile = this.session.sessionFile;
-		if (!sessionFile) {
+		const sessionRef = this.session.sessionRef;
+		if (!sessionRef) {
 			await this.session.reload().catch(() => {});
 			return;
 		}
 		try {
-			const result = await this.runtimeHost.switchSession(sessionFile, {
+			const result = await this.runtimeHost.switchSession(sessionRef, {
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
 			if (result.cancelled) {
@@ -2148,28 +2192,11 @@ export class InteractiveMode {
 			initialInput?: number[];
 		};
 		const authorizationSubset = preamble.authorization;
-		const rpcGrant = parseIrohRemoteRpcGrant(authorizationSubset.rpcGrant, "relay rpcGrant");
+		const authorization = createTuiRelayAuthorization(authorizationSubset);
+		const rpcGrant = authorization.client.rpcGrant;
 		// Worktree-bound conversations sanitize with the worktree checkout as the
 		// root; the parent checkout and the worktrees root must also redact.
 		const sanitizerOptions = getRelayServingSanitizerOptions(authorizationSubset, getAgentDir());
-		const authorization = {
-			ok: true as const,
-			allowTools: "",
-			client: {
-				nodeId: authorizationSubset.clientNodeId,
-				label: authorizationSubset.clientNodeId,
-				allowedWorkspaces: [authorizationSubset.workspaceName],
-				allowedTools: "",
-				rpcGrant,
-				pairedAt: 0,
-				lastSeenAt: 0,
-			},
-			paired: true,
-			pairingSecretConsumed: false,
-			workspace: { name: authorizationSubset.workspaceName, path: authorizationSubset.workspacePath },
-			workspaceNames: [authorizationSubset.workspaceName],
-			workspaces: [{ name: authorizationSubset.workspaceName, status: "available" as const }],
-		} satisfies IrohRemoteClientAuthorizationSuccess;
 
 		// The daemon's identity from the preamble: the phone verifies the saved
 		// host node id in the handshake response and every notification destination.
@@ -2278,7 +2305,7 @@ export class InteractiveMode {
 								authorization.workspaceNames = [...forwarded.workspaceMetadata.workspaceNames];
 								authorization.workspaces = forwarded.workspaceMetadata.workspaces.map((workspace) => ({
 									...workspace,
-								})) as typeof authorization.workspaces;
+								}));
 							}
 							return forwarded.response;
 						}
@@ -2342,6 +2369,7 @@ export class InteractiveMode {
 	}
 
 	private async releaseDaemonLeaseOnQuit(): Promise<void> {
+		this.daemonWorkObservation.dispose();
 		if (this.daemonAttach.connectionState() === "disabled") {
 			return;
 		}
@@ -2386,11 +2414,17 @@ export class InteractiveMode {
 	}
 
 	private async rebindReplacementSession(session: AgentSession): Promise<void> {
+		this.bindDaemonWorkObservation(session);
 		await this.rebindCurrentSession(session);
 		this.ui.requestRender(true);
 		const suspension = this.sessionRenderSuspension;
 		this.sessionRenderSuspension = undefined;
 		suspension?.release();
+	}
+
+	private bindDaemonWorkObservation(session: AgentSession): void {
+		if (this.daemonAttach.connectionState() === "disabled") return;
+		this.daemonWorkObservation.bind(session.gitContextProvider);
 	}
 
 	private async rebindCurrentSession(session: AgentSession): Promise<void> {
@@ -4605,6 +4639,11 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
+	private disposeRuntimeHost(): Promise<void> {
+		this.runtimeDisposePromise ??= Promise.resolve().then(() => this.runtimeHost.dispose());
+		return this.runtimeDisposePromise;
+	}
+
 	private async flushStdout(): Promise<void> {
 		await new Promise<void>((resolve) => {
 			let settled = false;
@@ -4647,7 +4686,7 @@ export class InteractiveMode {
 			// terminal. If the terminal is gone, the restore writes below emit EIO,
 			// which the stdout/stderr error handler turns into emergencyTerminalExit;
 			// the render loop is already idle, so this cannot hot-spin (see #4144).
-			await this.runtimeHost.dispose();
+			await this.disposeRuntimeHost();
 			// Hand the session back to the daemon only after the runtime finished
 			// writing the session file, so the daemon's lazy resume sees final state.
 			await this.releaseDaemonLeaseOnQuit();
@@ -4666,7 +4705,7 @@ export class InteractiveMode {
 		await this.ui.terminal.drainInput(1000);
 
 		this.stop();
-		await this.runtimeHost.dispose();
+		await this.disposeRuntimeHost();
 		// Hand the session back to the daemon only after the runtime finished
 		// writing the session file, so the daemon's lazy resume sees final state.
 		await this.releaseDaemonLeaseOnQuit();
@@ -7224,15 +7263,23 @@ export class InteractiveMode {
 	private showSessionSelector(): void {
 		this.showSelector((done) => {
 			const selector = new SessionSelectorComponent(
-				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
-				(onProgress) =>
-					this.sessionManager.usesDefaultSessionDir()
+				(onProgress, query) =>
+					query
+						? SessionManager.search(this.sessionManager.getCwd(), query, this.sessionManager.getSessionDir())
+						: SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
+				(onProgress, query) => {
+					if (query) {
+						return this.sessionManager.usesDefaultSessionDir()
+							? SessionManager.searchAll(query)
+							: SessionManager.searchAll(query, this.sessionManager.getSessionDir());
+					}
+					return this.sessionManager.usesDefaultSessionDir()
 						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
-				async (sessionPath) => {
+						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress);
+				},
+				async (sessionRef) => {
 					done();
-					await this.handleResumeSession(sessionPath);
+					await this.handleResumeSession(sessionRef);
 				},
 				() => {
 					done();
@@ -7243,31 +7290,49 @@ export class InteractiveMode {
 				},
 				() => this.ui.requestRender(),
 				{
-					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
+					renameSession: async (sessionRef, nextName) => {
 						const next = (nextName ?? "").trim();
 						if (!next) return;
-						const currentSessionFile = this.sessionManager.getSessionFile();
-						if (currentSessionFile && path.resolve(currentSessionFile) === path.resolve(sessionFilePath)) {
+						const currentRef = this.sessionManager.getSessionRef();
+						if (
+							currentRef &&
+							currentRef.storeId === sessionRef.storeId &&
+							currentRef.sessionId === sessionRef.sessionId &&
+							currentRef.sessionGeneration === sessionRef.sessionGeneration
+						) {
 							this.session.setSessionName(next);
 							await this.sessionManager.flush();
 							return;
 						}
-						const mgr = SessionManager.open(sessionFilePath);
-						mgr.appendSessionInfo(next);
-						await mgr.flush();
+						const manager = await SessionManager.open(sessionRef);
+						try {
+							manager.appendSessionInfo(next);
+							await manager.flush();
+						} catch (error) {
+							try {
+								await manager.closePersistence();
+							} catch (closeError) {
+								throw new AggregateError(
+									[error, closeError],
+									"Session rename failed and its manager could not be closed",
+								);
+							}
+							throw error;
+						}
+						await manager.closePersistence();
 					},
 					showRenameHint: true,
 					keybindings: this.keybindings,
 				},
 
-				this.sessionManager.getSessionFile(),
+				this.sessionManager.getSessionRef(),
 			);
 			return { component: selector, focus: selector };
 		});
 	}
 
 	private async handleResumeSession(
-		sessionPath: string,
+		sessionRef: SessionReference,
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean; seeded: boolean }> {
 		if (this.loadingAnimation) {
@@ -7276,7 +7341,7 @@ export class InteractiveMode {
 		}
 		this.statusContainer.clear();
 		try {
-			const result = await this.runtimeHost.switchSession(sessionPath, {
+			const result = await this.runtimeHost.switchSession(sessionRef, {
 				withSession: options?.withSession,
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
@@ -7293,7 +7358,7 @@ export class InteractiveMode {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true, seeded: false };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
+				const result = await this.runtimeHost.switchSession(sessionRef, {
 					cwdOverride: selectedCwd,
 					withSession: options?.withSession,
 					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
@@ -8080,7 +8145,7 @@ export class InteractiveMode {
 		if (sessionName) {
 			info += `${theme.fg("dim", "Name:")} ${sessionName}\n`;
 		}
-		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
+		info += `${theme.fg("dim", "Store:")} ${stats.sessionRef?.sessionDirectory ?? "In-memory"}\n`;
 		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n\n`;
 		info += `${theme.bold("Messages")}\n`;
 		info += `${theme.fg("dim", "User:")} ${stats.userMessages}\n`;
@@ -8209,7 +8274,7 @@ export class InteractiveMode {
 					await this.closeLspTrace();
 					let tracePath: string;
 					if (traceArg && traceArg.length > 0) {
-						tracePath = resolvePath(traceArg, this.session.sessionManager.getCwd());
+						tracePath = traceArg;
 					} else {
 						const scratchDirectory = this.createScratchDirectory("volt-lsp-trace-");
 						this.lspTraceScratchDirectory = scratchDirectory;
@@ -8217,7 +8282,8 @@ export class InteractiveMode {
 					}
 					try {
 						await this.session.setLspTraceFile(tracePath);
-						info = `LSP tracing enabled: ${tracePath}\nUse /lsp trace off to disable.`;
+						const resolvedTracePath = this.session.getLspStatus().traceFile ?? tracePath;
+						info = `LSP tracing enabled: ${resolvedTracePath}\nUse /lsp trace off to disable.`;
 					} catch (error) {
 						if (this.lspTraceScratchDirectory) {
 							this.removeScratchDirectory(this.lspTraceScratchDirectory);
@@ -8229,14 +8295,19 @@ export class InteractiveMode {
 		} else if (!status.enabled) {
 			info = "LSP is disabled. Run with --lsp or set lsp.enabled=true in settings.";
 		} else if (status.servers.length === 0) {
-			info = `${theme.bold("LSP Servers")}\n\nNo servers running. Servers spawn on first use of a matching file.`;
+			info = `${theme.bold("LSP Servers")}\n\n${theme.fg("dim", "Workspace root:")} ${status.workspaceRoot}\nNo servers running. Servers spawn on first use of a matching file.`;
 		} else {
 			info = `${theme.bold("LSP Servers")}\n`;
 			for (const server of status.servers) {
-				info += `\n${theme.bold(server.name)} ${server.alive ? theme.fg("success", "running") : theme.fg("error", "dead")}\n`;
-				info += `${theme.fg("dim", "Root:")} ${server.root}\n`;
+				info += `\n${theme.bold(server.name)} ${server.alive ? theme.fg("success", "running") : theme.fg("error", "failed")}\n`;
+				info += `${theme.fg("dim", "Workspace root:")} ${server.workspaceRoot}\n`;
+				info += `${theme.fg("dim", "Server root:")} ${server.root}\n`;
+				info += `${theme.fg("dim", "Executable:")} ${server.resolvedExecutable ?? `unresolved: ${server.unresolvedCommand}`}\n`;
+				info += `${theme.fg("dim", "Launch source:")} ${server.launchSource}\n`;
+				info += `${theme.fg("dim", "Start attempts:")} ${server.attempts}\n`;
 				info += `${theme.fg("dim", "Open documents:")} ${server.openDocuments}\n`;
 				info += `${theme.fg("dim", "Idle:")} ${formatIdle(server.idleMs)}\n`;
+				if (server.lastError) info += `${theme.fg("error", server.lastError)}\n`;
 			}
 			if (status.traceFile) {
 				info += `\n${theme.fg("dim", "Trace:")} ${status.traceFile}\n`;
@@ -8668,7 +8739,7 @@ export class InteractiveMode {
 	private async promptForReviewTarget(): Promise<ReviewTarget | undefined> {
 		const branchLabel = "Against base branch";
 		const uncommittedLabel = "Uncommitted changes";
-		const prLabel = "GitHub pull request";
+		const prLabel = "Pull request";
 		const commitLabel = "Specific commit";
 		const currentPullRequest = await probeCurrentBranchPullRequest(this.sessionManager.getCwd());
 		const currentPullRequestLabel = currentPullRequest
@@ -8708,7 +8779,7 @@ export class InteractiveMode {
 		return { kind: "commit" };
 	}
 
-	/** Show a local-branch picker and return the selected base branch. */
+	/** Show logical local/upstream base branches and return the selected target. */
 	private async promptForReviewBaseBranch(): Promise<string | undefined> {
 		const branches = await listBaseBranches(this.sessionManager.getCwd());
 		if ("error" in branches) {
@@ -9113,13 +9184,27 @@ export class InteractiveMode {
 				throw new Error("The review session opened without the selected findings.");
 			if (opened.seeded && requestedFindingIds === undefined) {
 				if (acknowledgedAt === undefined) throw new Error("Review session was seeded without acknowledgment");
-				const sourceSessionFile = sourceSessionManager.getSessionFile();
-				const acknowledgmentManager = sourceSessionFile
-					? SessionManager.open(sourceSessionFile, sourceSessionManager.getSessionDir())
+				const sourceSessionRef = sourceSessionManager.getSessionRef();
+				const acknowledgmentManager = sourceSessionRef
+					? await SessionManager.open(sourceSessionRef)
 					: sourceSessionManager;
-				acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
-				await acknowledgmentManager.flush();
-				if (sourceSessionFile) sourceSessionManager.setSessionFile(sourceSessionFile);
+				try {
+					acknowledgeReviewRun(acknowledgmentManager, record.runId, acknowledgedAt);
+					await acknowledgmentManager.flush();
+				} catch (error) {
+					if (sourceSessionRef) {
+						try {
+							await acknowledgmentManager.closePersistence();
+						} catch (closeError) {
+							throw new AggregateError(
+								[error, closeError],
+								"Review acknowledgment failed and its source manager could not be closed",
+							);
+						}
+					}
+					throw error;
+				}
+				if (sourceSessionRef) await acknowledgmentManager.closePersistence();
 			}
 			if (!opened.cancelled) this.renderCurrentSessionState();
 			return {
@@ -9172,15 +9257,7 @@ export class InteractiveMode {
 		}
 		if (action === REVIEW_RERUN_ACTION_ID) {
 			if (!record) throw new Error(`Unknown durable review run: ${runId}`);
-			const identity = record.target.identity;
-			const target: ReviewTarget =
-				identity.kind === "uncommitted"
-					? { kind: "uncommitted" }
-					: identity.kind === "branch"
-						? { kind: "branch", base: identity.baseCommit }
-						: identity.kind === "pr"
-							? { kind: "pr", number: identity.pullRequest ? String(identity.pullRequest.number) : undefined }
-							: { kind: "commit", sha: identity.headCommit };
+			const target = reviewTargetForRerun(record);
 			const rerun = await this.runInteractiveReviewWorkflow(target, {
 				tools: this.getReviewToolsForRun(),
 				requireConfirmation: true,
@@ -9200,7 +9277,7 @@ export class InteractiveMode {
 			if (!record) throw new Error(`Unknown durable review run: ${runId}`);
 			const confirmed = await this.showExtensionConfirm(
 				"Publish pull request review",
-				`Publish complete review ${record.runId} to GitHub? The PR head will be rechecked first.`,
+				`Publish complete review ${record.runId} to its code host? The PR head will be rechecked first.`,
 			);
 			if (!confirmed) return { action, status: "cancelled", message: "Review publishing cancelled" };
 			const published = await publishReviewRun(this.sessionManager.getCwd(), record);
@@ -9260,9 +9337,11 @@ export class InteractiveMode {
 				tools: options.tools,
 				requireConfirmation: options.requireConfirmation,
 				requireProjectTrust: options.requireProjectTrust,
-				confirm: ({ title, message }) => this.showExtensionConfirm(title, message),
+				confirm: ({ title, message, signal }) =>
+					this.showExtensionConfirm(title, message, signal ? { signal } : undefined),
 				onReviewModelWarning: (message) => this.showWarning(message),
 				createHooks: () => this.createReviewWorkflowHooks(),
+				workflowManager: this.runtimeHost.reviewWorkflows,
 			});
 
 			if (result.status !== "completed") {

@@ -1,10 +1,26 @@
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { SessionManager } from "../../src/core/session-manager.ts";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SessionManager, type SessionReference } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
+const managerOwner = createSessionManagerTestOwner();
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const tempDirs: string[] = [];
+
+function makeTempDir(): string {
+	const dir = mkdtempSync(join(tmpdir(), "volt-session-manager-"));
+	tempDirs.push(dir);
+	return dir;
+}
+
+beforeEach(() => managerOwner.start());
+
+afterEach(async () => {
+	await managerOwner.drain();
+	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 describe("SessionManager.newSession with custom id", () => {
 	it("uses the provided id instead of generating one", () => {
@@ -33,49 +49,49 @@ describe("SessionManager.newSession with custom id", () => {
 	it("generates a UUIDv7 id when no id is provided", () => {
 		const session = SessionManager.inMemory();
 		session.newSession();
-		const id = session.getSessionId();
-		expect(id).toBeDefined();
-		expect(id).not.toBe("");
-		expect(id).toMatch(UUID_V7_RE);
+		expect(session.getSessionId()).toMatch(UUID_V7_RE);
 	});
 
-	it("generates a UUIDv7 id when options is provided without id", () => {
+	it("generates a UUIDv7 id when options are provided without an id", () => {
 		const session = SessionManager.inMemory();
-		session.newSession({ parentSession: "parent.jsonl" });
-		const id = session.getSessionId();
-		expect(id).toBeDefined();
-		expect(id).not.toBe("");
-		expect(id).toMatch(UUID_V7_RE);
+		const parentSession: SessionReference = {
+			sessionDirectory: "/tmp/sessions",
+			storeId: "parent-store",
+			sessionGeneration: "generation-test",
+			sessionId: "parent",
+		};
+		session.newSession({ parentSession });
+		expect(session.getSessionId()).toMatch(UUID_V7_RE);
+		expect(session.getHeader()?.parentSession).toEqual(parentSession);
 	});
 
 	it("includes the custom id in the session header", () => {
 		const session = SessionManager.inMemory();
 		session.newSession({ id: "header-test-id" });
 
-		const header = session.getHeader();
-		expect(header).not.toBeNull();
-		expect(header!.id).toBe("header-test-id");
+		expect(session.getHeader()).toMatchObject({ id: "header-test-id" });
 	});
 
 	it("generates a UUIDv7 id when constructed without an explicit id", () => {
 		const session = SessionManager.inMemory();
 		expect(session.getSessionId()).toMatch(UUID_V7_RE);
-		expect(session.getHeader()!.id).toBe(session.getSessionId());
+		expect(session.getHeader()?.id).toBe(session.getSessionId());
 	});
 
-	it("uses the provided id when creating a persisted session", () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "volt-session-manager-"));
-		const session = SessionManager.create(tempDir, tempDir, { id: "created-session-id" });
+	it("uses the provided id and exposes a stable reference for a persisted session", async () => {
+		const tempDir = makeTempDir();
+		const session = await SessionManager.create(tempDir, tempDir, { id: "created-session-id" });
 
 		expect(session.getSessionId()).toBe("created-session-id");
-		expect(session.getHeader()!.id).toBe("created-session-id");
-		const sessionFile = session.getSessionFile()!;
-		expect(sessionFile).toContain("created-session-id");
-		expect(basename(sessionFile)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_created-session-id\.jsonl$/);
-		expect(existsSync(sessionFile)).toBe(false);
+		expect(session.getHeader()?.id).toBe("created-session-id");
+		expect(session.getSessionRef()).toMatchObject({
+			sessionDirectory: tempDir,
+			sessionId: "created-session-id",
+			storeId: expect.any(String),
+		});
 	});
 
-	it("generates a UUIDv7 id when creating a branched session", () => {
+	it("generates a UUIDv7 id when creating a branched session", async () => {
 		const session = SessionManager.inMemory();
 		const firstId = session.appendMessage({
 			role: "user",
@@ -83,80 +99,40 @@ describe("SessionManager.newSession with custom id", () => {
 			timestamp: Date.now(),
 		});
 
-		session.createBranchedSession(firstId);
+		await session.createBranchedSession(firstId);
 
 		expect(session.getSessionId()).toMatch(UUID_V7_RE);
-		expect(session.getHeader()!.id).toBe(session.getSessionId());
+		expect(session.getHeader()?.id).toBe(session.getSessionId());
 	});
 
-	it("generates a UUIDv7 id when forking from another session file", () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "volt-session-manager-"));
-		const sourcePath = join(tempDir, "source.jsonl");
-		writeFileSync(
-			sourcePath,
-			`${[
-				JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "legacy-session-id",
-					timestamp: new Date().toISOString(),
-					cwd: tempDir,
-				}),
-				JSON.stringify({
-					type: "message",
-					id: "entry-1",
-					parentId: null,
-					timestamp: new Date().toISOString(),
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: "hello" }],
-						api: "openai-responses",
-						provider: "openai",
-						model: "gpt-5.4",
-						usage: {
-							input: 0,
-							output: 0,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 0,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-						},
-						stopReason: "stop",
-						timestamp: Date.now(),
-					},
-				}),
-			].join("\n")}
-`,
-		);
+	it("generates a UUIDv7 id and records the parent reference when forking", async () => {
+		const tempDir = makeTempDir();
+		const source = await SessionManager.create(tempDir, tempDir, { id: "source-session-id" });
+		const sourceRef = source.getSessionRef();
+		if (!sourceRef) throw new Error("Expected a persisted source reference");
 
-		const forked = SessionManager.forkFrom(sourcePath, tempDir, tempDir);
-		const header = forked.getHeader();
-		expect(header).not.toBeNull();
-		expect(header!.id).toMatch(UUID_V7_RE);
-		expect(header!.parentSession).toBe(sourcePath);
+		const forked = await SessionManager.forkFrom(sourceRef, tempDir, tempDir);
+
+		expect(forked.getSessionId()).toMatch(UUID_V7_RE);
+		expect(forked.getHeader()?.parentSession).toEqual(sourceRef);
+		expect(forked.getSessionRef()?.sessionId).toBe(forked.getSessionId());
 	});
 
-	it("uses the provided id when forking from another session file", () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "volt-session-manager-"));
-		const sourcePath = join(tempDir, "source.jsonl");
-		writeFileSync(
-			sourcePath,
-			`${JSON.stringify({
-				type: "session",
-				version: 3,
-				id: "source-session-id",
-				timestamp: new Date().toISOString(),
-				cwd: tempDir,
-			})}\n`,
-		);
+	it("uses the provided id when forking", async () => {
+		const tempDir = makeTempDir();
+		const source = await SessionManager.create(tempDir, tempDir, { id: "source-session-id" });
+		const sourceRef = source.getSessionRef();
+		if (!sourceRef) throw new Error("Expected a persisted source reference");
 
-		const forked = SessionManager.forkFrom(sourcePath, tempDir, tempDir, { id: "forked-session-id" });
-		const header = forked.getHeader();
-		expect(header).not.toBeNull();
-		expect(header!.id).toBe("forked-session-id");
-		expect(header!.parentSession).toBe(sourcePath);
-		const sessionFile = forked.getSessionFile()!;
-		expect(sessionFile).toContain("forked-session-id");
-		expect(basename(sessionFile)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_forked-session-id\.jsonl$/);
+		const forked = await SessionManager.forkFrom(sourceRef, tempDir, tempDir, { id: "forked-session-id" });
+
+		expect(forked.getHeader()).toMatchObject({ id: "forked-session-id", parentSession: sourceRef });
+		expect(forked.getSessionRef()).toMatchObject({
+			sessionDirectory: tempDir,
+			storeId: sourceRef.storeId,
+			sessionGeneration: expect.any(String),
+			sessionId: "forked-session-id",
+		});
+		expect(forked.getSessionRef()?.sessionGeneration).not.toBe(sourceRef.sessionGeneration);
 	});
 });

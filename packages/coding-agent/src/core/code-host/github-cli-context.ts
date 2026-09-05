@@ -1,123 +1,31 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { spawnProcess } from "../utils/child-process.ts";
-import { terminateProcessTree } from "../utils/shell.ts";
+import { type GitHubCliResult, runGitHubCli } from "./github-cli.ts";
+import type {
+	ReviewCodeHostActor,
+	ReviewCodeHostContextCaptureOptions,
+	ReviewCodeHostContextCaptureResult,
+	ReviewCodeHostContextLimitation,
+	ReviewCodeHostContextLimitationCode,
+	ReviewCodeHostContextManifest,
+	ReviewCodeHostDiscussionEntry,
+	ReviewCodeHostLinkedIssue,
+	ReviewPullRequestAuthor,
+	ReviewPullRequestCheckSummary,
+	ReviewPullRequestIdentity,
+	ReviewPullRequestMergeability,
+	ReviewPullRequestReviewState,
+} from "./types.ts";
 
 export const REVIEW_GITHUB_TEXT_MAX_BYTES = 32 * 1024;
 export const REVIEW_GITHUB_LINKED_ISSUE_LIMIT = 20;
 export const REVIEW_GITHUB_DISCUSSION_LIMIT = 200;
 export const REVIEW_GITHUB_RENDERED_MAX_BYTES = 256 * 1024;
 
-const GH_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
-const GH_ERROR_MAX_BYTES = 64 * 1024;
 const CANONICAL_GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-
-export type ReviewGitHubContextLimitationCode =
-	| "api-error"
-	| "invalid-api-response"
-	| "text-limit"
-	| "linked-issue-limit"
-	| "discussion-limit"
-	| "aggregate-limit";
-
-export interface ReviewGitHubContextLimitation {
-	code: ReviewGitHubContextLimitationCode;
-	source: string;
-	count: number;
-}
-
-export interface ReviewPullRequestIdentity {
-	number: number;
-	title: string;
-	body: string;
-	url: string;
-	baseRefName: string;
-	headRefName: string;
-	baseRefOid: string;
-	headRefOid: string;
-}
-
-export interface ReviewGitHubActor {
-	login: string;
-	type: string;
-}
-
-export interface ReviewGitHubLinkedIssue {
-	id: string;
-	repository: string;
-	number: number;
-	title: string;
-	body: string;
-	url: string;
-	state: string;
-	stateReason?: string;
-	relationship: "closing" | "manual" | "unknown";
-	author?: ReviewGitHubActor;
-	createdAt?: string;
-	updatedAt?: string;
-}
-
-export interface ReviewGitHubDiscussionEntry {
-	id: string;
-	kind: "pr-comment" | "review-summary" | "review-thread-comment" | "linked-issue-comment";
-	body: string;
-	url?: string;
-	author?: ReviewGitHubActor;
-	authorAssociation?: string;
-	createdAt?: string;
-	updatedAt?: string;
-	state?: string;
-	commitOid?: string;
-	issue?: { repository: string; number: number };
-	thread?: {
-		id: string;
-		isResolved: boolean;
-		isOutdated: boolean;
-		path?: string;
-		line?: number;
-		startLine?: number;
-		originalLine?: number;
-		originalStartLine?: number;
-		diffSide?: string;
-	};
-	diffHunk?: string;
-	isMinimized?: boolean;
-	minimizedReason?: string;
-	replyToId?: string;
-}
-
-export interface ReviewGitHubContextManifest {
-	status: "complete" | "incomplete";
-	capturedAt: string;
-	linkedIssueCount: number;
-	discussionEntryCount: number;
-	renderedLinkedIssueCount: number;
-	renderedDiscussionEntryCount: number;
-	renderedBytes: number;
-	limitations: ReviewGitHubContextLimitation[];
-	fingerprint: string;
-}
-
-export interface ReviewGitHubContext {
-	manifest: ReviewGitHubContextManifest;
-	linkedIssues: ReviewGitHubLinkedIssue[];
-	discussionEntries: ReviewGitHubDiscussionEntry[];
-	rendered: string;
-}
-
-export type ReviewGitHubContextCaptureResult =
-	| { ok: true; pullRequest: ReviewPullRequestIdentity; context: ReviewGitHubContext }
-	| { ok: false; error: string; remoteError?: string };
 
 interface PullRequestView extends ReviewPullRequestIdentity {
 	id: string;
-}
-
-interface CommandResult {
-	ok: boolean;
-	stdout: Buffer;
-	stderr: string;
-	outputLimited: boolean;
 }
 
 interface GraphqlConnection {
@@ -127,8 +35,8 @@ interface GraphqlConnection {
 }
 
 interface CaptureState {
-	limitations: ReviewGitHubContextLimitation[];
-	discussionEntries: ReviewGitHubDiscussionEntry[];
+	limitations: ReviewCodeHostContextLimitation[];
+	discussionEntries: ReviewCodeHostDiscussionEntry[];
 }
 
 const LINKED_ISSUES_QUERY = `query VoltReviewLinkedIssues($id: ID!, $cursor: String, $manualOnly: Boolean!) {
@@ -279,68 +187,13 @@ const ISSUE_COMMENTS_QUERY = `query VoltReviewIssueComments($id: ID!, $cursor: S
   }
 }`;
 
-async function runGh(args: string[], cwd: string, input?: string, signal?: AbortSignal): Promise<CommandResult> {
-	if (signal?.aborted) throw new Error("GitHub context capture was cancelled.");
-	const result = await new Promise<CommandResult>((resolveResult) => {
-		const child = spawnProcess("gh", args, {
-			cwd,
-			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-			env: process.env,
-		});
-		const stdout: Buffer[] = [];
-		const stderr: Buffer[] = [];
-		let stdoutBytes = 0;
-		let stderrBytes = 0;
-		let outputLimited = false;
-		let settled = false;
-		const onAbort = (): void => {
-			child.stdin?.destroy();
-			if (child.pid) void terminateProcessTree(child.pid);
-			else child.kill();
-		};
-		const finish = (result: CommandResult): void => {
-			if (settled) return;
-			settled = true;
-			signal?.removeEventListener("abort", onAbort);
-			resolveResult(result);
-		};
-		const limitOutput = (): void => {
-			if (outputLimited) return;
-			outputLimited = true;
-			child.kill();
-		};
-		child.stdout?.on("data", (chunk: Buffer) => {
-			if (outputLimited) return;
-			stdoutBytes += chunk.length;
-			if (stdoutBytes > GH_OUTPUT_MAX_BYTES) limitOutput();
-			else stdout.push(chunk);
-		});
-		child.stderr?.on("data", (chunk: Buffer) => {
-			if (outputLimited) return;
-			stderrBytes += chunk.length;
-			if (stderrBytes > GH_ERROR_MAX_BYTES) limitOutput();
-			else stderr.push(chunk);
-		});
-		child.on("error", (error) => {
-			finish({ ok: false, stdout: Buffer.concat(stdout), stderr: error.message, outputLimited: false });
-		});
-		child.on("close", (code) => {
-			finish({
-				ok: code === 0 && !outputLimited,
-				stdout: outputLimited ? Buffer.alloc(0) : Buffer.concat(stdout, stdoutBytes),
-				stderr: outputLimited
-					? "GitHub CLI output exceeded its capture limit."
-					: Buffer.concat(stderr).toString("utf8"),
-				outputLimited,
-			});
-		});
-		child.stdin?.on("error", () => {});
-		signal?.addEventListener("abort", onAbort, { once: true });
-		if (signal?.aborted) onAbort();
-		else if (input !== undefined) child.stdin?.end(input);
+function runGh(args: string[], cwd: string, input?: string, signal?: AbortSignal): Promise<GitHubCliResult> {
+	return runGitHubCli(args, {
+		cwd,
+		...(input === undefined ? {} : { input }),
+		...(signal === undefined ? {} : { signal }),
+		cancellationMessage: "GitHub context capture was cancelled.",
 	});
-	if (signal?.aborted) throw new Error("GitHub context capture was cancelled.");
-	return result;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -355,13 +208,13 @@ function parseJson(value: Buffer): unknown {
 	}
 }
 
-function commandError(result: CommandResult): string {
+function commandError(result: GitHubCliResult): string {
 	return result.stderr.trim() || "command exited unsuccessfully";
 }
 
 function addLimitation(
-	limitations: ReviewGitHubContextLimitation[],
-	code: ReviewGitHubContextLimitationCode,
+	limitations: ReviewCodeHostContextLimitation[],
+	code: ReviewCodeHostContextLimitationCode,
 	source: string,
 	count = 1,
 ): void {
@@ -380,7 +233,7 @@ function truncateUtf8(value: string, maximumBytes: number): string {
 	return `${bytes.subarray(0, end).toString("utf8")}${suffix}`;
 }
 
-function boundedText(value: unknown, source: string, limitations: ReviewGitHubContextLimitation[]): string {
+function boundedText(value: unknown, source: string, limitations: ReviewCodeHostContextLimitation[]): string {
 	if (typeof value !== "string") return "";
 	if (Buffer.byteLength(value, "utf8") <= REVIEW_GITHUB_TEXT_MAX_BYTES) return value;
 	addLimitation(limitations, "text-limit", source);
@@ -400,17 +253,104 @@ function boolean(value: unknown): boolean | undefined {
 	return typeof value === "boolean" ? value : undefined;
 }
 
-function actor(value: unknown): ReviewGitHubActor | undefined {
+function actor(value: unknown): ReviewCodeHostActor | undefined {
 	if (!isObject(value)) return undefined;
 	const login = boundedStructuralString(value.login, 500);
 	const type = boundedStructuralString(value.__typename, 100);
 	return login && type ? { login, type } : undefined;
 }
 
+function pullRequestAuthor(value: unknown, pullRequestUrl: string): ReviewPullRequestAuthor | undefined {
+	if (!isObject(value) || typeof value.login !== "string") return undefined;
+	const login = value.login.trim();
+	if (login.length === 0 || Buffer.byteLength(login, "utf8") > 256 || /[\s/\\\u0000-\u001f\u007f]/u.test(login)) {
+		return undefined;
+	}
+	try {
+		const pullRequest = new URL(pullRequestUrl);
+		if (pullRequest.protocol !== "https:") return { login };
+		const avatar = new URL(`/${encodeURIComponent(login)}.png`, pullRequest.origin);
+		return avatar.toString().length <= 2_000 ? { login, avatarUrl: avatar.toString() } : { login };
+	} catch {
+		return { login };
+	}
+}
+
+function pullRequestReviewState(state: unknown, isDraft: unknown): ReviewPullRequestReviewState | undefined {
+	if (state === "MERGED") return "merged";
+	if (state === "CLOSED") return "closed";
+	if (state !== "OPEN" || typeof isDraft !== "boolean") return undefined;
+	return isDraft ? "draft" : "ready";
+}
+
+function pullRequestMergeability(value: unknown): ReviewPullRequestMergeability | undefined {
+	if (value === "MERGEABLE") return "mergeable";
+	if (value === "CONFLICTING") return "conflicting";
+	return value === "UNKNOWN" ? "unknown" : undefined;
+}
+
+function pullRequestCheckSummary(value: unknown): ReviewPullRequestCheckSummary | undefined {
+	if (!Array.isArray(value) || value.length > 10_000) return undefined;
+	let passedCount = 0;
+	let pendingCount = 0;
+	let failedCount = 0;
+	let neutralCount = 0;
+	let unknownCount = 0;
+	for (const item of value) {
+		if (!isObject(item) || typeof item.__typename !== "string") {
+			unknownCount++;
+			continue;
+		}
+		if (item.__typename === "StatusContext") {
+			if (item.state === "SUCCESS") passedCount++;
+			else if (item.state === "PENDING" || item.state === "EXPECTED") pendingCount++;
+			else if (item.state === "ERROR" || item.state === "FAILURE") failedCount++;
+			else unknownCount++;
+			continue;
+		}
+		if (item.__typename !== "CheckRun") {
+			unknownCount++;
+			continue;
+		}
+		if (item.status !== "COMPLETED") {
+			if (typeof item.status === "string") pendingCount++;
+			else unknownCount++;
+			continue;
+		}
+		if (item.conclusion === "SUCCESS") passedCount++;
+		else if (item.conclusion === "NEUTRAL" || item.conclusion === "SKIPPED") neutralCount++;
+		else if (
+			item.conclusion === "ACTION_REQUIRED" ||
+			item.conclusion === "CANCELLED" ||
+			item.conclusion === "FAILURE" ||
+			item.conclusion === "STALE" ||
+			item.conclusion === "STARTUP_FAILURE" ||
+			item.conclusion === "TIMED_OUT"
+		) {
+			failedCount++;
+		} else {
+			unknownCount++;
+		}
+	}
+	const totalCount = value.length;
+	const state =
+		totalCount === 0
+			? "none"
+			: failedCount > 0
+				? "failing"
+				: pendingCount > 0
+					? "pending"
+					: unknownCount > 0
+						? "unknown"
+						: "passing";
+	return { state, totalCount, passedCount, pendingCount, failedCount, neutralCount, unknownCount };
+}
+
 function parsePullRequestView(
 	value: unknown,
 	maximumNumber: number,
-	limitations: ReviewGitHubContextLimitation[],
+	limitations: ReviewCodeHostContextLimitation[],
+	observedAt: number,
 ): PullRequestView | undefined {
 	if (!isObject(value)) return undefined;
 	const number = integer(value.number);
@@ -418,6 +358,10 @@ function parsePullRequestView(
 	const url = boundedStructuralString(value.url);
 	const baseRefName = boundedStructuralString(value.baseRefName, 500);
 	const headRefName = boundedStructuralString(value.headRefName, 500);
+	const reviewState = pullRequestReviewState(value.state, value.isDraft);
+	const mergeability = pullRequestMergeability(value.mergeable);
+	const checks = pullRequestCheckSummary(value.statusCheckRollup);
+	const author = pullRequestAuthor(value.author, url ?? "");
 	if (
 		number === undefined ||
 		number < 1 ||
@@ -426,6 +370,8 @@ function parsePullRequestView(
 		!url ||
 		!baseRefName ||
 		!headRefName ||
+		!Number.isSafeInteger(observedAt) ||
+		observedAt < 0 ||
 		typeof value.baseRefOid !== "string" ||
 		typeof value.headRefOid !== "string" ||
 		!CANONICAL_GIT_OBJECT_ID_PATTERN.test(value.baseRefOid) ||
@@ -437,6 +383,7 @@ function parsePullRequestView(
 	}
 	return {
 		id,
+		providerId: "github",
 		number,
 		title: boundedText(value.title, "pull-request-title", limitations),
 		body: boundedText(value.body, "pull-request-body", limitations),
@@ -445,6 +392,12 @@ function parsePullRequestView(
 		headRefName,
 		baseRefOid: value.baseRefOid,
 		headRefOid: value.headRefOid,
+		...(author ? { author } : {}),
+		// Health fields are optional display metadata, not required review evidence.
+		...(reviewState ? { reviewState } : {}),
+		...(mergeability ? { mergeability } : {}),
+		...(checks ? { checks } : {}),
+		observedAt,
 	};
 }
 
@@ -453,7 +406,7 @@ async function graphql(
 	query: string,
 	variables: Record<string, unknown>,
 	signal?: AbortSignal,
-): Promise<CommandResult> {
+): Promise<GitHubCliResult> {
 	return runGh(["api", "graphql", "--input", "-"], cwd, JSON.stringify({ query, variables }), signal);
 }
 
@@ -477,7 +430,7 @@ async function loadConnection(options: {
 	variables: Record<string, unknown>;
 	path: string[];
 	source: string;
-	limitations: ReviewGitHubContextLimitation[];
+	limitations: ReviewCodeHostContextLimitation[];
 	signal?: AbortSignal;
 }): Promise<GraphqlConnection | undefined> {
 	const result = await graphql(options.cwd, options.query, options.variables, options.signal);
@@ -494,7 +447,7 @@ async function loadConnection(options: {
 function nextPageCursor(
 	connection: GraphqlConnection,
 	seenCursors: Set<string>,
-	limitations: ReviewGitHubContextLimitation[],
+	limitations: ReviewCodeHostContextLimitation[],
 	source: string,
 ): string | undefined {
 	const cursor = connection.endCursor;
@@ -508,8 +461,8 @@ function nextPageCursor(
 
 function parseLinkedIssue(
 	value: unknown,
-	limitations: ReviewGitHubContextLimitation[],
-): Omit<ReviewGitHubLinkedIssue, "relationship"> | undefined {
+	limitations: ReviewCodeHostContextLimitation[],
+): Omit<ReviewCodeHostLinkedIssue, "relationship"> | undefined {
 	if (!isObject(value) || !isObject(value.repository)) return undefined;
 	const id = boundedStructuralString(value.id, 500);
 	const repository = boundedStructuralString(value.repository.nameWithOwner, 1_000);
@@ -544,11 +497,11 @@ async function captureLinkedIssueSet(
 	cwd: string,
 	pullRequestId: string,
 	manualOnly: boolean,
-	limitations: ReviewGitHubContextLimitation[],
+	limitations: ReviewCodeHostContextLimitation[],
 	initialConnection: GraphqlConnection | undefined,
 	signal?: AbortSignal,
-): Promise<{ issues: Array<Omit<ReviewGitHubLinkedIssue, "relationship">>; complete: boolean }> {
-	const issues: Array<Omit<ReviewGitHubLinkedIssue, "relationship">> = [];
+): Promise<{ issues: Array<Omit<ReviewCodeHostLinkedIssue, "relationship">>; complete: boolean }> {
+	const issues: Array<Omit<ReviewCodeHostLinkedIssue, "relationship">> = [];
 	const seenCursors = new Set<string>();
 	let connection = initialConnection;
 	while (issues.length < REVIEW_GITHUB_LINKED_ISSUE_LIMIT) {
@@ -586,8 +539,8 @@ async function captureLinkedIssueSet(
 function commonDiscussionFields(
 	value: Record<string, unknown>,
 	bodySource: string,
-	limitations: ReviewGitHubContextLimitation[],
-): Omit<ReviewGitHubDiscussionEntry, "id" | "kind"> {
+	limitations: ReviewCodeHostContextLimitation[],
+): Omit<ReviewCodeHostDiscussionEntry, "id" | "kind"> {
 	return {
 		body: boundedText(value.body, bodySource, limitations),
 		...(boundedStructuralString(value.url) ? { url: boundedStructuralString(value.url) } : {}),
@@ -610,7 +563,7 @@ function commonDiscussionFields(
 
 function appendDiscussion(
 	state: CaptureState,
-	entry: ReviewGitHubDiscussionEntry | undefined,
+	entry: ReviewCodeHostDiscussionEntry | undefined,
 	source: string,
 ): boolean {
 	if (!entry) {
@@ -628,8 +581,8 @@ function appendDiscussion(
 
 function parsePrComment(
 	value: unknown,
-	limitations: ReviewGitHubContextLimitation[],
-): ReviewGitHubDiscussionEntry | undefined {
+	limitations: ReviewCodeHostContextLimitation[],
+): ReviewCodeHostDiscussionEntry | undefined {
 	if (!isObject(value)) return undefined;
 	const id = boundedStructuralString(value.id, 500);
 	if (!id || typeof value.body !== "string") return undefined;
@@ -638,8 +591,8 @@ function parsePrComment(
 
 function parseReviewSummary(
 	value: unknown,
-	limitations: ReviewGitHubContextLimitation[],
-): ReviewGitHubDiscussionEntry | undefined {
+	limitations: ReviewCodeHostContextLimitation[],
+): ReviewCodeHostDiscussionEntry | undefined {
 	if (!isObject(value)) return undefined;
 	const id = boundedStructuralString(value.id, 500);
 	const state = boundedStructuralString(value.state, 100);
@@ -660,9 +613,9 @@ function parseReviewSummary(
 
 function parseThreadComment(
 	value: unknown,
-	thread: ReviewGitHubDiscussionEntry["thread"],
-	limitations: ReviewGitHubContextLimitation[],
-): ReviewGitHubDiscussionEntry | undefined {
+	thread: ReviewCodeHostDiscussionEntry["thread"],
+	limitations: ReviewCodeHostContextLimitation[],
+): ReviewCodeHostDiscussionEntry | undefined {
 	if (!isObject(value) || !thread) return undefined;
 	const id = boundedStructuralString(value.id, 500);
 	const state = boundedStructuralString(value.state, 100);
@@ -687,9 +640,9 @@ function isPendingReviewComment(value: unknown): boolean {
 
 function parseIssueComment(
 	value: unknown,
-	issue: ReviewGitHubLinkedIssue,
-	limitations: ReviewGitHubContextLimitation[],
-): ReviewGitHubDiscussionEntry | undefined {
+	issue: ReviewCodeHostLinkedIssue,
+	limitations: ReviewCodeHostContextLimitation[],
+): ReviewCodeHostDiscussionEntry | undefined {
 	if (!isObject(value)) return undefined;
 	const id = boundedStructuralString(value.id, 500);
 	if (!id || typeof value.body !== "string") return undefined;
@@ -710,7 +663,7 @@ async function captureSimpleDiscussionConnection(options: {
 	state: CaptureState;
 	initialConnection: GraphqlConnection | undefined;
 	signal?: AbortSignal;
-	parse: (value: unknown, limitations: ReviewGitHubContextLimitation[]) => ReviewGitHubDiscussionEntry | undefined;
+	parse: (value: unknown, limitations: ReviewCodeHostContextLimitation[]) => ReviewCodeHostDiscussionEntry | undefined;
 }): Promise<boolean> {
 	const seenCursors = new Set<string>();
 	let connection = options.initialConnection;
@@ -736,7 +689,7 @@ async function captureSimpleDiscussionConnection(options: {
 	return true;
 }
 
-function parseThread(value: unknown): ReviewGitHubDiscussionEntry["thread"] | undefined {
+function parseThread(value: unknown): ReviewCodeHostDiscussionEntry["thread"] | undefined {
 	if (!isObject(value)) return undefined;
 	const id = boundedStructuralString(value.id, 500);
 	const isResolved = boolean(value.isResolved);
@@ -761,7 +714,7 @@ function parseThread(value: unknown): ReviewGitHubDiscussionEntry["thread"] | un
 
 async function captureThreadCommentPages(
 	cwd: string,
-	thread: NonNullable<ReviewGitHubDiscussionEntry["thread"]>,
+	thread: NonNullable<ReviewCodeHostDiscussionEntry["thread"]>,
 	initialConnection: GraphqlConnection,
 	state: CaptureState,
 	signal?: AbortSignal,
@@ -827,7 +780,7 @@ async function captureReviewThreads(
 
 async function captureIssueComments(
 	cwd: string,
-	issues: ReviewGitHubLinkedIssue[],
+	issues: ReviewCodeHostLinkedIssue[],
 	state: CaptureState,
 	signal?: AbortSignal,
 ): Promise<void> {
@@ -858,7 +811,7 @@ async function captureIssueComments(
 	}
 }
 
-function issueBlock(issue: ReviewGitHubLinkedIssue): string {
+function issueBlock(issue: ReviewCodeHostLinkedIssue): string {
 	return [
 		`## Linked issue ${issue.repository}#${issue.number}`,
 		JSON.stringify({
@@ -876,7 +829,7 @@ function issueBlock(issue: ReviewGitHubLinkedIssue): string {
 	].join("\n");
 }
 
-function discussionBlock(entry: ReviewGitHubDiscussionEntry): string {
+function discussionBlock(entry: ReviewCodeHostDiscussionEntry): string {
 	return [
 		`## Discussion entry ${entry.kind}`,
 		JSON.stringify({
@@ -903,9 +856,9 @@ function discussionBlock(entry: ReviewGitHubDiscussionEntry): string {
 
 function renderContext(
 	pullRequest: ReviewPullRequestIdentity,
-	linkedIssues: ReviewGitHubLinkedIssue[],
-	discussionEntries: ReviewGitHubDiscussionEntry[],
-	manifest: ReviewGitHubContextManifest,
+	linkedIssues: ReviewCodeHostLinkedIssue[],
+	discussionEntries: ReviewCodeHostDiscussionEntry[],
+	manifest: ReviewCodeHostContextManifest,
 	maximumBlockCount = linkedIssues.length + discussionEntries.length,
 ): { text: string; linkedIssueCount: number; discussionEntryCount: number } {
 	const header = [
@@ -914,6 +867,7 @@ function renderContext(
 		JSON.stringify({
 			manifest,
 			pullRequest: {
+				providerId: pullRequest.providerId,
 				number: pullRequest.number,
 				title: pullRequest.title,
 				body: pullRequest.body,
@@ -944,14 +898,15 @@ function renderContext(
 
 function contextFingerprint(
 	pullRequest: ReviewPullRequestIdentity,
-	linkedIssues: ReviewGitHubLinkedIssue[],
-	discussionEntries: ReviewGitHubDiscussionEntry[],
-	limitations: ReviewGitHubContextLimitation[],
+	linkedIssues: ReviewCodeHostLinkedIssue[],
+	discussionEntries: ReviewCodeHostDiscussionEntry[],
+	limitations: ReviewCodeHostContextLimitation[],
 ): string {
 	return createHash("sha256")
 		.update(
 			JSON.stringify({
 				pullRequest: {
+					providerId: pullRequest.providerId,
 					number: pullRequest.number,
 					title: pullRequest.title,
 					body: pullRequest.body,
@@ -971,7 +926,7 @@ async function finalHeadCheck(
 	cwd: string,
 	pullRequest: PullRequestView,
 	signal?: AbortSignal,
-): Promise<ReviewGitHubContextCaptureResult | undefined> {
+): Promise<ReviewCodeHostContextCaptureResult | undefined> {
 	const result = await runGh(
 		["pr", "view", String(pullRequest.number), "--json", "headRefOid"],
 		cwd,
@@ -1003,14 +958,10 @@ async function finalHeadCheck(
 	return undefined;
 }
 
-export async function captureReviewGitHubContext(options: {
-	cwd: string;
-	number?: string;
-	maxPullRequestNumber: number;
-	signal?: AbortSignal;
-	onProgress?: (message: string) => void;
-}): Promise<ReviewGitHubContextCaptureResult> {
-	const initialLimitations: ReviewGitHubContextLimitation[] = [];
+export async function capturePullRequestContextWithGitHubCli(
+	options: ReviewCodeHostContextCaptureOptions,
+): Promise<ReviewCodeHostContextCaptureResult> {
+	const initialLimitations: ReviewCodeHostContextLimitation[] = [];
 	options.onProgress?.("Loading pull request metadata…");
 	const result = await runGh(
 		[
@@ -1018,7 +969,7 @@ export async function captureReviewGitHubContext(options: {
 			"view",
 			...(options.number ? [options.number] : []),
 			"--json",
-			"id,number,title,body,baseRefName,headRefName,url,baseRefOid,headRefOid",
+			"id,number,title,body,baseRefName,headRefName,url,baseRefOid,headRefOid,author,state,isDraft,mergeable,statusCheckRollup",
 		],
 		options.cwd,
 		undefined,
@@ -1035,15 +986,20 @@ export async function captureReviewGitHubContext(options: {
 			remoteError: "Could not load pull request metadata with GitHub CLI.",
 		};
 	}
-	const pullRequest = parsePullRequestView(parseJson(result.stdout), options.maxPullRequestNumber, initialLimitations);
+	const pullRequest = parsePullRequestView(
+		parseJson(result.stdout),
+		options.maxPullRequestNumber,
+		initialLimitations,
+		Date.now(),
+	);
 	if (!pullRequest) return { ok: false, error: "Could not parse gh pr view output." };
 
 	options.onProgress?.("Capturing pull request context…");
-	const closingLimitations: ReviewGitHubContextLimitation[] = [];
-	const manualLimitations: ReviewGitHubContextLimitation[] = [];
-	const commentLimitations: ReviewGitHubContextLimitation[] = [];
-	const reviewLimitations: ReviewGitHubContextLimitation[] = [];
-	const threadLimitations: ReviewGitHubContextLimitation[] = [];
+	const closingLimitations: ReviewCodeHostContextLimitation[] = [];
+	const manualLimitations: ReviewCodeHostContextLimitation[] = [];
+	const commentLimitations: ReviewCodeHostContextLimitation[] = [];
+	const reviewLimitations: ReviewCodeHostContextLimitation[] = [];
+	const threadLimitations: ReviewCodeHostContextLimitation[] = [];
 	const [closingInitial, manualInitial, commentsInitial, reviewsInitial, threadsInitial] = await Promise.all([
 		loadConnection({
 			cwd: options.cwd,
@@ -1111,11 +1067,11 @@ export async function captureReviewGitHubContext(options: {
 	);
 	initialLimitations.push(...manualLimitations);
 	const manualIds = new Set(manual.issues.map((issue) => issue.id));
-	const linkedIssues: ReviewGitHubLinkedIssue[] = closing.issues.map((issue) => ({
+	const linkedIssues: ReviewCodeHostLinkedIssue[] = closing.issues.map((issue) => ({
 		...issue,
 		relationship: manualIds.has(issue.id) ? "manual" : manual.complete ? "closing" : "unknown",
 	}));
-	const discussionEntries: ReviewGitHubDiscussionEntry[] = [];
+	const discussionEntries: ReviewCodeHostDiscussionEntry[] = [];
 	const commentState: CaptureState = { limitations: commentLimitations, discussionEntries };
 	let underDiscussionLimit = await captureSimpleDiscussionConnection({
 		cwd: options.cwd,
@@ -1163,6 +1119,7 @@ export async function captureReviewGitHubContext(options: {
 	if (finalError) return finalError;
 
 	const identity: ReviewPullRequestIdentity = {
+		providerId: "github",
 		number: pullRequest.number,
 		title: pullRequest.title,
 		body: pullRequest.body,
@@ -1171,13 +1128,18 @@ export async function captureReviewGitHubContext(options: {
 		headRefName: pullRequest.headRefName,
 		baseRefOid: pullRequest.baseRefOid,
 		headRefOid: pullRequest.headRefOid,
+		...(pullRequest.author ? { author: { ...pullRequest.author } } : {}),
+		...(pullRequest.reviewState ? { reviewState: pullRequest.reviewState } : {}),
+		...(pullRequest.mergeability ? { mergeability: pullRequest.mergeability } : {}),
+		...(pullRequest.checks ? { checks: { ...pullRequest.checks } } : {}),
+		...(pullRequest.observedAt === undefined ? {} : { observedAt: pullRequest.observedAt }),
 	};
 	const capturedAt = new Date().toISOString();
 	const createManifest = (
 		renderedLinkedIssueCount: number,
 		renderedDiscussionEntryCount: number,
 		renderedBytes: number,
-	): ReviewGitHubContextManifest => ({
+	): ReviewCodeHostContextManifest => ({
 		status: state.limitations.length === 0 ? "complete" : "incomplete",
 		capturedAt,
 		linkedIssueCount: linkedIssues.length,

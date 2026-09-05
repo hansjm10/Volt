@@ -377,7 +377,7 @@ describe("HostActionRegistry", () => {
 		expect(descriptors.find((descriptor) => descriptor.id === REVIEW_PR_ACTION_ID)).toEqual(
 			expect.objectContaining({
 				label: "Review pull request",
-				description: expect.stringMatching(/GitHub credentials and network.*linked issues.*inline review threads/),
+				description: expect.stringMatching(/GitHub CLI code-host provider.*linked issues.*inline review threads/),
 				category: "review",
 				presentation: expect.objectContaining({ kind: "card", group: "Review", priority: 80 }),
 				requiresConfirmation: true,

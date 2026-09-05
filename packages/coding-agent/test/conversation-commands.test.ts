@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -9,12 +9,14 @@ import { getStaticIrohRemoteRpcFilterResult as getIrohRemoteRpcFilterResult } fr
 import { IrohRemoteHostStateManager } from "../src/core/remote/iroh/state-manager.ts";
 import { IROH_REMOTE_TRANSCRIPT_TEXT_MAX_SCALARS } from "../src/core/remote/iroh/transcript-text.ts";
 import type { IrohRemoteWorktreeRpcBackend } from "../src/core/remote/iroh/worktree-rpc.ts";
+import type { RpcGitContext } from "../src/core/rpc/types.ts";
 import { getDefaultSessionDir, type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 import {
 	type ConversationCommandContext,
 	type ConversationCommandRuntime,
 	createRemoteConversationTranscriptEntry,
 	createRemoteConversationTranscriptPage,
+	createRemoteListSessionsRpcResponse,
 	handleIntegratedConversationRpcCommand,
 	INTEGRATED_CONVERSATION_UNSUPPORTED_RPC_TYPES,
 	LEASE_DRAINING_RETRY_AFTER_MS,
@@ -26,8 +28,35 @@ import {
 	type RemoteSessionRuntimeState,
 	TURN_INITIATING_RPC_TYPES,
 } from "../src/daemon/conversation-commands.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
+import { loadPersistedSessionSnapshot } from "./utilities.ts";
 
-function createAuthorization(options: { workspacePath?: string } = {}): IrohRemoteClientAuthorizationSuccess {
+const STARTING_GIT_CONTEXT: RpcGitContext = {
+	repository: "volt-app",
+	head: {
+		kind: "branch",
+		name: "feature/work-organization",
+		oid: "0123456789abcdef0123456789abcdef01234567",
+	},
+	upstream: null,
+	base: null,
+	status: {
+		staged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+		unstaged: { added: 0, modified: 0, deleted: 0, renamed: 0 },
+		untracked: 0,
+		conflicted: 0,
+		total: 0,
+		clean: true,
+	},
+	operation: null,
+	revision: 1,
+	observedAt: "2026-08-29T00:00:00.000Z",
+	stale: false,
+};
+
+function createAuthorization(
+	options: { workspacePath?: string; workspaceGeneration?: number } = {},
+): IrohRemoteClientAuthorizationSuccess {
 	return {
 		ok: true,
 		allowTools: "read",
@@ -43,6 +72,7 @@ function createAuthorization(options: { workspacePath?: string } = {}): IrohRemo
 		paired: false,
 		pairingSecretConsumed: false,
 		workspace: { name: "ws", path: options.workspacePath ?? "/tmp/ws" },
+		...(options.workspaceGeneration === undefined ? {} : { workspaceGeneration: options.workspaceGeneration }),
 		workspaceNames: ["ws"],
 		workspaces: [{ name: "ws", status: "available" }],
 	};
@@ -91,6 +121,7 @@ function createContext(
 		webSearchKey?: ConversationCommandContext["webSearchKey"];
 		createWorktreeBackend?: ConversationCommandContext["createWorktreeBackend"];
 		listRuntimeStates?: ConversationCommandContext["listRuntimeStates"];
+		getWorkContext?: ConversationCommandContext["getWorkContext"];
 		agentDir?: string;
 	} = {},
 ): ConversationCommandContext {
@@ -107,6 +138,7 @@ function createContext(
 		...(options.webSearchKey === undefined ? {} : { webSearchKey: options.webSearchKey }),
 		...(options.createWorktreeBackend === undefined ? {} : { createWorktreeBackend: options.createWorktreeBackend }),
 		...(options.listRuntimeStates === undefined ? {} : { listRuntimeStates: options.listRuntimeStates }),
+		...(options.getWorkContext === undefined ? {} : { getWorkContext: options.getWorkContext }),
 		...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
 	};
 }
@@ -522,8 +554,10 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		const sessionDir = join(root, "sessions");
 		mkdirSync(workspacePath, { recursive: true });
 		mkdirSync(sessionDir, { recursive: true });
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
-			const manager = SessionManager.create(workspacePath, sessionDir);
+			const manager = await SessionManager.create(workspacePath, sessionDir);
 			manager.reserveClientInput("client-message-42", "prompt", {
 				message: `Read ${workspacePath}/fixture.txt`,
 			});
@@ -555,8 +589,10 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			});
 			expect(bootstrap?.items).toEqual([live]);
 			await manager.flush();
-			expect(readFileSync(manager.getSessionFile()!, "utf8")).toContain('"clientMessageId":"client-message-42"');
+			const persisted = await loadPersistedSessionSnapshot(manager);
+			expect(JSON.stringify(persisted.entries)).toContain('"clientMessageId":"client-message-42"');
 		} finally {
+			await managerOwner.drain();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -1252,6 +1288,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 				modifiedAt: new Date(2).toISOString(),
 				messageCount: 1,
 				cwd: "/tmp/agent/worktrees/--ws--/fix-login/packages/coding-agent",
+				startingGitContext: STARTING_GIT_CONTEXT,
 			},
 			{
 				sessionId: "s-plain",
@@ -1273,29 +1310,140 @@ describe("handleIntegratedConversationRpcCommand", () => {
 		const bySession = new Map(response.data.sessions.map((session) => [session.sessionId, session]));
 		expect(bySession.get("s-worktree")?.worktreeId).toBe("fix-login");
 		expect(bySession.get("s-worktree")?.workingDirectory).toBe("Volt/packages/coding-agent");
+		expect(bySession.get("s-worktree")?.startingGitContext).toEqual(STARTING_GIT_CONTEXT);
 		expect(bySession.get("s-plain")).not.toHaveProperty("worktreeId");
 		// Ids only — no checkout path may reach the wire.
 		expect(JSON.stringify(response)).not.toContain("/tmp/agent/worktrees");
 	});
 
+	it("joins sanitized Work context synchronously without provider discovery", async () => {
+		const runtime = createRuntime("s-work");
+		runtime.listSessions = async () => [
+			{
+				sessionId: "s-work",
+				sessionName: "Work session",
+				firstMessage: "hi",
+				createdAt: new Date(1).toISOString(),
+				modifiedAt: new Date(2).toISOString(),
+				messageCount: 1,
+			},
+		];
+		let lookupCalls = 0;
+		const providerCalls = 0;
+		const response = (await handleIntegratedConversationRpcCommand(
+			{ id: "work", type: "list_sessions" },
+			createAuthorization({ workspaceGeneration: 7 }),
+			createContext({
+				getWorkContext: (workspaceName, workspaceGeneration, sessionId) => {
+					lookupCalls++;
+					expect([workspaceName, workspaceGeneration, sessionId]).toEqual(["ws", 7, "s-work"]);
+					return {
+						changeId: "opaque-change",
+						repository: "Volt",
+						branch: "feature/work",
+						resolutionState: "resolved",
+						pullRequest: {
+							provider: "github",
+							number: 42,
+							title: "Work association",
+							status: "open",
+							stale: false,
+						},
+						checkoutPath: "/secret/path",
+						canonicalRepositoryId: "github:github.com/secret/repo",
+						matchedHeadOid: STARTING_GIT_CONTEXT.head.kind === "branch" ? STARTING_GIT_CONTEXT.head.oid : "",
+						rawError: "credential=secret",
+					} as never;
+				},
+			}),
+			runtime,
+		)) as { data: { sessions: Array<Record<string, unknown>> } };
+		expect(lookupCalls).toBe(1);
+		expect(providerCalls).toBe(0);
+		expect(response.data.sessions[0]?.workContext).toEqual({
+			changeId: "opaque-change",
+			repository: "Volt",
+			branch: "feature/work",
+			resolutionState: "resolved",
+			pullRequest: {
+				provider: "github",
+				number: 42,
+				title: "Work association",
+				status: "open",
+				stale: false,
+			},
+		});
+		const serialized = JSON.stringify(response);
+		expect(serialized).not.toContain("/secret/path");
+		expect(serialized).not.toContain("canonicalRepositoryId");
+		expect(serialized).not.toContain("matchedHeadOid");
+		expect(serialized).not.toContain("credential=secret");
+	});
+
+	it("keeps Work context stable across list_sessions pagination snapshots", async () => {
+		const runtime = createRuntime("s-new");
+		runtime.listSessions = async () => [
+			{
+				sessionId: "s-new",
+				sessionName: "New",
+				firstMessage: "new",
+				createdAt: new Date(2).toISOString(),
+				modifiedAt: new Date(2).toISOString(),
+				messageCount: 1,
+			},
+			{
+				sessionId: "s-old",
+				sessionName: "Old",
+				firstMessage: "old",
+				createdAt: new Date(1).toISOString(),
+				modifiedAt: new Date(1).toISOString(),
+				messageCount: 1,
+			},
+		];
+		let title = "Original title";
+		const getWorkContext = vi.fn((_workspace: string, _generation: number, sessionId: string) => ({
+			changeId: `change-${sessionId}`,
+			repository: "Volt",
+			branch: `feature/${sessionId}`,
+			resolutionState: "resolved" as const,
+			pullRequest: { provider: "github", number: 42, title, status: "open" as const, stale: false },
+		}));
+		const authorization = createAuthorization({ workspaceGeneration: 7 });
+		const context = createContext({ getWorkContext });
+		const first = (await createRemoteListSessionsRpcResponse(
+			{ id: "page-1", type: "list_sessions", limit: 1 },
+			authorization,
+			context,
+			runtime,
+		)) as { data: { sessions: Array<{ workContext: { pullRequest: { title: string } } }>; nextCursor: string } };
+		expect(first.data.sessions[0]?.workContext.pullRequest.title).toBe("Original title");
+		expect(getWorkContext).toHaveBeenCalledTimes(2);
+
+		title = "New title that must not enter the old snapshot";
+		const second = (await createRemoteListSessionsRpcResponse(
+			{ id: "page-2", type: "list_sessions", limit: 1, cursor: first.data.nextCursor },
+			authorization,
+			context,
+			runtime,
+		)) as { data: { sessions: Array<{ workContext: { pullRequest: { title: string } } }> } };
+		expect(second.data.sessions[0]?.workContext.pullRequest.title).toBe("Original title");
+		expect(getWorkContext).toHaveBeenCalledTimes(2);
+	});
+
 	it("includes parent workspace sessions when the active runtime cwd is a subfolder", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "volt-conversation-list-"));
+		const managerOwner = createSessionManagerTestOwner();
+		managerOwner.start();
 		try {
 			const workspacePath = join(tempDir, "repo");
 			const subfolderPath = join(workspacePath, "packages", "app");
 			const agentDir = join(tempDir, "agent");
 			mkdirSync(subfolderPath, { recursive: true });
 			const sessionDir = getDefaultSessionDir(workspacePath, agentDir);
-			writeFileSync(
-				join(sessionDir, "root-session.jsonl"),
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "s-root",
-					timestamp: new Date(1).toISOString(),
-					cwd: workspacePath,
-				})}\n`,
-			);
+			const rootManager = await SessionManager.create(workspacePath, sessionDir, { id: "s-root" });
+			rootManager.appendMessage({ role: "user", content: "root session", timestamp: 1 });
+			rootManager.appendCustomMessageEntry("test.persist", "persist root session", false);
+			await rootManager.flush();
 			const runtime = createRuntime("s-subfolder");
 			runtime.listSessions = async () => [
 				{
@@ -1321,6 +1469,7 @@ describe("handleIntegratedConversationRpcCommand", () => {
 			expect(bySessionId.get("s-root")).toBeDefined();
 			expect(bySessionId.get("s-subfolder")?.workingDirectory).toBe("packages/app");
 		} finally {
+			await managerOwner.drain();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

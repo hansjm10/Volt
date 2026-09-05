@@ -1,5 +1,5 @@
-import { fuzzyMatch } from "@hansjm10/volt-tui";
 import type { SessionInfo } from "../../../core/session-manager.ts";
+import { fuzzyMatchSessionText } from "../../../core/session-search.ts";
 
 export type SortMode = "threaded" | "recent" | "relevance";
 
@@ -24,7 +24,7 @@ function normalizeWhitespaceLower(text: string): string {
 }
 
 function getSessionSearchText(session: SessionInfo): string {
-	return `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
+	return `${session.id} ${session.name ?? ""} ${session.firstMessage} ${session.cwd}`;
 }
 
 export function hasSessionName(session: SessionInfo): boolean {
@@ -145,7 +145,7 @@ export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): M
 			continue;
 		}
 
-		const m = fuzzyMatch(token.value, text);
+		const m = fuzzyMatchSessionText(token.value, text);
 		if (!m.matches) return { matches: false, score: 0 };
 		totalScore += m.score;
 	}

@@ -24,7 +24,7 @@
 		"benchmark:streaming-markdown": "node --experimental-strip-types --conditions volt-source packages/coding-agent/benchmarks/streaming-markdown.ts",
 		"benchmark:memory": "node scripts/benchmark-coding-agent-memory.mjs",
 		"benchmark:swebench": "node scripts/benchmark-swebench.mjs",
-		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:changesets && npm run check:ts-imports && npm run check:coding-agent-source-exports && npm run check:shrinkwrap && npm run check:rpc-contract && npm run check:release-security && tsgo --noEmit && tsgo --noEmit -p packages/tui/tsconfig.json && tsgo --noEmit -p packages/agent/tsconfig.json && npm run check:browser-smoke",
+		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:changesets && npm run check:ts-imports && npm run check:coding-agent-source-exports && npm run check:source-launchers && npm run check:shrinkwrap && npm run check:rpc-contract && npm run check:release-security && tsc --noEmit && tsc --noEmit -p packages/tui/tsconfig.json && tsc --noEmit -p packages/agent/tsconfig.json && npm run check:browser-smoke",
 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
 		"check:coding-agent-source-exports": "node scripts/check-coding-agent-source-exports.mjs",
 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
@@ -34,6 +34,7 @@
 		"check:changesets": "node scripts/check-changesets.mjs",
 		"check:release-security": "node --test scripts/release-security.test.mjs scripts/bootstrap-npm-packages.test.mjs scripts/changelog.test.mjs scripts/check-changesets.test.mjs scripts/draft-changeset.test.mjs scripts/edit-tool-stats.test.mjs",
 		"check:rpc-contract": "node scripts/generate-rpc-schema.ts --check",
+		"check:source-launchers": "node --test scripts/source-launchers.test.mjs",
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
 		"contract:rpc": "node scripts/generate-rpc-schema.ts",
@@ -76,13 +77,13 @@
 		"@biomejs/biome": "2.3.5",
 		"@changesets/cli": "2.31.0",
 		"@types/node": "22.19.19",
-		"@typescript/native-preview": "7.0.0-dev.20260120.1",
+		"@typescript/native": "npm:typescript@7.0.2",
 		"esbuild": "0.28.1",
 		"husky": "9.1.7",
 		"jiti": "2.7.0",
 		"postject": "1.0.0-alpha.6",
 		"shx": "0.4.0",
-		"typescript": "5.9.3"
+		"typescript": "npm:@typescript/typescript6@6.0.2"
 	},
 	"engines": {
 		"node": ">=22.19.0"

@@ -76,6 +76,7 @@ Everything lives under `~/.volt/agent/daemon/` (mode `0700`):
 | `voltd.pid` | Advisory pidfile; liveness truth is always a socket probe |
 | `voltd.log` | Daemon log (`volt daemon logs`) |
 | `state.json` | Iroh secret key, paired clients, workspaces, settings (`0600`) |
+| `work-state.json` | Private, bounded session-to-change and pull-request associations (`0600`) |
 | `audit.jsonl` | Append-only audit log (pairing, leases, relays, lifecycle) |
 
 On first start the daemon migrates the legacy `remote/iroh-host.json` state
@@ -85,6 +86,18 @@ workspace/worktree metadata, but intentionally drops active clients, revoked
 clients, and pending pairing tickets. The daemon logs and audits this expected
 migration as `legacy_remote_access_dropped`; it is not corruption. Every old
 client must pair again to receive an explicit current grant.
+
+## Session storage
+
+Conversation history uses the same authoritative SQLite storage as local Volt.
+Each registered workspace's session directory, or an explicitly configured
+session directory, contains `sessions.sqlite`; session lists and resumes use its
+indexes. The daemon addresses conversations by stable workspace/session IDs and
+never sends the database path, session directory, or host-side
+`SessionReference` over the remote wire.
+
+Daemon handoffs reopen stable session identities from SQLite; they do not
+transfer or reopen JSONL snapshot files.
 
 ## Configured remote agents
 
@@ -139,6 +152,30 @@ When the TUI owns the lease, phone prompts run with the TUI session's full
 local tool set. `remote.allowTools` applies only to daemon-owned headless
 runtimes — see [Security](security.md).
 
+## Work and pull-request association
+
+The daemon observes fresh path-free Git branch state from whichever process
+owns a conversation lease. Daemon runtimes publish directly; a TUI may publish
+only over the exact local control connection holding that `(workspace,
+session)` lease. Phone input and `list_sessions` requests cannot choose an
+association or start provider discovery.
+
+For trusted workspaces, the daemon uses configured Git remotes plus the local
+authenticated `gh` CLI to match the exact head repository, branch, and object
+ID. Provider failure remains distinct from “no pull request,” ambiguous matches
+are not guessed, and configured/default base branches such as `main` are not
+grouped across sessions. A positive PR match is sticky: later checkouts,
+refresh failures, branch reuse, or a newer PR do not silently move the session
+to another change. Set `remote.pullRequestDiscovery: false` to disable provider
+calls.
+
+Associations are stored separately in private `work-state.json`. The file uses
+opaque local IDs and a salted hash of the common Git directory; checkout paths,
+credentials, raw provider output, and provider diagnostics are not projected to
+phones. `list_sessions.workContext` contains only the opaque change ID,
+repository display name, effective branch, resolution state, and bounded PR
+summary described in [Iroh Remote Protocol](iroh-remote-protocol.md#remote-rpc-command-allowlist).
+
 ## Git worktrees
 
 Concurrent sessions in one workspace share one checkout by default — two
@@ -152,11 +189,11 @@ and a `worktreeId`.
 
 Key behaviors:
 
-- **Sessions stay with the parent workspace.** Worktree sessions are stored
-  and listed under the parent workspace; leases, push notifications, and
-  `list_sessions` are unchanged. The daemon persists a session→worktree
-  binding so resumes (phone reattach, daemon restart, TUI takeover) land back
-  in the worktree checkout.
+- **Sessions stay with the parent workspace.** Worktree sessions use the
+  parent workspace's SQLite store and remain listed there; leases, push
+  notifications, and `list_sessions` are unchanged. The daemon persists a
+  session→worktree binding so resumes (phone reattach, daemon restart, TUI
+  takeover) land back in the worktree checkout.
 - **Policy inheritance.** A worktree runtime uses exactly the parent
   workspace's trust decision and tool allowlist — never wider. Trust is never
   prompted for or persisted on worktree paths.

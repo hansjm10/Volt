@@ -1,17 +1,29 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
+import {
+	CURRENT_SESSION_SNAPSHOT_VERSION,
+	CURRENT_SESSION_VERSION,
+	getDefaultSessionDir,
+	SessionManager,
+} from "../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "./session-manager-owner.ts";
 
 const cliPath = resolve(__dirname, "source-cli-runner.mjs");
+const CLI_TIMEOUT_MS = 50_000;
+const TEST_TIMEOUT_MS = 60_000;
+const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const tempDirs: string[] = [];
+const managerOwner = createSessionManagerTestOwner();
 
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) {
-		rmSync(dir, { recursive: true, force: true });
-	}
+beforeEach(() => managerOwner.start());
+
+afterEach(async () => {
+	await managerOwner.drain();
+	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function createTempDir(): string {
@@ -20,43 +32,29 @@ function createTempDir(): string {
 	return dir;
 }
 
-function hasSessionWithId(root: string, sessionId: string): boolean {
-	if (!existsSync(root)) return false;
-	for (const entry of readdirSync(root, { withFileTypes: true })) {
-		const path = join(root, entry.name);
-		if (entry.isDirectory() && hasSessionWithId(path, sessionId)) return true;
-		if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-
-		try {
-			const firstLine = readFileSync(path, "utf8").split("\n", 1)[0];
-			const header = JSON.parse(firstLine) as { type?: string; id?: string };
-			if (header.type === "session" && header.id === sessionId) return true;
-		} catch {
-			// Ignore malformed session files.
-		}
-	}
-	return false;
-}
-
 interface CliDirs {
 	agentDir: string;
 	projectDir: string;
 	sessionDir: string;
 }
 
+interface CliResult extends CliDirs {
+	code: number | null;
+	stderr: string;
+}
+
 async function runCli(
 	args: string[] | ((dirs: CliDirs) => string[]),
-	setup?: (dirs: CliDirs) => void,
-): Promise<{ code: number | null; agentDir: string; stderr: string }> {
+	setup?: (dirs: CliDirs) => Promise<void> | void,
+): Promise<CliResult> {
 	const tempRoot = createTempDir();
-	const dirs: CliDirs = {
-		agentDir: join(tempRoot, "agent"),
-		projectDir: join(tempRoot, "project"),
-		sessionDir: join(tempRoot, "sessions"),
-	};
-	mkdirSync(dirs.agentDir, { recursive: true });
-	mkdirSync(dirs.projectDir, { recursive: true });
-	setup?.(dirs);
+	const agentDir = join(tempRoot, "agent");
+	const projectDirPath = join(tempRoot, "project");
+	const sessionDir = join(tempRoot, "sessions");
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(projectDirPath, { recursive: true });
+	const dirs: CliDirs = { agentDir, projectDir: realpathSync(projectDirPath), sessionDir };
+	await setup?.(dirs);
 	const resolvedArgs = typeof args === "function" ? args(dirs) : args;
 
 	let stderr = "";
@@ -74,42 +72,108 @@ async function runCli(
 		child.stderr.on("data", (chunk) => {
 			stderr += chunk.toString();
 		});
-		child.on("error", reject);
-		child.on("close", resolvePromise);
+
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGKILL");
+		}, CLI_TIMEOUT_MS);
+		child.once("error", (error) => {
+			clearTimeout(timeout);
+			reject(error);
+		});
+		child.once("close", (exitCode) => {
+			clearTimeout(timeout);
+			if (timedOut) {
+				reject(new Error(`CLI timed out after ${CLI_TIMEOUT_MS}ms: ${resolvedArgs.join(" ")}`));
+				return;
+			}
+			resolvePromise(exitCode);
+		});
 	});
 
-	return { code, agentDir: dirs.agentDir, stderr };
+	return { code, stderr, ...dirs };
 }
 
-function writeSession(sessionDir: string, cwd: string, id: string): void {
+async function hasSessionWithId(result: CliResult, sessionId: string): Promise<boolean> {
+	const sessionDir = getDefaultSessionDir(result.projectDir, result.agentDir);
+	return (await SessionManager.findForResume(sessionDir, sessionId)) !== undefined;
+}
+
+async function writeSession(sessionDir: string, cwd: string, id: string): Promise<void> {
+	const manager = await SessionManager.create(cwd, sessionDir, { id });
+	await manager.flush();
+}
+
+function writeSnapshot(path: string, cwd: string, id: string): void {
+	const messageId = "snapshot-message";
 	writeFileSync(
-		join(sessionDir, `${id}.jsonl`),
-		`${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd })}\n`,
+		path,
+		`${[
+			{
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				snapshotVersion: CURRENT_SESSION_SNAPSHOT_VERSION,
+				id,
+				timestamp: "2026-09-01T00:00:00.000Z",
+				cwd,
+			},
+			{
+				type: "message",
+				id: messageId,
+				parentId: null,
+				ordinal: 1,
+				timestamp: "2026-09-01T00:00:01.000Z",
+				message: { role: "user", content: "snapshot message", timestamp: Date.parse("2026-09-01T00:00:01.000Z") },
+			},
+			{
+				type: "leaf",
+				id: "snapshot-leaf",
+				parentId: messageId,
+				ordinal: 2,
+				timestamp: "2026-09-01T00:00:02.000Z",
+				targetId: messageId,
+			},
+		]
+			.map((entry) => JSON.stringify(entry))
+			.join("\n")}\n`,
 	);
 }
 
-describe("--session-id read-only commands", () => {
+async function listSessionIds(sessionDir: string): Promise<string[]> {
+	const sessions = await SessionManager.listAll(sessionDir, undefined, { includeMessageFreeDurable: true });
+	return sessions.map((session) => session.id);
+}
+
+describe("--session-id read-only commands", { timeout: TEST_TIMEOUT_MS }, () => {
 	it("does not reserve a session for --help", async () => {
 		const result = await runCli(["--session-id", "read-only-help", "--help"]);
 
 		expect(result.code).toBe(0);
-		expect(hasSessionWithId(join(result.agentDir, "sessions"), "read-only-help")).toBe(false);
+		expect(await hasSessionWithId(result, "read-only-help")).toBe(false);
 	});
 
 	it("does not reserve a session for --list-models", async () => {
 		const result = await runCli(["--session-id", "read-only-models", "--list-models"]);
 
 		expect(result.code).toBe(0);
-		expect(hasSessionWithId(join(result.agentDir, "sessions"), "read-only-models")).toBe(false);
+		expect(await hasSessionWithId(result, "read-only-models")).toBe(false);
+	});
+
+	it("rejects an empty session name before reserving a session", async () => {
+		const result = await runCli(["--session-id", "empty-name", "--name", "   ", "-p", "hi"]);
+
+		expect(result.code).toBe(1);
+		expect(result.stderr).toContain("--name requires a non-empty value");
+		expect(await hasSessionWithId(result, "empty-name")).toBe(false);
 	});
 
 	it("rejects an existing fork target session id", async () => {
 		const result = await runCli(
 			(dirs) => ["--session-dir", dirs.sessionDir, "--fork", "source-id", "--session-id", "existing-id", "-p", "hi"],
-			(dirs) => {
-				mkdirSync(dirs.sessionDir, { recursive: true });
-				writeSession(dirs.sessionDir, dirs.projectDir, "source-id");
-				writeSession(dirs.sessionDir, dirs.projectDir, "existing-id");
+			async (dirs) => {
+				await writeSession(dirs.sessionDir, dirs.projectDir, "source-id");
+				await writeSession(dirs.sessionDir, dirs.projectDir, "existing-id");
 			},
 		);
 
@@ -118,7 +182,53 @@ describe("--session-id read-only commands", () => {
 	});
 });
 
-describe("--session-id validation", () => {
+describe("--fork path session identity", { timeout: TEST_TIMEOUT_MS }, () => {
+	it("generates a fresh session id", async () => {
+		const snapshotId = "snapshot-session-id";
+		const result = await runCli(
+			(dirs) => [
+				"--session-dir",
+				dirs.sessionDir,
+				"--fork",
+				join(dirs.projectDir, "snapshot.jsonl"),
+				"--model",
+				"missing-model",
+				"-p",
+				"hi",
+			],
+			(dirs) => writeSnapshot(join(dirs.projectDir, "snapshot.jsonl"), dirs.projectDir, snapshotId),
+		);
+
+		expect(result.code).toBe(1);
+		const sessionIds = await listSessionIds(result.sessionDir);
+		expect(sessionIds).toHaveLength(1);
+		expect(sessionIds[0]).toMatch(UUID_V7_RE);
+		expect(sessionIds[0]).not.toBe(snapshotId);
+	});
+
+	it("preserves an explicitly requested session id", async () => {
+		const result = await runCli(
+			(dirs) => [
+				"--session-dir",
+				dirs.sessionDir,
+				"--fork",
+				join(dirs.projectDir, "snapshot.jsonl"),
+				"--session-id",
+				"requested-fork-id",
+				"--model",
+				"missing-model",
+				"-p",
+				"hi",
+			],
+			(dirs) => writeSnapshot(join(dirs.projectDir, "snapshot.jsonl"), dirs.projectDir, "snapshot-session-id"),
+		);
+
+		expect(result.code).toBe(1);
+		expect(await listSessionIds(result.sessionDir)).toEqual(["requested-fork-id"]);
+	});
+});
+
+describe("--session-id validation", { timeout: TEST_TIMEOUT_MS }, () => {
 	it("rejects ids invalid under SessionManager rules without stack traces", async () => {
 		for (const id of ["-bad", "bad id"]) {
 			const result = await runCli(["--session-id", id, "-p", "hi"]);

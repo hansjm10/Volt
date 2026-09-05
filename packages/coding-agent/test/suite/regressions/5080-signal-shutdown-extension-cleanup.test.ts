@@ -1,10 +1,7 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import chalk from "chalk";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { APP_NAME } from "../../../src/config.ts";
-import type { SessionManager } from "../../../src/core/session-manager.ts";
+import type { SessionManager, SessionReference } from "../../../src/core/session-manager.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 
 // Regression for https://github.com/earendil-works/pi/issues/5080
@@ -18,6 +15,8 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	runtimeDisposePromise: Promise<void> | undefined;
+	disposeRuntimeHost: () => Promise<void>;
 	flushStdout: () => Promise<void>;
 	unregisterSignalHandlers: () => void;
 	runtimeHost: { dispose: () => Promise<void> };
@@ -31,32 +30,31 @@ type ShutdownThis = {
 };
 
 type InteractiveModePrototypeWithShutdown = {
+	disposeRuntimeHost(this: ShutdownThis): Promise<void>;
 	flushStdout(this: ShutdownThis): Promise<void>;
 	shutdown(this: ShutdownThis, options?: { fromSignal?: boolean }): Promise<void>;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown;
-const tempDirs: string[] = [];
 const originalStdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 
 class ProcessExitError extends Error {}
 
-function createSessionManager(options: { sessionFile?: string } = {}): SessionManager {
+const TEST_SESSION_REF: SessionReference = {
+	sessionDirectory: "/tmp/volt-sessions",
+	storeId: "test-store",
+	sessionGeneration: "generation-test",
+	sessionId: "test-session",
+};
+
+function createSessionManager(options: { sessionRef?: SessionReference } = {}): SessionManager {
 	return {
-		isPersisted: () => options.sessionFile !== undefined,
-		getSessionFile: () => options.sessionFile,
-		getSessionId: () => "test-session",
-		getSessionDir: () => "/tmp/volt-sessions",
+		isPersisted: () => options.sessionRef !== undefined,
+		getSessionRef: () => options.sessionRef,
+		getSessionId: () => options.sessionRef?.sessionId ?? "test-session",
+		getSessionDir: () => options.sessionRef?.sessionDirectory ?? "/tmp/volt-sessions",
 		usesDefaultSessionDir: () => true,
 	} as unknown as SessionManager;
-}
-
-function createTempFile(): string {
-	const dir = mkdtempSync(join(tmpdir(), "volt-shutdown-resume-hint-"));
-	tempDirs.push(dir);
-	const file = join(dir, "session.jsonl");
-	writeFileSync(file, "\n");
-	return file;
 }
 
 function setStdoutIsTTY(value: boolean): void {
@@ -74,6 +72,8 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
+		runtimeDisposePromise: undefined,
+		disposeRuntimeHost: (interactiveModePrototype as InteractiveModePrototypeWithShutdown).disposeRuntimeHost,
 		flushStdout: (interactiveModePrototype as InteractiveModePrototypeWithShutdown).flushStdout,
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {
@@ -128,9 +128,6 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 		restoreStdoutIsTTY();
-		for (const dir of tempDirs.splice(0)) {
-			rmSync(dir, { recursive: true, force: true });
-		}
 	});
 
 	test("signal-triggered shutdown emits session_shutdown before terminal writes", async () => {
@@ -230,7 +227,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 			.mockImplementation(completeStdoutWrite as typeof process.stdout.write);
 		setStdoutIsTTY(true);
 		const order: string[] = [];
-		const context = createContext(order, createSessionManager({ sessionFile: createTempFile() }));
+		const context = createContext(order, createSessionManager({ sessionRef: TEST_SESSION_REF }));
 
 		await callShutdown(context);
 
@@ -249,7 +246,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 			.mockImplementation(completeStdoutWrite as typeof process.stdout.write);
 		setStdoutIsTTY(true);
 		const order: string[] = [];
-		const context = createContext(order, createSessionManager({ sessionFile: createTempFile() }));
+		const context = createContext(order, createSessionManager({ sessionRef: TEST_SESSION_REF }));
 
 		await callShutdown(context, { fromSignal: true });
 

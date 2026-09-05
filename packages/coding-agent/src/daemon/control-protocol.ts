@@ -14,6 +14,7 @@ import {
 	parseIrohRemotePushNotificationIntent,
 } from "../core/remote/iroh/push.ts";
 import type { IrohRemoteClient } from "../core/remote/iroh/state.ts";
+import type { IrohRemoteWorkspaceMetadataSnapshot } from "../core/remote/iroh/workspace.ts";
 
 /**
  * Wire types and framing for the voltd control plane: JSONL over the unix
@@ -112,6 +113,19 @@ export type ControlRequest =
 	| { type: "lease_rekey_commit"; id: string; transactionId: string }
 	| { type: "lease_rekey_rollback"; id: string; transactionId: string }
 	| { type: "lease_rekey_dispose"; id: string; transactionId: string }
+	| {
+			type: "work_observe";
+			id: string;
+			workspaceName: string;
+			sessionId: string;
+			/** Path-free authoritative Git state from the exact TUI lease holder. */
+			gitContext: {
+				repository: string;
+				branch: string;
+				headOid: string;
+				baseRef?: string;
+			} | null;
+	  }
 	| ({ type: "pair_request"; id: string; workspaceName?: string } & ControlAccessSelection) // progress arrives as pairing_progress events
 	| { type: "pair_cancel"; id: string; requestId: string }
 	| { type: "clients_list"; id: string }
@@ -379,7 +393,7 @@ export type ControlResponse =
 			/** verbatim RPC response object for the TUI to forward to the phone */
 			response: Record<string, unknown>;
 			/** refreshed workspace metadata after a successful unregister_workspace */
-			workspaceMetadata?: { workspaceNames: string[]; workspaces: Array<{ name: string; status: string }> };
+			workspaceMetadata?: IrohRemoteWorkspaceMetadataSnapshot;
 	  }
 	| { type: "relay_push_delivery_result"; id: string; status: IrohRemotePushNotificationDeliveryStatus };
 
@@ -444,7 +458,7 @@ export interface RelayPreamble {
 	/** verbatim phone handshake JSON as received (parsed object, re-serialized) */
 	handshake: unknown;
 	/** authorization subset — everything the TUI needs to serve the stream */
-	authorization: {
+	authorization: IrohRemoteWorkspaceMetadataSnapshot & {
 		clientNodeId: string;
 		workspaceName: string;
 		workspacePath: string;
@@ -469,7 +483,6 @@ export interface RelayPreamble {
 	streamId: string;
 	resolvedTarget: {
 		sessionId: string;
-		sessionFilePath?: string;
 		selection: "created" | "created_after_missing" | "resumed" | "session_rekeyed";
 		requestedSessionId?: string;
 		workspaceName: string;
@@ -638,6 +651,20 @@ function isPushNotificationIntent(value: unknown): value is IrohRemotePushNotifi
 	return parseIrohRemotePushNotificationIntent(value) !== undefined;
 }
 
+function isWorkspaceMetadataSnapshot(value: Record<string, unknown>): boolean {
+	return (
+		Array.isArray(value.workspaceNames) &&
+		value.workspaceNames.every((workspaceName) => typeof workspaceName === "string") &&
+		Array.isArray(value.workspaces) &&
+		value.workspaces.every(
+			(workspace) =>
+				isRecord(workspace) &&
+				typeof workspace.name === "string" &&
+				(workspace.status === "available" || workspace.status === "missing" || workspace.status === "unavailable"),
+		)
+	);
+}
+
 export function parseHelloMessage(value: unknown): HelloMessage | undefined {
 	if (!isRecord(value) || value.type !== "hello") {
 		return undefined;
@@ -721,6 +748,36 @@ export function isControlRequest(value: unknown): value is ControlRequest {
 		case "lease_rekey_rollback":
 		case "lease_rekey_dispose":
 			return typeof value.transactionId === "string";
+		case "work_observe": {
+			if (
+				typeof value.workspaceName !== "string" ||
+				typeof value.sessionId !== "string" ||
+				value.workspaceName.length === 0 ||
+				value.workspaceName.length > 256 ||
+				value.sessionId.length === 0 ||
+				value.sessionId.length > 128
+			) {
+				return false;
+			}
+			if (value.gitContext === null) return true;
+			if (!isRecord(value.gitContext)) return false;
+			return (
+				typeof value.gitContext.repository === "string" &&
+				value.gitContext.repository.length > 0 &&
+				value.gitContext.repository.length <= 256 &&
+				!/[\0\r\n]/.test(value.gitContext.repository) &&
+				typeof value.gitContext.branch === "string" &&
+				value.gitContext.branch.length > 0 &&
+				value.gitContext.branch.length <= 1024 &&
+				!/[\0\r\n]/.test(value.gitContext.branch) &&
+				typeof value.gitContext.headOid === "string" &&
+				/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.gitContext.headOid) &&
+				(value.gitContext.baseRef === undefined ||
+					(typeof value.gitContext.baseRef === "string" &&
+						value.gitContext.baseRef.length <= 1024 &&
+						!/[\0\r\n]/.test(value.gitContext.baseRef)))
+			);
+		}
 		case "pair_cancel":
 			return typeof value.requestId === "string";
 		case "client_access_update":
@@ -837,7 +894,11 @@ export function isControlResponse(value: unknown): value is ControlResponse {
 		case "keep_awake_result":
 			return isRecord(value.keepAwake);
 		case "relay_rpc_result":
-			return isRecord(value.response);
+			return (
+				isRecord(value.response) &&
+				(value.workspaceMetadata === undefined ||
+					(isRecord(value.workspaceMetadata) && isWorkspaceMetadataSnapshot(value.workspaceMetadata)))
+			);
 		case "relay_push_delivery_result":
 			return isPushDeliveryStatus(value.status);
 		default:
@@ -880,7 +941,13 @@ export function isRelayPreamble(value: unknown): value is RelayPreamble {
 		return false;
 	}
 	try {
-		if (typeof value.authorization.allowedTools !== "string") {
+		if (
+			typeof value.authorization.clientNodeId !== "string" ||
+			typeof value.authorization.workspaceName !== "string" ||
+			typeof value.authorization.workspacePath !== "string" ||
+			typeof value.authorization.allowedTools !== "string" ||
+			!isWorkspaceMetadataSnapshot(value.authorization)
+		) {
 			return false;
 		}
 		parseIrohRemoteRpcGrant(value.authorization.rpcGrant, "relay rpcGrant");

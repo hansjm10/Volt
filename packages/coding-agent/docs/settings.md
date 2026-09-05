@@ -62,13 +62,15 @@ Profiles do not isolate auth or sessions yet. `sessionDir` and reserved profile 
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `personality` | string | `"default"` | Communication style for Volt's built-in system prompt: `"default"` for a collaborative, adaptive voice or `"pragmatic"` for direct recommendations focused on simple, maintainable solutions. Ignored when a custom `SYSTEM.md` replaces the built-in prompt |
+| `personality` | string | `"default"` | Communication style for Volt's built-in system prompt: `"default"` for a collaborative, adaptive voice, `"pragmatic"` for direct recommendations focused on simple, maintainable solutions, or `"simplified-technical"` for ASD-STE100-inspired Simplified Technical English in user-facing prose. Ignored when a custom `SYSTEM.md` replaces the built-in prompt |
 
 In interactive mode, run `/settings` and change **Personality**. The selection applies to the next turn.
 
+The `"simplified-technical"` personality keeps source code, identifiers, commands, configuration, quoted text, and repository artifacts in their normal technical form. It follows project conventions for code comments and documentation unless the user requests Simplified Technical English. It is a writing aid and does not certify full ASD-STE100 compliance.
+
 ```json
 {
-  "personality": "pragmatic"
+  "personality": "simplified-technical"
 }
 ```
 
@@ -253,7 +255,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `sessionDir` | string | - | Directory where session files are stored. Accepts absolute or relative paths, plus `~`. |
+| `sessionDir` | string | - | Directory containing the authoritative `sessions.sqlite` store. Accepts absolute or relative paths, plus `~`. |
 
 ```json
 { "sessionDir": ".volt/sessions" }
@@ -286,11 +288,11 @@ See [LSP Diagnostics](lsp.md) for the full reference, including built-in server 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `lsp.enabled` | boolean | `true` | Run language servers and append diagnostics to `edit`/`write` results; set `false` to disable (`--lsp` force-enables per run) |
-| `lsp.servers` | object | built-ins | Server definitions keyed by name, merged over the built-in defaults |
+| `lsp.servers` | object | built-ins | Server definitions keyed by name, merged over the built-in defaults. Command paths and root discovery are confined to the canonical project workspace |
 | `lsp.settleMs` | number | `1500` | How long to wait for published diagnostics after a change |
 | `lsp.firstSettleMs` | number | `10000` | Wait window for the first diagnostics from a freshly started server |
 | `lsp.idleShutdownMs` | number | `600000` | Shut down servers idle for this long; `0` disables |
-| `lsp.traceFile` | string | | Append LSP protocol traffic and server stderr to this file |
+| `lsp.traceFile` | string | | Append LSP protocol traffic, server stderr, and launch context to this file; relative paths resolve from the canonical project workspace |
 | `lsp.maxDiagnostics` | number | `20` | Maximum diagnostics reported per tool call |
 | `lsp.severity` | string | `"error"` | Minimum severity to report: `error`, `warning`, `information`, or `hint` |
 
@@ -303,6 +305,7 @@ Settings for the background daemon and live shared sessions; see [Background dae
 | `remote.background` | boolean | `false` | Interactive Volt starts the daemon automatically. Supported TUIs connect to an already-running daemon regardless, auto-register their workspace, and acquire a conversation lease. |
 | `remote.detachedRuntimeTtlMs` | number | `1800000` | How long the daemon retains an idle detached headless runtime (30 minutes) |
 | `remote.allowTools` | string[] | - | Additional tool ceiling for daemon-owned headless runtimes, intersected with the paired client's persisted grant and any workspace ceiling; `[]` denies all tools. TUI-owned conversations use the TUI session's full tool set. |
+| `remote.pullRequestDiscovery` | boolean | `true` | Let the daemon use local Git metadata and the authenticated GitHub CLI to discover exact repository + branch + head-OID pull-request associations for trusted sessions. Set `false` to disable provider calls; existing private Work state remains local. |
 
 ### Resources
 

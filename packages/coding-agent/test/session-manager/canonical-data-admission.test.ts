@@ -1,28 +1,32 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { SessionManager } from "../../src/core/session-manager.ts";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SessionManager, type SessionReference } from "../../src/core/session-manager.ts";
+import { createSessionManagerTestOwner } from "../session-manager-owner.ts";
 
 const cleanups: Array<{ manager: SessionManager; root: string }> = [];
+const managerOwner = createSessionManagerTestOwner();
 
-function createManager(): { manager: SessionManager; root: string; filePath: string } {
+async function createManager(): Promise<{ manager: SessionManager; root: string; ref: SessionReference }> {
 	const root = mkdtempSync(join(tmpdir(), "volt-canonical-session-"));
-	const manager = SessionManager.create(root, root);
+	const manager = await SessionManager.create(root, root);
+	const ref = manager.getSessionRef();
+	if (!ref) throw new Error("Expected a persisted session reference");
 	cleanups.push({ manager, root });
-	return { manager, root, filePath: manager.getSessionFile()! };
+	return { manager, root, ref };
 }
 
+beforeEach(() => managerOwner.start());
+
 afterEach(async () => {
-	for (const { manager, root } of cleanups.splice(0)) {
-		await manager.flush();
-		rmSync(root, { recursive: true, force: true });
-	}
+	await managerOwner.drain();
+	for (const { root } of cleanups.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("SessionManager canonical data admission", () => {
 	it("rejects invalid values before state, persistence, ordinals, or observers change", async () => {
-		const { manager, filePath } = createManager();
+		const { manager, ref } = await createManager();
 		const observed: string[] = [];
 		manager.subscribeEntries((entry) => observed.push(entry.id));
 		const cyclic: { self?: unknown } = {};
@@ -35,23 +39,137 @@ describe("SessionManager canonical data admission", () => {
 			["shared-memory", { value: new SharedArrayBuffer(1) }],
 		] as const) {
 			expect(() => manager.appendCustomEntry(label, data as never)).toThrow(
-				`Session custom entry must contain only JSON-compatible data`,
+				"Session custom entry must contain only JSON-compatible data",
 			);
 			expect(manager.getEntries()).toEqual([]);
 			expect(manager.getLeafId()).toBeNull();
 			expect(observed).toEqual([]);
-			expect(existsSync(filePath)).toBe(false);
 		}
 
 		const id = manager.appendCustomEntry("valid", { nested: { values: [1, "two", true, null] } });
 		await manager.flush();
-		const entry = manager.getEntry(id);
-		expect(entry?.ordinal).toBe(1);
+		expect(manager.getEntry(id)?.ordinal).toBe(1);
 		expect(observed).toEqual([id]);
+		expect((await SessionManager.open(ref)).getEntries()).toHaveLength(1);
 	});
 
-	it("owns valid input and round-trips it exactly through JSONL reopen", async () => {
-		const { manager, root, filePath } = createManager();
+	it("rejects out-of-range message timestamps before state or persistence changes", async () => {
+		const { manager, ref } = await createManager();
+		const observed: string[] = [];
+		manager.subscribeEntries((entry) => observed.push(entry.id));
+		const before = manager.issueCanonicalProjection();
+
+		expect(() =>
+			manager.appendMessage({
+				role: "user",
+				content: "outside the upper Date boundary",
+				timestamp: Number.MAX_SAFE_INTEGER,
+			}),
+		).toThrow("Session message timestamp must be representable as a Date");
+		expect(() =>
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "invalid-timestamp",
+				toolName: "test",
+				content: [{ type: "text", text: "outside the lower Date boundary" }],
+				isError: false,
+				timestamp: -Number.MAX_SAFE_INTEGER,
+			}),
+		).toThrow("Session message timestamp must be representable as a Date");
+
+		const after = manager.issueCanonicalProjection();
+		expect(after.revision).toBe(before.revision);
+		expect(after.entries).toEqual([]);
+		expect(manager.getEntries()).toEqual([]);
+		expect(manager.getLeafId()).toBeNull();
+		expect(observed).toEqual([]);
+		await manager.flush();
+
+		const persistedBeforeValidAppend = await SessionManager.open(ref);
+		expect(persistedBeforeValidAppend.getEntries()).toEqual([]);
+		expect(persistedBeforeValidAppend.getLeafId()).toBeNull();
+
+		const validUserId = manager.appendMessage({
+			role: "user",
+			content: "exact upper Date boundary",
+			timestamp: 8_640_000_000_000_000,
+		});
+		const validToolResultId = manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "valid-timestamp",
+			toolName: "test",
+			content: [{ type: "text", text: "exact lower Date boundary" }],
+			isError: false,
+			timestamp: -8_640_000_000_000_000,
+		});
+		await manager.flush();
+
+		expect(manager.getEntry(validUserId)?.ordinal).toBe(1);
+		expect(manager.getEntry(validToolResultId)?.ordinal).toBe(2);
+		expect(observed).toEqual([validUserId, validToolResultId]);
+		const persisted = await SessionManager.open(ref);
+		expect(persisted.getEntries().map((entry) => entry.id)).toEqual([validUserId, validToolResultId]);
+		expect(persisted.getLeafId()).toBe(validToolResultId);
+	});
+
+	it("rejects malformed entry bodies before assigning ordinals or notifying observers", async () => {
+		const { manager } = await createManager();
+		const observed: string[] = [];
+		manager.subscribeEntries((entry) => observed.push(entry.id));
+
+		expect(() =>
+			manager.appendMessage({
+				role: "user",
+				content: "unknown field",
+				timestamp: Date.now(),
+				unexpected: true,
+			} as never),
+		).toThrow("unknown property");
+		expect(() => manager.appendThinkingLevelChange("turbo")).toThrow("invalid thinking level");
+		expect(() => manager.appendFastModeChange("yes" as never)).toThrow("invalid enabled state");
+		expect(() => manager.appendModelChange("", "model")).toThrow("must not be empty");
+		expect(() =>
+			manager.appendCustomMessageEntry("custom", [{ type: "video", data: "nope" }] as never, true),
+		).toThrow("unsupported user content type");
+		expect(() =>
+			manager.appendSubagentSpawn({
+				toolCallId: "call-1",
+				subagentId: "sa_child",
+				agent: "researcher",
+				childSessionId: "child-session",
+				childSessionRef: {
+					sessionDirectory: "/sessions",
+					storeId: "store",
+					sessionId: "other-child",
+					sessionGeneration: "generation",
+				},
+				requestKey: "request-1",
+			}),
+		).toThrow("must match childSessionId");
+
+		expect(manager.getEntries()).toEqual([]);
+		expect(manager.getSubagentSpawnEntries()).toEqual([]);
+		expect(manager.getLeafId()).toBeNull();
+		expect(observed).toEqual([]);
+		const validId = manager.appendSessionInfo("valid");
+		expect(manager.getEntry(validId)?.ordinal).toBe(1);
+	});
+
+	it("bounds client input errors to a codec-valid terminal entry", async () => {
+		const { manager, ref } = await createManager();
+		manager.reserveClientInput("long-error", "prompt", { message: "fail" });
+
+		const failed = manager.transitionClientInput("long-error", "failed", "x".repeat(2_001));
+		expect(Array.from(failed.error ?? "")).toHaveLength(2_000);
+		expect(failed.error?.endsWith("…")).toBe(true);
+		await manager.flush();
+
+		const reopened = await SessionManager.open(ref);
+		expect(reopened.getClientInput("long-error")?.error).toBe(failed.error);
+	});
+
+	it("owns valid input and round-trips it exactly through SQLite reopen", async () => {
+		const { manager, ref } = await createManager();
 		const data = { nested: { values: [1, "two", true, null] } };
 		const expected = structuredClone(data);
 		manager.subscribeEntries((entry) => {
@@ -68,15 +186,14 @@ describe("SessionManager canonical data admission", () => {
 		if (inMemory?.type !== "custom") throw new Error("Expected custom entry");
 		expect(inMemory.data).toEqual(expected);
 
-		const reopened = SessionManager.open(filePath, root);
-		const persisted = reopened.getEntry(id);
+		const persisted = (await SessionManager.open(ref)).getEntry(id);
 		expect(persisted?.type).toBe("custom");
 		if (persisted?.type !== "custom") throw new Error("Expected reopened custom entry");
 		expect(persisted.data).toEqual(expected);
 	});
 
-	it("prevalidates branch summaries before moving the active leaf", () => {
-		const { manager } = createManager();
+	it("prevalidates branch summaries before moving the active leaf", async () => {
+		const { manager } = await createManager();
 		const firstId = manager.appendCustomMessageEntry("first", "first", true);
 		const secondId = manager.appendCustomMessageEntry("second", "second", true);
 		expect(manager.getLeafId()).toBe(secondId);

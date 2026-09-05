@@ -2,13 +2,23 @@ import { stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { isIrohRemoteWorkspaceName } from "./handshake.ts";
 import { normalizeIrohRemoteAllowTools } from "./protocol.ts";
-import type { IrohRemoteHostState, IrohRemoteWorkspace } from "./state.ts";
+import {
+	allocateIrohRemoteWorkspaceGeneration,
+	type IrohRemoteClient,
+	type IrohRemoteHostState,
+	type IrohRemoteWorkspace,
+} from "./state.ts";
 
 export type IrohRemoteWorkspaceAvailabilityStatus = "available" | "missing" | "unavailable";
 
 export interface IrohRemoteWorkspaceStatus {
 	name: string;
 	status: IrohRemoteWorkspaceAvailabilityStatus;
+}
+
+export interface IrohRemoteWorkspaceMetadataSnapshot {
+	workspaceNames: string[];
+	workspaces: IrohRemoteWorkspaceStatus[];
 }
 
 export type IrohRemoteWorkspaceAvailabilityClassifier = (
@@ -78,6 +88,9 @@ export function upsertIrohRemoteWorkspace(
 
 	const nextAllowedTools = savedWorkspace.allowedTools ?? existing.allowedTools;
 	if (existing.path === savedWorkspace.path && existing.allowedTools === nextAllowedTools) {
+		if (!(state.workspaceGenerations ?? []).some((record) => record.workspaceName === workspace.name)) {
+			allocateIrohRemoteWorkspaceGeneration(state, workspace.name);
+		}
 		return existing;
 	}
 	allocateIrohRemoteWorkspaceGeneration(state, workspace.name);
@@ -86,19 +99,6 @@ export function upsertIrohRemoteWorkspace(
 		existing.allowedTools = savedWorkspace.allowedTools;
 	}
 	return existing;
-}
-
-function allocateIrohRemoteWorkspaceGeneration(state: IrohRemoteHostState, workspaceName: string): void {
-	const currentGeneration = state.workspaceGenerationCounter ?? 0;
-	if (currentGeneration === Number.MAX_SAFE_INTEGER) {
-		throw new Error("Workspace generation counter is exhausted");
-	}
-	const generation = currentGeneration + 1;
-	state.workspaceGenerationCounter = generation;
-	state.workspaceGenerations = [
-		...(state.workspaceGenerations ?? []).filter((record) => record.workspaceName !== workspaceName),
-		{ workspaceName, generation },
-	];
 }
 
 export function getIrohRemoteWorkspaceNameAlias(name: string): string {
@@ -125,6 +125,21 @@ export async function getIrohRemoteWorkspaceStatuses(
 
 export function getAvailableIrohRemoteWorkspaceNames(workspaces: readonly IrohRemoteWorkspaceStatus[]): string[] {
 	return workspaces.filter((entry) => entry.status === "available").map((entry) => entry.name);
+}
+
+/** Scope host workspace metadata to the catalog visible to one paired client. */
+export function createAuthorizedIrohRemoteWorkspaceMetadata(
+	workspaces: readonly IrohRemoteWorkspaceStatus[],
+	client: Pick<IrohRemoteClient, "allowedWorkspaces">,
+): IrohRemoteWorkspaceMetadataSnapshot {
+	const allowedWorkspaceNames = client.allowedWorkspaces.length === 0 ? undefined : new Set(client.allowedWorkspaces);
+	const authorizedWorkspaces = workspaces
+		.filter((workspace) => allowedWorkspaceNames === undefined || allowedWorkspaceNames.has(workspace.name))
+		.map((workspace) => ({ ...workspace }));
+	return {
+		workspaceNames: getAvailableIrohRemoteWorkspaceNames(authorizedWorkspaces),
+		workspaces: authorizedWorkspaces,
+	};
 }
 
 async function getIrohRemoteWorkspaceStatus(

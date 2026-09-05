@@ -3,7 +3,12 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { detectGitOperation, GitContextProvider, parseGitStatusPorcelainV2 } from "../src/core/git-context-provider.ts";
+import {
+	detectGitOperation,
+	GitContextObservationBinding,
+	GitContextProvider,
+	parseGitStatusPorcelainV2,
+} from "../src/core/git-context-provider.ts";
 import { discoverGitWorktree, getGitRepositoryDisplayName } from "../src/core/git-repository.ts";
 
 const SHA1 = "0123456789abcdef0123456789abcdef01234567";
@@ -199,11 +204,86 @@ describe("Git repository discovery", () => {
 });
 
 describe("GitContextProvider", () => {
-	it("returns null for a non-Git cwd and parses an unborn repository", async () => {
+	it("distinguishes definitive non-Git observations from transient failures", async () => {
 		const nonGit = await GitContextProvider.create(tempDirectory("not-git"));
 		expect(nonGit.getSnapshot()).toBeNull();
+		expect(await nonGit.refresh()).toEqual({ status: "definitive", gitContext: null });
 		nonGit.dispose();
 
+		const syntheticRepository = createSyntheticWorktree("failed-observation");
+		installFakeGit("failure");
+		const failed = new GitContextProvider(syntheticRepository);
+		expect(await failed.refresh()).toEqual({ status: "transient_failure", gitContext: null });
+		failed.dispose();
+
+		if (originalPath === undefined) delete process.env[pathEnvironmentKey];
+		else process.env[pathEnvironmentKey] = originalPath;
+
+		const repository = initRepository("unborn-repository");
+		const provider = await GitContextProvider.create(repository);
+		expect(provider.getSnapshot()).toMatchObject({
+			repository: basename(repository),
+			head: { kind: "unborn", name: "main" },
+			status: { clean: true, total: 0 },
+			stale: false,
+			revision: 1,
+		});
+		provider.dispose();
+	});
+
+	it("publishes every definitive observation without treating failures as absence", async () => {
+		const repository = createSyntheticWorktree("observation-listener");
+		installFakeGit("failure");
+		const provider = new GitContextProvider(repository);
+		const observations: Array<"definitive" | "transient_failure"> = [];
+		provider.subscribeObservations((observation) => observations.push(observation.status));
+		expect((await provider.refresh()).status).toBe("transient_failure");
+		expect(observations).toEqual([]);
+
+		if (originalPath === undefined) delete process.env[pathEnvironmentKey];
+		else process.env[pathEnvironmentKey] = originalPath;
+		rmSync(join(repository, ".git"), { recursive: true });
+		expect(await provider.refresh()).toEqual({ status: "definitive", gitContext: null });
+		expect(observations).toEqual(["definitive"]);
+		provider.dispose();
+	});
+
+	it("rebinds host-owned observations to a replacement provider", async () => {
+		const initial = new GitContextProvider(tempDirectory("initial-non-git"));
+		const replacementRepository = initRepository("replacement-repository");
+		const replacement = new GitContextProvider(replacementRepository);
+		const observations: Array<string | null> = [];
+		const binding = new GitContextObservationBinding(
+			(observation) => {
+				if (observation.status === "definitive") {
+					observations.push(observation.gitContext?.repository ?? null);
+				}
+			},
+			{ monitor: true },
+		);
+
+		binding.bind(initial);
+		await waitFor(() => observations.length === 1);
+		expect(observations).toEqual([null]);
+		expect((initial as unknown as { observationCount: number }).observationCount).toBe(1);
+
+		binding.bind(replacement);
+		await waitFor(() => observations.includes(basename(replacementRepository)));
+		expect((initial as unknown as { observationCount: number }).observationCount).toBe(0);
+		expect((replacement as unknown as { observationCount: number }).observationCount).toBe(1);
+		const reboundObservationCount = observations.length;
+		await initial.refresh();
+		expect(observations).toHaveLength(reboundObservationCount);
+
+		binding.dispose();
+		expect((replacement as unknown as { observationCount: number }).observationCount).toBe(0);
+		await replacement.refresh();
+		expect(observations).toHaveLength(reboundObservationCount);
+		initial.dispose();
+		replacement.dispose();
+	});
+
+	it("parses an unborn repository", async () => {
 		const repository = initRepository("unborn-repository");
 		const provider = await GitContextProvider.create(repository);
 		expect(provider.getSnapshot()).toMatchObject({

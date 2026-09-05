@@ -18,6 +18,10 @@ import {
 	createIrohRemoteRpcErrorResponse,
 } from "../core/remote/iroh/rpc-command-filter.ts";
 import {
+	handleIrohRemoteSessionContextsRpcCommand,
+	type IrohRemoteSessionContextsRpcBackend,
+} from "../core/remote/iroh/session-contexts.ts";
+import {
 	handleIrohRemoteWorktreeRpcCommand,
 	IROH_REMOTE_WORKTREE_RPC_TYPES,
 	type IrohRemoteWorktreeRpcBackend,
@@ -178,12 +182,13 @@ export interface WorkspaceStreamContext {
 	closeStream(reason?: string): void;
 }
 
-/** Serve a workspaceDiscovery stream: list_sessions only. */
+/** Serve one read-only workspace discovery purpose. */
 export async function runWorkspaceDiscoveryStream(
 	context: WorkspaceStreamContext,
 	hooks:
 		| { purpose: "list_sessions"; commandContext: ConversationCommandContext }
-		| { purpose: "agent_options"; agentOptions: IrohRemoteAgentOptionsRpcBackend },
+		| { purpose: "agent_options"; agentOptions: IrohRemoteAgentOptionsRpcBackend }
+		| { purpose: "session_contexts"; sessionContexts: IrohRemoteSessionContextsRpcBackend },
 ): Promise<void> {
 	const { stream, authorization } = context;
 	await runWorkspaceUtilityRpcLoop(stream, context.initialInput, async (line) => {
@@ -196,7 +201,12 @@ export async function runWorkspaceDiscoveryStream(
 			await writeIrohRemoteJsonLine(stream.send, parsed.response, authorization);
 			return false;
 		}
-		const expectedType = hooks.purpose === "agent_options" ? "get_agent_options" : "list_sessions";
+		const expectedType =
+			hooks.purpose === "agent_options"
+				? "get_agent_options"
+				: hooks.purpose === "session_contexts"
+					? "get_session_contexts"
+					: "list_sessions";
 		if (parsed.command.type !== expectedType) {
 			await writeIrohRemoteJsonLine(
 				stream.send,
@@ -218,6 +228,16 @@ export async function runWorkspaceDiscoveryStream(
 			const result = await handleIrohRemoteAgentOptionsRpcCommand(parsed.command, {
 				authorizedWorkspaceName: authorization.workspace.name,
 				backend: hooks.agentOptions,
+			});
+			if (result.handled) {
+				await writeIrohRemoteJsonLine(stream.send, result.response, authorization);
+			}
+			return false;
+		}
+		if (hooks.purpose === "session_contexts") {
+			const result = await handleIrohRemoteSessionContextsRpcCommand(parsed.command, {
+				authorizedWorkspaceName: authorization.workspace.name,
+				backend: hooks.sessionContexts,
 			});
 			if (result.handled) {
 				await writeIrohRemoteJsonLine(stream.send, result.response, authorization);

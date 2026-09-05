@@ -1,4 +1,4 @@
-import { realpath, rm } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { relative, sep } from "node:path";
 import type {
 	AgentSessionReplacementTarget,
@@ -56,6 +56,8 @@ export interface IntegratedRuntimeEntry {
 	readonly key: string;
 	clientNodeId: string;
 	workspaceName: string;
+	readonly workspaceGeneration?: number;
+	readonly projectTrusted: boolean;
 	readonly sessionId: string;
 	runtime: AgentSessionRuntime;
 	readonly lifecycle: "prepared" | "active" | "retiring" | "retired";
@@ -147,6 +149,10 @@ export interface IntegratedRuntimeRegistryOptions {
 	) => { commit(): void; rollback(): void };
 	/** Retire and await every stream/subscriber owner before low-level runtime disposal. */
 	beforeRuntimeStop?: (entry: IntegratedRuntimeEntry, reason: string) => Promise<void>;
+	/** Called exactly once after a newly-created runtime is published in the registry. */
+	onRuntimePublished?: (entry: IntegratedRuntimeEntry) => void;
+	/** Called after a published runtime's coordinator and registry key move atomically. */
+	onRuntimeSessionRekeyed?: (entry: IntegratedRuntimeEntry, previousSessionId: string, sessionId: string) => void;
 	onRuntimeDisposed?: (entry: IntegratedRuntimeEntry, reason: string) => void;
 }
 
@@ -256,7 +262,8 @@ function assertAttachAdmissionOpen(signal: AbortSignal | undefined): void {
  * Observe an uncancellable external operation without letting it retain daemon
  * admission after shutdown. A late successful resource result is handed to an
  * explicit disposer so cancellation cannot turn eventual settlement into a
- * leaked runtime.
+ * leaked runtime. The disposer owns reporting because the cancellation caller
+ * has already settled before a late result exists.
  */
 function waitForAttachAdmission<T>(
 	operation: Promise<T>,
@@ -581,6 +588,7 @@ export class IntegratedRuntimeRegistry {
 				options.signal,
 			);
 			const toolPolicy = this.resolveToolPolicy(authorization);
+			const projectTrusted = this.options.getProjectTrustedForWorkspace(authorization.workspace);
 			assertAttachAdmissionOpen(options.signal);
 			const runtimeOperation = (this.options.createRuntime ?? createIrohRemoteAgentRuntimeWithSessionSelection)({
 				agentDir: this.options.agentDir,
@@ -596,10 +604,24 @@ export class IntegratedRuntimeRegistry {
 				},
 				onSubagentRuntimeCreated: (event) => this.registerSubagentRuntime(event, authorization),
 				profile: this.options.profile,
-				projectTrusted: this.options.getProjectTrustedForWorkspace(authorization.workspace),
+				projectTrusted,
 			});
 			const runtimeResult = await waitForAttachAdmission(runtimeOperation, options.signal, async (lateResult) => {
-				await cleanupUncommittedRuntime(lateResult.runtime, lateResult.sessionSelection);
+				try {
+					await cleanupUncommittedRuntime(lateResult.runtime);
+				} catch (error) {
+					await this.logAudit({
+						type: "runtime_start_cleanup_failed",
+						clientNodeId: authorization.client.nodeId,
+						workspace: authorization.workspace.name,
+						success: false,
+						error: error instanceof Error ? error.message : String(error),
+						details: {
+							reason: "attach_cancelled",
+							sessionId: lateResult.sessionSelection.sessionId,
+						},
+					});
+				}
 			});
 			runtime = runtimeResult.runtime;
 			sessionSelection = runtimeResult.sessionSelection;
@@ -636,13 +658,26 @@ export class IntegratedRuntimeRegistry {
 				this.getRegistryKey(authorization.workspace.name, sessionId),
 			);
 			if (reservedOwner) {
-				await cleanupUncommittedRuntime(runtime, sessionSelection);
+				const retryError = this.createAttachRetryError(
+					reservedOwner,
+					"conversation runtime replacement is still publishing",
+				);
+				const runtimeToDispose = runtime;
 				runtime = undefined;
-				throw this.createAttachRetryError(reservedOwner, "conversation runtime replacement is still publishing");
+				try {
+					await cleanupUncommittedRuntime(runtimeToDispose);
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[retryError, cleanupError],
+						"Conversation attach retry cleanup did not complete",
+					);
+				}
+				throw retryError;
 			}
 			if (owner) {
-				await cleanupUncommittedRuntime(runtime, sessionSelection);
+				const runtimeToDispose = runtime;
 				runtime = undefined;
+				await cleanupUncommittedRuntime(runtimeToDispose);
 				assertAttachAdmissionOpen(options.signal);
 				if (owner.lifecycle !== "active") {
 					throw this.createAttachRetryError(owner, "conversation runtime is retiring");
@@ -678,6 +713,10 @@ export class IntegratedRuntimeRegistry {
 			const entry = this.createEntryRecord({
 				clientNodeId: authorization.client.nodeId,
 				workspaceName: authorization.workspace.name,
+				...(authorization.workspaceGeneration === undefined
+					? {}
+					: { workspaceGeneration: authorization.workspaceGeneration }),
+				projectTrusted,
 				sessionId,
 				runtime: runtime!,
 				...(worktreePreparation === undefined ? {} : { worktreePreparation }),
@@ -701,9 +740,26 @@ export class IntegratedRuntimeRegistry {
 				sessionSelection,
 			};
 		} catch (error) {
-			await worktreePreparation?.release().catch(() => undefined);
+			const cleanupErrors: unknown[] = [];
+			try {
+				await worktreePreparation?.release();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
 			if (runtime) {
-				await cleanupUncommittedRuntime(runtime, sessionSelection);
+				const runtimeToDispose = runtime;
+				runtime = undefined;
+				try {
+					await cleanupUncommittedRuntime(runtimeToDispose);
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+			if (cleanupErrors.length > 0) {
+				throw new AggregateError(
+					[error, ...cleanupErrors],
+					"Conversation runtime creation failed and cleanup did not complete",
+				);
 			}
 			throw error;
 		}
@@ -712,6 +768,8 @@ export class IntegratedRuntimeRegistry {
 	private createEntryRecord(options: {
 		clientNodeId: string;
 		workspaceName: string;
+		workspaceGeneration?: number;
+		projectTrusted: boolean;
 		sessionId: string;
 		runtime: AgentSessionRuntime;
 		parentSessionId?: string;
@@ -731,6 +789,8 @@ export class IntegratedRuntimeRegistry {
 			},
 			clientNodeId: options.clientNodeId,
 			workspaceName: options.workspaceName,
+			...(options.workspaceGeneration === undefined ? {} : { workspaceGeneration: options.workspaceGeneration }),
+			projectTrusted: options.projectTrusted,
 			get sessionId() {
 				return coordinator.sessionId;
 			},
@@ -809,6 +869,10 @@ export class IntegratedRuntimeRegistry {
 		const entry = this.createEntryRecord({
 			clientNodeId: authorization.client.nodeId,
 			workspaceName,
+			...(parentEntry.workspaceGeneration === undefined
+				? {}
+				: { workspaceGeneration: parentEntry.workspaceGeneration }),
+			projectTrusted: parentEntry.projectTrusted,
 			sessionId: event.sessionId,
 			runtime: event.runtime,
 			parentSessionId: event.parentSessionId,
@@ -838,6 +902,7 @@ export class IntegratedRuntimeRegistry {
 				entry.coordinator.activateRuntime();
 				entry.coordinator.markDetached();
 				this.entries.set(entry.key, entry);
+				this.options.onRuntimePublished?.(entry);
 				this.scheduleRetention(entry, "subagent_created");
 				void this.logEntryAudit(entry, "remote_runtime_started", {
 					parentSessionId: event.parentSessionId,
@@ -853,9 +918,8 @@ export class IntegratedRuntimeRegistry {
 					return;
 				}
 				state = "rolled-back";
-				await entry.coordinator
-					.beginRuntimeRetirement("subagent_start_rolled_back", () => event.runtime.dispose())
-					.settled.catch(() => undefined);
+				await entry.coordinator.beginRuntimeRetirement("subagent_start_rolled_back", () => event.runtime.dispose())
+					.settled;
 			},
 		};
 	}
@@ -948,6 +1012,7 @@ export class IntegratedRuntimeRegistry {
 				throw this.createAttachRetryError(entry, "conversation runtime ownership changed during commit");
 			}
 			entry.coordinator.activateRuntime();
+			if (inserted) this.options.onRuntimePublished?.(entry);
 			const namedCreation = this.namedSessionCreations.get(entry.key);
 			if (namedCreation?.entry === entry) {
 				this.namedSessionCreations.delete(entry.key);
@@ -991,15 +1056,27 @@ export class IntegratedRuntimeRegistry {
 
 	private async finishPreparedEntryAbort(
 		entry: IntegratedRuntimeEntry,
-		sessionSelection: IntegratedConversationSessionSelection | undefined,
+		_sessionSelection: IntegratedConversationSessionSelection | undefined,
 	): Promise<void> {
 		if (entry.subscribers.size !== 0) {
 			throw new Error("Cannot abort a prepared conversation runtime with attached subscribers");
 		}
 		this.cancelRetention(entry);
-		await entry.worktreePreparation?.release().catch(() => undefined);
+		const cleanupErrors: unknown[] = [];
+		try {
+			await entry.worktreePreparation?.release();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
 		delete entry.worktreePreparation;
-		await cleanupUncommittedRuntime(entry.runtime, sessionSelection);
+		try {
+			await cleanupUncommittedRuntime(entry.runtime);
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError(cleanupErrors, "Prepared conversation runtime cleanup did not complete");
+		}
 		const namedCreation = this.namedSessionCreations.get(entry.key);
 		if (namedCreation?.entry === entry) {
 			this.namedSessionCreations.delete(entry.key);
@@ -1431,6 +1508,7 @@ export class IntegratedRuntimeRegistry {
 				}
 				phase = "finalized";
 				clearReservation();
+				this.options.onRuntimeSessionRekeyed?.(entry, target.previousSessionId, target.sessionId);
 				await this.logEntryAudit(entry, "remote_runtime_session_changed", {
 					previousSessionId: target.previousSessionId,
 					sessionId: target.sessionId,
@@ -1507,7 +1585,11 @@ export class IntegratedRuntimeRegistry {
 			try {
 				await this.rekeyEntry(entry, activeStreamEntry, session.sessionId);
 			} catch (error: unknown) {
-				await this.stopEntry(entry, "session_rekey_failed").catch(() => {});
+				try {
+					await this.stopEntry(entry, "session_rekey_failed");
+				} catch (cleanupError) {
+					throw new AggregateError([error, cleanupError], error instanceof Error ? error.message : String(error));
+				}
 				throw error;
 			}
 		}
@@ -1520,7 +1602,11 @@ export class IntegratedRuntimeRegistry {
 				await this.recordSessionChange(entry, session.sessionId, clientNodeId);
 				entry.recordedSessionIdsByClient.set(clientNodeId, session.sessionId);
 			} catch (error: unknown) {
-				await this.stopEntry(entry, "session_rekey_persistence_failed").catch(() => {});
+				try {
+					await this.stopEntry(entry, "session_rekey_persistence_failed");
+				} catch (cleanupError) {
+					throw new AggregateError([error, cleanupError], error instanceof Error ? error.message : String(error));
+				}
 				throw error;
 			}
 		}
@@ -1590,6 +1676,7 @@ export class IntegratedRuntimeRegistry {
 		if (entry.worktreeId !== undefined && this.options.bindWorktreeSession) {
 			await this.options.bindWorktreeSession(entry.workspaceName, entry.worktreeId, nextSessionId);
 		}
+		this.options.onRuntimeSessionRekeyed?.(entry, previousSessionId, nextSessionId);
 		await this.logEntryAudit(entry, "remote_runtime_session_changed", {
 			previousSessionId,
 			sessionId: nextSessionId,
@@ -1807,16 +1894,6 @@ export class IntegratedRuntimeRegistry {
 	}
 }
 
-async function cleanupUncommittedRuntime(
-	runtime: AgentSessionRuntime,
-	sessionSelection: IntegratedConversationSessionSelection | undefined,
-): Promise<void> {
-	const sessionFile = runtime.session.sessionFile;
-	await runtime.dispose().catch(() => {});
-	if (sessionSelection?.kind === "resumed") {
-		return;
-	}
-	if (typeof sessionFile === "string" && sessionFile.length > 0) {
-		await rm(sessionFile, { force: true }).catch(() => {});
-	}
+async function cleanupUncommittedRuntime(runtime: AgentSessionRuntime): Promise<void> {
+	await runtime.dispose();
 }
