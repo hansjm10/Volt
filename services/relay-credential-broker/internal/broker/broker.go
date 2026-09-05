@@ -241,7 +241,7 @@ func (b *Broker) CreatePairingClaimForGrant(ctx context.Context, hostRefreshToke
 	if host.Kind != "host" {
 		return PairingClaim{}, ErrEndpointForbidden
 	}
-	if err := b.requireActiveEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
+	if err := b.requireEntitledEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
 		if errors.Is(err, ErrRefreshExpired) {
 			if commitErr := transaction.Commit(ctx); commitErr != nil {
 				return PairingClaim{}, fmt.Errorf("commit host expiry: %w", commitErr)
@@ -622,7 +622,7 @@ func (b *Broker) ExchangePairingClaim(ctx context.Context, claimID, claimSecret 
 	if err != nil {
 		return Exchange{}, err
 	}
-	if err := b.requireActiveEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
+	if err := b.requireEntitledEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
 		if errors.Is(err, ErrRefreshExpired) {
 			if commitErr := transaction.Commit(ctx); commitErr != nil {
 				return Exchange{}, fmt.Errorf("commit host expiry: %w", commitErr)
@@ -733,7 +733,7 @@ func (b *Broker) RefreshAccessToken(ctx context.Context, refreshToken string) (A
 	if err != nil {
 		return AccessToken{}, err
 	}
-	if err := b.requireActiveEndpoint(ctx, transaction, grant, endpoint, host, now, true); err != nil {
+	if err := b.requireEntitledEndpoint(ctx, transaction, grant, endpoint, host, now, true); err != nil {
 		switch {
 		case errors.Is(err, ErrSubscriptionRequired):
 			if heartbeatErr := recordSubscriptionSuspensionHeartbeat(
@@ -1009,7 +1009,7 @@ func (b *Broker) lockEndpointForRefresh(
 	return grant, endpoint, host, nil
 }
 
-func (b *Broker) requireActiveEndpoint(
+func (b *Broker) requireEntitledEndpoint(
 	ctx context.Context,
 	transaction pgx.Tx,
 	grant grantRecord,
@@ -1028,6 +1028,23 @@ func (b *Broker) requireActiveEndpoint(
 		now,
 	); err != nil {
 		return err
+	}
+	// Check entitlement before inactivity so suspension heartbeats retain refresh authority.
+	return b.requireActiveEndpoint(ctx, transaction, grant, endpoint, host, now, recordExpiry)
+}
+
+// requireActiveEndpoint validates credential authority independently of subscription status.
+func (b *Broker) requireActiveEndpoint(
+	ctx context.Context,
+	transaction pgx.Tx,
+	grant grantRecord,
+	endpoint endpointRecord,
+	host endpointRecord,
+	now time.Time,
+	recordExpiry bool,
+) error {
+	if grant.RevokedAt.Valid || host.RevokedAt.Valid || endpoint.RevokedAt.Valid {
+		return ErrRefreshInvalid
 	}
 	if !now.Before(host.RefreshInactiveExpiresAt) {
 		if recordExpiry {
