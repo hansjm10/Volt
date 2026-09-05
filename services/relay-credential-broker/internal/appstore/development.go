@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"time"
@@ -31,15 +32,27 @@ func (v *DevelopmentVerifier) VerifyEntitlement(
 	_ context.Context,
 	proof Proof,
 ) (Entitlement, error) {
-	provided := sha256.Sum256([]byte(proof.SignedAppTransaction))
+	nonceText, secret, ok := strings.Cut(proof.SignedAppTransaction, ".")
+	if !ok || len(nonceText) != 2*sha256.Size {
+		return Entitlement{}, ErrProofInvalid
+	}
+	nonce, err := hex.DecodeString(nonceText)
+	if err != nil || hex.EncodeToString(nonce) != nonceText {
+		return Entitlement{}, ErrProofInvalid
+	}
+	provided := sha256.Sum256([]byte(secret))
 	if !equalBytes(provided[:], v.proofHash[:]) {
 		return Entitlement{}, ErrProofInvalid
 	}
 	now := v.now().UTC()
 	identityHash := sha256.Sum256([]byte(proof.DeviceVerificationID))
+	// A proof instance is stable across retries, but independent of its destination claim.
+	proofIdentity := append([]byte("volt-development-app-store-approval\x00"), provided[:]...)
+	proofIdentity = append(proofIdentity, identityHash[:]...)
+	proofIdentity = append(proofIdentity, nonce...)
 	return Entitlement{
 		AppTransactionID:    base64.RawURLEncoding.EncodeToString(identityHash[:]),
-		ApprovalProofHash:   provided,
+		ApprovalProofHash:   sha256.Sum256(proofIdentity),
 		ProofCreatedAt:      now,
 		Environment:         "Sandbox",
 		ProductID:           "com.hansjm10.volt.pro.annual",

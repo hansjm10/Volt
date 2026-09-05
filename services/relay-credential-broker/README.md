@@ -121,12 +121,16 @@ Database-backed tests isolate each case in a random schema and cover migration i
 
 The following commands print credentials and are only for an isolated local POC.
 
+In development mode, `signedAppTransaction` must be `<nonce>.<shared secret>`, where the nonce is exactly 64 lowercase hexadecimal characters (32 random bytes) and the secret is the unchanged `VOLT_DEVELOPMENT_APP_STORE_PROOF` value. Bare-secret submissions are no longer accepted. Generate one nonce per new proof instance and retain the composed proof for retries; do not regenerate it inside a retry loop. Retry the same claim with the exact same proof, device-verification ID, app node ID, and app refresh-token hash. New pairings use a fresh nonce while keeping the device-verification ID stable. Reusing the same proof and device on another claim is rejected as a replay. No database reset is required; Apple-mode proofs are unchanged.
+
 ```sh
 HOST_NODE_ID="$(printf 'a%.0s' $(seq 1 64))"
 APP_NODE_ID="$(printf 'b%.0s' $(seq 1 64))"
 CLAIM_SECRET="vpc_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
 HOST_REFRESH_TOKEN="vrr_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
 APP_REFRESH_TOKEN="vrr_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+APP_STORE_PROOF_NONCE="$(openssl rand -hex 32)"
+APP_STORE_PROOF="${APP_STORE_PROOF_NONCE}.${VOLT_DEVELOPMENT_APP_STORE_PROOF}"
 BASE_URL="http://127.0.0.1:8085"
 
 hash_secret() {
@@ -146,7 +150,7 @@ curl -i -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/exchange" \
 APP_CREDENTIAL="$(curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/approve" \
   -H 'Content-Type: application/json' \
   -H "X-Firebase-AppCheck: $VOLT_DEVELOPMENT_APP_CHECK_TOKEN" \
-  -d "{\"appNodeId\":\"$APP_NODE_ID\",\"appRefreshTokenHash\":\"$(hash_secret "$APP_REFRESH_TOKEN")\",\"signedAppTransaction\":\"$VOLT_DEVELOPMENT_APP_STORE_PROOF\",\"appStoreDeviceVerificationId\":\"11111111-1111-4111-8111-111111111111\"}")"
+  -d "{\"appNodeId\":\"$APP_NODE_ID\",\"appRefreshTokenHash\":\"$(hash_secret "$APP_REFRESH_TOKEN")\",\"signedAppTransaction\":\"$APP_STORE_PROOF\",\"appStoreDeviceVerificationId\":\"11111111-1111-4111-8111-111111111111\"}")"
 
 HOST_CREDENTIAL="$(curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/exchange" \
   -H "Authorization: Bearer $CLAIM_SECRET")"
@@ -336,7 +340,7 @@ The dashboard covers pairing outcomes and logs, broker status and latency, Cloud
 | `VOLT_FIREBASE_PROJECT_NUMBER` | required in Firebase mode | Exact Firebase project authority. |
 | `VOLT_ALLOWED_FIREBASE_APP_IDS` | required in Firebase mode | Comma-separated exact app-ID allowlist. |
 | `VOLT_APP_STORE_MODE` | `development` | `development` for a private local broker or `apple` for App Store verification. Public deployments must use `apple`. |
-| `VOLT_DEVELOPMENT_APP_STORE_PROOF` | required in development | Constant-time local entitlement proof, minimum 32 characters. Never expose this mode publicly. |
+| `VOLT_DEVELOPMENT_APP_STORE_PROOF` | required in development | Shared secret for constant-time local entitlement authentication, minimum 32 characters. Submit `<64-lowercase-hex nonce>.<shared secret>` as the development proof; retain the nonce for retries and generate a fresh one for each new proof instance. Never expose this mode publicly. |
 | `VOLT_APP_STORE_PRIVATE_KEY` | required in Apple mode | App Store Server API `.p8` private key from Secret Manager. Never log it. |
 | `VOLT_APP_STORE_KEY_ID` | required in Apple mode | App Store Server API key ID. |
 | `VOLT_APP_STORE_ISSUER_ID` | required in Apple mode | App Store Connect issuer ID. |
