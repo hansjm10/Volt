@@ -209,6 +209,13 @@ function notificationFixture() {
 	return fixture;
 }
 
+function publishRotatedKey(fixture) {
+	const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+	const kid = "rotatedabcdefghijklmnop";
+	fixture.jwks.keys.push({ ...publicKey.export({ format: "jwk" }), alg: "EdDSA", kid, use: "sig" });
+	return fixture.authorization({}, { kid }, privateKey);
+}
+
 const jwksFailures = [
 	["network error", () => { throw new TypeError("fetch failed"); }],
 	["timeout", () => { throw new DOMException("timed out", "TimeoutError"); }],
@@ -231,14 +238,18 @@ const jwksFailures = [
 	}), { headers: { "content-type": "application/json" } })],
 ];
 
-for (const cacheState of ["empty", "expired"]) {
+for (const cacheState of ["empty", "expired", "unknown key in fresh cache"]) {
 	for (const [failure, fail] of jwksFailures) {
-		test(`notification returns retryable 503 for ${failure} with ${cacheState} JWKS cache and recovers`, async () => {
+		test(`notification returns retryable 503 for ${failure} (${cacheState}) and recovers`, async () => {
 			const fixture = notificationFixture();
-			const authorization = fixture.authorization();
-			if (cacheState === "expired") {
+			let authorization = fixture.authorization();
+			if (cacheState !== "empty") {
 				assert.equal((await fixture.send(authorization)).status, 200);
-				fixture.now += 5 * 60_000;
+				if (cacheState === "expired") {
+					fixture.now += 5 * 60_000;
+				} else {
+					authorization = publishRotatedKey(fixture);
+				}
 			}
 			const before = {
 				fetches: fixture.fetchCount,
@@ -258,6 +269,18 @@ for (const cacheState of ["empty", "expired"]) {
 			assert.equal(fixture.messages.length, before.messages);
 
 			fixture.fetchJwks = healthyFetch;
+			if (cacheState === "unknown key in fresh cache") {
+				// A throttled retry retains 503, even if the service has recovered.
+				assert.deepEqual(await fixture.send(authorization), {
+					status: 503,
+					body: { error: "managed_relay_keys_unavailable" },
+				});
+				assert.equal(fixture.fetchCount, before.fetches + 1);
+				assert.equal(fixture.firestoreCalls, before.firestore);
+				assert.equal(fixture.updates.length, before.updates);
+				assert.equal(fixture.messages.length, before.messages);
+				fixture.now += 1_000;
+			}
 			assert.deepEqual(await fixture.send(authorization), {
 				status: 200,
 				body: { status: "sent", messageId: "message-one" },
@@ -267,6 +290,93 @@ for (const cacheState of ["empty", "expired"]) {
 		});
 	}
 }
+
+test("notification refreshes a warm JWKS once to accept a newly published signing key", async () => {
+	const fixture = notificationFixture();
+	assert.equal((await fixture.send()).status, 200);
+	const authorization = publishRotatedKey(fixture);
+	assert.equal((await fixture.send(authorization)).status, 200);
+	assert.equal((await fixture.send(authorization)).status, 200);
+	assert.equal(fixture.fetchCount, 2);
+	assert.equal(fixture.messages.length, 3);
+});
+
+test("concurrent unknown keys share one refresh while known cached keys remain usable", async () => {
+	const fixture = notificationFixture();
+	assert.equal((await fixture.send()).status, 200);
+	const authorization = publishRotatedKey(fixture);
+	const healthyFetch = fixture.fetchJwks;
+	let releaseFetch;
+	fixture.fetchJwks = () => new Promise((resolve) => { releaseFetch = resolve; });
+	const requests = Array.from({ length: 10 }, () => fixture.send(authorization));
+	assert.equal(fixture.fetchCount, 2);
+	assert.equal((await fixture.send()).status, 200);
+	assert.equal(fixture.fetchCount, 2);
+	releaseFetch(await healthyFetch());
+	const results = await Promise.all(requests);
+	assert.ok(results.every((result) => result.status === 200));
+	assert.equal(fixture.fetchCount, 2);
+	assert.equal(fixture.messages.length, 12);
+});
+
+test("unknown key refreshes are bounded across different kids and resume after the cooldown", async () => {
+	const fixture = notificationFixture();
+	assert.equal((await fixture.send()).status, 200);
+	const before = { firestore: fixture.firestoreCalls, updates: fixture.updates.length };
+	for (let index = 0; index < 10; index += 1) {
+		assert.deepEqual(await fixture.send(fixture.authorization({}, { kid: `unknownabcdefghijklmnop${index}` })), {
+			status: 401,
+			body: { error: "managed_relay_authorization_invalid" },
+		});
+	}
+	assert.equal(fixture.fetchCount, 2);
+	assert.equal(fixture.firestoreCalls, before.firestore);
+	assert.equal(fixture.updates.length, before.updates);
+	assert.equal(fixture.messages.length, 1);
+	fixture.now += 1_000;
+	assert.equal((await fixture.send(publishRotatedKey(fixture))).status, 200);
+	assert.equal(fixture.fetchCount, 3);
+});
+
+test("an unknown-key refresh cooldown is isolated to its broker JWKS URL", async () => {
+	const fixture = notificationFixture();
+	const canaryClaims = { iss: "https://credentials-canary.volt-cli.dev", aud: "volt-iroh-relay-canary" };
+	assert.equal((await fixture.send()).status, 200);
+	assert.equal((await fixture.send(fixture.authorization(canaryClaims))).status, 200);
+	assert.equal((await fixture.send(fixture.authorization({}, { kid: "unknownabcdefghijklmnop" }))).status, 401);
+	assert.equal(fixture.fetchCount, 3);
+	const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+	const kid = "canaryabcdefghijklmnop";
+	fixture.jwks.keys.push({ ...publicKey.export({ format: "jwk" }), alg: "EdDSA", kid, use: "sig" });
+	assert.equal((await fixture.send(fixture.authorization(canaryClaims, { kid }, privateKey))).status, 200);
+	assert.equal(fixture.fetchCount, 4);
+});
+
+for (const cacheState of ["empty", "expired"]) {
+	test(`an unknown kid with an ${cacheState} cache fetches JWKS only once per request`, async () => {
+		const fixture = notificationFixture();
+		if (cacheState === "expired") {
+			assert.equal((await fixture.send()).status, 200);
+			fixture.now += 5 * 60_000;
+		}
+		const before = fixture.fetchCount;
+		assert.equal((await fixture.send(fixture.authorization({}, { kid: "unknownabcdefghijklmnop" }))).status, 401);
+		assert.equal(fixture.fetchCount, before + 1);
+	});
+}
+
+test("a failed unknown-key refresh preserves known fresh keys but never permits expired keys", async () => {
+	const fixture = notificationFixture();
+	assert.equal((await fixture.send()).status, 200);
+	fixture.fetchJwks = () => { throw new TypeError("fetch failed"); };
+	assert.equal((await fixture.send(fixture.authorization({}, { kid: "unknownabcdefghijklmnop" }))).status, 503);
+	assert.equal((await fixture.send()).status, 200);
+	assert.equal(fixture.fetchCount, 2);
+	fixture.now += 5 * 60_000;
+	assert.equal((await fixture.send()).status, 503);
+	assert.equal(fixture.fetchCount, 3);
+	assert.equal(fixture.messages.length, 2);
+});
 
 test("notification continues verifying with a fresh cached JWKS during an outage", async () => {
 	const fixture = notificationFixture();

@@ -3,6 +3,7 @@ const { createPublicKey, verify } = require("node:crypto");
 const MAX_ACCESS_TOKEN_BYTES = 8 * 1024;
 const MAX_JWKS_BYTES = 16 * 1024;
 const JWKS_CACHE_MS = 5 * 60_000;
+const UNKNOWN_KEY_REFRESH_COOLDOWN_MS = 1_000;
 const CLOCK_SKEW_SECONDS = 30;
 const REQUEST_TIMEOUT_MS = 5_000;
 const identifierPattern = /^[A-Za-z0-9_-]{16,128}$/;
@@ -125,55 +126,86 @@ function createRelayAccessVerifier(options = {}) {
 
 async function resolveKey(cache, fetcher, now, deployment, keyId) {
 	let cached = cache.get(deployment.jwksUrl);
-	if (cached === undefined || cached.expiresAtMs <= now()) {
-		try {
-			const response = await fetcher(deployment.jwksUrl, {
-				headers: { accept: "application/json" },
-				method: "GET",
-				redirect: "error",
-				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-			});
-			if (!response.ok || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
-				throw new Error("managed relay keys unavailable");
-			}
-			const bytes = Buffer.from(await response.arrayBuffer());
-			if (bytes.length > MAX_JWKS_BYTES) {
-				throw new Error("managed relay keys invalid");
-			}
-			const decoded = JSON.parse(bytes.toString("utf8"));
-			if (!isRecord(decoded) || !Array.isArray(decoded.keys) || decoded.keys.length < 1 || decoded.keys.length > 8) {
-				throw new Error("managed relay keys invalid");
-			}
-			const keys = new Map();
-			for (const key of decoded.keys) {
-				if (
-					!isRecord(key) ||
-					key.kty !== "OKP" ||
-					key.crv !== "Ed25519" ||
-					key.alg !== "EdDSA" ||
-					key.use !== "sig" ||
-					typeof key.kid !== "string" ||
-					!identifierPattern.test(key.kid) ||
-					typeof key.x !== "string" ||
-					decodeBase64Url(key.x, 64).length !== 32 ||
-					keys.has(key.kid)
-				) {
-					throw new Error("managed relay keys invalid");
-				}
-				keys.set(key.kid, createPublicKey({ format: "jwk", key }));
-			}
-			cached = { expiresAtMs: now() + JWKS_CACHE_MS, keys };
-			cache.set(deployment.jwksUrl, cached);
-		} catch (cause) {
-			// A failed refresh says nothing about the bearer. Never use expired keys.
-			throw new RelayKeyServiceUnavailableError("managed relay keys unavailable", { cause });
-		}
+	if (cached === undefined) {
+		cached = {
+			expiresAtMs: 0,
+			keys: new Map(),
+			refreshPromise: undefined,
+			refreshError: undefined,
+			unknownKeyRefreshAfterMs: 0,
+		};
+		cache.set(deployment.jwksUrl, cached);
+	}
+	const expired = cached.expiresAtMs <= now();
+	if (!expired && cached.keys.has(keyId)) {
+		return cached.keys.get(keyId);
+	}
+	if (cached.refreshPromise === undefined && (expired || cached.unknownKeyRefreshAfterMs <= now())) {
+		// Bound misses per JWKS URL, not per attacker-controlled kid. Initial/expiry
+		// fetches still get one immediate rotation refresh on a later cached miss.
+		if (!expired) cached.unknownKeyRefreshAfterMs = now() + UNKNOWN_KEY_REFRESH_COOLDOWN_MS;
+		cached.refreshPromise = refreshKeys(cached, fetcher, now, deployment).finally(() => {
+			cached.refreshPromise = undefined;
+		});
+	}
+	if (cached.refreshPromise !== undefined) {
+		await cached.refreshPromise;
+	} else if (cached.refreshError !== undefined) {
+		// Throttling a failed refresh must not reclassify the bearer as invalid.
+		throw cached.refreshError;
 	}
 	const key = cached.keys.get(keyId);
 	if (key === undefined) {
 		throw new RelayAccessVerificationError("managed relay key unknown");
 	}
 	return key;
+}
+
+async function refreshKeys(cached, fetcher, now, deployment) {
+	try {
+		const response = await fetcher(deployment.jwksUrl, {
+			headers: { accept: "application/json" },
+			method: "GET",
+			redirect: "error",
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+		});
+		if (!response.ok || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+			throw new Error("managed relay keys unavailable");
+		}
+		const bytes = Buffer.from(await response.arrayBuffer());
+		if (bytes.length > MAX_JWKS_BYTES) {
+			throw new Error("managed relay keys invalid");
+		}
+		const decoded = JSON.parse(bytes.toString("utf8"));
+		if (!isRecord(decoded) || !Array.isArray(decoded.keys) || decoded.keys.length < 1 || decoded.keys.length > 8) {
+			throw new Error("managed relay keys invalid");
+		}
+		const keys = new Map();
+		for (const key of decoded.keys) {
+			if (
+				!isRecord(key) ||
+				key.kty !== "OKP" ||
+				key.crv !== "Ed25519" ||
+				key.alg !== "EdDSA" ||
+				key.use !== "sig" ||
+				typeof key.kid !== "string" ||
+				!identifierPattern.test(key.kid) ||
+				typeof key.x !== "string" ||
+				decodeBase64Url(key.x, 64).length !== 32 ||
+				keys.has(key.kid)
+			) {
+				throw new Error("managed relay keys invalid");
+			}
+			keys.set(key.kid, createPublicKey({ format: "jwk", key }));
+		}
+		cached.keys = keys;
+		cached.expiresAtMs = now() + JWKS_CACHE_MS;
+		cached.refreshError = undefined;
+	} catch (cause) {
+		// A failed refresh says nothing about the bearer. Never use expired keys.
+		cached.refreshError = new RelayKeyServiceUnavailableError("managed relay keys unavailable", { cause });
+		throw cached.refreshError;
+	}
 }
 
 function decodeSegment(value, maximumBytes) {
