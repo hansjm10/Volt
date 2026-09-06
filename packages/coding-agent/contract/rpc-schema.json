@@ -3360,6 +3360,31 @@
 				},
 				"requestId": {
 					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"discussionConfiguration": {
+					"type": "object",
+					"properties": {
+						"model": {
+							"type": "object",
+							"required": [
+								"provider",
+								"modelId"
+							],
+							"properties": {
+								"provider": {
+									"type": "string"
+								},
+								"modelId": {
+									"type": "string"
+								}
+							},
+							"additionalProperties": false
+						},
+						"thinkingLevel": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false

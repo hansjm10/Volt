@@ -173,6 +173,17 @@ export const RPC_COMMAND_SCHEMAS = {
 		runId: RpcConversationIdentifierSchema,
 		findingIds: Type.Array(RpcConversationIdentifierSchema, { minItems: 1, maxItems: 50, uniqueItems: true }),
 		requestId: RpcConversationIdentifierSchema,
+		discussionConfiguration: Type.Optional(
+			Type.Object(
+				{
+					model: Type.Optional(
+						Type.Object({ provider: Type.String(), modelId: Type.String() }, { additionalProperties: false }),
+					),
+					thinkingLevel: Type.Optional(Type.String()),
+				},
+				{ additionalProperties: false },
+			),
+		),
 	}),
 	list_review_discussions: commandSchema("list_review_discussions", {
 		runId: RpcConversationIdentifierSchema,

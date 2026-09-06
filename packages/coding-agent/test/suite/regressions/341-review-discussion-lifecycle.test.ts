@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
+import { type FauxModelDefinition, fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { Compile } from "typebox/compile";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -10,6 +10,7 @@ import {
 	createAgentSessionRuntime,
 } from "../../../src/core/agent-session-runtime.ts";
 import { BUILTIN_HOST_ACTION_REGISTRY, type HostActionInvocationContext } from "../../../src/core/host-actions.ts";
+import { getStaticIrohRemoteRpcFilterResult } from "../../../src/core/remote/iroh/rpc-command-filter.ts";
 import { registerReviewHandoffAliases } from "../../../src/core/review-anchors.ts";
 import { assertReviewDiscussionRpcAllowed } from "../../../src/core/review-discussion-policy.ts";
 import { HostReviewDiscussionService, type ReviewDiscussionService } from "../../../src/core/review-discussions.ts";
@@ -84,9 +85,12 @@ function record(): ReviewRunRecord {
 	};
 }
 
-async function fixture() {
+async function fixture(models?: FauxModelDefinition[]) {
 	const root = mkdtempSync(join(tmpdir(), "volt-341-lifecycle-"));
-	const harness = await createHarness({ settings: { lsp: { enabled: false }, compaction: { enabled: false } } });
+	const harness = await createHarness({
+		models,
+		settings: { lsp: { enabled: false }, compaction: { enabled: false } },
+	});
 	const runtimes: AgentSessionRuntime[] = [];
 	const gates: Array<() => void> = [];
 	cleanups.push(async () => {
@@ -176,6 +180,127 @@ function successful(result: Awaited<ReturnType<ReviewDiscussionService["start"]>
 }
 
 describe("Regression #341 host sibling lifecycle", () => {
+	it.each(["both", "model", "thinking", "neither"] as const)(
+		"applies %s configuration before kickoff and preserves it across retry and reset",
+		async (selection) => {
+			const { source, api, harness, runtimes } = await fixture([
+				{ id: "chat", reasoning: true },
+				{ id: "selected", reasoning: true },
+				{ id: "review", reasoning: true },
+			]);
+			const provider = harness.models[0].provider;
+			harness.settingsManager.setDefaultModelAndProvider(provider, "chat");
+			harness.settingsManager.setDefaultThinkingLevel("low");
+			await source.session.setModel(harness.getModel("review")!, { persistDefault: false });
+			source.session.setThinkingLevel("high", { persistDefault: false });
+			const expectedModel = selection === "both" || selection === "model" ? "selected" : "chat";
+			const expectedThinking = selection === "both" || selection === "thinking" ? "medium" : "low";
+			let observed: unknown;
+			harness.setResponses([
+				(_context, _options, _state, model) => {
+					observed = { model: model.id, thinking: runtimes[1]!.session.thinkingLevel };
+					return fauxAssistantMessage("answer");
+				},
+			]);
+			const discussionConfiguration =
+				selection === "neither"
+					? undefined
+					: {
+							...(selection === "both" || selection === "model"
+								? { model: { provider, modelId: "selected" } }
+								: {}),
+							...(selection === "both" || selection === "thinking" ? { thinkingLevel: "medium" } : {}),
+						};
+			const command = {
+				type: "start_review_discussions",
+				runId: "review-341",
+				findingIds: ["f1"],
+				requestId: "start",
+				discussionConfiguration,
+			} as const;
+			expect(validateRpcCommandPayload(command)).toBeUndefined();
+			const remote = getStaticIrohRemoteRpcFilterResult(JSON.stringify(command));
+			expect(remote).toMatchObject({ allowed: true, command: JSON.parse(JSON.stringify(command)) });
+			const response = await handleRpcCommand(JSON.parse(JSON.stringify(command)), {
+				session: source.session,
+				runtimeHost: source,
+				options: {},
+				assertConversationGenerationCurrent: () => {},
+			} as RpcCommandDispatcherContext);
+			expect(response).toMatchObject({ success: true, data: { results: [{ outcome: "created" }] } });
+			await runtimes[1]!.session.waitForIdle();
+			expect(observed).toEqual({ model: expectedModel, thinking: expectedThinking });
+			const first = (await api.list("review-341")).discussions[0]!;
+			const retry = successful(
+				await api.start("review-341", ["f1"], "retry", {
+					model: { provider, modelId: "review" },
+					thinkingLevel: "high",
+				}),
+			)[0]!;
+			expect(retry.sessionId).toBe(first.sessionId);
+			expect(runtimes[1]!.session.model?.id).toBe(expectedModel);
+			harness.settingsManager.setDefaultModelAndProvider(provider, "review");
+			harness.settingsManager.setDefaultThinkingLevel("high");
+			await api.reset(first.discussionId, first.sessionId, "reset");
+			expect(runtimes[2]!.session.model?.id).toBe(expectedModel);
+			expect(runtimes[2]!.session.thinkingLevel).toBe(expectedThinking);
+			expect(runtimes[2]!.session.messages.some((message) => message.role === "user")).toBe(false);
+		},
+	);
+
+	it("rejects unavailable models and unsupported thinking before creating any children", async () => {
+		const { source, api, harness, runtimes } = await fixture([{ id: "chat", reasoning: false }]);
+		const provider = harness.models[0].provider;
+		for (const discussionConfiguration of [
+			{ model: { provider, modelId: "missing" } },
+			{ thinkingLevel: "high" },
+			{ thinkingLevel: "unknown" },
+		]) {
+			const response = await handleRpcCommand(
+				{
+					type: "start_review_discussions",
+					runId: "review-341",
+					findingIds: ["f1", "f2"],
+					requestId: "invalid",
+					discussionConfiguration,
+				},
+				{
+					session: source.session,
+					runtimeHost: source,
+					options: {},
+					assertConversationGenerationCurrent: () => {},
+				} as RpcCommandDispatcherContext,
+			);
+			expect(response).toMatchObject({ success: false, error: expect.stringMatching(/unavailable|Unsupported/) });
+			expect((await api.list("review-341")).discussions).toEqual([]);
+			expect(runtimes).toHaveLength(1);
+		}
+		vi.spyOn(source.session.modelRegistry, "getAvailable").mockReturnValue([]);
+		await expect(
+			api.start("review-341", ["f1"], "no-auth", { model: { provider, modelId: "chat" } }),
+		).rejects.toThrow("unavailable");
+		expect((await api.list("review-341")).discussions).toEqual([]);
+	});
+
+	it("rejects malformed nested discussion configuration at the shared RPC boundary", () => {
+		for (const discussionConfiguration of [
+			null,
+			{ model: { provider: "p", id: "m" } },
+			{ model: { provider: "p" } },
+			{ thinkingLevel: 2 },
+			{ extra: true },
+		]) {
+			expect(
+				validateRpcCommandPayload({
+					type: "start_review_discussions",
+					runId: "review-341",
+					findingIds: ["f1"],
+					requestId: "invalid",
+					discussionConfiguration,
+				}),
+			).toBeDefined();
+		}
+	});
 	it("projects identity without permission claims and executes RPC bash and current-context plans", async () => {
 		const { api, harness, runtimes, root, source } = await fixture();
 		await source.session.setAgentMode("plan");

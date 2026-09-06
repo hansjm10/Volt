@@ -14,6 +14,7 @@ import type { McpGatewayExecutionContext } from "../../core/mcp/types.ts";
 import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/agent-options.ts";
 import { createReviewSeedMessage } from "../../core/review.ts";
 import { assertReviewDiscussionRpcAllowed } from "../../core/review-discussion-policy.ts";
+import { ReviewDiscussionConfigurationError } from "../../core/review-discussions.ts";
 import { getReviewGeneral } from "../../core/review-general.ts";
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
@@ -606,14 +607,21 @@ export async function handleRpcCommand(
 				context.assertConversationGenerationCurrent();
 				const data =
 					command.type === "start_review_discussions"
-						? await service.start(command.runId, command.findingIds, command.requestId)
+						? await service.start(
+								command.runId,
+								command.findingIds,
+								command.requestId,
+								command.discussionConfiguration,
+							)
 						: command.type === "list_review_discussions"
 							? await service.list(command.runId, command.cursor, command.limit)
 							: command.type === "reset_review_discussion"
 								? await service.reset(command.discussionId, command.expectedSessionId, command.requestId)
 								: await service.source();
 				return createRpcSuccessResponse(id, command.type, data);
-			} catch {
+			} catch (error) {
+				if (error instanceof ReviewDiscussionConfigurationError)
+					return createRpcErrorResponse(id, command.type, error.message);
 				return createRpcErrorResponse(
 					id,
 					command.type,

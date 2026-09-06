@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@hansjm10/volt-ai";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
+import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { findInitialModel } from "./model-resolver.ts";
 import { appendReviewFindingTransition, getReviewRun, type ReviewFindingTransitionRecord } from "./review-state.ts";
 import type {
 	RpcListReviewDiscussions,
@@ -8,6 +11,7 @@ import type {
 	RpcReviewDiscussionLink,
 	RpcStartReviewDiscussions,
 } from "./rpc/schema/review-discussions.ts";
+import type { RpcCommand } from "./rpc/types.ts";
 import { decodeStoredSessionEntry } from "./session-entry-codec.ts";
 import { SessionManager, type SessionReference } from "./session-manager.ts";
 import { acquireSharedSQLiteSessionStore, type SQLiteSessionStoreClient } from "./session-store/client.ts";
@@ -19,8 +23,17 @@ import type {
 	SessionStoreReviewDiscussionLookup,
 } from "./session-store/types.ts";
 
+type DiscussionConfiguration = Extract<RpcCommand, { type: "start_review_discussions" }>["discussionConfiguration"];
+
+export class ReviewDiscussionConfigurationError extends Error {}
+
 export interface ReviewDiscussionService {
-	start(runId: string, findingIds: readonly string[], requestId: string): Promise<RpcStartReviewDiscussions>;
+	start(
+		runId: string,
+		findingIds: readonly string[],
+		requestId: string,
+		discussionConfiguration?: DiscussionConfiguration,
+	): Promise<RpcStartReviewDiscussions>;
 	list(runId: string, cursor?: string, limit?: number): Promise<RpcListReviewDiscussions>;
 	reset(discussionId: string, expectedSessionId: string, requestId: string): Promise<RpcResetReviewDiscussion>;
 	source(): Promise<RpcReviewDiscussion | null>;
@@ -175,10 +188,10 @@ export class HostReviewDiscussionService {
 						}
 					});
 				}),
-			start: (runId, ids, requestId) =>
+			start: (runId, ids, requestId, discussionConfiguration) =>
 				this.track(runtime, () =>
 					this.withStore(runtime, (store, ref, assertCurrent) =>
-						this.start(runtime, store, ref, assertCurrent, runId, ids, requestId),
+						this.start(runtime, store, ref, assertCurrent, runId, ids, requestId, discussionConfiguration),
 					),
 				),
 			list: (runId, cursor, limit) =>
@@ -371,6 +384,7 @@ export class HostReviewDiscussionService {
 		runId: string,
 		findingIds: readonly string[],
 		requestId: string,
+		discussionConfiguration?: DiscussionConfiguration,
 	): Promise<RpcStartReviewDiscussions> {
 		if (findingIds.length < 1 || findingIds.length > 50 || new Set(findingIds).size !== findingIds.length)
 			throw new Error("Select between 1 and 50 unique findings");
@@ -390,6 +404,37 @@ export class HostReviewDiscussionService {
 			if (!owner) await manager.closePersistence();
 		}
 		assertCurrent();
+		// Resolve normal chat defaults, never the source review's temporary selection.
+		// Validate the entire request before any child is persisted or launched.
+		const { modelRegistry, settingsManager } = runtime.session;
+		const selected = discussionConfiguration?.model;
+		const model = selected
+			? modelRegistry.find(selected.provider, selected.modelId)
+			: (
+					await findInitialModel({
+						scopedModels: [],
+						isContinuing: false,
+						defaultProvider: settingsManager.getDefaultProvider(),
+						defaultModelId: settingsManager.getDefaultModel(),
+						modelRegistry,
+					})
+				).model;
+		const available = await modelRegistry.getAvailable();
+		if (!model || !available.some((item) => item.provider === model.provider && item.id === model.id))
+			throw new ReviewDiscussionConfigurationError("Review discussion model is unavailable");
+		const requestedThinking = discussionConfiguration?.thinkingLevel;
+		if (
+			requestedThinking !== undefined &&
+			!getSupportedThinkingLevels(model).some((level) => level === requestedThinking)
+		)
+			throw new ReviewDiscussionConfigurationError(
+				`Unsupported review discussion thinking level: ${requestedThinking}`,
+			);
+		const thinkingLevel =
+			requestedThinking ??
+			clampThinkingLevel(model, settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
+		const chosenModel = { provider: model.provider, id: model.id };
+		assertCurrent();
 		const results = await Promise.all(
 			findingIds.map((findingId) =>
 				this.serial(
@@ -406,10 +451,8 @@ export class HostReviewDiscussionService {
 								JSON.stringify({
 									finding: immutableFinding,
 									target: { description: record.target.description, identity: revision },
-									model: runtime.session.model
-										? { provider: runtime.session.model.provider, id: runtime.session.model.id }
-										: null,
-									thinkingLevel: runtime.session.thinkingLevel,
+									model: chosenModel,
+									thinkingLevel,
 									fastMode: runtime.session.fastModeEnabled,
 								}),
 							) as SessionStoreJsonValue;
