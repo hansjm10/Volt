@@ -1,10 +1,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { IrohRemoteOutcomeError } from "../src/core/remote/iroh/protocol.ts";
 import { SessionManager, type SessionReference } from "../src/core/session-manager.ts";
 import { SQLiteSessionStoreClient } from "../src/core/session-store/index.ts";
+import { SessionStoreError } from "../src/core/session-store/types.ts";
 import {
 	createSessionManagerTargetStore,
 	type IrohRemoteSessionTarget,
@@ -63,6 +65,114 @@ async function resolve(target: IrohRemoteSessionTarget, store: FakeStore) {
 }
 
 describe("resolveIrohRemoteSessionTarget", () => {
+	it("resumes the same durable conversation after a schema outage is repaired", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "volt-session-target-recovery-"));
+		try {
+			const manager = await SessionManager.create(tempDir, tempDir, { id: "preserved-session" });
+			manager.reserveClientInput("handled-input", "prompt", { message: "/handled" });
+			manager.transitionClientInput("handled-input", "started");
+			manager.transitionClientInput("handled-input", "completed");
+			await manager.flush();
+			const originalRef = manager.getSessionRef();
+			await manager.closePersistence();
+			const db = new DatabaseSync(join(tempDir, "sessions.sqlite"));
+			db.exec("CREATE VIEW unexpected_schema AS SELECT 1");
+			db.close();
+			const store = createSessionManagerTargetStore(tempDir, tempDir);
+			await expect(
+				resolveIrohRemoteSessionTarget({ kind: "last", resumeSessionId: "preserved-session" }, WORKSPACE, store),
+			).rejects.toMatchObject({ outcome: "workspace_unavailable", workspace: "volt", retryAfterMs: 5_000 });
+			const repaired = new DatabaseSync(join(tempDir, "sessions.sqlite"));
+			repaired.exec("DROP VIEW unexpected_schema");
+			repaired.close();
+			const resumed = await resolveIrohRemoteSessionTarget(
+				{ kind: "session", sessionId: "preserved-session" },
+				WORKSPACE,
+				store,
+			);
+			try {
+				expect(resumed.selection).toBe("resumed");
+				expect(resumed.sessionRef).toEqual(originalRef);
+				expect(resumed.sessionManager.getClientInput("handled-input")?.state).toBe("completed");
+			} finally {
+				await resumed.sessionManager.closePersistence();
+			}
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(["find", "open"] as const)("keeps workspace storage failures retryable during %s", async (phase) => {
+		const source = ref("existing");
+		const store = createFakeStore([{ id: "existing", ref: source }]);
+		const failure = new SessionStoreError("store_schema_mismatch", "private database schema details");
+		const failingOperation = vi.fn(async () => {
+			throw failure;
+		});
+		if (phase === "find") store.find = failingOperation;
+		else store.open = failingOperation;
+		for (const target of [
+			{ kind: "last", resumeSessionId: "existing" },
+			{ kind: "new", sessionId: "existing" },
+			{ kind: "session", sessionId: "existing" },
+		] as const) {
+			await expect(resolve(target, store)).rejects.toMatchObject({
+				outcome: "workspace_unavailable",
+				workspace: "volt",
+				retryAfterMs: 5_000,
+				cause: failure,
+			});
+		}
+		expect(store.createdIds).toEqual([]);
+		store.find = async () => source;
+		store.open = async () => ({ getSessionId: () => "existing", getSessionRef: () => source });
+		expect(await resolve({ kind: "session", sessionId: "existing" }, store)).toMatchObject({
+			selection: "resumed",
+			sessionRef: source,
+		});
+	});
+
+	it.each([
+		"store_busy",
+		"store_io_error",
+		"worker_failed",
+		"closed",
+		"invalid_response",
+		"store_initialization_failed",
+	] as const)("does not mark conversations stale for %s", async (code) => {
+		const store = createFakeStore();
+		store.find = async () => {
+			throw new SessionStoreError(code, "storage unavailable");
+		};
+		await expect(resolve({ kind: "last", resumeSessionId: "existing" }, store)).rejects.toMatchObject({
+			outcome: "workspace_unavailable",
+			workspace: "volt",
+			retryAfterMs: 5_000,
+		});
+		expect(store.createdIds).toEqual([]);
+	});
+
+	it.each(["find", "open"] as const)("preserves disk exhaustion during %s", async (phase) => {
+		for (const failure of [
+			new SessionStoreError("store_full", "database full"),
+			new Error("write failed", { cause: Object.assign(new Error("quota"), { code: "EDQUOT" }) }),
+		]) {
+			const store = createFakeStore([{ id: "existing", ref: ref("existing") }]);
+			const fail = async () => {
+				throw failure;
+			};
+			if (phase === "find") store.find = fail;
+			else store.open = fail;
+			await expect(resolve({ kind: "last", resumeSessionId: "existing" }, store)).rejects.toMatchObject({
+				outcome: "host_storage_full",
+				cause: failure,
+				workspace: "volt",
+				sessionId: "existing",
+			});
+			expect(store.createdIds).toEqual([]);
+		}
+	});
+
 	it("creates the caller-named session for target new", async () => {
 		const store = createFakeStore([{ id: "existing", ref: ref("existing") }]);
 		const resolved = await resolve({ kind: "new", sessionId: "caller-session" }, store);
