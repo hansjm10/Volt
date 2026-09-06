@@ -72,6 +72,7 @@ export async function registerReviewHandoffAliases(
 	target: SessionManager,
 	runIds: readonly string[],
 ): Promise<void> {
+	if (runIds.length === 0) return;
 	const from = source.getSessionRef();
 	const to = target.getSessionRef();
 	if (!from || !to) return;
