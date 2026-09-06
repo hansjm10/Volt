@@ -96,10 +96,17 @@ export const RPC_COMMAND_SCHEMAS = {
 		images: Type.Optional(RpcConversationInputImagesSchema),
 	}),
 	abort: commandSchema("abort", {}),
-	new_session: commandSchema("new_session", {
-		parentSessionId: Type.Optional(RpcConversationIdentifierSchema),
-		preserveReviewRunId: Type.Optional(RpcConversationIdentifierSchema),
-	}),
+	new_session: Type.Object(
+		commandSchema("new_session", {
+			parentSessionId: Type.Optional(RpcConversationIdentifierSchema),
+			preserveReviewRunId: Type.Optional(RpcConversationIdentifierSchema),
+			replaceReviewGeneral: Type.Optional(Type.Boolean()),
+		}).properties,
+		{
+			additionalProperties: false,
+			anyOf: [{ properties: { replaceReviewGeneral: { const: false } } }, { required: ["preserveReviewRunId"] }],
+		},
+	),
 	set_agent_mode: commandSchema("set_agent_mode", {
 		mode: RpcAgentModeSchema,
 	}),
@@ -162,6 +169,34 @@ export const RPC_COMMAND_SCHEMAS = {
 	),
 
 	// Detached review workflows
+	start_review_discussions: commandSchema("start_review_discussions", {
+		runId: RpcConversationIdentifierSchema,
+		findingIds: Type.Array(RpcConversationIdentifierSchema, { minItems: 1, maxItems: 50, uniqueItems: true }),
+		requestId: RpcConversationIdentifierSchema,
+		discussionConfiguration: Type.Optional(
+			Type.Object(
+				{
+					model: Type.Optional(
+						Type.Object({ provider: Type.String(), modelId: Type.String() }, { additionalProperties: false }),
+					),
+					thinkingLevel: Type.Optional(Type.String()),
+				},
+				{ additionalProperties: false },
+			),
+		),
+	}),
+	list_review_discussions: commandSchema("list_review_discussions", {
+		runId: RpcConversationIdentifierSchema,
+		cursor: Type.Optional(Type.String({ maxLength: 32, pattern: "^[0-9]+$" })),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+	}),
+	reset_review_discussion: commandSchema("reset_review_discussion", {
+		discussionId: RpcConversationIdentifierSchema,
+		expectedSessionId: RpcConversationIdentifierSchema,
+		requestId: RpcConversationIdentifierSchema,
+	}),
+	get_review_discussion_source: commandSchema("get_review_discussion_source", {}),
+	get_review_general: commandSchema("get_review_general", { runId: RpcConversationIdentifierSchema }),
 	cancel_workflow: commandSchema("cancel_workflow", { workflowId: RpcConversationIdentifierSchema }),
 	get_review_result: commandSchema("get_review_result", { runId: RpcConversationIdentifierSchema }),
 	list_review_workflows: commandSchema("list_review_workflows", {

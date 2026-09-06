@@ -51,7 +51,7 @@ export interface IrohRemoteWorkspaceDiscoveryTarget {
 }
 
 export interface IrohRemoteWorkspaceManagementTarget {
-	purpose: "unregister_workspace" | "manage_worktrees";
+	purpose: "unregister_workspace" | "manage_worktrees" | "list_workspace_directories";
 }
 
 export interface IrohRemoteHostHandshakeMetadata {
@@ -526,7 +526,11 @@ function parseWorkspaceManagementTarget(value: unknown): IrohRemoteWorkspaceMana
 		"handshake workspaceManagement purpose",
 		"invalid_conversation_target",
 	);
-	if (purpose !== "unregister_workspace" && purpose !== "manage_worktrees") {
+	if (
+		purpose !== "unregister_workspace" &&
+		purpose !== "manage_worktrees" &&
+		purpose !== "list_workspace_directories"
+	) {
 		throw new IrohRemoteHandshakeError("invalid_conversation_target", "unsupported workspaceManagement purpose");
 	}
 	return { purpose };
@@ -899,7 +903,11 @@ function parseWorkspaceDiscoveryResponseMetadata(value: unknown): IrohRemoteWork
 function parseWorkspaceManagementResponseMetadata(value: unknown): IrohRemoteWorkspaceManagementTarget {
 	const metadata = expectRecord(value, "handshake response workspaceManagement");
 	expectKnownResponseFields(metadata, "handshake response workspaceManagement", ["purpose"]);
-	if (metadata.purpose !== "unregister_workspace" && metadata.purpose !== "manage_worktrees") {
+	if (
+		metadata.purpose !== "unregister_workspace" &&
+		metadata.purpose !== "manage_worktrees" &&
+		metadata.purpose !== "list_workspace_directories"
+	) {
 		throw new Error("handshake response workspaceManagement purpose must be a supported management purpose");
 	}
 	return { purpose: metadata.purpose };

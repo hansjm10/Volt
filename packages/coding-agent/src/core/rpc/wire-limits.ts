@@ -179,6 +179,8 @@ export const RPC_STABLE_ERROR_CODES = [
 	"client_input_outcome_ambiguous",
 	"stale_plan_revision",
 	"stale_conversation_authority",
+	"review_discussions_unavailable",
+	"review_source_unavailable",
 ] as const;
 export type RpcStableErrorCode = (typeof RPC_STABLE_ERROR_CODES)[number];
 

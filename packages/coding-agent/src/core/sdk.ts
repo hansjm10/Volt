@@ -32,6 +32,7 @@ import {
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
+import { seedReviewDiscussionSession } from "./review-discussions.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "./subagents/tool-names.ts";
@@ -345,6 +346,7 @@ async function createAgentSessionWithTrackedResources(
 		sessionManager = await SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 		onDefaultSessionManagerCreated(sessionManager);
 	}
+	seedReviewDiscussionSession(sessionManager);
 	await sessionManager.flush();
 
 	if (!resourceLoader) {
@@ -474,8 +476,9 @@ async function createAgentSessionWithTrackedResources(
 			.catch(() => undefined);
 		return manager;
 	};
-	const mcpManager = options.disableMcp ? undefined : (options.mcpManager ?? (await createDefaultMcpManager()));
-	if (!options.disableMcp && options.mcpManager === undefined && mcpManager !== undefined) {
+	const suppliedMcpManager = options.mcpManager;
+	const mcpManager = options.disableMcp ? undefined : (suppliedMcpManager ?? (await createDefaultMcpManager()));
+	if (!options.disableMcp && suppliedMcpManager === undefined && mcpManager !== undefined) {
 		untransferredFinalizers.push(() => mcpManager.dispose());
 	}
 
@@ -499,7 +502,9 @@ async function createAgentSessionWithTrackedResources(
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
 	const initialActiveToolNames: string[] = (
 		options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames
-	).filter((name) => !excludedToolNameSet?.has(name));
+	).filter(
+		(name) => !excludedToolNameSet?.has(name) && (allowedToolNames === undefined || allowedToolNames.includes(name)),
+	);
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -620,7 +625,7 @@ async function createAgentSessionWithTrackedResources(
 		hostInteraction: options.hostInteraction,
 		subagentToolManager: options.subagentToolManager,
 		mcpManager,
-		mcpManagerFactory: options.disableMcp || options.mcpManager ? undefined : createDefaultMcpManager,
+		mcpManagerFactory: options.disableMcp || suppliedMcpManager ? undefined : createDefaultMcpManager,
 	});
 	untransferredFinalizers.length = 0;
 	return {

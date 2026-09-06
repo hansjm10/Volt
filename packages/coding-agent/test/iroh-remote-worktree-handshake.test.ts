@@ -170,6 +170,9 @@ describe("hello: worktreeId on conversation targets", () => {
 		expect(parseHello({ workspaceManagement: { purpose: "unregister_workspace" } })).toMatchObject({
 			workspaceManagement: { purpose: "unregister_workspace" },
 		});
+		expect(parseHello({ workspaceManagement: { purpose: "list_workspace_directories" } })).toMatchObject({
+			workspaceManagement: { purpose: "list_workspace_directories" },
+		});
 		expect(parseHello({ workspaceDiscovery: { purpose: "agent_options" } })).toMatchObject({
 			workspaceDiscovery: { purpose: "agent_options" },
 		});
@@ -226,6 +229,11 @@ describe("handshake response: worktreeId echo", () => {
 		expect(
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceManagement: { purpose: "manage_worktrees" } })),
 		).toMatchObject({ success: true, workspaceManagement: { purpose: "manage_worktrees" } });
+		expect(
+			parseIrohRemoteHandshakeResponseLine(
+				responseLine({ workspaceManagement: { purpose: "list_workspace_directories" } }),
+			),
+		).toMatchObject({ success: true, workspaceManagement: { purpose: "list_workspace_directories" } });
 		expect(
 			parseIrohRemoteHandshakeResponseLine(responseLine({ workspaceDiscovery: { purpose: "agent_options" } })),
 		).toMatchObject({ success: true, workspaceDiscovery: { purpose: "agent_options" } });

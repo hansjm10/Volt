@@ -1,4 +1,6 @@
-export const SESSION_STORE_SCHEMA_ID = "volt-session-store-v1";
+import { REVIEW_DISCUSSION_SCHEMA_SQL } from "./discussion-schema.ts";
+
+export const SESSION_STORE_SCHEMA_ID = "volt-session-store-v2";
 
 export const SESSION_STORE_TABLE_NAMES = [
 	"store_metadata",
@@ -7,6 +9,10 @@ export const SESSION_STORE_TABLE_NAMES = [
 	"client_inputs",
 	"search_chunks",
 	"transaction_commits",
+	"review_anchors",
+	"review_anchor_aliases",
+	"review_discussions",
+	"review_discussion_children",
 ] as const;
 
 export const SESSION_STORE_INDEX_NAMES = [
@@ -16,6 +22,8 @@ export const SESSION_STORE_INDEX_NAMES = [
 	"client_inputs_state_idx",
 	"search_chunks_entry_idx",
 	"transaction_commits_session_revision_idx",
+	"review_anchors_source_idx",
+	"review_discussions_run_idx",
 ] as const;
 
 export const SESSION_STORE_SCHEMA_SQL = `
@@ -140,4 +148,5 @@ CREATE TABLE transaction_commits (
 
 CREATE UNIQUE INDEX transaction_commits_session_revision_idx
 	ON transaction_commits (session_id, session_generation, after_revision DESC);
+${REVIEW_DISCUSSION_SCHEMA_SQL}
 `;

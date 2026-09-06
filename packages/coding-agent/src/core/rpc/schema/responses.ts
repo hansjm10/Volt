@@ -33,6 +33,13 @@ import {
 	RpcReviewWorkflowResultResponseSchema,
 } from "./projections.ts";
 import {
+	RpcListReviewDiscussionsSchema,
+	RpcResetReviewDiscussionSchema,
+	RpcReviewDiscussionSchema,
+	RpcReviewGeneralSchema,
+	RpcStartReviewDiscussionsSchema,
+} from "./review-discussions.ts";
+import {
 	RpcCatalogModelSchema,
 	RpcKeepAwakeStatusSchema,
 	RpcListSubagentsResponseSchema,
@@ -321,7 +328,15 @@ export const RPC_RESPONSE_SCHEMAS = {
 	),
 
 	// Detached review workflows
+	start_review_discussions: dataResponse("start_review_discussions", RpcStartReviewDiscussionsSchema),
+	list_review_discussions: dataResponse("list_review_discussions", RpcListReviewDiscussionsSchema),
+	reset_review_discussion: dataResponse("reset_review_discussion", RpcResetReviewDiscussionSchema),
+	get_review_discussion_source: dataResponse(
+		"get_review_discussion_source",
+		Type.Union([RpcReviewDiscussionSchema, Type.Null()]),
+	),
 	cancel_workflow: voidResponse("cancel_workflow"),
+	get_review_general: dataResponse("get_review_general", RpcReviewGeneralSchema),
 	get_review_result: dataResponse("get_review_result", RpcReviewWorkflowResultResponseSchema),
 	list_review_workflows: dataResponse("list_review_workflows", RpcReviewWorkflowListResponseSchema),
 	open_review_session: dataResponse("open_review_session", cancelledDataSchema),
