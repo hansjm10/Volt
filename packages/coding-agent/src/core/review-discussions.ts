@@ -298,30 +298,43 @@ export class HostReviewDiscussionService {
 			? await store.loadSession(row.current.child.sessionId, row.current.child.sessionGeneration)
 			: null;
 		const entries = snapshot?.entries.map(decodeStoredSessionEntry) ?? [];
-		const lastMessage = entries.findLast((entry) => entry.type === "message")?.message;
+		const byId = new Map(entries.map((entry) => [entry.id, entry]));
+		const branchIds = new Set<string>();
+		let branchId = snapshot?.session.leafId;
+		while (branchId) {
+			if (branchIds.has(branchId)) throw new Error("Review discussion branch contains a parent cycle");
+			branchIds.add(branchId);
+			branchId = byId.get(branchId)?.parentId;
+		}
+		const branch = entries.filter((entry) => branchIds.has(entry.id));
+		const lastMessage = branch.findLast((entry) => entry.type === "message")?.message;
+		const inputs = snapshot?.clientInputs ?? [];
 		const lastUser = entries.findLast((entry) => entry.type === "message" && entry.message.role === "user");
-		const lastReceipt = entries.findLast((entry) => entry.type === "client_input_receipt");
-		const input = snapshot?.clientInputs.find((entry) => entry.clientMessageId === lastReceipt?.clientMessageId);
-		// A queued or failed request has no canonical user message. An earlier answer
-		// must not hide it, even if that answer finished after the input was queued.
-		const undeliveredInput = (lastReceipt?.ordinal ?? -1) > (lastUser?.ordinal ?? -1) ? input : undefined;
+		const lastFailure = entries.findLast((entry) => entry.type === "client_input_state" && entry.state === "failed");
+		// Steering can overtake older follow-ups. Every outstanding receipt matters,
+		// even when a newer request already has a canonical user message and answer.
+		const hasInterruptedInput = inputs.some((input) => input.state === "accepted" || input.state === "started");
+		// Recovery may fail an older queued input after a newer answer. Keep that
+		// failure visible until another input is delivered; navigating the tree does
+		// not change the session-wide receipt history or acknowledge it again.
+		const hasFailedInput = (lastFailure?.ordinal ?? -1) > (lastUser?.ordinal ?? -1);
 		const terminal = lastMessage?.role === "assistant" ? lastMessage.stopReason : undefined;
 		// Client-input completion means a canonical user entry, not a completed provider answer.
 		const status = !row.current.available
 			? "unavailable"
 			: runtime?.session.isBusy
 				? "running"
-				: undeliveredInput?.state === "failed"
-					? "failed"
-					: undeliveredInput?.state === "accepted" || undeliveredInput?.state === "started"
-						? "interrupted"
+				: hasInterruptedInput
+					? "interrupted"
+					: hasFailedInput
+						? "failed"
 						: terminal === "aborted"
 							? "cancelled"
 							: terminal === "error"
 								? "failed"
 								: terminal === "stop" || terminal === "length"
 									? "completed"
-									: lastMessage || input
+									: lastMessage || inputs.length > 0
 										? "interrupted"
 										: row.current.ordinal > 1
 											? "idle"

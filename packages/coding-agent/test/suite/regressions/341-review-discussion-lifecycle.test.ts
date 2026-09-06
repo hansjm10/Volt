@@ -431,6 +431,63 @@ describe("Regression #341 host sibling lifecycle", () => {
 		},
 	);
 
+	it("keeps an older undelivered follow-up visible after a newer input answers and recovery fails it", async () => {
+		const { api, harness, runtimes, source, service } = await fixture();
+		harness.setResponses([fauxAssistantMessage("Initial answer"), fauxAssistantMessage("Newer steering answer")]);
+		await api.start("review-341", ["f1"], "start");
+		const child = runtimes[1]!;
+		await child.session.waitForIdle();
+		const manager = child.session.sessionManager;
+		// Persist the crash boundary after a newer steering request overtakes an
+		// older follow-up, but before the follow-up reaches canonical delivery.
+		manager.reserveClientInput("older-follow-up", "follow_up", { message: "Deferred work", images: [] });
+		manager.markClientInputQueued("older-follow-up", {
+			delivery: "follow_up",
+			message: "Deferred work",
+			images: [],
+		});
+		await child.session.prompt("Newer steering request", { source: "rpc", clientMessageId: "newer" });
+		const ref = child.session.sessionRef!;
+		await manager.flush();
+		expect(manager.getClientInputRecoveryPlan().kind).toBe("replay");
+		await child.dispose();
+		runtimes.splice(1, 1);
+		expect((await api.list("review-341")).discussions[0]!.status).toBe("interrupted");
+		const reopened = await source.createReviewDiscussionSibling(await SessionManager.open(ref));
+		runtimes.push(reopened);
+		reopened.reviewDiscussions = service.forRuntime(reopened);
+		await reopened.startRecoveredClientInputs();
+		expect(reopened.session.sessionManager.getClientInput("older-follow-up")?.state).toBe("failed");
+		expect((await api.list("review-341")).discussions[0]!.status).toBe("failed");
+		harness.setResponses([fauxAssistantMessage("Explicit retry answer")]);
+		await reopened.session.prompt("Retry deferred work", { source: "rpc", clientMessageId: "retry" });
+		expect((await api.list("review-341")).discussions[0]!.status).toBe("completed");
+		expect(reopened.session.messages.filter((message) => message.role === "user")).toHaveLength(3);
+	});
+
+	it("projects the selected branch when navigating between completed and failed answers", async () => {
+		const { api, harness, runtimes } = await fixture();
+		harness.setResponses([
+			fauxAssistantMessage("Initial answer"),
+			fauxAssistantMessage("Failure", { stopReason: "error", errorMessage: "Failed" }),
+		]);
+		const [discussion] = successful(await api.start("review-341", ["f1"], "start"));
+		const child = runtimes[1]!;
+		await child.session.waitForIdle();
+		const initialLeaf = child.session.sessionManager.getLeafId()!;
+		await child.session.prompt("Later attempt", { source: "rpc", clientMessageId: "later" });
+		const failedLeaf = child.session.sessionManager.getLeafId()!;
+		expect((await api.list("review-341")).discussions[0]!.status).toBe("failed");
+		await child.session.navigateTree(initialLeaf);
+		expect(child.session.sessionManager.getLeafId()).toBe(initialLeaf);
+		expect((await api.list("review-341")).discussions[0]).toMatchObject({
+			currentSessionId: discussion!.sessionId,
+			status: "completed",
+		});
+		await child.session.navigateTree(failedLeaf);
+		expect((await api.list("review-341")).discussions[0]!.status).toBe("failed");
+	});
+
 	it("source handoff aliases converge and copied/forked metadata cannot grant authority", async () => {
 		const { api, harness, source, service, runtimes, factory, root } = await fixture();
 		harness.setResponses([fauxAssistantMessage("answer")]);
