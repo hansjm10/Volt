@@ -13,16 +13,19 @@ import { getMcpRpcCapabilities, listMcpRpcServers } from "../../core/mcp/rpc.ts"
 import type { McpGatewayExecutionContext } from "../../core/mcp/types.ts";
 import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/agent-options.ts";
 import { createReviewSeedMessage } from "../../core/review.ts";
+import { assertReviewDiscussionRpcAllowed } from "../../core/review-discussion-policy.ts";
+import { ReviewDiscussionConfigurationError } from "../../core/review-discussions.ts";
+import { getReviewGeneral } from "../../core/review-general.ts";
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
 	acknowledgeReviewRun,
-	appendReviewFindingTransition,
 	appendReviewPublication,
 	appendReviewRun,
-	exportReviewFeedback,
-	getReviewRun,
+	exportCanonicalReviewFeedback,
+	getCanonicalReviewRun,
 	type HydratedReviewRunRecord,
-	listReviewRuns,
+	listCanonicalReviewRuns,
+	recordReviewFindingOutcome,
 } from "../../core/review-state.ts";
 import { createReviewFileMetadata, createReviewPullRequestMetadata } from "../../core/review-workflows.ts";
 import { getRpcErrorResponseTarget, isUsableRpcConversationIdentifier } from "../../core/rpc/correlation.ts";
@@ -301,6 +304,7 @@ export async function handleRpcCommand(
 ): Promise<RpcResponse | undefined> {
 	const { options, runtimeHost, session } = context;
 	const id = typeof command.id === "string" ? command.id : undefined;
+	assertReviewDiscussionRpcAllowed(session, command);
 
 	switch (command.type) {
 		// =================================================================
@@ -377,8 +381,10 @@ export async function handleRpcCommand(
 		}
 
 		case "new_session": {
+			if (command.replaceReviewGeneral && !command.preserveReviewRunId)
+				return createRpcErrorResponse(id, "new_session", "replaceReviewGeneral requires preserveReviewRunId");
 			const preservedReviewRun = command.preserveReviewRunId
-				? getReviewRun(session.sessionManager, command.preserveReviewRunId)
+				? await getCanonicalReviewRun(session.sessionManager, command.preserveReviewRunId)
 				: undefined;
 			if (command.preserveReviewRunId && !preservedReviewRun) {
 				return createRpcErrorResponse(id, "new_session", `Unknown review run: ${command.preserveReviewRunId}`);
@@ -396,6 +402,8 @@ export async function handleRpcCommand(
 			}
 			const newSessionOptions = {
 				rebindRequestId: id,
+				...(command.preserveReviewRunId ? { preserveReviewRunId: command.preserveReviewRunId } : {}),
+				...(command.replaceReviewGeneral ? { replaceReviewGeneral: true } : {}),
 				...(parentSessionRef ? { parentSessionRef } : {}),
 				...(preservedReviewRun
 					? {
@@ -412,7 +420,15 @@ export async function handleRpcCommand(
 						}
 					: {}),
 			};
-			const result = await runSessionNewHostAction(context.createHostActionContext(), newSessionOptions);
+			// General publication is the final durable runtime step. The runtime's
+			// replacement listeners already rebind RPC; do not run a second fallible
+			// afterSessionSwitch callback after that irreversible commit.
+			const result = command.replaceReviewGeneral
+				? await runtimeHost.newSession({
+						...newSessionOptions,
+						assertConversationGenerationCurrent: context.assertConversationGenerationCurrent,
+					})
+				: await runSessionNewHostAction(context.createHostActionContext(), newSessionOptions);
 			return createRpcSuccessResponse(id, "new_session", { cancelled: result.cancelled });
 		}
 
@@ -578,13 +594,53 @@ export async function handleRpcCommand(
 		// Detached review workflows
 		// =================================================================
 
+		case "start_review_discussions":
+		case "list_review_discussions":
+		case "reset_review_discussion":
+		case "get_review_discussion_source": {
+			const service = runtimeHost.reviewDiscussions;
+			if (!service)
+				return createRpcErrorResponse(id, command.type, "This backend has no daemon sibling service", {
+					code: "review_discussions_unavailable",
+				});
+			try {
+				context.assertConversationGenerationCurrent();
+				const data =
+					command.type === "start_review_discussions"
+						? await service.start(
+								command.runId,
+								command.findingIds,
+								command.requestId,
+								command.discussionConfiguration,
+							)
+						: command.type === "list_review_discussions"
+							? await service.list(command.runId, command.cursor, command.limit)
+							: command.type === "reset_review_discussion"
+								? await service.reset(command.discussionId, command.expectedSessionId, command.requestId)
+								: await service.source();
+				return createRpcSuccessResponse(id, command.type, data);
+			} catch (error) {
+				if (error instanceof ReviewDiscussionConfigurationError)
+					return createRpcErrorResponse(id, command.type, error.message);
+				return createRpcErrorResponse(
+					id,
+					command.type,
+					"Review source identity, placement, or runtime admission changed",
+					{ code: "review_source_unavailable" },
+				);
+			}
+		}
+
 		case "cancel_workflow": {
 			runtimeHost.reviewWorkflows.cancel(command.workflowId);
 			return createRpcSuccessResponse(id, "cancel_workflow");
 		}
 
 		case "list_review_workflows": {
-			const page = listReviewRuns(session.sessionManager, { cursor: command.cursor, limit: command.limit });
+			const page = await listCanonicalReviewRuns(session.sessionManager, {
+				cursor: command.cursor,
+				limit: command.limit,
+			});
 			return createRpcSuccessResponse(id, "list_review_workflows", {
 				runs: page.runs.map((run) => projectReviewRun(run, false)),
 				activeWorkflows: runtimeHost.reviewWorkflows.list().filter((workflow) => workflow.status === "running"),
@@ -592,8 +648,16 @@ export async function handleRpcCommand(
 			});
 		}
 
+		case "get_review_general": {
+			return createRpcSuccessResponse(
+				id,
+				"get_review_general",
+				await getReviewGeneral(session.sessionManager, command.runId),
+			);
+		}
+
 		case "get_review_result": {
-			const record = getReviewRun(session.sessionManager, command.runId);
+			const record = await getCanonicalReviewRun(session.sessionManager, command.runId);
 			if (!record)
 				return createRpcErrorResponse(id, "get_review_result", `Unknown durable review run: ${command.runId}`);
 			return createRpcSuccessResponse(id, "get_review_result", projectReviewRun(record, true));
@@ -601,7 +665,7 @@ export async function handleRpcCommand(
 
 		case "open_review_session": {
 			const sourceSessionManager = session.sessionManager;
-			const record = getReviewRun(sourceSessionManager, command.runId);
+			const record = await getCanonicalReviewRun(sourceSessionManager, command.runId);
 			if (!record?.result)
 				return createRpcErrorResponse(
 					id,
@@ -680,7 +744,7 @@ export async function handleRpcCommand(
 		}
 
 		case "record_review_finding_outcome": {
-			const record = getReviewRun(session.sessionManager, command.runId);
+			const record = await getCanonicalReviewRun(session.sessionManager, command.runId);
 			if (!record?.result?.findings.some((finding) => finding.id === command.findingId)) {
 				return createRpcErrorResponse(
 					id,
@@ -695,19 +759,24 @@ export async function handleRpcCommand(
 					"Dismissed findings require an explicit reason.",
 				);
 			}
-			const transition = appendReviewFindingTransition(session.sessionManager, {
+			const outcome = {
 				runId: command.runId,
 				findingId: command.findingId,
 				status: command.status,
 				...(command.reason ? { reason: command.reason } : {}),
 				...(command.note ? { note: command.note } : {}),
+			};
+			const transition = await recordReviewFindingOutcome(session.sessionManager, outcome, {
+				recordCanonicalOutcome: runtimeHost.reviewDiscussions?.recordOutcome,
+				assertCurrent: context.assertConversationGenerationCurrent,
 			});
 			await session.sessionManager.flush();
-			return createRpcSuccessResponse(id, "record_review_finding_outcome", transition);
+			const { schemaVersion: _schemaVersion, ...data } = transition;
+			return createRpcSuccessResponse(id, "record_review_finding_outcome", data);
 		}
 
 		case "rerun_review": {
-			const record = getReviewRun(session.sessionManager, command.runId);
+			const record = await getCanonicalReviewRun(session.sessionManager, command.runId);
 			if (!record) return createRpcErrorResponse(id, "rerun_review", `Unknown review run: ${command.runId}`);
 			const response = await BUILTIN_HOST_ACTION_REGISTRY.invoke(
 				REVIEW_RERUN_ACTION_ID,
@@ -736,7 +805,7 @@ export async function handleRpcCommand(
 		}
 
 		case "publish_review": {
-			const record = getReviewRun(session.sessionManager, command.runId);
+			const record = await getCanonicalReviewRun(session.sessionManager, command.runId);
 			if (!record) return createRpcErrorResponse(id, "publish_review", `Unknown review run: ${command.runId}`);
 			const published = await publishReviewRun(session.sessionManager.getCwd(), record);
 			appendReviewPublication(session.sessionManager, { runId: record.runId, ...published });
@@ -745,7 +814,11 @@ export async function handleRpcCommand(
 		}
 
 		case "export_review_feedback":
-			return createRpcSuccessResponse(id, "export_review_feedback", exportReviewFeedback(session.sessionManager));
+			return createRpcSuccessResponse(
+				id,
+				"export_review_feedback",
+				await exportCanonicalReviewFeedback(session.sessionManager),
+			);
 
 		// =================================================================
 		// Push notifications

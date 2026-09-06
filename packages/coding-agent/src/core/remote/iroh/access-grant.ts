@@ -150,7 +150,10 @@ const OBSERVE_COMMANDS = new Set([
 	"get_transcript",
 	"get_session_tree",
 	"get_review_result",
+	"get_review_general",
 	"list_review_workflows",
+	"list_review_discussions",
+	"get_review_discussion_source",
 	"report_stream_discontinuity",
 	"get_message_images",
 	"get_transcript_entry_text",
@@ -177,6 +180,8 @@ const CONTROL_COMMANDS = new Set([
 	"invoke_ui_action",
 	"cancel_workflow",
 	"open_review_session",
+	"start_review_discussions",
+	"reset_review_discussion",
 	"acknowledge_review",
 	"record_review_finding_outcome",
 	"rerun_review",
@@ -249,6 +254,7 @@ export function getIrohRemoteStreamCapability(options: {
 	// Worktree management is command-sensitive: the stream itself has no wider
 	// gate than each parsed command.
 	if (options.purpose === "manage_worktrees") return undefined;
+	if (options.purpose === "list_workspace_directories") return "conversation.observe.v1";
 	if (options.purpose === "unregister_workspace") return "workspace.manage.v1";
 	return undefined;
 }

@@ -75,7 +75,9 @@
 			"client_input_conflict",
 			"client_input_outcome_ambiguous",
 			"stale_plan_revision",
-			"stale_conversation_authority"
+			"stale_conversation_authority",
+			"review_discussions_unavailable",
+			"review_source_unavailable"
 		],
 		"remoteErrorStrings": [
 			"invalid_cursor",
@@ -671,6 +673,21 @@
 					"$ref": "#/$defs/RpcCommand.invoke_ui_action"
 				},
 				{
+					"$ref": "#/$defs/RpcCommand.start_review_discussions"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.list_review_discussions"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.reset_review_discussion"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_review_discussion_source"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_review_general"
+				},
+				{
 					"$ref": "#/$defs/RpcCommand.cancel_workflow"
 				},
 				{
@@ -954,6 +971,21 @@
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.invoke_ui_action"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.start_review_discussions"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.list_review_discussions"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.reset_review_discussion"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_review_discussion_source"
+				},
+				{
+					"$ref": "#/$defs/RpcCommand.get_review_general"
 				},
 				{
 					"$ref": "#/$defs/RpcCommand.cancel_workflow"
@@ -1876,6 +1908,48 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcCommand.get_review_discussion_source": {
+			"type": "object",
+			"required": [
+				"type"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_review_discussion_source"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.get_review_general": {
+			"type": "object",
+			"required": [
+				"type",
+				"runId"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "get_review_general"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcCommand.get_review_result": {
 			"type": "object",
 			"required": [
@@ -2327,6 +2401,39 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcCommand.list_review_discussions": {
+			"type": "object",
+			"required": [
+				"type",
+				"runId"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "list_review_discussions"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"cursor": {
+					"type": "string",
+					"maxLength": 32,
+					"pattern": "^[0-9]+$"
+				},
+				"limit": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 50
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcCommand.list_review_workflows": {
 			"type": "object",
 			"required": [
@@ -2446,9 +2553,26 @@
 				},
 				"preserveReviewRunId": {
 					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"replaceReviewGeneral": {
+					"type": "boolean"
 				}
 			},
-			"additionalProperties": false
+			"additionalProperties": false,
+			"anyOf": [
+				{
+					"properties": {
+						"replaceReviewGeneral": {
+							"const": false
+						}
+					}
+				},
+				{
+					"required": [
+						"preserveReviewRunId"
+					]
+				}
+			]
 		},
 		"RpcCommand.open_review_session": {
 			"type": "object",
@@ -2843,6 +2967,37 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcCommand.reset_review_discussion": {
+			"type": "object",
+			"required": [
+				"type",
+				"discussionId",
+				"expectedSessionId",
+				"requestId"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "reset_review_discussion"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"discussionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"expectedSessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"requestId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcCommand.set_agent_mode": {
 			"type": "object",
 			"required": [
@@ -3168,6 +3323,68 @@
 				},
 				"redirectUrl": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcCommand.start_review_discussions": {
+			"type": "object",
+			"required": [
+				"type",
+				"runId",
+				"findingIds",
+				"requestId"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "start_review_discussions"
+				},
+				"conversationAuthority": {
+					"$ref": "#/$defs/RpcConversationAuthority"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"findingIds": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcConversationIdentifier"
+					},
+					"minItems": 1,
+					"maxItems": 50,
+					"uniqueItems": true
+				},
+				"requestId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"discussionConfiguration": {
+					"type": "object",
+					"properties": {
+						"model": {
+							"type": "object",
+							"required": [
+								"provider",
+								"modelId"
+							],
+							"properties": {
+								"provider": {
+									"type": "string"
+								},
+								"modelId": {
+									"type": "string"
+								}
+							},
+							"additionalProperties": false
+						},
+						"thinkingLevel": {
+							"type": "string"
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
@@ -3903,7 +4120,9 @@
 								"client_input_conflict",
 								"client_input_outcome_ambiguous",
 								"stale_plan_revision",
-								"stale_conversation_authority"
+								"stale_conversation_authority",
+								"review_discussions_unavailable",
+								"review_source_unavailable"
 							]
 						}
 					},
@@ -3945,7 +4164,9 @@
 								"client_input_conflict",
 								"client_input_outcome_ambiguous",
 								"stale_plan_revision",
-								"stale_conversation_authority"
+								"stale_conversation_authority",
+								"review_discussions_unavailable",
+								"review_source_unavailable"
 							]
 						}
 					},
@@ -4790,6 +5011,30 @@
 				},
 				"reason": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcListReviewDiscussions": {
+			"type": "object",
+			"required": [
+				"runId",
+				"discussions"
+			],
+			"properties": {
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"discussions": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/RpcReviewDiscussion"
+					},
+					"maxItems": 50
+				},
+				"nextCursor": {
+					"type": "string",
+					"maxLength": 32
 				}
 			},
 			"additionalProperties": false
@@ -6475,6 +6720,31 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcResetReviewDiscussion": {
+			"type": "object",
+			"required": [
+				"requestId",
+				"status",
+				"discussion"
+			],
+			"properties": {
+				"requestId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"status": {
+					"type": "string",
+					"enum": [
+						"reset",
+						"conflict",
+						"busy"
+					]
+				},
+				"discussion": {
+					"$ref": "#/$defs/RpcReviewDiscussion"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcResponse": {
 			"anyOf": [
 				{
@@ -6526,7 +6796,22 @@
 					"$ref": "#/$defs/RpcResponse.invoke_ui_action"
 				},
 				{
+					"$ref": "#/$defs/RpcResponse.start_review_discussions"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.list_review_discussions"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.reset_review_discussion"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.get_review_discussion_source"
+				},
+				{
 					"$ref": "#/$defs/RpcResponse.cancel_workflow"
+				},
+				{
+					"$ref": "#/$defs/RpcResponse.get_review_general"
 				},
 				{
 					"$ref": "#/$defs/RpcResponse.get_review_result"
@@ -7843,6 +8128,103 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcResponse.get_review_discussion_source": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_review_discussion_source"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/RpcReviewDiscussion"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.get_review_general": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "get_review_general"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"type": "object",
+					"required": [
+						"runId",
+						"sourceSessionId",
+						"generalSessionId",
+						"generalSessionGeneration",
+						"generalRevision",
+						"generalAvailable"
+					],
+					"properties": {
+						"runId": {
+							"$ref": "#/$defs/RpcConversationIdentifier"
+						},
+						"sourceSessionId": {
+							"$ref": "#/$defs/RpcConversationIdentifier"
+						},
+						"generalSessionId": {
+							"$ref": "#/$defs/RpcConversationIdentifier"
+						},
+						"generalSessionGeneration": {
+							"$ref": "#/$defs/RpcConversationIdentifier"
+						},
+						"generalRevision": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"generalAvailable": {
+							"type": "boolean"
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcResponse.get_review_result": {
 			"type": "object",
 			"required": [
@@ -8435,6 +8817,36 @@
 				},
 				"data": {
 					"$ref": "#/$defs/RpcMcpToolsResponse"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.list_review_discussions": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "list_review_discussions"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcListReviewDiscussions"
 				}
 			},
 			"additionalProperties": false
@@ -9093,6 +9505,36 @@
 			},
 			"additionalProperties": false
 		},
+		"RpcResponse.reset_review_discussion": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "reset_review_discussion"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcResetReviewDiscussion"
+				}
+			},
+			"additionalProperties": false
+		},
 		"RpcResponse.set_agent_mode": {
 			"type": "object",
 			"required": [
@@ -9482,6 +9924,36 @@
 				},
 				"data": {
 					"$ref": "#/$defs/RpcMcpAuthResponse"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcResponse.start_review_discussions": {
+			"type": "object",
+			"required": [
+				"type",
+				"command",
+				"success",
+				"data"
+			],
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string",
+					"const": "response"
+				},
+				"command": {
+					"type": "string",
+					"const": "start_review_discussions"
+				},
+				"success": {
+					"type": "boolean",
+					"const": true
+				},
+				"data": {
+					"$ref": "#/$defs/RpcStartReviewDiscussions"
 				}
 			},
 			"additionalProperties": false
@@ -9989,6 +10461,88 @@
 					"items": {
 						"type": "string"
 					}
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcReviewDiscussion": {
+			"type": "object",
+			"required": [
+				"discussionId",
+				"runId",
+				"findingId",
+				"sourceSessionId",
+				"sessionId",
+				"currentSessionId",
+				"sourceAvailable",
+				"available",
+				"status"
+			],
+			"properties": {
+				"discussionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"findingId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"sourceSessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"sessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"currentSessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"sourceAvailable": {
+					"type": "boolean"
+				},
+				"available": {
+					"type": "boolean"
+				},
+				"status": {
+					"type": "string",
+					"enum": [
+						"idle",
+						"running",
+						"pending",
+						"completed",
+						"failed",
+						"cancelled",
+						"interrupted",
+						"unavailable"
+					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcReviewDiscussionLink": {
+			"type": "object",
+			"required": [
+				"discussionId",
+				"runId",
+				"findingId",
+				"sourceSessionId",
+				"sessionId"
+			],
+			"properties": {
+				"discussionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"findingId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"sourceSessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"sessionId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
 				}
 			},
 			"additionalProperties": false
@@ -11301,6 +11855,9 @@
 				"current"
 			],
 			"properties": {
+				"reviewDiscussion": {
+					"$ref": "#/$defs/RpcReviewDiscussionLink"
+				},
 				"sessionId": {
 					"type": "string"
 				},
@@ -11362,6 +11919,9 @@
 				"followUpQueue"
 			],
 			"properties": {
+				"reviewDiscussion": {
+					"$ref": "#/$defs/RpcReviewDiscussionLink"
+				},
 				"model": {
 					"$ref": "#/$defs/RpcModel"
 				},
@@ -12062,6 +12622,84 @@
 				},
 				"baseDir": {
 					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"RpcStartReviewDiscussions": {
+			"type": "object",
+			"required": [
+				"runId",
+				"requestId",
+				"results"
+			],
+			"properties": {
+				"runId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"requestId": {
+					"$ref": "#/$defs/RpcConversationIdentifier"
+				},
+				"results": {
+					"type": "array",
+					"items": {
+						"anyOf": [
+							{
+								"type": "object",
+								"required": [
+									"findingId",
+									"outcome",
+									"discussion"
+								],
+								"properties": {
+									"findingId": {
+										"$ref": "#/$defs/RpcConversationIdentifier"
+									},
+									"outcome": {
+										"type": "string",
+										"enum": [
+											"created",
+											"existing"
+										]
+									},
+									"discussion": {
+										"$ref": "#/$defs/RpcReviewDiscussion"
+									}
+								},
+								"additionalProperties": false
+							},
+							{
+								"type": "object",
+								"required": [
+									"findingId",
+									"outcome",
+									"errorCode"
+								],
+								"properties": {
+									"findingId": {
+										"$ref": "#/$defs/RpcConversationIdentifier"
+									},
+									"outcome": {
+										"type": "string",
+										"const": "failed"
+									},
+									"errorCode": {
+										"type": "string",
+										"enum": [
+											"unknown_finding",
+											"source_unavailable",
+											"launch_failed"
+										]
+									},
+									"discussion": {
+										"$ref": "#/$defs/RpcReviewDiscussion"
+									}
+								},
+								"additionalProperties": false
+							}
+						]
+					},
+					"maxItems": 50
 				}
 			},
 			"additionalProperties": false

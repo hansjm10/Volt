@@ -134,11 +134,11 @@ import {
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
 	acknowledgeReviewRun,
-	appendReviewFindingTransition,
 	appendReviewPublication,
 	appendReviewRun,
-	exportReviewFeedback,
-	getReviewRun,
+	exportCanonicalReviewFeedback,
+	getCanonicalReviewRun,
+	recordReviewFindingOutcome,
 } from "../../core/review-state.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
@@ -9138,8 +9138,15 @@ export class InteractiveMode {
 		action: string,
 		args: Record<string, unknown>,
 	): Promise<Awaited<ReturnType<NonNullable<HostActionInvocationContext["runReviewLifecycleAction"]>>>> {
+		const session = this.session;
+		const generation = session.conversationGenerationRevision;
+		const assertCurrent = () => {
+			if (this.session !== session || session.conversationGenerationRevision !== generation)
+				throw new Error("The review conversation changed; retry from the current session.");
+		};
 		const runId = typeof args.runId === "string" ? args.runId : undefined;
-		const record = runId ? getReviewRun(this.session.sessionManager, runId) : undefined;
+		const record = runId ? await getCanonicalReviewRun(session.sessionManager, runId) : undefined;
+		assertCurrent();
 		if (action !== REVIEW_EXPORT_FEEDBACK_ACTION_ID && !record)
 			throw new Error(`Unknown durable review run: ${runId ?? "missing"}`);
 		if (action === REVIEW_FIX_ACTION_ID) {
@@ -9234,18 +9241,25 @@ export class InteractiveMode {
 				reason !== "other"
 			)
 				throw new Error("Dismissed findings require an explicit reason.");
-			appendReviewFindingTransition(this.session.sessionManager, {
-				runId: record.runId,
-				findingId,
-				status,
-				...(reason === "false_positive" ||
-				reason === "intentional" ||
-				reason === "not_actionable" ||
-				reason === "other"
-					? { reason }
-					: {}),
-				...(typeof args.note === "string" ? { note: args.note } : {}),
-			});
+			await recordReviewFindingOutcome(
+				session.sessionManager,
+				{
+					runId: record.runId,
+					findingId,
+					status,
+					...(reason === "false_positive" ||
+					reason === "intentional" ||
+					reason === "not_actionable" ||
+					reason === "other"
+						? { reason }
+						: {}),
+					...(typeof args.note === "string" ? { note: args.note } : {}),
+				},
+				{
+					recordCanonicalOutcome: this.runtimeHost.reviewDiscussions?.recordOutcome,
+					assertCurrent,
+				},
+			);
 			await this.session.sessionManager.flush();
 			return {
 				action,
@@ -9280,9 +9294,14 @@ export class InteractiveMode {
 				`Publish complete review ${record.runId} to its code host? The PR head will be rechecked first.`,
 			);
 			if (!confirmed) return { action, status: "cancelled", message: "Review publishing cancelled" };
-			const published = await publishReviewRun(this.sessionManager.getCwd(), record);
-			appendReviewPublication(this.session.sessionManager, { runId: record.runId, ...published });
-			await this.session.sessionManager.flush();
+			assertCurrent();
+			const current = await getCanonicalReviewRun(session.sessionManager, record.runId);
+			assertCurrent();
+			if (!current) throw new Error(`Unknown durable review run: ${record.runId}`);
+			const published = await publishReviewRun(session.sessionManager.getCwd(), current);
+			assertCurrent();
+			appendReviewPublication(session.sessionManager, { runId: record.runId, ...published });
+			await session.sessionManager.flush();
 			return {
 				action,
 				status: "completed",
@@ -9296,13 +9315,12 @@ export class InteractiveMode {
 					: await this.showExtensionInput("Export review feedback", "review-feedback.json");
 			if (!requestedPath?.trim())
 				return { action, status: "cancelled", message: "Review feedback export cancelled" };
-			const outputPath = path.resolve(this.sessionManager.getCwd(), requestedPath.trim());
+			assertCurrent();
+			const feedback = await exportCanonicalReviewFeedback(session.sessionManager);
+			assertCurrent();
+			const outputPath = path.resolve(session.sessionManager.getCwd(), requestedPath.trim());
 			fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-			fs.writeFileSync(
-				outputPath,
-				`${JSON.stringify(exportReviewFeedback(this.session.sessionManager), null, 2)}\n`,
-				{ mode: 0o600 },
-			);
+			fs.writeFileSync(outputPath, `${JSON.stringify(feedback, null, 2)}\n`, { mode: 0o600 });
 			return { action, status: "completed", message: `Review feedback exported to ${outputPath}` };
 		}
 		throw new Error(`Unsupported review lifecycle action: ${action}`);

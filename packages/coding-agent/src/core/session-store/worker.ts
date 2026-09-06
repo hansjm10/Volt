@@ -1,5 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
@@ -12,6 +11,7 @@ import {
 import { decodeStoredSessionEntry, parsePersistedSessionEntry, sessionEntryEnvelope } from "../session-entry-codec.ts";
 import type { SessionEntry } from "../session-manager.ts";
 import { fuzzyMatchSessionText } from "../session-search.ts";
+import { hardenSessionStoreSidecars } from "./artifacts.ts";
 import {
 	digestSessionStoreTransactionPayload,
 	parseCanonicalSessionStoreJson,
@@ -30,12 +30,7 @@ import {
 	type SessionStoreWorkerOperation,
 	type SessionStoreWorkerResponseEnvelope,
 } from "./protocol.ts";
-import {
-	SESSION_STORE_INDEX_NAMES,
-	SESSION_STORE_SCHEMA_ID,
-	SESSION_STORE_SCHEMA_SQL,
-	SESSION_STORE_TABLE_NAMES,
-} from "./schema.ts";
+import { initializeSessionStoreSchema } from "./schema-migration.ts";
 import {
 	SESSION_STORE_BUSY_TIMEOUT_MS,
 	SESSION_STORE_DATABASE_FILENAME,
@@ -44,6 +39,7 @@ import {
 	type SessionStoreClientInput,
 	type SessionStoreCommitEvidence,
 	type SessionStoreCommitReconciliation,
+	type SessionStoreCreateReviewDiscussionInput,
 	type SessionStoreCreateSessionInput,
 	type SessionStoreDeleteSessionInput,
 	type SessionStoreDeleteSessionResult,
@@ -51,15 +47,23 @@ import {
 	SessionStoreError,
 	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
+	type SessionStoreRegisterReviewAnchorInput,
+	type SessionStoreReplaceReviewGeneralInput,
+	type SessionStoreResetReviewDiscussionInput,
+	type SessionStoreResetReviewDiscussionResult,
+	type SessionStoreReviewAnchor,
+	type SessionStoreReviewDiscussion,
+	type SessionStoreReviewDiscussionChild,
+	type SessionStoreReviewSource,
 	type SessionStoreSearchChunk,
 	type SessionStoreSearchResult,
+	type SessionStoreSessionIdentity,
 	type SessionStoreSessionSummary,
 	type SessionStoreSnapshot,
 	type SessionStoreTransactionResult,
 } from "./types.ts";
 
 const data = parseSessionStoreWorkerData(workerData);
-const expectedTableNames = new Set<string>(SESSION_STORE_TABLE_NAMES);
 const sessionDirectory = resolve(data.sessionDirectory);
 const databasePath = resolve(sessionDirectory, SESSION_STORE_DATABASE_FILENAME);
 const port = parentPort;
@@ -123,9 +127,8 @@ function sqlBoolean(row: Record<string, unknown>, key: string): boolean {
 }
 
 function hardenStoreArtifacts(): void {
-	for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
-		if (existsSync(path)) hardenPrivateRegularFileSync(path);
-	}
+	hardenPrivateRegularFileSync(databasePath);
+	hardenSessionStoreSidecars(databasePath);
 }
 
 function pragmaInteger(db: DatabaseSync, sql: string, key: string): number {
@@ -165,139 +168,12 @@ function withDeferredReadTransaction<T>(db: DatabaseSync, action: () => T): T {
 	}
 }
 
-function userSchemaObjects(db: DatabaseSync, type: "table" | "index"): string[] {
-	return db
-		.prepare(
-			"SELECT name FROM sqlite_schema WHERE type = ? AND name NOT LIKE 'sqlite_%' AND (? <> 'index' OR sql IS NOT NULL) ORDER BY name",
-		)
-		.all(type, type)
-		.map((row) => sqlString(row, "name"));
-}
-
-function schemaDigest(db: DatabaseSync): string {
-	const objects = db
-		.prepare(
-			`SELECT type, name, tbl_name AS tableName, sql
-			FROM sqlite_schema
-			WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
-			ORDER BY type, name`,
-		)
-		.all()
-		.map((row) => ({
-			type: sqlString(row, "type"),
-			name: sqlString(row, "name"),
-			tableName: sqlString(row, "tableName"),
-			sql: sqlString(row, "sql"),
-		}));
-	const canonicalObjects = stringifyCanonicalSessionStoreJson(objects, "Session store schema objects");
-	return `sha256:${createHash("sha256").update(canonicalObjects, "utf8").digest("hex")}`;
-}
-
-function expectedSchemaDigest(): string {
-	const expected = new DatabaseSync(":memory:");
-	try {
-		expected.exec(SESSION_STORE_SCHEMA_SQL);
-		return schemaDigest(expected);
-	} finally {
-		expected.close();
-	}
-}
-
-const EXPECTED_SCHEMA_DIGEST = expectedSchemaDigest();
-
-function assertExactNames(actual: readonly string[], expected: readonly string[], description: string): void {
-	const expectedSorted = [...expected].sort();
-	if (actual.length !== expectedSorted.length || actual.some((name, index) => name !== expectedSorted[index])) {
-		throw new SessionStoreError(
-			"store_schema_mismatch",
-			`Session store ${description} do not match schema version ${SESSION_STORE_SCHEMA_VERSION}`,
-		);
-	}
-}
-
-function initializeNewSchema(db: DatabaseSync): void {
-	withTransaction(db, () => {
-		const userVersion = pragmaInteger(db, "PRAGMA user_version", "user_version");
-		if (userVersion !== 0) return;
-		if (db.prepare("SELECT 1 AS present FROM main.sqlite_schema LIMIT 1").get()) {
-			throw new SessionStoreError(
-				"store_schema_mismatch",
-				"Refusing to initialize an unversioned non-empty session store",
-			);
-		}
-		db.exec(SESSION_STORE_SCHEMA_SQL);
-		const insertMetadata = db.prepare("INSERT INTO store_metadata (key, value_json) VALUES (?, ?)");
-		insertMetadata.run("schema_id", stringifyCanonicalSessionStoreJson(SESSION_STORE_SCHEMA_ID, "Schema id"));
-		insertMetadata.run("schema_digest", stringifyCanonicalSessionStoreJson(EXPECTED_SCHEMA_DIGEST, "Schema digest"));
-		insertMetadata.run("store_id", stringifyCanonicalSessionStoreJson(randomUUID(), "Store id"));
-		insertMetadata.run(
-			"schema_version",
-			stringifyCanonicalSessionStoreJson(SESSION_STORE_SCHEMA_VERSION, "Schema version"),
-		);
-		insertMetadata.run("created_at", stringifyCanonicalSessionStoreJson(new Date().toISOString(), "Creation time"));
-		db.exec(`PRAGMA user_version = ${SESSION_STORE_SCHEMA_VERSION}`);
-	});
-}
-
-function validateSchema(db: DatabaseSync): void {
-	const userVersion = pragmaInteger(db, "PRAGMA user_version", "user_version");
-	if (userVersion !== SESSION_STORE_SCHEMA_VERSION) {
-		throw new SessionStoreError(
-			"store_schema_mismatch",
-			`Session store schema version ${userVersion} is unsupported; expected ${SESSION_STORE_SCHEMA_VERSION}`,
-		);
-	}
-	assertExactNames(userSchemaObjects(db, "table"), SESSION_STORE_TABLE_NAMES, "tables");
-	assertExactNames(userSchemaObjects(db, "index"), SESSION_STORE_INDEX_NAMES, "indexes");
-	if (schemaDigest(db) !== EXPECTED_SCHEMA_DIGEST) {
-		throw new SessionStoreError(
-			"store_schema_mismatch",
-			"Session store DDL, views, or triggers do not match the expected schema",
-		);
-	}
-
-	const strictRows = db
-		.prepare("PRAGMA table_list")
-		.all()
-		.filter((row) => sqlString(row, "schema") === "main" && expectedTableNames.has(sqlString(row, "name")));
-	if (
-		strictRows.length !== SESSION_STORE_TABLE_NAMES.length ||
-		strictRows.some((row) => sqlInteger(row, "strict") !== 1)
-	) {
-		throw new SessionStoreError("store_schema_mismatch", "Every session store table must use SQLite STRICT mode");
-	}
-
-	const metadataRows = db.prepare("SELECT key, value_json FROM store_metadata ORDER BY key").all();
-	const metadata = new Map(
-		metadataRows.map((row) => [
-			sqlString(row, "key"),
-			parseCanonicalSessionStoreJson(sqlString(row, "value_json"), `Store metadata ${sqlString(row, "key")}`),
-		]),
-	);
-	const persistedStoreId = metadata.get("store_id");
-	if (
-		metadata.size !== 5 ||
-		metadata.get("schema_id") !== SESSION_STORE_SCHEMA_ID ||
-		metadata.get("schema_digest") !== EXPECTED_SCHEMA_DIGEST ||
-		metadata.get("schema_version") !== SESSION_STORE_SCHEMA_VERSION ||
-		typeof metadata.get("created_at") !== "string" ||
-		typeof persistedStoreId !== "string" ||
-		persistedStoreId.length === 0 ||
-		persistedStoreId.length > 512
-	) {
-		throw new SessionStoreError("store_schema_mismatch", "Session store metadata does not match its schema version");
-	}
-	storeId = persistedStoreId;
-}
-
 function openDatabase(): SessionStoreInfo {
 	if (closed) throw new SessionStoreError("closed", "Session store is closed");
 	if (database) return storeInfo();
 
 	ensurePrivateDirectorySync(sessionDirectory);
-	for (const path of [`${databasePath}-wal`, `${databasePath}-shm`]) {
-		if (existsSync(path)) hardenPrivateRegularFileSync(path);
-	}
+	hardenSessionStoreSidecars(databasePath);
 	try {
 		writePrivateNewFileSync(databasePath, new Uint8Array());
 	} catch (error) {
@@ -340,9 +216,7 @@ function openDatabase(): SessionStoreInfo {
 		opened.exec("PRAGMA temp_store = MEMORY");
 		opened.exec("PRAGMA secure_delete = ON");
 
-		const userVersion = pragmaInteger(opened, "PRAGMA user_version", "user_version");
-		if (userVersion === 0) initializeNewSchema(opened);
-		validateSchema(opened);
+		storeId = initializeSessionStoreSchema(opened);
 		database = opened;
 		hardenStoreArtifacts();
 		return storeInfo();
@@ -508,6 +382,19 @@ function findSummary(
 }
 
 function insertSession(db: DatabaseSync, input: SessionStoreCreateSessionInput): void {
+	// Historical references are tombstones for exact incarnations, even after session deletion.
+	if (
+		db
+			.prepare(`SELECT 1 FROM review_anchors WHERE source_session_id = ? AND source_session_generation = ?
+		UNION ALL SELECT 1 FROM review_discussion_children WHERE child_session_id = ? AND child_session_generation = ?
+		UNION ALL SELECT 1 FROM review_anchor_aliases WHERE session_id = ? AND session_generation = ? LIMIT 1`)
+			.get(input.id, input.sessionGeneration, input.id, input.sessionGeneration, input.id, input.sessionGeneration)
+	) {
+		throw new SessionStoreError(
+			"review_identity_conflict",
+			"Cannot reuse a historically referenced session incarnation",
+		);
+	}
 	try {
 		db.prepare(
 			`INSERT INTO sessions (
@@ -536,6 +423,347 @@ function insertSession(db: DatabaseSync, input: SessionStoreCreateSessionInput):
 		}
 		throw error;
 	}
+}
+
+function reviewSourceAvailable(db: DatabaseSync, source: SessionStoreReviewSource): boolean {
+	const summary = findSummary(db, source.sessionId, source.sessionGeneration);
+	return summary !== null && canonicalCwdIdentity(summary.cwd) === source.cwd;
+}
+
+function findReviewAnchor(db: DatabaseSync, runId: string): SessionStoreReviewAnchor | null {
+	const row = db.prepare("SELECT * FROM review_anchors WHERE run_id = ?").get(runId);
+	if (!row) return null;
+	const source = {
+		sessionId: sqlString(row, "source_session_id"),
+		sessionGeneration: sqlString(row, "source_session_generation"),
+		cwd: sqlString(row, "cwd"),
+	};
+	const general = {
+		sessionId: sqlString(row, "general_session_id"),
+		sessionGeneration: sqlString(row, "general_session_generation"),
+	};
+	return {
+		runId,
+		source,
+		createdAt: sqlString(row, "created_at"),
+		sourceAvailable: reviewSourceAvailable(db, source),
+		general,
+		generalRevision: sqlInteger(row, "general_revision"),
+		generalAvailable: reviewSourceAvailable(db, { ...general, cwd: source.cwd }),
+	};
+}
+
+function resolveReviewAnchor(
+	db: DatabaseSync,
+	runId: string,
+	member: SessionStoreReviewSource,
+): SessionStoreReviewAnchor | null {
+	const anchor = findReviewAnchor(db, runId);
+	if (
+		!anchor ||
+		anchor.source.cwd !== canonicalCwdIdentity(member.cwd) ||
+		!reviewSourceAvailable(db, { ...member, cwd: anchor.source.cwd })
+	)
+		return null;
+	const canonical =
+		anchor.source.sessionId === member.sessionId && anchor.source.sessionGeneration === member.sessionGeneration;
+	const alias = db
+		.prepare("SELECT 1 FROM review_anchor_aliases WHERE run_id = ? AND session_id = ? AND session_generation = ?")
+		.get(runId, member.sessionId, member.sessionGeneration);
+	return canonical || alias ? anchor : null;
+}
+
+function registerReviewAlias(
+	runId: string,
+	member: SessionStoreReviewSource,
+	alias: SessionStoreReviewSource,
+): SessionStoreReviewAnchor {
+	const db = requireDatabase();
+	return withTransaction(db, () => {
+		const anchor = resolveReviewAnchor(db, runId, member);
+		if (!anchor)
+			throw new SessionStoreError("review_identity_conflict", "Review handoff is not owned by this session");
+		requireAvailableReviewSource(anchor);
+		if (anchor.source.cwd !== canonicalCwdIdentity(alias.cwd))
+			throw new SessionStoreError("review_cwd_mismatch", "Review handoff cwd mismatch");
+		if (!reviewSourceAvailable(db, { ...alias, cwd: anchor.source.cwd }))
+			throw new SessionStoreError("review_source_unavailable", "Review handoff session is unavailable");
+		if (
+			db
+				.prepare(
+					"SELECT 1 FROM review_discussion_children WHERE child_session_id = ? AND child_session_generation = ?",
+				)
+				.get(alias.sessionId, alias.sessionGeneration)
+		)
+			throw new SessionStoreError(
+				"review_identity_conflict",
+				"Discussion children cannot become source authorities",
+			);
+		db.prepare(
+			"INSERT OR IGNORE INTO review_anchor_aliases (run_id, session_id, session_generation) VALUES (?, ?, ?)",
+		).run(runId, alias.sessionId, alias.sessionGeneration);
+		return anchor;
+	});
+}
+
+/** Read-only membership includes historical finding children, never canonical write authority. */
+function resolveReviewGeneral(
+	db: DatabaseSync,
+	runId: string,
+	member: SessionStoreReviewSource,
+): SessionStoreReviewAnchor | null {
+	const anchor = findReviewAnchor(db, runId);
+	if (
+		!anchor ||
+		anchor.source.cwd !== canonicalCwdIdentity(member.cwd) ||
+		!reviewSourceAvailable(db, { ...member, cwd: anchor.source.cwd })
+	)
+		return null;
+	if (resolveReviewAnchor(db, runId, member)) return anchor;
+	const child = db
+		.prepare(`SELECT 1 FROM review_discussion_children c
+		JOIN review_discussions d ON d.discussion_id = c.discussion_id
+		WHERE d.run_id = ? AND c.child_session_id = ? AND c.child_session_generation = ?`)
+		.get(runId, member.sessionId, member.sessionGeneration);
+	return child ? anchor : null;
+}
+
+function replaceReviewGeneral(input: SessionStoreReplaceReviewGeneralInput): SessionStoreReviewAnchor {
+	const db = requireDatabase();
+	return withTransaction(db, () => {
+		const anchor = resolveReviewAnchor(db, input.runId, input.member);
+		if (
+			!anchor ||
+			!anchor.generalAvailable ||
+			anchor.generalRevision !== input.expectedRevision ||
+			anchor.general.sessionId !== input.member.sessionId ||
+			anchor.general.sessionGeneration !== input.member.sessionGeneration
+		)
+			throw new SessionStoreError("review_identity_conflict", "Only the exact current General can replace itself");
+		const replacement = input.replacement;
+		if (
+			anchor.source.cwd !== canonicalCwdIdentity(replacement.cwd) ||
+			!reviewSourceAvailable(db, { ...replacement, cwd: anchor.source.cwd })
+		)
+			throw new SessionStoreError("review_source_unavailable", "Replacement General is unavailable");
+		if (
+			db
+				.prepare(
+					"SELECT 1 FROM review_discussion_children WHERE child_session_id = ? AND child_session_generation = ?",
+				)
+				.get(replacement.sessionId, replacement.sessionGeneration) ||
+			(replacement.sessionId === input.member.sessionId &&
+				replacement.sessionGeneration === input.member.sessionGeneration)
+		)
+			throw new SessionStoreError(
+				"review_identity_conflict",
+				"Replacement General must be a new source conversation",
+			);
+		db.prepare(
+			"INSERT OR IGNORE INTO review_anchor_aliases (run_id, session_id, session_generation) VALUES (?, ?, ?)",
+		).run(input.runId, replacement.sessionId, replacement.sessionGeneration);
+		db.prepare(`UPDATE review_anchors SET general_session_id = ?, general_session_generation = ?, general_revision = general_revision + 1
+			WHERE run_id = ? AND general_revision = ?`).run(
+			replacement.sessionId,
+			replacement.sessionGeneration,
+			input.runId,
+			input.expectedRevision,
+		);
+		return findReviewAnchor(db, input.runId)!;
+	});
+}
+
+function assertReviewSource(anchor: Pick<SessionStoreReviewAnchor, "source">, source: SessionStoreReviewSource): void {
+	if (anchor.source.sessionId !== source.sessionId || anchor.source.sessionGeneration !== source.sessionGeneration) {
+		throw new SessionStoreError("review_identity_conflict", "Review run belongs to a different source incarnation");
+	}
+	if (anchor.source.cwd !== canonicalCwdIdentity(source.cwd)) {
+		throw new SessionStoreError("review_cwd_mismatch", "Review source cwd does not match its canonical anchor");
+	}
+}
+
+function requireAvailableReviewSource(anchor: Pick<SessionStoreReviewAnchor, "sourceAvailable">): void {
+	if (!anchor.sourceAvailable)
+		throw new SessionStoreError(
+			"review_source_unavailable",
+			"Review source is missing, deleted, stale or has a different cwd",
+		);
+}
+
+function registerReviewAnchor(input: SessionStoreRegisterReviewAnchorInput): SessionStoreReviewAnchor {
+	const db = requireDatabase();
+	return withTransaction(db, () => {
+		const existing = findReviewAnchor(db, input.runId);
+		if (existing) {
+			assertReviewSource(existing, input.source);
+			requireAvailableReviewSource(existing);
+			return existing;
+		}
+		const source = { ...input.source, cwd: canonicalCwdIdentity(input.source.cwd) };
+		const summary = findSummary(db, source.sessionId, source.sessionGeneration);
+		if (!summary)
+			throw new SessionStoreError("review_source_unavailable", "Review source incarnation does not exist");
+		if (canonicalCwdIdentity(summary.cwd) !== source.cwd)
+			throw new SessionStoreError("review_cwd_mismatch", "Review source cwd mismatch");
+		db.prepare(
+			`INSERT INTO review_anchors (run_id, source_session_id, source_session_generation, cwd, created_at,
+			general_session_id, general_session_generation, general_revision) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+		).run(
+			input.runId,
+			source.sessionId,
+			source.sessionGeneration,
+			source.cwd,
+			input.createdAt,
+			source.sessionId,
+			source.sessionGeneration,
+		);
+		return findReviewAnchor(db, input.runId)!;
+	});
+}
+
+function reviewChildFromRow(
+	db: DatabaseSync,
+	row: Record<string, unknown>,
+	cwd: string,
+): SessionStoreReviewDiscussionChild {
+	const child: SessionStoreSessionIdentity = {
+		sessionId: sqlString(row, "child_session_id"),
+		sessionGeneration: sqlString(row, "child_session_generation"),
+	};
+	const summary = findSummary(db, child.sessionId, child.sessionGeneration);
+	return {
+		discussionId: sqlString(row, "discussion_id"),
+		ordinal: sqlInteger(row, "ordinal"),
+		child,
+		createdAt: sqlString(row, "created_at"),
+		requestId: sqlString(row, "request_id"),
+		kickoffClientMessageId: sqlString(row, "kickoff_client_message_id"),
+		available: summary !== null && canonicalCwdIdentity(summary.cwd) === cwd,
+	};
+}
+
+function reviewDiscussionFromRow(db: DatabaseSync, row: Record<string, unknown>): SessionStoreReviewDiscussion {
+	const discussionId = sqlString(row, "discussion_id");
+	const runId = sqlString(row, "run_id");
+	const anchor = findReviewAnchor(db, runId);
+	const childRow = db
+		.prepare("SELECT * FROM review_discussion_children WHERE discussion_id = ? AND ordinal = ?")
+		.get(discussionId, sqlInteger(row, "current_ordinal"));
+	if (!anchor || !childRow)
+		throw new SessionStoreError("constraint_failed", "Review discussion has missing canonical relations");
+	return {
+		discussionId,
+		runId,
+		findingId: sqlString(row, "finding_id"),
+		source: anchor.source,
+		sourceAvailable: anchor.sourceAvailable,
+		contextSnapshot: parseCanonicalSessionStoreJson(sqlString(row, "context_snapshot_json"), "Review context"),
+		createdAt: sqlString(row, "created_at"),
+		current: reviewChildFromRow(db, childRow, anchor.source.cwd),
+	};
+}
+
+function requireReviewDiscussion(db: DatabaseSync, discussionId: string): SessionStoreReviewDiscussion {
+	const row = db.prepare("SELECT * FROM review_discussions WHERE discussion_id = ?").get(discussionId);
+	if (!row) throw new SessionStoreError("review_discussion_not_found", "Review discussion does not exist");
+	return reviewDiscussionFromRow(db, row);
+}
+
+function reserveReviewChild(
+	db: DatabaseSync,
+	input: SessionStoreCreateReviewDiscussionInput | SessionStoreResetReviewDiscussionInput,
+	cwd: string,
+	ordinal: number,
+): void {
+	if (canonicalCwdIdentity(input.child.cwd) !== cwd)
+		throw new SessionStoreError("review_cwd_mismatch", "Discussion child must use the canonical source cwd");
+	insertSession(db, input.child);
+	db.prepare(`INSERT INTO review_discussion_children (discussion_id, ordinal, child_session_id, child_session_generation,
+		request_id, request_json, kickoff_client_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+		input.discussionId,
+		ordinal,
+		input.child.id,
+		input.child.sessionGeneration,
+		input.requestId,
+		stringifyCanonicalSessionStoreJson(input, "Review request"),
+		input.kickoffClientMessageId,
+		input.createdAt,
+	);
+}
+
+function createReviewDiscussion(input: SessionStoreCreateReviewDiscussionInput): SessionStoreReviewDiscussion {
+	const db = requireDatabase();
+	return withTransaction(db, () => {
+		const anchor = findReviewAnchor(db, input.runId);
+		if (!anchor)
+			throw new SessionStoreError(
+				"review_anchor_not_found",
+				"Canonical review anchor must be registered before creating discussions",
+			);
+		assertReviewSource(anchor, input.source);
+		requireAvailableReviewSource(anchor);
+		if (canonicalCwdIdentity(input.child.cwd) !== anchor.source.cwd)
+			throw new SessionStoreError("review_cwd_mismatch", "Discussion child cwd mismatch");
+		const existing = db
+			.prepare("SELECT * FROM review_discussions WHERE run_id = ? AND finding_id = ?")
+			.get(input.runId, input.findingId);
+		if (existing) return reviewDiscussionFromRow(db, existing);
+		if (db.prepare("SELECT 1 FROM review_discussions WHERE discussion_id = ?").get(input.discussionId)) {
+			throw new SessionStoreError("review_identity_conflict", "Discussion id already belongs to another finding");
+		}
+		db.prepare(`INSERT INTO review_discussions (discussion_id, run_id, finding_id, context_snapshot_json, created_at, current_ordinal)
+			VALUES (?, ?, ?, ?, ?, 1)`).run(
+			input.discussionId,
+			input.runId,
+			input.findingId,
+			stringifyCanonicalSessionStoreJson(input.contextSnapshot, "Review context"),
+			input.createdAt,
+		);
+		reserveReviewChild(db, input, anchor.source.cwd, 1);
+		return requireReviewDiscussion(db, input.discussionId);
+	});
+}
+
+function resetReviewDiscussion(input: SessionStoreResetReviewDiscussionInput): SessionStoreResetReviewDiscussionResult {
+	const db = requireDatabase();
+	return withTransaction(db, () => {
+		const discussion = requireReviewDiscussion(db, input.discussionId);
+		const anchor = {
+			runId: discussion.runId,
+			source: discussion.source,
+			createdAt: discussion.createdAt,
+			sourceAvailable: discussion.sourceAvailable,
+		};
+		assertReviewSource(anchor, input.source);
+		const previous = db
+			.prepare("SELECT * FROM review_discussion_children WHERE discussion_id = ? AND request_id = ?")
+			.get(input.discussionId, input.requestId);
+		if (previous) {
+			if (
+				sqlString(previous, "request_json") !== stringifyCanonicalSessionStoreJson(input, "Review reset request")
+			) {
+				throw new SessionStoreError(
+					"review_identity_conflict",
+					"Review request id already identifies a different operation",
+				);
+			}
+			return { status: "reset", child: reviewChildFromRow(db, previous, discussion.source.cwd) };
+		}
+		requireAvailableReviewSource(anchor);
+		if (
+			discussion.current.child.sessionId !== input.expectedChild.sessionId ||
+			discussion.current.child.sessionGeneration !== input.expectedChild.sessionGeneration
+		) {
+			return { status: "conflict", child: discussion.current };
+		}
+		// A deleted current child can be reset, but never silently rebound to a reused id.
+		const ordinal = discussion.current.ordinal + 1;
+		reserveReviewChild(db, input, discussion.source.cwd, ordinal);
+		db.prepare(
+			"UPDATE review_discussions SET current_ordinal = ? WHERE discussion_id = ? AND current_ordinal = ?",
+		).run(ordinal, input.discussionId, discussion.current.ordinal);
+		return { status: "reset", child: requireReviewDiscussion(db, input.discussionId).current };
+	});
 }
 
 function createSession(input: SessionStoreCreateSessionInput): SessionStoreSessionSummary {
@@ -1271,6 +1499,72 @@ function closeDatabase(): null {
 
 function execute(operation: SessionStoreWorkerOperation): unknown {
 	switch (operation.kind) {
+		case "replace_review_general":
+			return replaceReviewGeneral(operation.input);
+		case "resolve_review_general":
+			return withDeferredReadTransaction(requireDatabase(), () =>
+				resolveReviewGeneral(requireDatabase(), operation.runId, operation.member),
+			);
+		case "register_review_alias":
+			return registerReviewAlias(operation.runId, operation.member, operation.alias);
+		case "resolve_review_anchor":
+			return withDeferredReadTransaction(requireDatabase(), () =>
+				resolveReviewAnchor(requireDatabase(), operation.runId, operation.member),
+			);
+		case "register_review_anchor":
+			return registerReviewAnchor(operation.input);
+		case "create_review_discussion":
+			return createReviewDiscussion(operation.input);
+		case "reset_review_discussion":
+			return resetReviewDiscussion(operation.input);
+		case "find_review_anchor":
+			return withDeferredReadTransaction(requireDatabase(), () =>
+				findReviewAnchor(requireDatabase(), operation.runId),
+			);
+		case "find_review_discussion_by_id":
+		case "find_review_discussion":
+		case "find_review_discussion_by_child":
+		case "list_review_discussions":
+		case "list_review_discussion_history": {
+			const db = requireDatabase();
+			return withDeferredReadTransaction(db, () => {
+				if (operation.kind === "find_review_discussion_by_id") {
+					const row = db
+						.prepare("SELECT * FROM review_discussions WHERE discussion_id = ?")
+						.get(operation.discussionId);
+					return row ? reviewDiscussionFromRow(db, row) : null;
+				}
+				if (operation.kind === "find_review_discussion") {
+					const row = db
+						.prepare("SELECT * FROM review_discussions WHERE run_id = ? AND finding_id = ?")
+						.get(operation.runId, operation.findingId);
+					return row ? reviewDiscussionFromRow(db, row) : null;
+				}
+				if (operation.kind === "find_review_discussion_by_child") {
+					const row = db
+						.prepare(
+							"SELECT * FROM review_discussion_children WHERE child_session_id = ? AND child_session_generation = ?",
+						)
+						.get(operation.child.sessionId, operation.child.sessionGeneration);
+					if (!row) return null;
+					const discussion = requireReviewDiscussion(db, sqlString(row, "discussion_id"));
+					return { discussion, child: reviewChildFromRow(db, row, discussion.source.cwd) };
+				}
+				if (operation.kind === "list_review_discussions") {
+					return db
+						.prepare("SELECT * FROM review_discussions WHERE run_id = ? ORDER BY discussion_id LIMIT ? OFFSET ?")
+						.all(operation.runId, operation.limit, operation.offset)
+						.map((row) => reviewDiscussionFromRow(db, row));
+				}
+				const discussion = requireReviewDiscussion(db, operation.discussionId);
+				return db
+					.prepare(
+						"SELECT * FROM review_discussion_children WHERE discussion_id = ? ORDER BY ordinal LIMIT ? OFFSET ?",
+					)
+					.all(operation.discussionId, operation.limit, operation.offset)
+					.map((row) => reviewChildFromRow(db, row, discussion.source.cwd));
+			});
+		}
 		case "initialize":
 			return openDatabase();
 		case "verify_foreign_keys":

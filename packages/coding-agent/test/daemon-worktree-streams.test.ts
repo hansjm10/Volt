@@ -1,6 +1,14 @@
 import { Buffer } from "node:buffer";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { createIrohRemotePresetAccess, type IrohRemoteRpcGrant } from "../src/core/remote/iroh/access-grant.ts";
+import {
+	createIrohRemoteExplicitAccess,
+	createIrohRemotePresetAccess,
+	getIrohRemoteStreamCapability,
+	type IrohRemoteRpcGrant,
+} from "../src/core/remote/iroh/access-grant.ts";
 import { type IrohRemoteAuditEvent, IrohRemoteAuditLogger } from "../src/core/remote/iroh/audit.ts";
 import type { IrohRemoteClientAuthorizationSuccess } from "../src/core/remote/iroh/authorization.ts";
 import type { IrohRemoteWorkspaceWorktree } from "../src/core/remote/iroh/state.ts";
@@ -468,6 +476,7 @@ describe("workspace unregister management stream", () => {
 				},
 				unregisterWorkspace,
 			},
+			"unregister_workspace",
 		);
 
 		expect(parseWrittenObjects(send)).toEqual([
@@ -494,6 +503,106 @@ describe("workspace unregister management stream", () => {
 					worktreeCount: 1,
 					worktreeIds: ["fix-login"],
 				},
+			},
+		]);
+	});
+});
+
+describe("read-only workspace directory management stream", () => {
+	it.each(["coding", "full"] as const)(
+		"lists folders using %s access and rejects workspace removal",
+		async (preset) => {
+			const root = await mkdtemp(join(tmpdir(), "volt-directory-stream-"));
+			try {
+				await mkdir(join(root, "packages", "app"), { recursive: true });
+				const authorization = createAuthorization(createIrohRemotePresetAccess(preset).rpcGrant);
+				authorization.workspace = { name: "ws", path: root };
+				const recv = new ManualIrohRecvStream();
+				const send = new ManualIrohSendStream();
+				for (const command of [
+					{ id: "folders", type: "list_workspace_directories", workspaceName: "ws", path: "packages" },
+					{ id: "foreign", type: "list_workspace_directories", workspaceName: "other" },
+					{ id: "escape", type: "list_workspace_directories", workspaceName: "ws", path: "../" },
+					{ id: "remove", type: "unregister_workspace", workspaceName: "ws" },
+				])
+					recv.pushLine(JSON.stringify(command));
+				recv.end();
+				const unregisterWorkspace = vi.fn(async () => ({
+					ok: true as const,
+					closedStreamCount: 0,
+					stoppedRuntimeCount: 0,
+				}));
+				await runWorkspaceManagementStream(
+					{
+						stream: { recv, send },
+						initialInput: [],
+						authorization,
+						isRpcGrantCurrent: () => true,
+						closeStream: vi.fn(),
+					},
+					{
+						auditLogger: new IrohRemoteAuditLogger(),
+						commandContext: {
+							stateManager: new IrohRemoteHostStateManager(),
+							sessionListCursors: new Map(),
+							sessionListCursorTtlMs: 60_000,
+						},
+						unregisterWorkspace,
+					},
+					"list_workspace_directories",
+				);
+				expect(parseWrittenObjects(send)).toMatchObject([
+					{
+						id: "folders",
+						success: true,
+						data: { workspaceName: "ws", path: "packages", directories: [{ name: "app", path: "packages/app" }] },
+					},
+					{ id: "foreign", success: false, error: "session_mismatch" },
+					{ id: "escape", success: false, error: "invalid_working_directory" },
+					{ id: "remove", success: false, error: "unsupported_on_workspace_management_stream" },
+				]);
+				expect(unregisterWorkspace).not.toHaveBeenCalled();
+				expect(
+					getIrohRemoteStreamCapability({ mode: "workspaceManagement", purpose: "list_workspace_directories" }),
+				).toBe("conversation.observe.v1");
+				expect(
+					getIrohRemoteStreamCapability({ mode: "workspaceManagement", purpose: "unregister_workspace" }),
+				).toBe("workspace.manage.v1");
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("denies folder reads without observation authority", async () => {
+		const recv = new ManualIrohRecvStream();
+		const send = new ManualIrohSendStream();
+		recv.pushLine(JSON.stringify({ id: "folders", type: "list_workspace_directories", workspaceName: "ws" }));
+		recv.end();
+		await runWorkspaceManagementStream(
+			{
+				stream: { recv, send },
+				initialInput: [],
+				authorization: createAuthorization(createIrohRemoteExplicitAccess([], []).rpcGrant),
+				isRpcGrantCurrent: () => true,
+				closeStream: vi.fn(),
+			},
+			{
+				auditLogger: new IrohRemoteAuditLogger(),
+				commandContext: {
+					stateManager: new IrohRemoteHostStateManager(),
+					sessionListCursors: new Map(),
+					sessionListCursorTtlMs: 60_000,
+				},
+				unregisterWorkspace: vi.fn(),
+			},
+			"list_workspace_directories",
+		);
+		expect(parseWrittenObjects(send)).toMatchObject([
+			{
+				id: "folders",
+				success: false,
+				error: { code: "rpc_capability_denied", requiredCapability: "conversation.observe.v1" },
 			},
 		]);
 	});

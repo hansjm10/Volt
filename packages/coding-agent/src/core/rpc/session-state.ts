@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import type { AgentSession, AgentSessionQueuedMessage } from "../agent-session.ts";
 import { DEFAULT_PLANNING_STATE } from "../planning.ts";
+import { projectReviewDiscussionLink } from "../review-discussions.ts";
 import { isRuntimeQueueEntryId, isValidClientMessageId } from "../session-manager.ts";
 import { SUBAGENT_REGISTRY_TOOL_NAME } from "../subagents/tool-names.ts";
 import { projectSubagentDetails } from "./transcript.ts";
@@ -621,7 +622,9 @@ export function buildRpcSessionState(session: AgentSession): RpcSessionState {
 	if (followUpQueue.projection) projection.followUpQueue = followUpQueue.projection;
 	if (activeTools.projection) projection.activeTools = activeTools.projection;
 
+	const discussion = session.sessionManager.getReviewDiscussion?.();
 	const state: RpcSessionState = {
+		...(discussion ? { reviewDiscussion: projectReviewDiscussionLink(discussion) } : {}),
 		...(includeModel ? { model: session.model } : {}),
 		thinkingLevel: session.thinkingLevel,
 		availableThinkingLevels: session.getAvailableThinkingLevels(),

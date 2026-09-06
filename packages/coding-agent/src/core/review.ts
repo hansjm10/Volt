@@ -47,7 +47,7 @@ import {
 	appendReviewRunDurably,
 	assertReviewControlsPersistLosslessly,
 	createReviewRunRecord,
-	planIncrementalReview,
+	planCanonicalIncrementalReview,
 	type ReviewIncrementalPlan,
 	type ReviewRunRecord,
 	reconcileFindingIdentities,
@@ -1112,7 +1112,7 @@ export async function prepareReviewWorkflow(options: PrepareReviewWorkflowOption
 			model: reviewModel.model,
 			verifierModel: verifier.model,
 			startedAt: options.startedAt ?? Date.now(),
-			incrementalPlan: planIncrementalReview(
+			incrementalPlan: await planCanonicalIncrementalReview(
 				options.sessionManager,
 				resolution,
 				controls,

@@ -20,9 +20,17 @@ import {
 	type PlanningState,
 	StalePlanRevisionError,
 } from "./planning.ts";
-import { captureReviewStateForHandoff, restoreReviewStateFromHandoff } from "./review-state.ts";
+import { registerReviewHandoffAliases } from "./review-anchors.ts";
+import {
+	getReviewDiscussionLink,
+	projectReviewDiscussionLink,
+	type ReviewDiscussionService,
+} from "./review-discussions.ts";
+import { prepareReviewGeneralReplacement } from "./review-general.ts";
+import { captureReviewStateForHandoff, listReviewRuns, restoreReviewStateFromHandoff } from "./review-state.ts";
 import { ReviewWorkflowManager } from "./review-workflows.ts";
 import { ConversationProjectionFeed, type ConversationProjectionSource } from "./rpc/conversation-projection-feed.ts";
+import type { RpcReviewDiscussionLink } from "./rpc/schema/review-discussions.ts";
 import type { RpcGitContext } from "./rpc/types.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists, MissingSessionCwdError } from "./session-cwd.ts";
@@ -69,6 +77,7 @@ export interface SubagentRuntimeContext {
 }
 
 export interface WorkspaceSessionSummary {
+	reviewDiscussion?: RpcReviewDiscussionLink;
 	sessionId: string;
 	sessionName?: string;
 	createdAt: string;
@@ -93,7 +102,7 @@ export interface AgentSessionSwitchOptions {
 
 export interface AgentSessionReplacementTransaction {
 	commit(): Promise<void>;
-	/** Release the replacement reservation after the new projection generation is published. */
+	/** Finish host ownership before replacement callbacks and any durable publication barrier. */
 	finalize?(): Promise<void>;
 	rollback(): Promise<void>;
 	dispose(): Promise<void>;
@@ -311,6 +320,27 @@ export class AgentSessionRuntime {
 	private readonly clientInputAdmissions = new Map<Promise<void>, AgentSession>();
 	private _reviewWorkflows?: ReviewWorkflowManager;
 	readonly conversationProjectionFeed: ConversationProjectionFeed;
+	/** Installed only by a daemon with sibling runtime ownership. */
+	reviewDiscussions?: ReviewDiscussionService;
+
+	/** Host-only creation: does not replace or rekey the selected source runtime. */
+	async createReviewDiscussionSibling(manager: SessionManager): Promise<AgentSessionRuntime> {
+		if (
+			this.session.isReviewDiscussion ||
+			!manager.getReviewDiscussion() ||
+			!sameFilesystemLocation(manager.getCwd(), this.cwd)
+		) {
+			await manager.closePersistence();
+			throw new Error("Review sibling requires an exact source cwd and a durable child binding");
+		}
+		return createAgentSessionRuntime(this.createRuntime, {
+			cwd: this.cwd,
+			agentDir: this.services.agentDir,
+			sessionManager: manager,
+			profile: this.getReplacementProfile(),
+			...this.getReplacementGitContextOptions(this.cwd),
+		});
+	}
 
 	constructor(
 		_session: AgentSession,
@@ -629,6 +659,11 @@ export class AgentSessionRuntime {
 		operation: (context: AgentSessionStructuralOperation) => Promise<T>,
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<T> {
+		if (this.session.isReviewDiscussion) {
+			return Promise.reject(
+				new Error("Finding discussion identity is source-linked; reset context from the source review"),
+			);
+		}
 		if (!this.acceptingStructuralOperations) {
 			return Promise.reject(new Error("Agent session runtime is no longer accepting structural operations"));
 		}
@@ -770,6 +805,8 @@ export class AgentSessionRuntime {
 		sessionManager: SessionManager;
 		create: () => Promise<CreateAgentSessionRuntimeResult>;
 		afterApply?: () => Promise<void>;
+		/** Last durable publication step, after every fallible replacement callback. */
+		commitPublication?: () => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		/** RPC request correlated with the replacement bootstrap, when any. */
 		rebindRequestId?: string;
@@ -853,8 +890,33 @@ export class AgentSessionRuntime {
 					) {
 						throw new Error("Agent session replacement changed before ownership commit");
 					}
+					const publicationSession = created.session;
+					const publicationGeneration = created.session.conversationGenerationRevision;
+					const commitPublication = options.commitPublication;
+					const assertPublicationCurrent = (boundary: "before" | "during"): void => {
+						if (
+							this.sessionInvalidated ||
+							this.session !== publicationSession ||
+							this.session.sessionId !== sessionId ||
+							this.session.conversationGenerationRevision !== publicationGeneration ||
+							this.lifecycleRevision !== options.operation.expectedRevision + 1
+						)
+							throw new Error(`Agent session replacement changed ${boundary} durable publication`);
+					};
 					await transaction?.commit();
-					return await this.finishSessionReplacement(options.withSession, transaction, options.rebindRequestId);
+					return await this.finishSessionReplacement(
+						options.withSession,
+						transaction,
+						options.rebindRequestId,
+						commitPublication
+							? async () => {
+									assertPublicationCurrent("before");
+									await commitPublication();
+									assertPublicationCurrent("during");
+									this.conversationProjectionFeed.commitSourceRebind(options.rebindRequestId);
+								}
+							: undefined,
+					);
 				} catch (error: unknown) {
 					const replacementError = error instanceof Error ? error : new Error(String(error));
 					const cleanupErrors: unknown[] = [];
@@ -999,6 +1061,7 @@ export class AgentSessionRuntime {
 		withSession: ((ctx: ReplacedSessionContext) => Promise<void>) | undefined,
 		transaction: AgentSessionReplacementTransaction | undefined,
 		rebindRequestId: string | undefined,
+		publishReplacement?: () => Promise<void>,
 	): Promise<{ seeded: boolean }> {
 		try {
 			for (const listener of [...this.sessionWillProjectListeners]) {
@@ -1009,7 +1072,22 @@ export class AgentSessionRuntime {
 			this.conversationProjectionFeed.failSourceRebind(ownershipError);
 			throw ownershipError;
 		}
-		this.conversationProjectionFeed.commitSourceRebind(rebindRequestId);
+		// Ordinary replacements publish before extension callbacks so their input
+		// and UI interactions can stream. A durable destination replacement must
+		// instead finish preparation and commit its routing record before clients
+		// can adopt the candidate identity. Preparation failures retain the original
+		// General. After the routing commit, projection failure may close the runtime
+		// but its persisted General remains the authoritative resumable destination.
+		if (!publishReplacement) this.conversationProjectionFeed.commitSourceRebind(rebindRequestId);
+		const result = await this.bindAndSeedReplacementSession(withSession, transaction);
+		await publishReplacement?.();
+		return result;
+	}
+
+	private async bindAndSeedReplacementSession(
+		withSession: ((ctx: ReplacedSessionContext) => Promise<void>) | undefined,
+		transaction: AgentSessionReplacementTransaction | undefined,
+	): Promise<{ seeded: boolean }> {
 		await transaction?.finalize?.();
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
@@ -1053,7 +1131,9 @@ export class AgentSessionRuntime {
 		const header = this.session.sessionManager.getHeader();
 		const startingGitContext = this.session.sessionManager.getStartingGitContext();
 		const summary = this.session.sessionManager.getSessionEntrySummary();
+		const discussion = this.session.sessionManager.getReviewDiscussion();
 		return {
+			...(discussion ? { reviewDiscussion: projectReviewDiscussionLink(discussion) } : {}),
 			sessionId: this.session.sessionId,
 			sessionName: this.session.sessionName,
 			createdAt: toSessionTimestamp(header?.timestamp),
@@ -1072,8 +1152,14 @@ export class AgentSessionRuntime {
 
 	async listSessions(): Promise<WorkspaceSessionSummary[]> {
 		const current = this.getCurrentSessionSummary();
-		const summaries = (await this.listWorkspaceSessionInfos()).map((info) =>
-			sessionInfoToSummary(info, this.session.sessionId),
+		const summaries = await Promise.all(
+			(await this.listWorkspaceSessionInfos()).map(async (info) => {
+				const reviewDiscussion = await getReviewDiscussionLink(info.ref);
+				return {
+					...sessionInfoToSummary(info, this.session.sessionId),
+					...(reviewDiscussion ? { reviewDiscussion } : {}),
+				};
+			}),
 		);
 		const currentIndex = summaries.findIndex((summary) => summary.sessionId === current.sessionId);
 		if (currentIndex === -1) {
@@ -1194,6 +1280,8 @@ export class AgentSessionRuntime {
 
 	async newSession(options?: {
 		parentSessionRef?: SessionReference;
+		preserveReviewRunId?: string;
+		replaceReviewGeneral?: boolean;
 		/** RPC request correlated with the replacement bootstrap, when any. */
 		rebindRequestId?: string;
 		/** Override the new session's cwd (e.g. a daemon-managed worktree checkout). */
@@ -1226,6 +1314,9 @@ export class AgentSessionRuntime {
 		strategy: PlanExecutionStrategy,
 		assertConversationGenerationCurrent?: () => void,
 	): Promise<{ planning: PlanningState; selectedSessionId: string; started: boolean }> {
+		if (this.session.isReviewDiscussion && strategy === "new_session") {
+			throw new Error("Finding discussions execute plans in the current context; reset through the source review");
+		}
 		const sourceSession = this.session;
 		const sourcePlanning = sourceSession.planningState;
 		const sourcePlan = sourcePlanning.plan;
@@ -1377,6 +1468,8 @@ export class AgentSessionRuntime {
 		options:
 			| {
 					parentSessionRef?: SessionReference;
+					preserveReviewRunId?: string;
+					replaceReviewGeneral?: boolean;
 					rebindRequestId?: string;
 					cwd?: string;
 					sessionDir?: string;
@@ -1389,6 +1482,8 @@ export class AgentSessionRuntime {
 			| undefined,
 		operation: AgentSessionStructuralOperation,
 	): Promise<AgentSessionReplacementResult> {
+		if (options?.replaceReviewGeneral && !options.preserveReviewRunId)
+			throw new Error("replaceReviewGeneral requires preserveReviewRunId");
 		const beforeResult = await this.emitBeforeSwitch("new");
 		this.assertStructuralOperationCurrent(operation);
 		if (beforeResult.cancelled) {
@@ -1414,13 +1509,27 @@ export class AgentSessionRuntime {
 		}
 		const ownsSessionManager = sessionManager !== this.session.sessionManager;
 		let managerTransferred = false;
+		let generalReplacement: Awaited<ReturnType<typeof prepareReviewGeneralReplacement>> | undefined;
 		try {
+			if (options?.replaceReviewGeneral)
+				generalReplacement = await prepareReviewGeneralReplacement(
+					this.session.sessionManager,
+					options.preserveReviewRunId!,
+				);
 			this.assertStructuralOperationCurrent(operation);
 			if (options?.setup) {
 				await options.setup(sessionManager);
 				this.assertStructuralOperationCurrent(operation);
 			}
 			await sessionManager.flush();
+			await registerReviewHandoffAliases(
+				this.session.sessionManager,
+				sessionManager,
+				listReviewRuns(sessionManager, { limit: 50 })
+					.runs.map((run) => run.runId)
+					.filter((runId) => !generalReplacement || runId !== options?.preserveReviewRunId),
+			);
+			this.assertStructuralOperationCurrent(operation);
 
 			managerTransferred = true;
 			const replacement = await this.replaceCurrentSession({
@@ -1441,6 +1550,7 @@ export class AgentSessionRuntime {
 					}),
 				withSession: options?.withSession,
 				rebindRequestId: options?.rebindRequestId,
+				...(generalReplacement ? { commitPublication: () => generalReplacement!.commit(sessionManager) } : {}),
 			});
 			return { cancelled: false, seeded: replacement.seeded };
 		} catch (error) {
@@ -1450,6 +1560,8 @@ export class AgentSessionRuntime {
 				error,
 				"New session preparation failed and its owned manager could not be closed",
 			);
+		} finally {
+			await generalReplacement?.dispose();
 		}
 	}
 

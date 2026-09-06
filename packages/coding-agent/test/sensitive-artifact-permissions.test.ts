@@ -139,8 +139,10 @@ describe.skipIf(process.platform === "win32")("sensitive artifact permissions", 
 		writeFileSync(victimPath, "do not replace", { mode: 0o644 });
 		const jsonlPath = join(root, "session.jsonl");
 		symlinkSync(victimPath, jsonlPath);
-		const exporter = { sessionManager: manager } as unknown as AgentSession;
-		AgentSession.prototype.exportToJsonl.call(exporter, jsonlPath);
+		const exporter = Object.assign(Object.create(AgentSession.prototype) as AgentSession, {
+			sessionManager: manager,
+		});
+		exporter.exportToJsonl(jsonlPath);
 
 		expect(lstatSync(jsonlPath).isSymbolicLink()).toBe(false);
 		expect(mode(jsonlPath)).toBe(0o600);

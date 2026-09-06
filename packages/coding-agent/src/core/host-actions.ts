@@ -3,6 +3,10 @@ import { type Api, type Model, supportsFastInference } from "@hansjm10/volt-ai";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
 import type { AgentMode, PlanExecutionStrategy, PlanningState } from "./planning.ts";
 import type { ReviewRunControls, ReviewTarget, ReviewWorkflowResult } from "./review.ts";
+import {
+	isReviewDiscussionHostActionAllowed,
+	REVIEW_DISCUSSION_SOURCE_ACTION_MESSAGE,
+} from "./review-discussion-policy.ts";
 import type {
 	UiActionArgumentDescriptor,
 	UiActionDescriptor,
@@ -20,6 +24,7 @@ export type HostActionNewSessionResult = Awaited<ReturnType<RuntimeNewSession>>;
 export type HostActionCompactResult = Awaited<ReturnType<RuntimeSession["compact"]>>;
 
 export interface HostActionSessionState {
+	isReviewDiscussion?: boolean;
 	/** Falls back to isStreaming for legacy host integrations. */
 	isBusy?: boolean;
 	isStreaming: boolean;
@@ -275,6 +280,8 @@ export class HostActionRegistry {
 		args: unknown,
 		options: HostActionInvokeOptions = {},
 	): Promise<UiActionInvocationResponse> {
+		if (context.session.isReviewDiscussion && !isReviewDiscussionHostActionAllowed(actionId, args))
+			throw new Error(REVIEW_DISCUSSION_SOURCE_ACTION_MESSAGE);
 		if (actionId.length === 0) {
 			throw new Error("UI action id must be a non-empty string");
 		}
@@ -311,6 +318,7 @@ export async function runSessionNewHostAction(
 	context: HostActionInvocationContext,
 	options?: HostActionNewSessionOptions,
 ): Promise<HostActionNewSessionResult> {
+	if (context.session.isReviewDiscussion) throw new Error(REVIEW_DISCUSSION_SOURCE_ACTION_MESSAGE);
 	const result = await context.newSession(options);
 	if (!result.cancelled) {
 		await context.afterSessionSwitch?.();
@@ -343,6 +351,7 @@ export async function runReviewHostAction(
 	target: ReviewTarget,
 	options: HostActionReviewOptions,
 ): Promise<ReviewWorkflowResult> {
+	if (context.session.isReviewDiscussion) throw new Error(REVIEW_DISCUSSION_SOURCE_ACTION_MESSAGE);
 	if (!context.runReviewAction) {
 		throw new Error("Review actions are not available in this host");
 	}
@@ -1135,7 +1144,10 @@ function createReviewInvocationResponse(action: string, result: ReviewWorkflowRe
 }
 
 function createDescriptor(action: HostActionDefinition, context: HostActionDescriptorContext): UiActionDescriptor {
-	const availability = action.availability?.(context) ?? { enabled: true };
+	const availability =
+		context.session.isReviewDiscussion && !isReviewDiscussionHostActionAllowed(action.id)
+			? { enabled: false, disabledReason: REVIEW_DISCUSSION_SOURCE_ACTION_MESSAGE }
+			: (action.availability?.(context) ?? { enabled: true });
 	const state = typeof action.state === "function" ? action.state(context) : action.state;
 	const descriptor: UiActionDescriptor = {
 		schemaVersion: 1,

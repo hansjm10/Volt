@@ -161,6 +161,8 @@ With optional stable parent identity:
 
 `parentSessionId` must identify a session in the active store. The new session receives its own stable ID; refresh with `get_state` after a successful replacement.
 
+`preserveReviewRunId` copies the selected canonical review into the new session. Optional `replaceReviewGeneral: true` additionally replaces that run's current General destination, and is legal only with `preserveReviewRunId`. The initiating exact session generation must still be the current General. Successful publication atomically advances its durable revision and registers the replacement alias; cancelled, failed or stale competing replacements do not advance it. Ordinary new sessions and history opens never promote General.
+
 Response:
 ```json
 {"type": "response", "command": "new_session", "success": true, "data": {"cancelled": false}}
@@ -760,6 +762,27 @@ Review invocations return `accepted` with a `workflowId` and run detached from t
 - `get_review_result` returns the same descriptor plus the bounded changed-file inventory and structured findings for completed reviews: `findings` (title, body, priority, confidence, file, line), optional `coverage`, `overallCorrectness`, and `overallExplanation`. PR results may include the bounded PR body in `target.identity.pullRequest.body` and context capture status/counts/limitation codes/fingerprint; linked issues and discussion text remain excluded. Finding prose remains code-derived by the context-blind presentation pass. A report or presentation that cannot be validated fails the workflow with a bounded host-generated error. Unknown run ids fail with a normal RPC error.
 - `cancel_workflow` aborts a running review; the workflow ends with `workflow_end` status `cancelled`. Cancelling an unknown or finished workflow fails with a normal RPC error.
 - `open_review_session` starts a fresh session seeded with a completed review's findings (the client-driven replacement for the old forced session switch) and responds with `{ "cancelled": boolean }`. It fails for unknown or non-completed workflows. It also fails when the replacement session was created but the seed was skipped because recovered durable client input failed to replay; in that case the review stays retained (still listed and fetchable) so the open can be retried.
+
+#### get_review_general
+
+Read the durable current General destination for a review run:
+
+```json
+{"type":"get_review_general","runId":"review:abc"}
+{"type":"response","command":"get_review_general","success":true,"data":{"runId":"review:abc","sourceSessionId":"source","generalSessionId":"general","generalSessionGeneration":"generation","generalRevision":1,"generalAvailable":true}}
+```
+
+All response data fields are required. Revision is a non-negative integer. Lookup is authorized from the exact source/alias or a historical/current finding child of the same run, never from copied transcript metadata or foreign stores/generations. If the exact General generation is missing, `generalAvailable` is false and its saved identity remains in the response; clients must not substitute `sourceSessionId`. This command grants no canonical outcome-writing authority and requires only conversation observation over Iroh.
+
+#### Review finding discussions
+
+Daemon-backed hosts expose `start_review_discussions` (`runId`, 1–50 unique `findingIds`, semantic `requestId`), `list_review_discussions` (`runId`, optional `cursor`/`limit` up to 50), `reset_review_discussion` (`discussionId`, `expectedSessionId`, `requestId`) and `get_review_discussion_source`. Start/list/reset are source-owned; source lookup is available from a child. A host without the sibling service returns `review_discussions_unavailable`.
+
+State, bootstrap and session-list metadata may contain `reviewDiscussion` with `discussionId`, `runId`, `findingId`, `sourceSessionId` and `sessionId`. This link describes identity, not permissions; it has no `readOnly` field. Discussion descriptors additionally include `currentSessionId`, `sourceAvailable`, `available` and `status`.
+
+Discussions have normal Build permissions under existing workspace/client/tool grants, including requested code fixes, shell, LSP mutations, MCP and delegation. Normal Plan research restrictions and approval rules still apply; Plan authoring, change/discard and `plan_execute` with `retain_context` work in the discussion. Source-owned identity replacement, fork/clone, clear-context plan execution and canonical outcome/lifecycle actions remain unavailable there; use the source review for those actions. Direct RPC and host actions add no discussion-specific tool restrictions.
+
+Starting discussions requests analysis, not automatic edits. Subsequent fix requests are actionable. Resumed sessions receive current trusted policy that supersedes older read-only context without rewriting transcripts. Reset retains history and creates idle context without inference; interrupted inputs require a fresh explicit retry rather than automatic replay.
 
 #### Native UI Action Security
 

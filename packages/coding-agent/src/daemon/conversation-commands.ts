@@ -29,12 +29,14 @@ import {
 	IROH_REMOTE_LIST_WORKTREES_RPC_TYPE,
 	type IrohRemoteWorktreeRpcBackend,
 } from "../core/remote/iroh/worktree-rpc.ts";
+import { getReviewDiscussionLink } from "../core/review-discussions.ts";
 import {
 	DEFAULT_CONVERSATION_PROJECTION_MAX_ASSISTANT_CUMULATIVE_CONTENT_UTF8_BYTES,
 	measureConversationProjectionUtf8BytesWithin,
 } from "../core/rpc/conversation-projection-limits.ts";
 import { getRpcErrorResponseTarget } from "../core/rpc/correlation.ts";
 import { getRemoteVisibleCustomMessageRole } from "../core/rpc/custom-message-projection.ts";
+import type { RpcReviewDiscussionLink } from "../core/rpc/schema/review-discussions.ts";
 import { projectSessionTreePage } from "../core/rpc/session-tree.ts";
 import {
 	type ResolvedSessionToolCall,
@@ -70,6 +72,8 @@ export const TURN_INITIATING_RPC_TYPES: ReadonlySet<string> = new Set([
 	"prompt",
 	"new_session",
 	"plan_execute",
+	"start_review_discussions",
+	"reset_review_discussion",
 	"invoke_ui_action",
 	"steer",
 	"follow_up",
@@ -124,6 +128,7 @@ export type RemoteRpcCommand = Record<string, unknown> & { type: string };
 export type RemoteSessionRuntimeState = Exclude<LeaseState, "unowned">;
 
 export interface RemoteSessionListEntry {
+	reviewDiscussion?: RpcReviewDiscussionLink;
 	sessionId: string;
 	title: string;
 	createdAt: string;
@@ -152,6 +157,7 @@ export interface RemoteSessionListCursorEntry {
 }
 
 interface ConversationSessionSummary {
+	reviewDiscussion?: RpcReviewDiscussionLink;
 	sessionId: string;
 	sessionName?: string;
 	createdAt: string;
@@ -1623,6 +1629,7 @@ function getRemoteSessionTimestampMs(value: string): number {
 }
 
 interface RemoteSessionSummaryInput {
+	reviewDiscussion?: RpcReviewDiscussionLink;
 	sessionId: string;
 	title: unknown;
 	createdAt: string | Date;
@@ -1666,6 +1673,7 @@ function createRemoteSessionSummary(
 		sortUpdatedAtMs: getRemoteSessionTimestampMs(updatedAt),
 		session: {
 			sessionId: input.sessionId,
+			...(input.reviewDiscussion ? { reviewDiscussion: input.reviewDiscussion } : {}),
 			title: sanitizeRemoteTextField(typeof input.title === "string" ? input.title : "", 160, authorization),
 			createdAt,
 			updatedAt,
@@ -1718,6 +1726,7 @@ export async function listRemoteWorkspaceSessionSummaries(
 			const summary = createRemoteSessionSummary(
 				{
 					sessionId: info.id,
+					reviewDiscussion: await getReviewDiscussionLink(info.ref),
 					title: info.name ?? info.firstMessage,
 					createdAt: info.created,
 					updatedAt: info.modified,
@@ -1740,6 +1749,7 @@ export async function listRemoteWorkspaceSessionSummaries(
 			const summary = createRemoteSessionSummary(
 				{
 					sessionId: liveSummary.sessionId,
+					reviewDiscussion: liveSummary.reviewDiscussion,
 					title: liveSummary.sessionName ?? liveSummary.firstMessage,
 					createdAt: liveSummary.createdAt,
 					updatedAt: liveSummary.modifiedAt,

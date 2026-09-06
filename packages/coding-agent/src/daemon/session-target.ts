@@ -1,6 +1,48 @@
 import { isIrohRemoteSessionId } from "../core/remote/iroh/handshake.ts";
-import { IrohRemoteOutcomeError } from "../core/remote/iroh/protocol.ts";
+import {
+	IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE,
+	IrohRemoteOutcomeError,
+	isIrohRemoteHostStorageFullError,
+} from "../core/remote/iroh/protocol.ts";
 import { SessionManager, type SessionReference } from "../core/session-manager.ts";
+import { SessionStoreError } from "../core/session-store/types.ts";
+
+function sessionTargetFailure(error: unknown, workspace: string, sessionId: string): IrohRemoteOutcomeError {
+	if (isIrohRemoteHostStorageFullError(error) || (error instanceof SessionStoreError && error.code === "store_full")) {
+		return Object.assign(new IrohRemoteOutcomeError("host_storage_full", IROH_REMOTE_HOST_STORAGE_FULL_MESSAGE), {
+			cause: error,
+			workspace,
+			sessionId,
+		});
+	}
+	if (
+		error instanceof SessionStoreError &&
+		[
+			"closed",
+			"invalid_response",
+			"store_initialization_failed",
+			"store_schema_mismatch",
+			"store_busy",
+			"store_io_error",
+			"worker_failed",
+		].includes(error.code)
+	) {
+		// A workspace-wide store failure says nothing about this conversation's
+		// identity. Keep it retryable instead of making every saved pin stale.
+		return Object.assign(
+			new IrohRemoteOutcomeError(
+				"workspace_unavailable",
+				"workspace session storage is unavailable; retry after the host recovers",
+			),
+			{ cause: error, workspace, retryAfterMs: 5_000 },
+		);
+	}
+	return Object.assign(new IrohRemoteOutcomeError("session_unavailable", "session state is corrupt or ambiguous"), {
+		cause: error,
+		workspace,
+		sessionId,
+	});
+}
 
 /**
  * Conversation target for a remote session, after the owner's last-session
@@ -93,11 +135,11 @@ export async function resolveIrohRemoteSessionTarget<H extends SessionTargetSess
 		existingSessionRef = sessions.find
 			? await sessions.find(requestedSessionId)
 			: (await sessions.list()).find((session) => session.id === requestedSessionId)?.ref;
-	} catch {
+	} catch (error) {
 		// Corrupt or duplicate durable identity is unavailable, never missing. In
 		// particular, `last` must not create a fresh idempotency domain and replay
 		// a handled side effect under the same clientMessageId.
-		throw new IrohRemoteOutcomeError("session_unavailable", "session state is corrupt or ambiguous");
+		throw sessionTargetFailure(error, workspace.name, requestedSessionId);
 	}
 	if (!existingSessionRef) {
 		if (target.kind === "session") {
@@ -115,11 +157,11 @@ export async function resolveIrohRemoteSessionTarget<H extends SessionTargetSess
 			throw new Error("session identity changed while opening resume target");
 		}
 		return resolved(sessionManager, "resumed", target.kind === "new" ? undefined : requestedSessionId);
-	} catch {
+	} catch (error) {
 		// Lookup and open cannot be atomic across an arbitrary injected store. Fail
 		// closed if the target disappears, is replaced, or no longer claims the
 		// requested durable idempotency domain between those operations.
-		throw new IrohRemoteOutcomeError("session_unavailable", "session state is corrupt or ambiguous");
+		throw sessionTargetFailure(error, workspace.name, requestedSessionId);
 	}
 }
 

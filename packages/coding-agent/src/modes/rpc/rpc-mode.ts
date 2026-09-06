@@ -58,12 +58,12 @@ import {
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
 	acknowledgeReviewRun,
-	appendReviewFindingTransition,
 	appendReviewPublication,
 	appendReviewRun,
 	createReviewRunRecord,
-	exportReviewFeedback,
-	getReviewRun,
+	exportCanonicalReviewFeedback,
+	getCanonicalReviewRun,
+	recordReviewFindingOutcome,
 } from "../../core/review-state.ts";
 import { type ProjectionDiagnostic, StreamProjector } from "../../core/rpc/stream-projection.ts";
 import type { RpcTransport } from "../../core/rpc/transport.ts";
@@ -226,6 +226,8 @@ const RPC_CONVERSATION_AUTHORITY_MUTATION_TYPES: ReadonlySet<RpcCommand["type"]>
 	"set_thinking_level",
 	"invoke_ui_action",
 	"open_review_session",
+	"start_review_discussions",
+	"reset_review_discussion",
 	"acknowledge_review",
 ]);
 
@@ -1274,7 +1276,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		},
 		runReviewLifecycleAction: async (action, args) => {
 			const runId = typeof args.runId === "string" ? args.runId : undefined;
-			const record = runId ? getReviewRun(commandSession.sessionManager, runId) : undefined;
+			const record = runId ? await getCanonicalReviewRun(commandSession.sessionManager, runId) : undefined;
+			assertConversationGenerationCurrent?.();
 			if (action !== REVIEW_EXPORT_FEEDBACK_ACTION_ID && !record)
 				throw new Error(`Unknown durable review run: ${runId ?? "missing"}`);
 			if (action === REVIEW_FIX_ACTION_ID) {
@@ -1369,18 +1372,25 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 					reason !== "other"
 				)
 					throw new Error("Dismissed findings require an explicit reason.");
-				appendReviewFindingTransition(commandSession.sessionManager, {
-					runId: record.runId,
-					findingId,
-					status,
-					...(reason === "false_positive" ||
-					reason === "intentional" ||
-					reason === "not_actionable" ||
-					reason === "other"
-						? { reason }
-						: {}),
-					...(typeof args.note === "string" ? { note: args.note } : {}),
-				});
+				await recordReviewFindingOutcome(
+					commandSession.sessionManager,
+					{
+						runId: record.runId,
+						findingId,
+						status,
+						...(reason === "false_positive" ||
+						reason === "intentional" ||
+						reason === "not_actionable" ||
+						reason === "other"
+							? { reason }
+							: {}),
+						...(typeof args.note === "string" ? { note: args.note } : {}),
+					},
+					{
+						recordCanonicalOutcome: runtimeHost.reviewDiscussions?.recordOutcome,
+						assertCurrent: assertConversationGenerationCurrent,
+					},
+				);
 				await commandSession.sessionManager.flush();
 				return {
 					action,
@@ -1430,7 +1440,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				await mkdir(dirname(outputPath), { recursive: true });
 				await writeFile(
 					outputPath,
-					`${JSON.stringify(exportReviewFeedback(commandSession.sessionManager), null, 2)}\n`,
+					`${JSON.stringify(await exportCanonicalReviewFeedback(commandSession.sessionManager), null, 2)}\n`,
 					{ mode: 0o600 },
 				);
 				return { action, status: "completed", message: `Review feedback exported to ${outputPath}` };

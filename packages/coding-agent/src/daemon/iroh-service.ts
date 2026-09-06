@@ -168,6 +168,7 @@ import {
 	revokeIrohManagedRelayCredential,
 } from "./relay-credential.ts";
 import { RelayRegistry } from "./relay-stream.ts";
+import { beginReviewSiblingAdmission, withReviewSourceWriteLease } from "./review-sibling-admission.ts";
 import {
 	createSessionManagerTargetStore,
 	type IrohRemoteSessionTarget,
@@ -984,6 +985,29 @@ class IrohDaemonService {
 				this.worktrees.beginRuntimePreparation(workspaceName, worktreeId),
 			bindWorktreeSession: (workspaceName, worktreeId, sessionId) =>
 				this.worktrees.bindSession(workspaceName, worktreeId, sessionId),
+			beginReviewSiblingAdmission: (parent, sessionId) => {
+				const lease = this.admission.tryAcquire();
+				if (!lease) throw new Error("Review sibling admission is closed");
+				return beginReviewSiblingAdmission({
+					workspaceName: parent.workspaceName,
+					sessionId,
+					broker: this.leaseBroker,
+					lease,
+					validateWorkspace: () => this.validateReviewWorkspace(parent),
+				});
+			},
+			withReviewSourceWrite: (parent, source, write) => {
+				const lease = this.admission.tryAcquire();
+				if (!lease) return Promise.reject(new Error("Review source write admission closed"));
+				return withReviewSourceWriteLease({
+					workspaceName: parent.workspaceName,
+					sessionId: source.sessionId,
+					broker: this.leaseBroker,
+					lease,
+					write,
+					validateWorkspace: () => this.validateReviewWorkspace(parent),
+				});
+			},
 			onRuntimePublished: (entry) => this.startRuntimeWorkObservation(entry),
 			onRuntimeSessionRekeyed: (entry, previousSessionId) => {
 				this.rekeyRuntimeWorkObservation(entry, previousSessionId);
@@ -1462,6 +1486,26 @@ class IrohDaemonService {
 			relayMode: this.relayMode,
 			...(this.relayMode === "production" ? { relayUrls: this.relayUrls } : {}),
 		};
+	}
+
+	private async validateReviewWorkspace(parent: IntegratedRuntimeEntry): Promise<void> {
+		const state = await this.stateManager.getState();
+		const workspace = state.workspaces.find((item) => item.name === parent.workspaceName);
+		const generation = state.workspaceGenerations?.find(
+			(item) => item.workspaceName === parent.workspaceName,
+		)?.generation;
+		if (!workspace || generation !== parent.workspaceGeneration)
+			throw new Error("Review workspace authority changed");
+		const worktree =
+			parent.worktreeId === undefined
+				? undefined
+				: state.worktrees?.find(
+						(item) => item.workspaceName === parent.workspaceName && item.id === parent.worktreeId,
+					);
+		if (parent.worktreeId !== undefined && !worktree) throw new Error("Review worktree unavailable");
+		const root = await realpath(worktree?.path ?? workspace.path);
+		const cwd = await realpath(parent.runtime.cwd);
+		if (!isPathInside(root, cwd)) throw new Error("Review source escaped its workspace");
 	}
 
 	private isAuthorizationCurrent(authorization: IrohRemoteClientAuthorizationSuccess): Promise<boolean> {
@@ -2885,7 +2929,14 @@ class IrohDaemonService {
 				await this.runWorktreeManagement(stream, handshake, connectionId, streamId, owner);
 				return;
 			}
-			await this.runWorkspaceManagement(stream, handshake, connectionId, streamId, owner);
+			await this.runWorkspaceManagement(
+				stream,
+				handshake,
+				connectionId,
+				streamId,
+				owner,
+				handshake.hello.workspaceManagement.purpose,
+			);
 			return;
 		}
 		await this.runIntegratedConversation(stream, handshake, connectionId, streamId, owner);
@@ -3169,6 +3220,7 @@ class IrohDaemonService {
 		connectionId: string,
 		streamId: string,
 		owner: IrohPhysicalStreamOwner,
+		purpose: "unregister_workspace" | "list_workspace_directories",
 	): Promise<void> {
 		await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
 		await this.dependencies.beforeAuthorizedStreamPublication?.("workspace_management", handshake.authorization);
@@ -3228,6 +3280,7 @@ class IrohDaemonService {
 						return { ok: true, closedStreamCount, stoppedRuntimeCount };
 					},
 				},
+				purpose,
 			);
 		} finally {
 			activeStream.remove();
@@ -4657,6 +4710,9 @@ class IrohDaemonService {
 			workspacePath?: string;
 		} = {},
 	): Promise<{ closedStreamCount: number; stoppedRuntimeCount: number }> {
+		this.runtimes.fenceReviewOperations(
+			this.runtimes.values().filter((entry) => entry.workspaceName === workspaceName),
+		);
 		for (const entry of this.runtimeWorkObservers.keys()) {
 			if (entry.workspaceName === workspaceName) this.stopRuntimeWorkObservation(entry);
 		}
@@ -4702,6 +4758,7 @@ class IrohDaemonService {
 			this.runtimes.values(),
 			nodeId,
 		);
+		this.runtimes.fenceReviewOperations(runtimeEntries);
 		const entries = collectClientAuthorityInvalidationStreams(this.activeStreams, runtimeEntries, nodeId);
 		for (const entry of entries) {
 			this.activeStreams.unregister(entry);
@@ -4733,9 +4790,14 @@ class IrohDaemonService {
 						.get(relay.workspaceName, relay.sessionId)
 						?.closeTransport(relay.relayId, reason) ?? Promise.resolve(false),
 			);
-		const runtimeEntries = this.runtimes
-			.values()
-			.filter((entry) => entry.clientNodeId === nodeId && entry.workspaceName === workspaceName);
+		const runtimeEntries = [
+			...collectClientAuthorityInvalidationRuntimes(
+				this.activeStreams,
+				this.runtimes.values().filter((entry) => entry.workspaceName === workspaceName),
+				nodeId,
+			),
+		];
+		this.runtimes.fenceReviewOperations(runtimeEntries);
 		const relayResults = await Promise.allSettled(relayClosures);
 		let closedStreamCount = relayResults.filter(
 			(result): result is PromiseFulfilledResult<true> => result.status === "fulfilled" && result.value,
@@ -4764,6 +4826,7 @@ class IrohDaemonService {
 			this.runtimes.values(),
 			nodeId,
 		);
+		this.runtimes.fenceReviewOperations(runtimeEntries);
 		const entries = collectClientAuthorityInvalidationStreams(this.activeStreams, runtimeEntries, nodeId);
 		for (const entry of entries) {
 			this.activeStreams.unregister(entry);
