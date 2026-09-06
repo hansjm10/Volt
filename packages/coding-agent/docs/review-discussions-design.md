@@ -10,6 +10,12 @@ Canonical outcome reads, rerun planning, publishing and feedback resolve the ori
 
 Source and child references include store/session generations internally. Runtime lookup is additionally scoped to the requester's registered workspace name and generation. Client projections never include store paths or generations as caller-granted authority.
 
+## Current General destination
+
+Each canonical review anchor separately persists an exact-generation General pointer and monotonic revision. The original source initializes revision zero. `get_review_general` is a read-only lookup available to exact source/alias members and current or historical finding children of that same run. It returns required `runId`, `sourceSessionId`, `generalSessionId`, `generalSessionGeneration`, `generalRevision` and `generalAvailable`; an unavailable destination is never replaced by the canonical source.
+
+`new_session` accepts `replaceReviewGeneral: true` only with `preserveReviewRunId`. The initiating session must be the exact current General. The runtime captures its revision before preparation, excludes this run from early alias registration, and commits the General CAS and alias edge together only after successful replacement callbacks and the final structural check. Failed setup, ownership publication, rebinding or seeding cannot advance the pointer. Competing old-General replacements fail the persisted CAS. Ordinary handoffs, aliases and history opens never promote. Canonical source ownership, finding links, reset history and outcome-writing rules are unchanged.
+
 ## Sibling admission
 
 The daemon's review service creates siblings without rekeying the source. Broker/coordinator producer admission is acquired before opening the child manager or seeding context. Cold-open competitors either reuse an admitted runtime or retry without modifying its persistence. Registry publication, worktree binding, broker finalization and cleanup retain exact ownership; failed initialization is fully quiescent before provisional ownership is released.

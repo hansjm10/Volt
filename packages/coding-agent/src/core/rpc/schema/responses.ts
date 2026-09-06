@@ -36,6 +36,7 @@ import {
 	RpcListReviewDiscussionsSchema,
 	RpcResetReviewDiscussionSchema,
 	RpcReviewDiscussionSchema,
+	RpcReviewGeneralSchema,
 	RpcStartReviewDiscussionsSchema,
 } from "./review-discussions.ts";
 import {
@@ -335,6 +336,7 @@ export const RPC_RESPONSE_SCHEMAS = {
 		Type.Union([RpcReviewDiscussionSchema, Type.Null()]),
 	),
 	cancel_workflow: voidResponse("cancel_workflow"),
+	get_review_general: dataResponse("get_review_general", RpcReviewGeneralSchema),
 	get_review_result: dataResponse("get_review_result", RpcReviewWorkflowResultResponseSchema),
 	list_review_workflows: dataResponse("list_review_workflows", RpcReviewWorkflowListResponseSchema),
 	open_review_session: dataResponse("open_review_session", cancelledDataSchema),

@@ -48,6 +48,7 @@ import {
 	type SessionStoreForeignKeyVerificationResult,
 	type SessionStoreInfo,
 	type SessionStoreRegisterReviewAnchorInput,
+	type SessionStoreReplaceReviewGeneralInput,
 	type SessionStoreResetReviewDiscussionInput,
 	type SessionStoreResetReviewDiscussionResult,
 	type SessionStoreReviewAnchor,
@@ -437,11 +438,18 @@ function findReviewAnchor(db: DatabaseSync, runId: string): SessionStoreReviewAn
 		sessionGeneration: sqlString(row, "source_session_generation"),
 		cwd: sqlString(row, "cwd"),
 	};
+	const general = {
+		sessionId: sqlString(row, "general_session_id"),
+		sessionGeneration: sqlString(row, "general_session_generation"),
+	};
 	return {
 		runId,
 		source,
 		createdAt: sqlString(row, "created_at"),
 		sourceAvailable: reviewSourceAvailable(db, source),
+		general,
+		generalRevision: sqlInteger(row, "general_revision"),
+		generalAvailable: reviewSourceAvailable(db, { ...general, cwd: source.cwd }),
 	};
 }
 
@@ -498,7 +506,74 @@ function registerReviewAlias(
 	});
 }
 
-function assertReviewSource(anchor: SessionStoreReviewAnchor, source: SessionStoreReviewSource): void {
+/** Read-only membership includes historical finding children, never canonical write authority. */
+function resolveReviewGeneral(
+	db: DatabaseSync,
+	runId: string,
+	member: SessionStoreReviewSource,
+): SessionStoreReviewAnchor | null {
+	const anchor = findReviewAnchor(db, runId);
+	if (
+		!anchor ||
+		anchor.source.cwd !== canonicalCwdIdentity(member.cwd) ||
+		!reviewSourceAvailable(db, { ...member, cwd: anchor.source.cwd })
+	)
+		return null;
+	if (resolveReviewAnchor(db, runId, member)) return anchor;
+	const child = db
+		.prepare(`SELECT 1 FROM review_discussion_children c
+		JOIN review_discussions d ON d.discussion_id = c.discussion_id
+		WHERE d.run_id = ? AND c.child_session_id = ? AND c.child_session_generation = ?`)
+		.get(runId, member.sessionId, member.sessionGeneration);
+	return child ? anchor : null;
+}
+
+function replaceReviewGeneral(input: SessionStoreReplaceReviewGeneralInput): SessionStoreReviewAnchor {
+	const db = requireDatabase();
+	return withTransaction(db, () => {
+		const anchor = resolveReviewAnchor(db, input.runId, input.member);
+		if (
+			!anchor ||
+			!anchor.generalAvailable ||
+			anchor.generalRevision !== input.expectedRevision ||
+			anchor.general.sessionId !== input.member.sessionId ||
+			anchor.general.sessionGeneration !== input.member.sessionGeneration
+		)
+			throw new SessionStoreError("review_identity_conflict", "Only the exact current General can replace itself");
+		const replacement = input.replacement;
+		if (
+			anchor.source.cwd !== canonicalCwdIdentity(replacement.cwd) ||
+			!reviewSourceAvailable(db, { ...replacement, cwd: anchor.source.cwd })
+		)
+			throw new SessionStoreError("review_source_unavailable", "Replacement General is unavailable");
+		if (
+			db
+				.prepare(
+					"SELECT 1 FROM review_discussion_children WHERE child_session_id = ? AND child_session_generation = ?",
+				)
+				.get(replacement.sessionId, replacement.sessionGeneration) ||
+			(replacement.sessionId === input.member.sessionId &&
+				replacement.sessionGeneration === input.member.sessionGeneration)
+		)
+			throw new SessionStoreError(
+				"review_identity_conflict",
+				"Replacement General must be a new source conversation",
+			);
+		db.prepare(
+			"INSERT OR IGNORE INTO review_anchor_aliases (run_id, session_id, session_generation) VALUES (?, ?, ?)",
+		).run(input.runId, replacement.sessionId, replacement.sessionGeneration);
+		db.prepare(`UPDATE review_anchors SET general_session_id = ?, general_session_generation = ?, general_revision = general_revision + 1
+			WHERE run_id = ? AND general_revision = ?`).run(
+			replacement.sessionId,
+			replacement.sessionGeneration,
+			input.runId,
+			input.expectedRevision,
+		);
+		return findReviewAnchor(db, input.runId)!;
+	});
+}
+
+function assertReviewSource(anchor: Pick<SessionStoreReviewAnchor, "source">, source: SessionStoreReviewSource): void {
 	if (anchor.source.sessionId !== source.sessionId || anchor.source.sessionGeneration !== source.sessionGeneration) {
 		throw new SessionStoreError("review_identity_conflict", "Review run belongs to a different source incarnation");
 	}
@@ -507,7 +582,7 @@ function assertReviewSource(anchor: SessionStoreReviewAnchor, source: SessionSto
 	}
 }
 
-function requireAvailableReviewSource(anchor: SessionStoreReviewAnchor): void {
+function requireAvailableReviewSource(anchor: Pick<SessionStoreReviewAnchor, "sourceAvailable">): void {
 	if (!anchor.sourceAvailable)
 		throw new SessionStoreError(
 			"review_source_unavailable",
@@ -531,9 +606,18 @@ function registerReviewAnchor(input: SessionStoreRegisterReviewAnchorInput): Ses
 		if (canonicalCwdIdentity(summary.cwd) !== source.cwd)
 			throw new SessionStoreError("review_cwd_mismatch", "Review source cwd mismatch");
 		db.prepare(
-			"INSERT INTO review_anchors (run_id, source_session_id, source_session_generation, cwd, created_at) VALUES (?, ?, ?, ?, ?)",
-		).run(input.runId, source.sessionId, source.sessionGeneration, source.cwd, input.createdAt);
-		return { ...input, source, sourceAvailable: true };
+			`INSERT INTO review_anchors (run_id, source_session_id, source_session_generation, cwd, created_at,
+			general_session_id, general_session_generation, general_revision) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+		).run(
+			input.runId,
+			source.sessionId,
+			source.sessionGeneration,
+			source.cwd,
+			input.createdAt,
+			source.sessionId,
+			source.sessionGeneration,
+		);
+		return findReviewAnchor(db, input.runId)!;
 	});
 }
 
@@ -1415,6 +1499,12 @@ function closeDatabase(): null {
 
 function execute(operation: SessionStoreWorkerOperation): unknown {
 	switch (operation.kind) {
+		case "replace_review_general":
+			return replaceReviewGeneral(operation.input);
+		case "resolve_review_general":
+			return withDeferredReadTransaction(requireDatabase(), () =>
+				resolveReviewGeneral(requireDatabase(), operation.runId, operation.member),
+			);
 		case "register_review_alias":
 			return registerReviewAlias(operation.runId, operation.member, operation.alias);
 		case "resolve_review_anchor":

@@ -14,6 +14,7 @@ import type { McpGatewayExecutionContext } from "../../core/mcp/types.ts";
 import { toIrohRemoteAgentOptionsCatalogModel } from "../../core/remote/iroh/agent-options.ts";
 import { createReviewSeedMessage } from "../../core/review.ts";
 import { assertReviewDiscussionRpcAllowed } from "../../core/review-discussion-policy.ts";
+import { getReviewGeneral } from "../../core/review-general.ts";
 import { publishReviewRun } from "../../core/review-publish.ts";
 import {
 	acknowledgeReviewRun,
@@ -379,6 +380,8 @@ export async function handleRpcCommand(
 		}
 
 		case "new_session": {
+			if (command.replaceReviewGeneral && !command.preserveReviewRunId)
+				return createRpcErrorResponse(id, "new_session", "replaceReviewGeneral requires preserveReviewRunId");
 			const preservedReviewRun = command.preserveReviewRunId
 				? await getCanonicalReviewRun(session.sessionManager, command.preserveReviewRunId)
 				: undefined;
@@ -398,6 +401,8 @@ export async function handleRpcCommand(
 			}
 			const newSessionOptions = {
 				rebindRequestId: id,
+				...(command.preserveReviewRunId ? { preserveReviewRunId: command.preserveReviewRunId } : {}),
+				...(command.replaceReviewGeneral ? { replaceReviewGeneral: true } : {}),
 				...(parentSessionRef ? { parentSessionRef } : {}),
 				...(preservedReviewRun
 					? {
@@ -414,7 +419,15 @@ export async function handleRpcCommand(
 						}
 					: {}),
 			};
-			const result = await runSessionNewHostAction(context.createHostActionContext(), newSessionOptions);
+			// General publication is the final durable runtime step. The runtime's
+			// replacement listeners already rebind RPC; do not run a second fallible
+			// afterSessionSwitch callback after that irreversible commit.
+			const result = command.replaceReviewGeneral
+				? await runtimeHost.newSession({
+						...newSessionOptions,
+						assertConversationGenerationCurrent: context.assertConversationGenerationCurrent,
+					})
+				: await runSessionNewHostAction(context.createHostActionContext(), newSessionOptions);
 			return createRpcSuccessResponse(id, "new_session", { cancelled: result.cancelled });
 		}
 
@@ -625,6 +638,14 @@ export async function handleRpcCommand(
 				activeWorkflows: runtimeHost.reviewWorkflows.list().filter((workflow) => workflow.status === "running"),
 				...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
 			});
+		}
+
+		case "get_review_general": {
+			return createRpcSuccessResponse(
+				id,
+				"get_review_general",
+				await getReviewGeneral(session.sessionManager, command.runId),
+			);
 		}
 
 		case "get_review_result": {

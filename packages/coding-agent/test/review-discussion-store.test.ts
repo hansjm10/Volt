@@ -82,6 +82,105 @@ afterEach(async () => {
 });
 
 describe("Regression #341 durable review discussions", () => {
+	it("initializes General, never promotes ordinary aliases, CAS replaces repeatedly and survives reopen", async () => {
+		const { first, second, source, cwd, anchor: registration } = await fixture();
+		const initial = await first.findReviewAnchor("run");
+		expect(initial).toMatchObject({
+			general: { sessionId: source.sessionId, sessionGeneration: source.sessionGeneration },
+			generalRevision: 0,
+			generalAvailable: true,
+		});
+		for (const id of ["a", "b", "c"]) await first.createHiddenSession(child(id, cwd));
+		const a = { sessionId: "a", sessionGeneration: "generation:a", cwd };
+		const b = { sessionId: "b", sessionGeneration: "generation:b", cwd };
+		const c = { sessionId: "c", sessionGeneration: "generation:c", cwd };
+		await first.registerReviewAlias("run", source, a);
+		expect(await first.resolveReviewGeneral("run", a)).toEqual(initial);
+		const requests = [a, b].map((replacement) => ({
+			runId: "run",
+			member: source,
+			expectedRevision: 0,
+			replacement,
+		}));
+		const results = await Promise.allSettled([
+			first.replaceReviewGeneral(requests[0]!),
+			second.replaceReviewGeneral(requests[1]!),
+		]);
+		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+		expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+		const winner = (await first.findReviewAnchor("run"))!;
+		expect(winner.generalRevision).toBe(1);
+		expect(winner.source).toEqual(initial!.source);
+		await expect(
+			first.replaceReviewGeneral({ ...requests[0]!, expectedRevision: 1, replacement: c }),
+		).rejects.toMatchObject({ code: "review_identity_conflict" });
+		await first.replaceReviewGeneral({
+			runId: "run",
+			member: { ...winner.general, cwd },
+			expectedRevision: 1,
+			replacement: c,
+		});
+		const final = await first.resolveReviewGeneral("run", source);
+		expect(final).toMatchObject({ general: { sessionId: "c" }, generalRevision: 2 });
+		expect(await first.registerReviewAnchor(registration)).toEqual(final);
+		await Promise.all([first.close(), second.close()]);
+		const reopened = await SQLiteSessionStoreClient.open(first.sessionDirectory);
+		clients.push(reopened);
+		expect(await reopened.resolveReviewGeneral("run", source)).toEqual(final);
+		expect(await reopened.resolveReviewGeneral("run", { ...winner.general, cwd })).toEqual(final);
+	});
+
+	it("authorizes same-run historical children only, preserves exact unavailable General and canonical authority", async () => {
+		const { first, source, input, cwd } = await fixture();
+		const discussion = await first.createOrGetReviewDiscussion(input);
+		const next = await first.resetReviewDiscussion(reset(input));
+		for (const member of [discussion.current.child, next.child.child]) {
+			expect(await first.resolveReviewGeneral("run", { ...member, cwd })).toMatchObject({ generalRevision: 0 });
+			expect(await first.resolveReviewAnchor("run", { ...member, cwd })).toBeNull();
+			expect(await first.resolveReviewGeneral("other", { ...member, cwd })).toBeNull();
+			expect(await first.resolveReviewGeneral("run", { ...member, sessionGeneration: "wrong", cwd })).toBeNull();
+		}
+		await first.createHiddenSession(child("general", cwd));
+		const general = { sessionId: "general", sessionGeneration: "generation:general", cwd };
+		await first.replaceReviewGeneral({ runId: "run", member: source, expectedRevision: 0, replacement: general });
+		await first.deleteSession({
+			sessionId: general.sessionId,
+			sessionGeneration: general.sessionGeneration,
+			expectedRevision: 0,
+		});
+		await first.createHiddenSession({ ...child("general", cwd), sessionGeneration: "reused" });
+		expect(await first.resolveReviewGeneral("run", source)).toMatchObject({
+			general: { sessionId: "general", sessionGeneration: "generation:general" },
+			generalRevision: 1,
+			generalAvailable: false,
+			sourceAvailable: true,
+		});
+		expect(await first.resolveReviewGeneral("run", { ...general, sessionGeneration: "reused" })).toBeNull();
+		expect((await first.findReviewDiscussion("run", "finding"))?.source.sessionId).toBe(source.sessionId);
+	});
+
+	it("rolls back General pointer and alias membership together when durable publication fails", async () => {
+		const { first, source, cwd } = await fixture();
+		await first.createHiddenSession(child("candidate", cwd));
+		const candidate = { sessionId: "candidate", sessionGeneration: "generation:candidate", cwd };
+		const db = new DatabaseSync(first.info.databasePath);
+		try {
+			db.exec(
+				"CREATE TRIGGER fail_general BEFORE UPDATE ON review_anchors BEGIN SELECT RAISE(ABORT, 'injected'); END",
+			);
+			await expect(
+				first.replaceReviewGeneral({ runId: "run", member: source, expectedRevision: 0, replacement: candidate }),
+			).rejects.toThrow("injected");
+			expect(await first.resolveReviewAnchor("run", candidate)).toBeNull();
+			expect(await first.findReviewAnchor("run")).toMatchObject({
+				generalRevision: 0,
+				general: { sessionId: source.sessionId },
+			});
+			db.exec("DROP TRIGGER fail_general");
+		} finally {
+			db.close();
+		}
+	});
 	it("atomically creates one hidden empty child across independent workers and returns the canonical winner", async () => {
 		const { first, second, input } = await fixture();
 		const competing = {
@@ -379,6 +478,9 @@ describe("Regression #341 durable review discussions", () => {
 				source: input.source,
 				createdAt: NOW,
 				sourceAvailable: "true",
+				general: { sessionId: "source", sessionGeneration: "generation:source" },
+				generalRevision: 0,
+				generalAvailable: true,
 			}),
 		).toThrow(/boolean/);
 		expect(() =>

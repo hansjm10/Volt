@@ -2,6 +2,19 @@ import { type Static, Type } from "typebox";
 import { stringEnum } from "./helpers.ts";
 import { RpcConversationIdentifierSchema as Identifier } from "./primitives.ts";
 
+export const RpcReviewGeneralSchema = Type.Object(
+	{
+		runId: Identifier,
+		sourceSessionId: Identifier,
+		generalSessionId: Identifier,
+		generalSessionGeneration: Identifier,
+		generalRevision: Type.Integer({ minimum: 0 }),
+		generalAvailable: Type.Boolean(),
+	},
+	{ additionalProperties: false },
+);
+export type RpcReviewGeneral = Static<typeof RpcReviewGeneralSchema>;
+
 export const RpcReviewDiscussionLinkSchema = Type.Object(
 	{
 		discussionId: Identifier,

@@ -5,6 +5,9 @@ CREATE TABLE review_anchors (
 	source_session_id TEXT NOT NULL CHECK (length(source_session_id) BETWEEN 1 AND 512),
 	source_session_generation TEXT NOT NULL CHECK (length(source_session_generation) BETWEEN 1 AND 512),
 	cwd TEXT NOT NULL CHECK (length(cwd) >= 1),
+	general_session_id TEXT NOT NULL CHECK (length(general_session_id) BETWEEN 1 AND 512),
+	general_session_generation TEXT NOT NULL CHECK (length(general_session_generation) BETWEEN 1 AND 512),
+	general_revision INTEGER NOT NULL CHECK (general_revision >= 0),
 	created_at TEXT NOT NULL
 ) STRICT, WITHOUT ROWID;
 

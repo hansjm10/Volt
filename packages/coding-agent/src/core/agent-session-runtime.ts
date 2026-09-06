@@ -26,6 +26,7 @@ import {
 	projectReviewDiscussionLink,
 	type ReviewDiscussionService,
 } from "./review-discussions.ts";
+import { prepareReviewGeneralReplacement } from "./review-general.ts";
 import { captureReviewStateForHandoff, listReviewRuns, restoreReviewStateFromHandoff } from "./review-state.ts";
 import { ReviewWorkflowManager } from "./review-workflows.ts";
 import { ConversationProjectionFeed, type ConversationProjectionSource } from "./rpc/conversation-projection-feed.ts";
@@ -804,6 +805,8 @@ export class AgentSessionRuntime {
 		sessionManager: SessionManager;
 		create: () => Promise<CreateAgentSessionRuntimeResult>;
 		afterApply?: () => Promise<void>;
+		/** Last durable publication step, after every fallible replacement callback. */
+		commitPublication?: () => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		/** RPC request correlated with the replacement bootstrap, when any. */
 		rebindRequestId?: string;
@@ -887,8 +890,25 @@ export class AgentSessionRuntime {
 					) {
 						throw new Error("Agent session replacement changed before ownership commit");
 					}
+					const publicationGeneration = created.session.conversationGenerationRevision;
 					await transaction?.commit();
-					return await this.finishSessionReplacement(options.withSession, transaction, options.rebindRequestId);
+					const result = await this.finishSessionReplacement(
+						options.withSession,
+						transaction,
+						options.rebindRequestId,
+					);
+					if (options.commitPublication) {
+						if (
+							this.sessionInvalidated ||
+							this.session !== created.session ||
+							this.session.sessionId !== sessionId ||
+							this.session.conversationGenerationRevision !== publicationGeneration ||
+							this.lifecycleRevision !== options.operation.expectedRevision + 1
+						)
+							throw new Error("Agent session replacement changed before durable publication");
+						await options.commitPublication();
+					}
+					return result;
 				} catch (error: unknown) {
 					const replacementError = error instanceof Error ? error : new Error(String(error));
 					const cleanupErrors: unknown[] = [];
@@ -1236,6 +1256,8 @@ export class AgentSessionRuntime {
 
 	async newSession(options?: {
 		parentSessionRef?: SessionReference;
+		preserveReviewRunId?: string;
+		replaceReviewGeneral?: boolean;
 		/** RPC request correlated with the replacement bootstrap, when any. */
 		rebindRequestId?: string;
 		/** Override the new session's cwd (e.g. a daemon-managed worktree checkout). */
@@ -1422,6 +1444,8 @@ export class AgentSessionRuntime {
 		options:
 			| {
 					parentSessionRef?: SessionReference;
+					preserveReviewRunId?: string;
+					replaceReviewGeneral?: boolean;
 					rebindRequestId?: string;
 					cwd?: string;
 					sessionDir?: string;
@@ -1434,6 +1458,8 @@ export class AgentSessionRuntime {
 			| undefined,
 		operation: AgentSessionStructuralOperation,
 	): Promise<AgentSessionReplacementResult> {
+		if (options?.replaceReviewGeneral && !options.preserveReviewRunId)
+			throw new Error("replaceReviewGeneral requires preserveReviewRunId");
 		const beforeResult = await this.emitBeforeSwitch("new");
 		this.assertStructuralOperationCurrent(operation);
 		if (beforeResult.cancelled) {
@@ -1459,7 +1485,13 @@ export class AgentSessionRuntime {
 		}
 		const ownsSessionManager = sessionManager !== this.session.sessionManager;
 		let managerTransferred = false;
+		let generalReplacement: Awaited<ReturnType<typeof prepareReviewGeneralReplacement>> | undefined;
 		try {
+			if (options?.replaceReviewGeneral)
+				generalReplacement = await prepareReviewGeneralReplacement(
+					this.session.sessionManager,
+					options.preserveReviewRunId!,
+				);
 			this.assertStructuralOperationCurrent(operation);
 			if (options?.setup) {
 				await options.setup(sessionManager);
@@ -1469,7 +1501,9 @@ export class AgentSessionRuntime {
 			await registerReviewHandoffAliases(
 				this.session.sessionManager,
 				sessionManager,
-				listReviewRuns(sessionManager, { limit: 50 }).runs.map((run) => run.runId),
+				listReviewRuns(sessionManager, { limit: 50 })
+					.runs.map((run) => run.runId)
+					.filter((runId) => !generalReplacement || runId !== options?.preserveReviewRunId),
 			);
 			this.assertStructuralOperationCurrent(operation);
 
@@ -1492,6 +1526,7 @@ export class AgentSessionRuntime {
 					}),
 				withSession: options?.withSession,
 				rebindRequestId: options?.rebindRequestId,
+				...(generalReplacement ? { commitPublication: () => generalReplacement!.commit(sessionManager) } : {}),
 			});
 			return { cancelled: false, seeded: replacement.seeded };
 		} catch (error) {
@@ -1501,6 +1536,8 @@ export class AgentSessionRuntime {
 				error,
 				"New session preparation failed and its owned manager could not be closed",
 			);
+		} finally {
+			await generalReplacement?.dispose();
 		}
 	}
 

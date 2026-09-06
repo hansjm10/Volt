@@ -150,6 +150,7 @@ const OBSERVE_COMMANDS = new Set([
 	"get_transcript",
 	"get_session_tree",
 	"get_review_result",
+	"get_review_general",
 	"list_review_workflows",
 	"list_review_discussions",
 	"get_review_discussion_source",

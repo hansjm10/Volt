@@ -96,10 +96,17 @@ export const RPC_COMMAND_SCHEMAS = {
 		images: Type.Optional(RpcConversationInputImagesSchema),
 	}),
 	abort: commandSchema("abort", {}),
-	new_session: commandSchema("new_session", {
-		parentSessionId: Type.Optional(RpcConversationIdentifierSchema),
-		preserveReviewRunId: Type.Optional(RpcConversationIdentifierSchema),
-	}),
+	new_session: Type.Object(
+		commandSchema("new_session", {
+			parentSessionId: Type.Optional(RpcConversationIdentifierSchema),
+			preserveReviewRunId: Type.Optional(RpcConversationIdentifierSchema),
+			replaceReviewGeneral: Type.Optional(Type.Boolean()),
+		}).properties,
+		{
+			additionalProperties: false,
+			anyOf: [{ properties: { replaceReviewGeneral: { const: false } } }, { required: ["preserveReviewRunId"] }],
+		},
+	),
 	set_agent_mode: commandSchema("set_agent_mode", {
 		mode: RpcAgentModeSchema,
 	}),
@@ -178,6 +185,7 @@ export const RPC_COMMAND_SCHEMAS = {
 		requestId: RpcConversationIdentifierSchema,
 	}),
 	get_review_discussion_source: commandSchema("get_review_discussion_source", {}),
+	get_review_general: commandSchema("get_review_general", { runId: RpcConversationIdentifierSchema }),
 	cancel_workflow: commandSchema("cancel_workflow", { workflowId: RpcConversationIdentifierSchema }),
 	get_review_result: commandSchema("get_review_result", { runId: RpcConversationIdentifierSchema }),
 	list_review_workflows: commandSchema("list_review_workflows", {

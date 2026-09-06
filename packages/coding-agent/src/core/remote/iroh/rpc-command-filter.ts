@@ -53,6 +53,7 @@ export const IROH_REMOTE_RPC_PASSTHROUGH_TYPES = new Set([
 	"get_ui_actions",
 	"cancel_workflow",
 	"get_review_result",
+	"get_review_general",
 	"list_review_workflows",
 	"open_review_session",
 	"start_review_discussions",

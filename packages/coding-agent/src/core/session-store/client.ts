@@ -25,6 +25,7 @@ import {
 	type SessionStoreListOptions,
 	type SessionStoreReconcileCommitInput,
 	type SessionStoreRegisterReviewAnchorInput,
+	type SessionStoreReplaceReviewGeneralInput,
 	type SessionStoreResetReviewDiscussionInput,
 	type SessionStoreResetReviewDiscussionResult,
 	type SessionStoreReviewAnchor,
@@ -256,6 +257,17 @@ export class SQLiteSessionStoreClient {
 		member: SessionStoreReviewSource,
 	): Promise<SessionStoreReviewAnchor | null> {
 		return (await this.call({ kind: "resolve_review_anchor", runId, member })) as SessionStoreReviewAnchor | null;
+	}
+
+	async resolveReviewGeneral(
+		runId: string,
+		member: SessionStoreReviewSource,
+	): Promise<SessionStoreReviewAnchor | null> {
+		return (await this.call({ kind: "resolve_review_general", runId, member })) as SessionStoreReviewAnchor | null;
+	}
+
+	async replaceReviewGeneral(input: SessionStoreReplaceReviewGeneralInput): Promise<SessionStoreReviewAnchor> {
+		return (await this.call({ kind: "replace_review_general", input })) as SessionStoreReviewAnchor;
 	}
 
 	async findReviewAnchor(runId: string): Promise<SessionStoreReviewAnchor | null> {

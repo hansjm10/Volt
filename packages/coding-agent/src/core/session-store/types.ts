@@ -214,6 +214,16 @@ export interface SessionStoreRegisterReviewAnchorInput {
 
 export interface SessionStoreReviewAnchor extends SessionStoreRegisterReviewAnchorInput {
 	readonly sourceAvailable: boolean;
+	readonly general: SessionStoreSessionIdentity;
+	readonly generalRevision: number;
+	readonly generalAvailable: boolean;
+}
+
+export interface SessionStoreReplaceReviewGeneralInput {
+	readonly runId: string;
+	readonly member: SessionStoreReviewSource;
+	readonly expectedRevision: number;
+	readonly replacement: SessionStoreReviewSource;
 }
 
 export interface SessionStoreCreateReviewDiscussionInput {

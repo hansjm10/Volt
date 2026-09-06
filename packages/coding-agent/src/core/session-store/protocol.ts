@@ -29,6 +29,7 @@ import {
 	type SessionStoreOrigin,
 	type SessionStoreReconcileCommitInput,
 	type SessionStoreRegisterReviewAnchorInput,
+	type SessionStoreReplaceReviewGeneralInput,
 	type SessionStoreResetReviewDiscussionInput,
 	type SessionStoreResetReviewDiscussionResult,
 	type SessionStoreReviewAnchor,
@@ -52,6 +53,8 @@ export interface SessionStoreWorkerData {
 }
 
 export type SessionStoreWorkerOperation =
+	| { readonly kind: "replace_review_general"; readonly input: SessionStoreReplaceReviewGeneralInput }
+	| { readonly kind: "resolve_review_general"; readonly runId: string; readonly member: SessionStoreReviewSource }
 	| {
 			readonly kind: "register_review_alias";
 			readonly runId: string;
@@ -533,12 +536,23 @@ function parseResetReviewDiscussion(value: unknown, path: string): SessionStoreR
 
 function parseReviewAnchor(value: unknown, path: string): SessionStoreReviewAnchor {
 	const input = record(value, path);
-	exactKeys(input, path, ["runId", "source", "createdAt", "sourceAvailable"]);
+	exactKeys(input, path, [
+		"runId",
+		"source",
+		"createdAt",
+		"sourceAvailable",
+		"general",
+		"generalRevision",
+		"generalAvailable",
+	]);
 	return {
 		runId: idValue(input.runId, `${path}.runId`),
 		source: parseReviewSource(input.source, `${path}.source`),
 		createdAt: timestampValue(input.createdAt, `${path}.createdAt`),
 		sourceAvailable: booleanValue(input.sourceAvailable, `${path}.sourceAvailable`),
+		general: parseIdentity(input.general, `${path}.general`),
+		generalRevision: safeInteger(input.generalRevision, `${path}.generalRevision`),
+		generalAvailable: booleanValue(input.generalAvailable, `${path}.generalAvailable`),
 	};
 }
 
@@ -601,6 +615,20 @@ export function parseSessionStoreWorkerOperation(value: unknown): SessionStoreWo
 	const input = record(value, "$operation");
 	const kind = stringValue(input.kind, "$operation.kind");
 	switch (kind) {
+		case "replace_review_general": {
+			exactKeys(input, "$operation", ["kind", "input"]);
+			const replacement = record(input.input, "$operation.input");
+			exactKeys(replacement, "$operation.input", ["runId", "member", "expectedRevision", "replacement"]);
+			return {
+				kind,
+				input: {
+					runId: idValue(replacement.runId, "$operation.input.runId"),
+					member: parseReviewSource(replacement.member, "$operation.input.member"),
+					expectedRevision: safeInteger(replacement.expectedRevision, "$operation.input.expectedRevision"),
+					replacement: parseReviewSource(replacement.replacement, "$operation.input.replacement"),
+				},
+			};
+		}
 		case "register_review_alias":
 			exactKeys(input, "$operation", ["kind", "runId", "member", "alias"]);
 			return {
@@ -609,6 +637,7 @@ export function parseSessionStoreWorkerOperation(value: unknown): SessionStoreWo
 				member: parseReviewSource(input.member, "$operation.member"),
 				alias: parseReviewSource(input.alias, "$operation.alias"),
 			};
+		case "resolve_review_general":
 		case "resolve_review_anchor":
 			exactKeys(input, "$operation", ["kind", "runId", "member"]);
 			return {
@@ -980,9 +1009,11 @@ export function parseSessionStoreOperationResult(
 	switch (kind) {
 		case "register_review_alias":
 		case "register_review_anchor":
+		case "replace_review_general":
 			return parseReviewAnchor(value, "$result");
 		case "resolve_review_anchor":
 		case "find_review_anchor":
+		case "resolve_review_general":
 			return value === null ? null : parseReviewAnchor(value, "$result");
 		case "create_review_discussion":
 			return parseReviewDiscussion(value, "$result");
