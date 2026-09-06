@@ -967,6 +967,7 @@ describe("Iroh remote core helpers", () => {
 			"get_ui_actions",
 			"cancel_workflow",
 			"get_review_result",
+			"get_review_general",
 			"list_review_workflows",
 			"open_review_session",
 			"start_review_discussions",

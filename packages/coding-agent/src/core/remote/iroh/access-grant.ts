@@ -254,6 +254,7 @@ export function getIrohRemoteStreamCapability(options: {
 	// Worktree management is command-sensitive: the stream itself has no wider
 	// gate than each parsed command.
 	if (options.purpose === "manage_worktrees") return undefined;
+	if (options.purpose === "list_workspace_directories") return "conversation.observe.v1";
 	if (options.purpose === "unregister_workspace") return "workspace.manage.v1";
 	return undefined;
 }

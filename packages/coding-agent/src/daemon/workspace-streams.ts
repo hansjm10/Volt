@@ -287,6 +287,7 @@ function parseWorkspaceDirectoryPath(command: RemoteRpcCommand): string | undefi
 export async function runWorkspaceManagementStream(
 	context: WorkspaceStreamContext,
 	hooks: WorkspaceStreamHooks,
+	purpose: "unregister_workspace" | "list_workspace_directories",
 ): Promise<void> {
 	const { stream, authorization } = context;
 	await runWorkspaceUtilityRpcLoop(stream, context.initialInput, async (line) => {
@@ -299,10 +300,7 @@ export async function runWorkspaceManagementStream(
 			await writeIrohRemoteJsonLine(stream.send, parsed.response, authorization);
 			return false;
 		}
-		if (
-			parsed.command.type !== "unregister_workspace" &&
-			parsed.command.type !== LIST_WORKSPACE_DIRECTORIES_RPC_TYPE
-		) {
+		if (parsed.command.type !== purpose) {
 			await writeIrohRemoteJsonLine(
 				stream.send,
 				createIrohRemoteRpcErrorResponse(

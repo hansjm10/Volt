@@ -297,34 +297,35 @@ export class HostReviewDiscussionService {
 		const snapshot = row.current.available
 			? await store.loadSession(row.current.child.sessionId, row.current.child.sessionGeneration)
 			: null;
-		const input = snapshot?.clientInputs.find(
-			(entry) => entry.clientMessageId === row.current.kickoffClientMessageId,
-		);
-		const messages =
-			snapshot?.entries.flatMap((raw) => {
-				const entry = decodeStoredSessionEntry(raw);
-				return entry.type === "message" ? [entry.message] : [];
-			}) ?? [];
-		const lastMessage = messages.at(-1);
+		const entries = snapshot?.entries.map(decodeStoredSessionEntry) ?? [];
+		const lastMessage = entries.findLast((entry) => entry.type === "message")?.message;
+		const lastUser = entries.findLast((entry) => entry.type === "message" && entry.message.role === "user");
+		const lastReceipt = entries.findLast((entry) => entry.type === "client_input_receipt");
+		const input = snapshot?.clientInputs.find((entry) => entry.clientMessageId === lastReceipt?.clientMessageId);
+		// A queued or failed request has no canonical user message. An earlier answer
+		// must not hide it, even if that answer finished after the input was queued.
+		const undeliveredInput = (lastReceipt?.ordinal ?? -1) > (lastUser?.ordinal ?? -1) ? input : undefined;
 		const terminal = lastMessage?.role === "assistant" ? lastMessage.stopReason : undefined;
 		// Client-input completion means a canonical user entry, not a completed provider answer.
 		const status = !row.current.available
 			? "unavailable"
 			: runtime?.session.isBusy
 				? "running"
-				: terminal === "aborted"
-					? "cancelled"
-					: terminal === "error"
-						? "failed"
-						: terminal === "stop" || terminal === "length"
-							? "completed"
-							: input?.state === "failed"
+				: undeliveredInput?.state === "failed"
+					? "failed"
+					: undeliveredInput?.state === "accepted" || undeliveredInput?.state === "started"
+						? "interrupted"
+						: terminal === "aborted"
+							? "cancelled"
+							: terminal === "error"
 								? "failed"
-								: messages.length > 0 || input
-									? "interrupted"
-									: row.current.ordinal > 1
-										? "idle"
-										: "pending";
+								: terminal === "stop" || terminal === "length"
+									? "completed"
+									: lastMessage || input
+										? "interrupted"
+										: row.current.ordinal > 1
+											? "idle"
+											: "pending";
 		return {
 			...projectReviewDiscussionLink({ discussion: row, child: row.current }),
 			currentSessionId: row.current.child.sessionId,

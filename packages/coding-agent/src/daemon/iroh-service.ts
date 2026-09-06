@@ -2929,7 +2929,14 @@ class IrohDaemonService {
 				await this.runWorktreeManagement(stream, handshake, connectionId, streamId, owner);
 				return;
 			}
-			await this.runWorkspaceManagement(stream, handshake, connectionId, streamId, owner);
+			await this.runWorkspaceManagement(
+				stream,
+				handshake,
+				connectionId,
+				streamId,
+				owner,
+				handshake.hello.workspaceManagement.purpose,
+			);
 			return;
 		}
 		await this.runIntegratedConversation(stream, handshake, connectionId, streamId, owner);
@@ -3213,6 +3220,7 @@ class IrohDaemonService {
 		connectionId: string,
 		streamId: string,
 		owner: IrohPhysicalStreamOwner,
+		purpose: "unregister_workspace" | "list_workspace_directories",
 	): Promise<void> {
 		await writeIrohRemoteHandshakeResponse(stream.send, handshake.response);
 		await this.dependencies.beforeAuthorizedStreamPublication?.("workspace_management", handshake.authorization);
@@ -3272,6 +3280,7 @@ class IrohDaemonService {
 						return { ok: true, closedStreamCount, stoppedRuntimeCount };
 					},
 				},
+				purpose,
 			);
 		} finally {
 			activeStream.remove();

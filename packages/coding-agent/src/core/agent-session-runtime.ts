@@ -102,7 +102,7 @@ export interface AgentSessionSwitchOptions {
 
 export interface AgentSessionReplacementTransaction {
 	commit(): Promise<void>;
-	/** Release the replacement reservation after the new projection generation is published. */
+	/** Finish host ownership before replacement callbacks and any durable publication barrier. */
 	finalize?(): Promise<void>;
 	rollback(): Promise<void>;
 	dispose(): Promise<void>;
@@ -890,25 +890,33 @@ export class AgentSessionRuntime {
 					) {
 						throw new Error("Agent session replacement changed before ownership commit");
 					}
+					const publicationSession = created.session;
 					const publicationGeneration = created.session.conversationGenerationRevision;
-					await transaction?.commit();
-					const result = await this.finishSessionReplacement(
-						options.withSession,
-						transaction,
-						options.rebindRequestId,
-					);
-					if (options.commitPublication) {
+					const commitPublication = options.commitPublication;
+					const assertPublicationCurrent = (boundary: "before" | "during"): void => {
 						if (
 							this.sessionInvalidated ||
-							this.session !== created.session ||
+							this.session !== publicationSession ||
 							this.session.sessionId !== sessionId ||
 							this.session.conversationGenerationRevision !== publicationGeneration ||
 							this.lifecycleRevision !== options.operation.expectedRevision + 1
 						)
-							throw new Error("Agent session replacement changed before durable publication");
-						await options.commitPublication();
-					}
-					return result;
+							throw new Error(`Agent session replacement changed ${boundary} durable publication`);
+					};
+					await transaction?.commit();
+					return await this.finishSessionReplacement(
+						options.withSession,
+						transaction,
+						options.rebindRequestId,
+						commitPublication
+							? async () => {
+									assertPublicationCurrent("before");
+									await commitPublication();
+									assertPublicationCurrent("during");
+									this.conversationProjectionFeed.commitSourceRebind(options.rebindRequestId);
+								}
+							: undefined,
+					);
 				} catch (error: unknown) {
 					const replacementError = error instanceof Error ? error : new Error(String(error));
 					const cleanupErrors: unknown[] = [];
@@ -1053,6 +1061,7 @@ export class AgentSessionRuntime {
 		withSession: ((ctx: ReplacedSessionContext) => Promise<void>) | undefined,
 		transaction: AgentSessionReplacementTransaction | undefined,
 		rebindRequestId: string | undefined,
+		publishReplacement?: () => Promise<void>,
 	): Promise<{ seeded: boolean }> {
 		try {
 			for (const listener of [...this.sessionWillProjectListeners]) {
@@ -1063,7 +1072,22 @@ export class AgentSessionRuntime {
 			this.conversationProjectionFeed.failSourceRebind(ownershipError);
 			throw ownershipError;
 		}
-		this.conversationProjectionFeed.commitSourceRebind(rebindRequestId);
+		// Ordinary replacements publish before extension callbacks so their input
+		// and UI interactions can stream. A durable destination replacement must
+		// instead finish preparation and commit its routing record before clients
+		// can adopt the candidate identity. Preparation failures retain the original
+		// General. After the routing commit, projection failure may close the runtime
+		// but its persisted General remains the authoritative resumable destination.
+		if (!publishReplacement) this.conversationProjectionFeed.commitSourceRebind(rebindRequestId);
+		const result = await this.bindAndSeedReplacementSession(withSession, transaction);
+		await publishReplacement?.();
+		return result;
+	}
+
+	private async bindAndSeedReplacementSession(
+		withSession: ((ctx: ReplacedSessionContext) => Promise<void>) | undefined,
+		transaction: AgentSessionReplacementTransaction | undefined,
+	): Promise<{ seeded: boolean }> {
 		await transaction?.finalize?.();
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);

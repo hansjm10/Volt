@@ -391,6 +391,46 @@ describe("Regression #341 host sibling lifecycle", () => {
 		await expect(runtimes[1]!.importFromJsonl("missing")).rejects.toThrow("source-linked");
 	});
 
+	it.each([false, true])(
+		"shows interrupted later input after reconnect (reset: %s) until an explicit retry answers",
+		async (reset) => {
+			const { api, harness, runtimes, source, service } = await fixture();
+			harness.setResponses([fauxAssistantMessage("Initial answer")]);
+			const [first] = successful(await api.start("review-341", ["f1"], "start"));
+			await runtimes[1]!.session.waitForIdle();
+			if (reset) await api.reset(first!.discussionId, first!.sessionId, "reset");
+			const child = runtimes.at(-1)!;
+			const manager = child.session.sessionManager;
+			manager.reserveClientInput("interrupted-follow-up", "follow_up", {
+				message: "Check another case",
+				images: [],
+			});
+			manager.markClientInputQueued("interrupted-follow-up", {
+				delivery: "follow_up",
+				message: "Check another case",
+				images: [],
+			});
+			const ref = child.session.sessionRef!;
+			await manager.flush();
+			await child.dispose();
+			runtimes.splice(runtimes.indexOf(child), 1);
+			expect((await api.list("review-341")).discussions[0]!.status).toBe("interrupted");
+			const reopened = await source.createReviewDiscussionSibling(await SessionManager.open(ref));
+			runtimes.push(reopened);
+			reopened.reviewDiscussions = service.forRuntime(reopened);
+			await reopened.startRecoveredClientInputs();
+			expect(reopened.session.sessionManager.getClientInput("interrupted-follow-up")).toMatchObject({
+				state: "failed",
+				error: expect.stringContaining("interrupted"),
+			});
+			expect((await api.list("review-341")).discussions[0]!.status).toBe("failed");
+			harness.setResponses([fauxAssistantMessage("Explicit retry answer")]);
+			await reopened.session.prompt("Retry the interrupted request", { source: "rpc", clientMessageId: "retry" });
+			expect((await api.list("review-341")).discussions[0]!.status).toBe("completed");
+			expect(reopened.session.messages.filter((message) => message.role === "user")).toHaveLength(reset ? 1 : 2);
+		},
+	);
+
 	it("source handoff aliases converge and copied/forked metadata cannot grant authority", async () => {
 		const { api, harness, source, service, runtimes, factory, root } = await fixture();
 		harness.setResponses([fauxAssistantMessage("answer")]);
