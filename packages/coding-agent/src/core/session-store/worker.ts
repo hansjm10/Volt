@@ -215,6 +215,16 @@ function assertExactNames(actual: readonly string[], expected: readonly string[]
 	}
 }
 
+function assertIncludesNames(actual: readonly string[], expected: readonly string[], description: string): void {
+	const actualNames = new Set(actual);
+	if (expected.some((name) => !actualNames.has(name))) {
+		throw new SessionStoreError(
+			"store_schema_mismatch",
+			`Session store ${description} are missing from the supported schema`,
+		);
+	}
+}
+
 function initializeNewSchema(db: DatabaseSync): void {
 	withTransaction(db, () => {
 		const userVersion = pragmaInteger(db, "PRAGMA user_version", "user_version");
@@ -241,15 +251,26 @@ function initializeNewSchema(db: DatabaseSync): void {
 
 function validateSchema(db: DatabaseSync): void {
 	const userVersion = pragmaInteger(db, "PRAGMA user_version", "user_version");
-	if (userVersion !== SESSION_STORE_SCHEMA_VERSION) {
+	const supportsForwardV2Store = userVersion === 2;
+	if (userVersion !== SESSION_STORE_SCHEMA_VERSION && !supportsForwardV2Store) {
 		throw new SessionStoreError(
 			"store_schema_mismatch",
 			`Session store schema version ${userVersion} is unsupported; expected ${SESSION_STORE_SCHEMA_VERSION}`,
 		);
 	}
-	assertExactNames(userSchemaObjects(db, "table"), SESSION_STORE_TABLE_NAMES, "tables");
-	assertExactNames(userSchemaObjects(db, "index"), SESSION_STORE_INDEX_NAMES, "indexes");
-	if (schemaDigest(db) !== EXPECTED_SCHEMA_DIGEST) {
+	const tableNames = userSchemaObjects(db, "table");
+	const indexNames = userSchemaObjects(db, "index");
+	if (supportsForwardV2Store) {
+		// Newer Volt builds add review tables to the same SQLite store. This
+		// checkout only uses the core session tables, so retain the newer data
+		// while validating the schema this worker actually reads.
+		assertIncludesNames(tableNames, SESSION_STORE_TABLE_NAMES, "core tables");
+		assertIncludesNames(indexNames, SESSION_STORE_INDEX_NAMES, "core indexes");
+	} else {
+		assertExactNames(tableNames, SESSION_STORE_TABLE_NAMES, "tables");
+		assertExactNames(indexNames, SESSION_STORE_INDEX_NAMES, "indexes");
+	}
+	if (!supportsForwardV2Store && schemaDigest(db) !== EXPECTED_SCHEMA_DIGEST) {
 		throw new SessionStoreError(
 			"store_schema_mismatch",
 			"Session store DDL, views, or triggers do not match the expected schema",
@@ -277,9 +298,10 @@ function validateSchema(db: DatabaseSync): void {
 	const persistedStoreId = metadata.get("store_id");
 	if (
 		metadata.size !== 5 ||
-		metadata.get("schema_id") !== SESSION_STORE_SCHEMA_ID ||
-		metadata.get("schema_digest") !== EXPECTED_SCHEMA_DIGEST ||
-		metadata.get("schema_version") !== SESSION_STORE_SCHEMA_VERSION ||
+		metadata.get("schema_id") !== (supportsForwardV2Store ? "volt-session-store-v2" : SESSION_STORE_SCHEMA_ID) ||
+		(typeof metadata.get("schema_digest") !== "string" && !supportsForwardV2Store) ||
+		(!supportsForwardV2Store && metadata.get("schema_digest") !== EXPECTED_SCHEMA_DIGEST) ||
+		metadata.get("schema_version") !== (supportsForwardV2Store ? 2 : SESSION_STORE_SCHEMA_VERSION) ||
 		typeof metadata.get("created_at") !== "string" ||
 		typeof persistedStoreId !== "string" ||
 		persistedStoreId.length === 0 ||
