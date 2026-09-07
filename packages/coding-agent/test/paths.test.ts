@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -21,29 +22,29 @@ function createTempDir(): string {
 }
 
 describe("canonicalizePath", () => {
-	it("returns the real path for a regular file", () => {
+	it("returns the real path for a regular file", async () => {
 		const dir = createTempDir();
 		const file = join(dir, "file.txt");
 		writeFileSync(file, "hello");
-		expect(canonicalizePath(file)).toBe(realpathSync(file));
+		expect(canonicalizePath(file)).toBe(await realpath(file));
 	});
 
-	it("resolves symlinks to their targets", () => {
+	it("resolves symlinks to their targets", async () => {
 		const dir = createTempDir();
 		const target = join(dir, "target.txt");
 		const link = join(dir, "link.txt");
 		writeFileSync(target, "hello");
 		if (!tryCreateFileSymlinkSync(target, link)) return;
-		expect(canonicalizePath(link)).toBe(realpathSync(target));
+		expect(canonicalizePath(link)).toBe(await realpath(target));
 	});
 
-	it("resolves directory symlinks", () => {
+	it("resolves directory symlinks", async () => {
 		const dir = createTempDir();
 		const targetDir = join(dir, "target-dir");
 		const linkDir = join(dir, "link-dir");
 		mkdirSync(targetDir);
 		createDirectorySymlinkSync(targetDir, linkDir);
-		expect(canonicalizePath(linkDir)).toBe(realpathSync(targetDir));
+		expect(canonicalizePath(linkDir)).toBe(await realpath(targetDir));
 	});
 
 	it("falls back to the raw path when the target does not exist", () => {

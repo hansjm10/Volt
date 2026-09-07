@@ -957,7 +957,7 @@ describe("LspManager", () => {
 		const status = manager.getStatus();
 		expect(status).toHaveLength(1);
 		expect(status[0].name).toBe("fake");
-		expect(status[0].root).toBe(realpathSync(tempDir));
+		expect(status[0].root).toBe(realpathSync.native(tempDir));
 		expect(status[0].alive).toBe(true);
 		expect(status[0].openDocuments).toBe(1);
 		expect(status[0].idleMs).toBeGreaterThanOrEqual(0);
@@ -1018,20 +1018,20 @@ describe("LspManager", () => {
 		writeFileSync(filePath, "class FakeClass\n");
 		expect(await manager.documentSymbols(filePath)).toContain("FakeClass");
 		const status = manager.getStatus()[0];
-		expect(status.workspaceRoot).toBe(realpathSync(projectDir));
-		expect(status.root).toBe(realpathSync(projectDir));
+		expect(status.workspaceRoot).toBe(realpathSync.native(projectDir));
+		expect(status.root).toBe(realpathSync.native(projectDir));
 		const expectedExecutable =
 			process.platform === "win32"
-				? join(realpathSync(projectDir), "server", "fake-server.cmd")
-				: join(realpathSync(projectDir), "server", "fake-server");
+				? join(realpathSync.native(projectDir), "server", "fake-server.cmd")
+				: join(realpathSync.native(projectDir), "server", "fake-server");
 		expect(process.platform === "win32" ? status.resolvedExecutable?.toLowerCase() : status.resolvedExecutable).toBe(
 			process.platform === "win32" ? expectedExecutable.toLowerCase() : expectedExecutable,
 		);
 		expect(status.launchSource).toBe("project-relative");
-		expect(manager.getTraceFile()).toBe(join(realpathSync(projectDir), "logs", "lsp.log"));
+		expect(manager.getTraceFile()).toBe(join(realpathSync.native(projectDir), "logs", "lsp.log"));
 
 		await manager.setTraceFile("runtime-trace.log");
-		expect(manager.getTraceFile()).toBe(join(realpathSync(projectDir), "runtime-trace.log"));
+		expect(manager.getTraceFile()).toBe(join(realpathSync.native(projectDir), "runtime-trace.log"));
 	});
 
 	it("accepts sibling workspace paths through the supplied lexical project-root alias", async () => {
@@ -1061,10 +1061,10 @@ describe("LspManager", () => {
 		expect(await manager.fileDiagnostics(join(runtimeDir, "runtime.foo"))).toContain(
 			"runtime.foo(1,5): error: found ERROR on line 1",
 		);
-		expect(manager.getWorkspaceRoot()).toBe(realpathSync(realProjectDir));
+		expect(manager.getWorkspaceRoot()).toBe(realpathSync.native(realProjectDir));
 		expect(manager.getStatus()[0]).toMatchObject({
-			workspaceRoot: realpathSync(realProjectDir),
-			root: realpathSync(realProjectDir),
+			workspaceRoot: realpathSync.native(realProjectDir),
+			root: realpathSync.native(realProjectDir),
 		});
 	});
 
@@ -1206,7 +1206,7 @@ describe("LspManager", () => {
 		const filePath = join(nestedDir, "test.foo");
 		writeFileSync(filePath, "class FakeClass\n");
 		await manager.documentSymbols(filePath);
-		expect(manager.getStatus()[0].root).toBe(realpathSync(projectDir));
+		expect(manager.getStatus()[0].root).toBe(realpathSync.native(projectDir));
 	});
 
 	it("rejects lexical and resolved or dangling symlink access outside projectCwd", async () => {
@@ -1278,8 +1278,8 @@ describe("LspManager", () => {
 		expect(await manager.documentSymbols(goodFile)).toContain("FakeClass");
 
 		const statuses = manager.getStatus();
-		const badStatus = statuses.find((status) => status.root === realpathSync(badRoot));
-		const goodStatus = statuses.find((status) => status.root === realpathSync(goodRoot));
+		const badStatus = statuses.find((status) => status.root === realpathSync.native(badRoot));
+		const goodStatus = statuses.find((status) => status.root === realpathSync.native(goodRoot));
 		expect(badStatus).toMatchObject({ alive: false, attempts: 3 });
 		expect(badStatus?.lastError).toContain("bad root startup");
 		expect(goodStatus).toMatchObject({ alive: true, attempts: 1 });

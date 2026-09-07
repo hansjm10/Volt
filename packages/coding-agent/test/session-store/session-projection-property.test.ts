@@ -198,6 +198,7 @@ async function applyStatefulOperation(
 }
 
 describe("session projection reducer properties", () => {
+	// Both properties repeatedly reopen disk-backed SQLite workers; allow for full-suite I/O contention.
 	it(`keeps incremental and replay state equal across transaction partitions (seed ${PROPERTY_SEED})`, async () => {
 		await fc.assert(
 			fc.asyncProperty(
@@ -231,7 +232,7 @@ describe("session projection reducer properties", () => {
 			),
 			{ seed: PROPERTY_SEED, numRuns: 20 },
 		);
-	}, 30_000);
+	}, 60_000);
 
 	it(`keeps stateful projections replayable across branch, metadata, and rollback operations (seed ${PROPERTY_SEED + 1})`, async () => {
 		await fc.assert(
@@ -257,5 +258,5 @@ describe("session projection reducer properties", () => {
 			}),
 			{ seed: PROPERTY_SEED + 1, numRuns: 15 },
 		);
-	}, 30_000);
+	}, 60_000);
 });

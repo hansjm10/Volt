@@ -27,7 +27,9 @@ export interface PathInputOptions {
  */
 export function canonicalizePath(path: string): string {
 	try {
-		return realpathSync(path);
+		// Match fs.promises.realpath, including Windows 8.3 names and on-disk casing.
+		// The JS realpathSync implementation can retain a short-name alias.
+		return realpathSync.native(path);
 	} catch {
 		return path;
 	}
