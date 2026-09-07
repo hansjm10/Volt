@@ -277,11 +277,12 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	});
 
-	it("should preserve extension-origin steering messages when the active run aborts", async () => {
+	it("delivers retained steer and follow-up queues after a remote abort", async () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 		let sawSteeringMessage = false;
-		let lastInputSource: string | undefined;
+		let sawFollowUpMessage = false;
+		const inputSources: string[] = [];
 		const queueEvents: Array<{
 			steering: readonly AgentSessionQueuedMessage[];
 			followUp: readonly AgentSessionQueuedMessage[];
@@ -307,10 +308,18 @@ describe("AgentSession concurrent prompt guard", () => {
 								.join("\n");
 						});
 
-					if (userTexts.includes("Steer from extension")) {
-						sawSteeringMessage = true;
+					const hasSteeringMessage = userTexts.includes("Steer from extension");
+					const hasFollowUpMessage = userTexts.includes("Follow-up from remote");
+					if (hasSteeringMessage || hasFollowUpMessage) {
+						sawSteeringMessage ||= hasSteeringMessage;
+						sawFollowUpMessage ||= hasFollowUpMessage;
 						stream.push({ type: "start", seq: 0, snapshot: createAssistantMessage(""), toolState: [] });
-						stream.push({ type: "done", seq: 1, reason: "stop", message: createAssistantMessage("Steered") });
+						stream.push({
+							type: "done",
+							seq: 1,
+							reason: "stop",
+							message: createAssistantMessage("Queued message handled"),
+						});
 						return;
 					}
 
@@ -345,7 +354,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 			(volt) => {
 				volt.on("input", async (event) => {
-					lastInputSource = event.source;
+					inputSources.push(event.source);
 				});
 			},
 		]);
@@ -379,19 +388,35 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		volt!.sendUserMessage("Steer from extension", { deliverAs: "steer" });
 		await new Promise((resolve) => setTimeout(resolve, 25));
+		const followUpClientMessageId = "remote-follow-up-after-abort";
+		const followUpPrompt = session.prompt("Follow-up from remote", {
+			streamingBehavior: "followUp",
+			clientMessageId: followUpClientMessageId,
+			source: "rpc",
+		});
+		const abort = session.abort("remote_request");
 
-		expect(session.pendingMessageCount).toBe(1);
-		expect(session.getSteeringMessages().map((message) => message.text)).toContain("Steer from extension");
-		expect(lastInputSource).toBe("extension");
+		await followUpPrompt;
+		expect(inputSources).toContain("extension");
+		expect(inputSources).toContain("rpc");
 		expect(
-			queueEvents.some((event) => event.steering.some((message) => message.text === "Steer from extension")),
+			queueEvents.some(
+				(event) =>
+					event.steering.some((message) => message.text === "Steer from extension") &&
+					event.followUp.some((message) => message.text === "Follow-up from remote"),
+			),
 		).toBe(true);
 
-		await session.abort();
+		await abort;
 		await firstPrompt.catch(() => {});
+		await session.waitForIdle();
 
-		expect(sawSteeringMessage).toBe(false);
-		expect(session.getSteeringMessages().map((message) => message.text)).toContain("Steer from extension");
+		expect(sawSteeringMessage).toBe(true);
+		expect(sawFollowUpMessage).toBe(true);
+		expect(session.pendingMessageCount).toBe(0);
+		expect(session.getSteeringMessages()).toEqual([]);
+		expect(session.getFollowUpMessages()).toEqual([]);
+		expect(sessionManager.getClientInput(followUpClientMessageId)).toMatchObject({ state: "completed" });
 	});
 
 	it("should allow prompt() after previous completes", async () => {
