@@ -8,6 +8,7 @@ import {
 	exchangeIrohManagedRelayCredentialClaim,
 	type IrohManagedRelayCredential,
 	type IrohManagedRelayCredentialClaim,
+	IrohRelayCredentialSubscriptionInactiveError,
 	managedRelayCredentialFailureRetryMs,
 	managedRelayCredentialPendingRetryMs,
 	managedRelayCredentialRateLimitRetryMs,
@@ -25,7 +26,14 @@ const claimId = "abcdefghijklmnopqrstuvwx";
 const hostNodeId = "a".repeat(64);
 const appNodeId = "b".repeat(64);
 let server: Server;
-let responseMode: "normal" | "pending" | "rate-limited" | "oversized" | "redirect" | "revoke" = "normal";
+let responseMode:
+	| "normal"
+	| "pending"
+	| "rate-limited"
+	| "subscription-inactive"
+	| "oversized"
+	| "redirect"
+	| "revoke" = "normal";
 let observedRequest: { url?: string; method?: string; authorization?: string; body: string } | undefined;
 let redirectedRequestCount = 0;
 
@@ -96,6 +104,11 @@ beforeAll(async () => {
 			if (responseMode === "revoke") {
 				response.writeHead(204);
 				response.end();
+				return;
+			}
+			if (responseMode === "subscription-inactive") {
+				response.writeHead(402, { "content-type": "application/json", "retry-after": "3600" });
+				response.end(JSON.stringify({ error: "subscription_inactive" }));
 				return;
 			}
 			if (request.url === "/v1/pairing-claims") {
@@ -259,6 +272,19 @@ describe("managed relay credential lifecycle", () => {
 			authorization: `Bearer ${original.refreshToken}`,
 			body: "",
 		});
+	});
+
+	it("retains refresh authority while a subscription is inactive", async () => {
+		responseMode = "subscription-inactive";
+		const original = credential();
+		try {
+			await refreshIrohManagedRelayCredential(original);
+			expect.unreachable("expected subscription suspension");
+		} catch (error) {
+			expect(error).toBeInstanceOf(IrohRelayCredentialSubscriptionInactiveError);
+			expect((error as IrohRelayCredentialSubscriptionInactiveError).retryAfterMs).toBe(3_600_000);
+		}
+		expect(original.refreshToken).toBe(`vrr_${"d".repeat(43)}`);
 	});
 
 	it("rejects an oversized chunked refresh response", async () => {

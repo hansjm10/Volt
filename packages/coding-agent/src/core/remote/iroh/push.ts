@@ -284,7 +284,7 @@ export interface IrohRemotePushNotificationDispatcherOptions {
 }
 
 export interface IrohRemotePushRelayHttpClientOptions {
-	authToken?: string;
+	authToken?: string | (() => string | undefined);
 	baseUrl?: string;
 	fetcher?: (input: string, init: RequestInit) => Promise<Response>;
 	timeoutMs?: number;
@@ -361,7 +361,7 @@ async function readRelayErrorDetail(response: Response): Promise<string | undefi
 }
 
 export class IrohRemotePushRelayHttpClient implements IrohRemotePushRelayClient {
-	private readonly authToken: string | undefined;
+	private readonly authToken: string | (() => string | undefined) | undefined;
 	private readonly baseUrl: string;
 	private readonly fetcher: (input: string, init: RequestInit) => Promise<Response>;
 	private readonly timeoutMs: number;
@@ -430,9 +430,10 @@ export class IrohRemotePushRelayHttpClient implements IrohRemotePushRelayClient 
 	}
 
 	private createHeaders(): Record<string, string> {
+		const authToken = typeof this.authToken === "function" ? this.authToken() : this.authToken;
 		return {
 			"content-type": "application/json",
-			...(this.authToken ? { authorization: `Bearer ${this.authToken}` } : {}),
+			...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
 		};
 	}
 }

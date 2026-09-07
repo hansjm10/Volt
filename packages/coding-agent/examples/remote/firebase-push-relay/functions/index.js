@@ -6,6 +6,12 @@ const { getMessaging } = require("firebase-admin/messaging");
 const { onRequest } = require("firebase-functions/v2/https");
 const { createPushTargetRegistrationHandler } = require("./registration.js");
 const {
+	RelayAccessVerificationError,
+	RelayKeyServiceUnavailableError,
+	createRelayAccessVerifier,
+	requireMatchingRelayGrant,
+} = require("./relay-auth.js");
+const {
 	RequestError,
 	assertRequestEnvelope,
 	assertVerifiedAppCheck,
@@ -53,6 +59,7 @@ const maxRegistrationsPerInstancePerMinute = getBoundedPositiveInteger(
 	DEFAULT_REGISTRATIONS_PER_INSTANCE_PER_MINUTE,
 );
 const registrationWindows = new Map();
+const verifyRelayAccess = createRelayAccessVerifier();
 const registerPushTarget = createPushTargetRegistrationHandler({
 	enforceRegistrationRateLimit,
 	getPushTargetsCollection,
@@ -184,7 +191,25 @@ async function getPushTargetStatus(request, response) {
 
 async function sendNotification(request, response) {
 	const notification = parseNotification(readJsonBody(request));
-	const authorizedTarget = await reserveAuthorizedPushTarget(notification);
+	let relayAccess;
+	try {
+		relayAccess = await verifyRelayAccess(
+			getHeader(request, "authorization"),
+			notification.hostNodeId,
+		);
+	} catch (error) {
+		if (error instanceof RelayKeyServiceUnavailableError) {
+			throw new RequestError(503, "managed_relay_keys_unavailable");
+		}
+		if (error instanceof RelayAccessVerificationError) {
+			throw new RequestError(401, "managed_relay_authorization_invalid");
+		}
+		throw error;
+	}
+	const authorizedTarget = await reserveAuthorizedPushTarget(
+		notification,
+		relayAccess.grantId,
+	);
 	const { pushTarget, pushTargetRef } = authorizedTarget;
 
 	try {
@@ -207,7 +232,7 @@ async function sendNotification(request, response) {
 	}
 }
 
-async function reserveAuthorizedPushTarget(request) {
+async function reserveAuthorizedPushTarget(request, relayGrantId) {
 	const pushTargetRef = getPushTargetsCollection().doc(request.pushTargetId);
 	return getFirestore().runTransaction(async (transaction) => {
 		const snapshot = await transaction.get(pushTargetRef);
@@ -224,6 +249,11 @@ async function reserveAuthorizedPushTarget(request) {
 		if (!isAuthorizedTargetCredential(pushTarget, request.pushTargetAuthToken)) {
 			throw new RequestError(401, "unauthorized");
 		}
+		try {
+			requireMatchingRelayGrant(pushTarget.grantId, relayGrantId);
+		} catch {
+			throw new RequestError(403, "push_target_grant_mismatch");
+		}
 
 		const nowMs = Date.now();
 		const windowStartedAtMs = getFirestoreTimestampMillis(pushTarget.deliveryWindowStartedAt);
@@ -237,6 +267,7 @@ async function reserveAuthorizedPushTarget(request) {
 		}
 		transaction.update(pushTargetRef, {
 			deliveryWindowCount: deliveryWindowCount + 1,
+			grantId: relayGrantId,
 			deliveryWindowStartedAt: inCurrentWindow
 				? pushTarget.deliveryWindowStartedAt
 				: Timestamp.fromMillis(nowMs),

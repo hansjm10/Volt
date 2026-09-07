@@ -20,6 +20,43 @@ function createPushTarget(index: number): IrohRemotePushTarget {
 }
 
 describe("Iroh push relay target revocation", () => {
+	it("reads the current managed relay token for each notification", async () => {
+		let accessToken = "first.jwt.signature";
+		const fetcher = vi.fn(
+			async (_input: string, _init: RequestInit) => new Response('{"status":"sent"}', { status: 200 }),
+		);
+		const client = new IrohRemotePushRelayHttpClient({
+			authToken: () => accessToken,
+			baseUrl: "https://push.example.test",
+			fetcher,
+		});
+		const request = {
+			pushTargetId: "target-1",
+			pushTargetAuthToken: "target-secret",
+			eventId: "event-1",
+			hostNodeId: "a".repeat(64),
+			kind: "conversation_completed",
+			title: "Done",
+			body: "Agent finished",
+			data: {
+				eventId: "event-1",
+				hostNodeId: "a".repeat(64),
+				kind: "conversation_completed",
+			},
+		};
+
+		await client.sendNotification(request);
+		accessToken = "second.jwt.signature";
+		await client.sendNotification(request);
+
+		expect(fetcher.mock.calls[0]?.[1]?.headers).toMatchObject({
+			authorization: "Bearer first.jwt.signature",
+		});
+		expect(fetcher.mock.calls[1]?.[1]?.headers).toMatchObject({
+			authorization: "Bearer second.jwt.signature",
+		});
+	});
+
 	it("posts only target credentials to the fixed revoke route", async () => {
 		const fetcher = vi.fn(
 			async (_input: string, _init: RequestInit) => new Response('{"status":"revoked"}', { status: 200 }),

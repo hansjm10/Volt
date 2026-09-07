@@ -17,20 +17,91 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/appstore"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/testdatabase"
 )
 
-const developmentAppCheckToken = "development-app-check-token-at-least-32-bytes"
+const (
+	developmentAppCheckToken = "development-app-check-token-at-least-32-bytes"
+	defaultSubscriptionID    = "subscription-default"
+	testDeviceVerificationID = "11111111-1111-4111-8111-111111111111"
+)
+
+type testAppStoreVerifier struct {
+	now func() time.Time
+}
+
+func (v testAppStoreVerifier) VerifyEntitlement(
+	_ context.Context,
+	proof appstore.Proof,
+) (appstore.Entitlement, error) {
+	if strings.TrimSpace(proof.SignedAppTransaction) == "" {
+		return appstore.Entitlement{}, appstore.ErrProofInvalid
+	}
+	now := v.now().UTC()
+	appTransactionID, _, ok := strings.Cut(
+		proof.SignedAppTransaction,
+		"::",
+	)
+	if !ok {
+		return appstore.Entitlement{}, appstore.ErrProofInvalid
+	}
+	proofHash := sha256.Sum256([]byte(proof.SignedAppTransaction))
+	return appstore.Entitlement{
+		AppTransactionID:    appTransactionID,
+		ApprovalProofHash:   proofHash,
+		ProofCreatedAt:      now,
+		Environment:         "Sandbox",
+		ProductID:           "com.hansjm10.volt.pro.annual",
+		SubscriptionGroupID: "test-group",
+		Status:              appstore.StatusActive,
+		EntitledUntil:       now.Add(24 * time.Hour),
+		SourceSignedAt:      now,
+		VerifiedAt:          now,
+	}, nil
+}
+
+func (v testAppStoreVerifier) ReconcileEntitlement(
+	_ context.Context,
+	appTransactionID string,
+	environment string,
+) (appstore.Entitlement, error) {
+	now := v.now().UTC()
+	return appstore.Entitlement{
+		AppTransactionID:    appTransactionID,
+		Environment:         environment,
+		ProductID:           "com.hansjm10.volt.pro.annual",
+		SubscriptionGroupID: "test-group",
+		Status:              appstore.StatusActive,
+		EntitledUntil:       now.Add(24 * time.Hour),
+		SourceSignedAt:      now,
+		VerifiedAt:          now,
+	}, nil
+}
+
+func (testAppStoreVerifier) VerifyNotification(
+	context.Context,
+	string,
+) (appstore.Notification, error) {
+	return appstore.Notification{}, appstore.ErrProofInvalid
+}
 
 type testService struct {
 	handler *Server
 	signer  *credential.Signer
+	pool    *pgxpool.Pool
 	now     time.Time
 }
 
 func newTestService(t *testing.T) *testService {
+	t.Helper()
+	return newTestServiceWithPool(t, testdatabase.Open(t))
+}
+
+func newTestServiceWithPool(t *testing.T, pool *pgxpool.Pool) *testService {
 	t.Helper()
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -42,9 +113,9 @@ func newTestService(t *testing.T) *testService {
 	}
 	service := &testService{
 		signer: signer,
+		pool:   pool,
 		now:    time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC),
 	}
-	pool := testdatabase.Open(t)
 	brokerService, err := broker.New(pool, signer, broker.Config{
 		ClaimTTL:                10 * time.Minute,
 		AccessTokenTTL:          15 * time.Minute,
@@ -61,15 +132,23 @@ func newTestService(t *testing.T) *testService {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := NewServer(brokerService, signer, appCheck, Config{
-		MaxConcurrentRequests:         8,
-		RefreshMinInterval:            5 * time.Second,
-		MaxBootstrapRequestsPerMinute: 100,
-		MaxApprovalRequestsPerMinute:  100,
-		MaxExchangeRequestsPerMinute:  100,
-		ReadinessCheck:                pool.Ping,
-		Now:                           func() time.Time { return service.now },
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler, err := NewServer(
+		brokerService,
+		signer,
+		appCheck,
+		testAppStoreVerifier{now: func() time.Time { return service.now }},
+		Config{
+			MaxConcurrentRequests:         8,
+			RefreshMinInterval:            5 * time.Second,
+			EntitlementReconcileInterval:  24 * time.Hour,
+			MaxBootstrapRequestsPerMinute: 100,
+			MaxApprovalRequestsPerMinute:  100,
+			MaxExchangeRequestsPerMinute:  100,
+			ReadinessCheck:                pool.Ping,
+			Now:                           func() time.Time { return service.now },
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +173,10 @@ func TestBootstrapPairingUsesClientGeneratedStableRefreshSecrets(t *testing.T) {
 	}
 
 	approvalBody := encodeBody(t, map[string]string{
-		"appNodeId":           appNodeID,
-		"appRefreshTokenHash": secretHash(appRefreshToken),
+		"appNodeId":                    appNodeID,
+		"appRefreshTokenHash":          secretHash(appRefreshToken),
+		"signedAppTransaction":         testSignedAppTransaction(defaultSubscriptionID, claim.ClaimID),
+		"appStoreDeviceVerificationId": testDeviceVerificationID,
 	})
 	unauthenticatedApproval := service.request(t, http.MethodPost, "/v1/pairing-claims/"+claim.ClaimID+"/approve", approvalBody, nil)
 	if unauthenticatedApproval.Code != http.StatusUnauthorized {
@@ -134,8 +215,10 @@ func TestBootstrapPairingUsesClientGeneratedStableRefreshSecrets(t *testing.T) {
 	}
 
 	conflictingApproval := service.request(t, http.MethodPost, "/v1/pairing-claims/"+claim.ClaimID+"/approve", encodeBody(t, map[string]string{
-		"appNodeId":           appNodeID,
-		"appRefreshTokenHash": secretHash(testSecret("vrr_", 4)),
+		"appNodeId":                    appNodeID,
+		"appRefreshTokenHash":          secretHash(testSecret("vrr_", 4)),
+		"signedAppTransaction":         testSignedAppTransaction(defaultSubscriptionID, claim.ClaimID),
+		"appStoreDeviceVerificationId": testDeviceVerificationID,
 	}), map[string]string{"X-Firebase-AppCheck": developmentAppCheckToken})
 	if conflictingApproval.Code != http.StatusConflict {
 		t.Fatalf("conflicting refresh hash status = %d, body = %s", conflictingApproval.Code, conflictingApproval.Body.String())
@@ -266,8 +349,10 @@ func TestExistingGrantAddsAndRevokesOneAppEndpoint(t *testing.T) {
 	var duplicateNodeClaim broker.PairingClaim
 	decodeResponse(t, duplicateNodeClaimResponse, &duplicateNodeClaim)
 	duplicateNodeApproval := service.request(t, http.MethodPost, "/v1/pairing-claims/"+duplicateNodeClaim.ClaimID+"/approve", encodeBody(t, map[string]string{
-		"appNodeId":           secondAppNodeID,
-		"appRefreshTokenHash": secretHash(testSecret("vrr_", 21)),
+		"appNodeId":                    secondAppNodeID,
+		"appRefreshTokenHash":          secretHash(testSecret("vrr_", 21)),
+		"signedAppTransaction":         testSignedAppTransaction(defaultSubscriptionID, duplicateNodeClaim.ClaimID),
+		"appStoreDeviceVerificationId": testDeviceVerificationID,
 	}), map[string]string{"X-Firebase-AppCheck": developmentAppCheckToken})
 	if duplicateNodeApproval.Code != http.StatusConflict {
 		t.Fatalf("duplicate grant/node approval status = %d, body = %s", duplicateNodeApproval.Code, duplicateNodeApproval.Body.String())
@@ -278,7 +363,13 @@ func TestExistingGrantAddsAndRevokesOneAppEndpoint(t *testing.T) {
 	otherHostRefreshToken := testSecret("vrr_", 23)
 	otherAppRefreshToken := testSecret("vrr_", 24)
 	otherClaim := service.createBootstrapClaim(t, otherHostNodeID, otherClaimSecret, otherHostRefreshToken)
-	otherApproval := service.approveClaim(t, otherClaim.ClaimID, secondAppNodeID, otherAppRefreshToken)
+	otherApproval := service.approveClaimWithSubscription(
+		t,
+		otherClaim.ClaimID,
+		secondAppNodeID,
+		otherAppRefreshToken,
+		"subscription-other",
+	)
 	if otherApproval.GrantID == firstApproval.GrantID {
 		t.Fatal("independent daemon identity reused the first grant")
 	}
@@ -424,8 +515,10 @@ func TestPairingClaimsRejectConflictsExpiryAndMalformedInput(t *testing.T) {
 	appRefreshToken := testSecret("vrr_", 17)
 	service.approveClaim(t, claim.ClaimID, appNodeID, appRefreshToken)
 	conflict := service.request(t, http.MethodPost, "/v1/pairing-claims/"+claim.ClaimID+"/approve", encodeBody(t, map[string]string{
-		"appNodeId":           strings.Repeat("5", 64),
-		"appRefreshTokenHash": secretHash(appRefreshToken),
+		"appNodeId":                    strings.Repeat("5", 64),
+		"appRefreshTokenHash":          secretHash(appRefreshToken),
+		"signedAppTransaction":         testSignedAppTransaction(defaultSubscriptionID, claim.ClaimID),
+		"appStoreDeviceVerificationId": testDeviceVerificationID,
 	}), map[string]string{"X-Firebase-AppCheck": developmentAppCheckToken})
 	if conflict.Code != http.StatusConflict {
 		t.Fatalf("conflicting approval status = %d, body = %s", conflict.Code, conflict.Body.String())
@@ -613,11 +706,39 @@ func (s *testService) createBootstrapClaim(t *testing.T, hostNodeID, claimSecret
 	return claim
 }
 
-func (s *testService) approveClaim(t *testing.T, claimID, appNodeID, appRefreshToken string) broker.Approval {
+func testSignedAppTransaction(subscriptionID, claimID string) string {
+	return subscriptionID + "::" + claimID
+}
+
+func (s *testService) approveClaim(
+	t *testing.T,
+	claimID string,
+	appNodeID string,
+	appRefreshToken string,
+) broker.Approval {
+	t.Helper()
+	return s.approveClaimWithSubscription(
+		t,
+		claimID,
+		appNodeID,
+		appRefreshToken,
+		defaultSubscriptionID,
+	)
+}
+
+func (s *testService) approveClaimWithSubscription(
+	t *testing.T,
+	claimID string,
+	appNodeID string,
+	appRefreshToken string,
+	subscriptionID string,
+) broker.Approval {
 	t.Helper()
 	response := s.request(t, http.MethodPost, "/v1/pairing-claims/"+claimID+"/approve", encodeBody(t, map[string]string{
-		"appNodeId":           appNodeID,
-		"appRefreshTokenHash": secretHash(appRefreshToken),
+		"appNodeId":                    appNodeID,
+		"appRefreshTokenHash":          secretHash(appRefreshToken),
+		"signedAppTransaction":         testSignedAppTransaction(subscriptionID, claimID),
+		"appStoreDeviceVerificationId": testDeviceVerificationID,
 	}), map[string]string{"X-Firebase-AppCheck": developmentAppCheckToken})
 	if response.Code != http.StatusOK {
 		t.Fatalf("approval status = %d, body = %s", response.Code, response.Body.String())

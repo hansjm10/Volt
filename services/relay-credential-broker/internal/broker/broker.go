@@ -16,47 +16,58 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/appstore"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
 )
 
 var (
-	ErrClaimCapacity       = errors.New("pairing claim capacity reached")
-	ErrEndpointCapacity    = errors.New("endpoint credential capacity reached")
-	ErrAppEndpointCapacity = errors.New("app endpoint capacity reached for grant")
-	ErrInvalidHostNodeID   = errors.New("invalid host node ID")
-	ErrInvalidAppNodeID    = errors.New("invalid app node ID")
-	ErrInvalidSecretHash   = errors.New("invalid secret hash")
-	ErrClaimNotFound       = errors.New("pairing claim not found")
-	ErrClaimExpired        = errors.New("pairing claim expired")
-	ErrClaimPending        = errors.New("pairing claim pending")
-	ErrClaimUnauthorized   = errors.New("pairing claim unauthorized")
-	ErrClaimConflict       = errors.New("pairing claim conflicts with existing approval")
-	ErrRefreshHashConflict = errors.New("refresh credential hash already exists")
-	ErrRefreshInvalid      = errors.New("refresh credential invalid")
-	ErrRefreshExpired      = errors.New("refresh credential expired")
-	ErrRefreshThrottled    = errors.New("refresh credential used too frequently")
-	ErrGrantRevoked        = errors.New("daemon identity grant revoked")
-	ErrEndpointNotFound    = errors.New("endpoint credential not found")
-	ErrEndpointForbidden   = errors.New("endpoint credential is outside host grant")
-	ErrAppCheckInvalid     = errors.New("verified App Check token is invalid")
-	ErrAppCheckReplay      = errors.New("Firebase App Check token was already consumed")
+	ErrClaimCapacity          = errors.New("pairing claim capacity reached")
+	ErrEndpointCapacity       = errors.New("endpoint credential capacity reached")
+	ErrAppEndpointCapacity    = errors.New("app endpoint capacity reached for grant")
+	ErrInvalidHostNodeID      = errors.New("invalid host node ID")
+	ErrInvalidAppNodeID       = errors.New("invalid app node ID")
+	ErrInvalidSecretHash      = errors.New("invalid secret hash")
+	ErrClaimNotFound          = errors.New("pairing claim not found")
+	ErrClaimExpired           = errors.New("pairing claim expired")
+	ErrClaimPending           = errors.New("pairing claim pending")
+	ErrClaimUnauthorized      = errors.New("pairing claim unauthorized")
+	ErrClaimConflict          = errors.New("pairing claim conflicts with existing approval")
+	ErrRefreshHashConflict    = errors.New("refresh credential hash already exists")
+	ErrRefreshInvalid         = errors.New("refresh credential invalid")
+	ErrRefreshExpired         = errors.New("refresh credential expired")
+	ErrRefreshThrottled       = errors.New("refresh credential used too frequently")
+	ErrGrantRevoked           = errors.New("daemon identity grant revoked")
+	ErrEndpointNotFound       = errors.New("endpoint credential not found")
+	ErrEndpointForbidden      = errors.New("endpoint credential is outside host grant")
+	ErrAppCheckInvalid        = errors.New("verified App Check token is invalid")
+	ErrAppCheckReplay         = errors.New("Firebase App Check token was already consumed")
+	ErrSubscriptionRequired   = errors.New("active Volt Pro subscription required")
+	ErrSubscriptionConflict   = errors.New("subscription does not match daemon grant")
+	ErrSubscriptionSuperseded = errors.New("pairing claim was superseded by a newer daemon")
+	ErrAppStoreProofReplay    = errors.New("App Store approval proof was already used for another claim")
 )
 
-var nodeIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var (
+	nodeIDPattern           = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	appTransactionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+)
 
 const (
-	claimSecretPrefix                = "vpc_"
-	refreshPrefix                    = "vrr_"
-	secretByteCount                  = 32
-	MaxClaimTTL                      = 30 * time.Minute
-	MaxAccessTokenTTL                = time.Hour
-	MaxRefreshInactivityTTL          = 90 * 24 * time.Hour
-	claimRetention                   = 24 * time.Hour
-	endpointTombstoneRetention       = 30 * 24 * time.Hour
-	appCheckPruneSkew                = 30 * time.Second
-	claimCapacityLockID        int64 = 8_606_146_524_991_413_122
-	endpointCapacityLockID     int64 = 8_606_146_524_991_413_123
+	claimSecretPrefix                   = "vpc_"
+	refreshPrefix                       = "vrr_"
+	secretByteCount                     = 32
+	MaxClaimTTL                         = 30 * time.Minute
+	MaxAccessTokenTTL                   = time.Hour
+	MaxRefreshInactivityTTL             = 90 * 24 * time.Hour
+	claimRetention                      = 24 * time.Hour
+	endpointTombstoneRetention          = 30 * 24 * time.Hour
+	appCheckPruneSkew                   = 30 * time.Second
+	appStoreNotificationRetention       = 90 * 24 * time.Hour
+	claimCapacityLockID           int64 = 8_606_146_524_991_413_122
+	endpointCapacityLockID        int64 = 8_606_146_524_991_413_123
 )
+
+const entitlementReconcileAttemptMinInterval = time.Hour
 
 type SecretHash [sha256.Size]byte
 
@@ -88,6 +99,7 @@ type pairingClaim struct {
 	ID                       string
 	SecretHash               SecretHash
 	HostNodeID               string
+	CreatedAt                time.Time
 	ExpiresAt                time.Time
 	GrantID                  string
 	HasGrant                 bool
@@ -101,6 +113,17 @@ type grantRecord struct {
 	ID         string
 	HostNodeID string
 	RevokedAt  pgtype.Timestamptz
+}
+
+type entitlementRecord struct {
+	AppTransactionID    string
+	Environment         string
+	ProductID           pgtype.Text
+	SubscriptionGroupID pgtype.Text
+	Status              string
+	EntitledUntil       pgtype.Timestamptz
+	SourceSignedAt      time.Time
+	LastVerifiedAt      time.Time
 }
 
 type endpointRecord struct {
@@ -117,6 +140,20 @@ type endpointRecord struct {
 type PairingClaim struct {
 	ClaimID   string    `json:"claimId"`
 	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+type EntitlementRefreshState struct {
+	AppTransactionID string
+	Environment      string
+	Status           string
+	EntitledUntil    pgtype.Timestamptz
+	LastVerifiedAt   time.Time
+}
+
+func (state EntitlementRefreshState) Active(now time.Time) bool {
+	return (state.Status == string(appstore.StatusActive) ||
+		state.Status == string(appstore.StatusGrace)) &&
+		state.EntitledUntil.Valid && now.Before(state.EntitledUntil.Time)
 }
 
 type AccessToken struct {
@@ -206,7 +243,7 @@ func (b *Broker) CreatePairingClaimForGrant(ctx context.Context, hostRefreshToke
 	if host.Kind != "host" {
 		return PairingClaim{}, ErrEndpointForbidden
 	}
-	if err := b.requireActiveEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
+	if err := b.requireEntitledEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
 		if errors.Is(err, ErrRefreshExpired) {
 			if commitErr := transaction.Commit(ctx); commitErr != nil {
 				return PairingClaim{}, fmt.Errorf("commit host expiry: %w", commitErr)
@@ -313,6 +350,7 @@ func (b *Broker) ApprovePairingClaim(
 	ctx context.Context,
 	claimID string,
 	appCheck AppCheckProof,
+	entitlement appstore.Entitlement,
 	appNodeID string,
 	appRefreshHash SecretHash,
 ) (Approval, error) {
@@ -325,6 +363,9 @@ func (b *Broker) ApprovePairingClaim(
 	now := b.now().UTC()
 	if appCheck.ReplayProtected && !now.Before(appCheck.ExpiresAt) {
 		return Approval{}, ErrAppCheckInvalid
+	}
+	if !entitlement.Active(now) {
+		return Approval{}, ErrSubscriptionRequired
 	}
 
 	transaction, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -350,6 +391,18 @@ func (b *Broker) ApprovePairingClaim(
 			return Approval{}, ErrAppCheckReplay
 		}
 	}
+	currentEntitlement, err := upsertAndLockEntitlement(
+		ctx,
+		transaction,
+		entitlement,
+		now,
+	)
+	if err != nil {
+		return Approval{}, err
+	}
+	if !currentEntitlement.active(now) {
+		return Approval{}, ErrSubscriptionRequired
+	}
 
 	claim, err := lockPairingClaim(ctx, transaction, claimID)
 	if err != nil {
@@ -358,8 +411,25 @@ func (b *Broker) ApprovePairingClaim(
 	if !now.Before(claim.ExpiresAt) {
 		return Approval{}, ErrClaimExpired
 	}
+	if err := consumeAppStoreApprovalProof(
+		ctx,
+		transaction,
+		claim.ID,
+		entitlement,
+		now,
+	); err != nil {
+		return Approval{}, err
+	}
 	if claim.ApprovedAppEndpointID != "" {
-		approval, app, err := b.retryApproval(ctx, transaction, claim, appNodeID, appRefreshHash, now)
+		approval, app, err := b.retryApproval(
+			ctx,
+			transaction,
+			claim,
+			entitlement.AppTransactionID,
+			appNodeID,
+			appRefreshHash,
+			now,
+		)
 		if err != nil {
 			return Approval{}, err
 		}
@@ -431,6 +501,17 @@ func (b *Broker) ApprovePairingClaim(
 		}
 	}
 
+	if err := bindEntitlementToGrant(
+		ctx,
+		transaction,
+		entitlement.AppTransactionID,
+		grant.ID,
+		claim.CreatedAt,
+		now,
+	); err != nil {
+		return Approval{}, err
+	}
+
 	app, err := insertEndpoint(ctx, transaction, grant.ID, "app", appNodeID, appRefreshHash, now, b.config.RefreshInactivityTTL)
 	if err != nil {
 		return Approval{}, mapEndpointInsertError(err)
@@ -462,6 +543,7 @@ func (b *Broker) retryApproval(
 	ctx context.Context,
 	transaction pgx.Tx,
 	claim pairingClaim,
+	appTransactionID string,
 	appNodeID string,
 	appRefreshHash SecretHash,
 	now time.Time,
@@ -472,6 +554,15 @@ func (b *Broker) retryApproval(
 	}
 	if grant.RevokedAt.Valid {
 		return Approval{}, endpointRecord{}, ErrGrantRevoked
+	}
+	if err := requireGrantEntitlement(
+		ctx,
+		transaction,
+		grant.ID,
+		appTransactionID,
+		now,
+	); err != nil {
+		return Approval{}, endpointRecord{}, err
 	}
 	host, err := lockHostEndpoint(ctx, transaction, grant.ID)
 	if err != nil {
@@ -533,7 +624,7 @@ func (b *Broker) ExchangePairingClaim(ctx context.Context, claimID, claimSecret 
 	if err != nil {
 		return Exchange{}, err
 	}
-	if err := b.requireActiveEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
+	if err := b.requireEntitledEndpoint(ctx, transaction, grant, host, host, now, true); err != nil {
 		if errors.Is(err, ErrRefreshExpired) {
 			if commitErr := transaction.Commit(ctx); commitErr != nil {
 				return Exchange{}, fmt.Errorf("commit host expiry: %w", commitErr)
@@ -567,6 +658,102 @@ func (b *Broker) ExchangePairingClaim(ctx context.Context, claimID, claimSecret 
 	}, nil
 }
 
+func (b *Broker) EntitlementForRefresh(
+	ctx context.Context,
+	refreshToken string,
+) (EntitlementRefreshState, error) {
+	transaction, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return EntitlementRefreshState{}, fmt.Errorf("begin entitlement lookup: %w", err)
+	}
+	defer rollback(transaction)
+	grant, endpoint, host, err := b.lockEndpointForRefresh(
+		ctx,
+		transaction,
+		refreshToken,
+	)
+	if err != nil {
+		return EntitlementRefreshState{}, err
+	}
+	if grant.RevokedAt.Valid || endpoint.RevokedAt.Valid || host.RevokedAt.Valid {
+		return EntitlementRefreshState{}, ErrRefreshInvalid
+	}
+	var state EntitlementRefreshState
+	if err := transaction.QueryRow(ctx, `
+		SELECT entitlement.app_transaction_id, entitlement.environment,
+		       entitlement.status, entitlement.entitled_until,
+		       entitlement.last_verified_at
+		FROM grant_entitlements AS binding
+		JOIN app_store_entitlements AS entitlement
+		  ON entitlement.app_transaction_id = binding.app_transaction_id
+		WHERE binding.grant_id = $1
+	`, grant.ID).Scan(
+		&state.AppTransactionID,
+		&state.Environment,
+		&state.Status,
+		&state.EntitledUntil,
+		&state.LastVerifiedAt,
+	); errors.Is(err, pgx.ErrNoRows) {
+		return EntitlementRefreshState{}, ErrSubscriptionRequired
+	} else if err != nil {
+		return EntitlementRefreshState{}, fmt.Errorf("read refresh entitlement: %w", err)
+	}
+	return state, nil
+}
+
+// TryReserveEntitlementReconciliation admits one refresh-triggered Apple attempt.
+// The identity must come from EntitlementForRefresh, after its transaction ends:
+// approval locks entitlement before grant, so do not retain refresh lookup locks.
+func (b *Broker) TryReserveEntitlementReconciliation(
+	ctx context.Context,
+	appTransactionID string,
+	environment string,
+	reconcileInterval time.Duration,
+) (bool, error) {
+	if reconcileInterval <= 0 {
+		return false, errors.New("entitlement reconciliation interval must be positive")
+	}
+	now := b.now().UTC()
+	// This standalone UPDATE commits before Apple I/O. Never refund an attempt,
+	// including on cancellation or failure, or change successful verification time.
+	result, err := b.pool.Exec(ctx, `
+		UPDATE app_store_entitlements
+		SET last_reconcile_attempt_at = $3
+		WHERE app_transaction_id = $1 AND environment = $2
+		  AND (status NOT IN ('active', 'grace') OR entitled_until <= $3
+		       OR last_verified_at <= $4)
+		  AND (last_reconcile_attempt_at IS NULL OR last_reconcile_attempt_at <= $5)
+	`, appTransactionID, environment, now, now.Add(-reconcileInterval),
+		now.Add(-entitlementReconcileAttemptMinInterval))
+	if err != nil {
+		return false, fmt.Errorf("reserve App Store reconciliation: %w", err)
+	}
+	return result.RowsAffected() == 1, nil
+}
+
+func (b *Broker) ApplyEntitlementReconciliation(
+	ctx context.Context,
+	entitlement appstore.Entitlement,
+) error {
+	transaction, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin App Store reconciliation: %w", err)
+	}
+	defer rollback(transaction)
+	if _, err := upsertAndLockEntitlement(
+		ctx,
+		transaction,
+		entitlement,
+		b.now().UTC(),
+	); err != nil {
+		return err
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		return fmt.Errorf("commit App Store reconciliation: %w", err)
+	}
+	return nil
+}
+
 func (b *Broker) RefreshAccessToken(ctx context.Context, refreshToken string) (AccessToken, error) {
 	transaction, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -578,8 +765,22 @@ func (b *Broker) RefreshAccessToken(ctx context.Context, refreshToken string) (A
 	if err != nil {
 		return AccessToken{}, err
 	}
-	if err := b.requireActiveEndpoint(ctx, transaction, grant, endpoint, host, now, true); err != nil {
-		if errors.Is(err, ErrRefreshExpired) {
+	if err := b.requireEntitledEndpoint(ctx, transaction, grant, endpoint, host, now, true); err != nil {
+		switch {
+		case errors.Is(err, ErrSubscriptionRequired):
+			if heartbeatErr := recordSubscriptionSuspensionHeartbeat(
+				ctx,
+				transaction,
+				endpoint.ID,
+				host.ID,
+				now.Add(b.config.RefreshInactivityTTL),
+			); heartbeatErr != nil {
+				return AccessToken{}, heartbeatErr
+			}
+			if commitErr := transaction.Commit(ctx); commitErr != nil {
+				return AccessToken{}, fmt.Errorf("commit subscription suspension heartbeat: %w", commitErr)
+			}
+		case errors.Is(err, ErrRefreshExpired):
 			if commitErr := transaction.Commit(ctx); commitErr != nil {
 				return AccessToken{}, fmt.Errorf("commit credential expiry: %w", commitErr)
 			}
@@ -840,6 +1041,31 @@ func (b *Broker) lockEndpointForRefresh(
 	return grant, endpoint, host, nil
 }
 
+func (b *Broker) requireEntitledEndpoint(
+	ctx context.Context,
+	transaction pgx.Tx,
+	grant grantRecord,
+	endpoint endpointRecord,
+	host endpointRecord,
+	now time.Time,
+	recordExpiry bool,
+) error {
+	if grant.RevokedAt.Valid || host.RevokedAt.Valid || endpoint.RevokedAt.Valid {
+		return ErrRefreshInvalid
+	}
+	if err := requireActiveGrantEntitlement(
+		ctx,
+		transaction,
+		grant.ID,
+		now,
+	); err != nil {
+		return err
+	}
+	// Check entitlement before inactivity so suspension heartbeats retain refresh authority.
+	return b.requireActiveEndpoint(ctx, transaction, grant, endpoint, host, now, recordExpiry)
+}
+
+// requireActiveEndpoint validates credential authority independently of subscription status.
 func (b *Broker) requireActiveEndpoint(
 	ctx context.Context,
 	transaction pgx.Tx,
@@ -873,6 +1099,304 @@ func (b *Broker) requireActiveEndpoint(
 	return ErrRefreshExpired
 }
 
+func recordSubscriptionSuspensionHeartbeat(
+	ctx context.Context,
+	transaction pgx.Tx,
+	endpointID string,
+	hostEndpointID string,
+	expiresAt time.Time,
+) error {
+	if _, err := transaction.Exec(ctx, `
+		UPDATE endpoints
+		SET refresh_inactive_expires_at = $3
+		WHERE id IN ($1, $2) AND revoked_at IS NULL
+	`, endpointID, hostEndpointID, expiresAt); err != nil {
+		return fmt.Errorf("record subscription suspension heartbeat: %w", err)
+	}
+	return nil
+}
+
+func (record entitlementRecord) active(now time.Time) bool {
+	return (record.Status == string(appstore.StatusActive) ||
+		record.Status == string(appstore.StatusGrace)) &&
+		record.EntitledUntil.Valid && now.Before(record.EntitledUntil.Time)
+}
+
+func consumeAppStoreApprovalProof(
+	ctx context.Context,
+	transaction pgx.Tx,
+	claimID string,
+	entitlement appstore.Entitlement,
+	now time.Time,
+) error {
+	var zeroHash [sha256.Size]byte
+	if entitlement.ApprovalProofHash == zeroHash ||
+		entitlement.ProofCreatedAt.IsZero() ||
+		entitlement.ProofCreatedAt.Before(now.Add(-10*time.Minute)) ||
+		entitlement.ProofCreatedAt.After(now.Add(time.Minute)) {
+		return ErrSubscriptionRequired
+	}
+	result, err := transaction.Exec(ctx, `
+		INSERT INTO app_store_approval_proofs (
+			proof_identity_hash, claim_id, app_transaction_id,
+			proof_created_at, consumed_at
+		)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT DO NOTHING
+	`, entitlement.ApprovalProofHash[:], claimID,
+		entitlement.AppTransactionID, entitlement.ProofCreatedAt, now)
+	if err != nil {
+		return fmt.Errorf("consume App Store approval proof: %w", err)
+	}
+	if result.RowsAffected() == 1 {
+		return nil
+	}
+	var existingClaimID string
+	var existingAppTransactionID string
+	if err := transaction.QueryRow(ctx, `
+		SELECT claim_id, app_transaction_id
+		FROM app_store_approval_proofs
+		WHERE proof_identity_hash = $1
+	`, entitlement.ApprovalProofHash[:]).Scan(
+		&existingClaimID,
+		&existingAppTransactionID,
+	); err != nil {
+		return fmt.Errorf("read App Store approval proof: %w", err)
+	}
+	if existingClaimID != claimID ||
+		existingAppTransactionID != entitlement.AppTransactionID {
+		return ErrAppStoreProofReplay
+	}
+	return nil
+}
+
+func upsertAndLockEntitlement(
+	ctx context.Context,
+	transaction pgx.Tx,
+	entitlement appstore.Entitlement,
+	now time.Time,
+) (entitlementRecord, error) {
+	if !appTransactionIDPattern.MatchString(entitlement.AppTransactionID) ||
+		(entitlement.Environment != "Production" && entitlement.Environment != "Sandbox") ||
+		entitlement.SourceSignedAt.IsZero() || entitlement.VerifiedAt.IsZero() {
+		return entitlementRecord{}, ErrSubscriptionRequired
+	}
+	switch entitlement.Status {
+	case appstore.StatusActive, appstore.StatusGrace:
+		if entitlement.EntitledUntil.IsZero() {
+			return entitlementRecord{}, ErrSubscriptionRequired
+		}
+	case appstore.StatusBillingRetry, appstore.StatusExpired,
+		appstore.StatusRevoked, appstore.StatusInactive:
+	default:
+		return entitlementRecord{}, ErrSubscriptionRequired
+	}
+	var entitledUntil any
+	if !entitlement.EntitledUntil.IsZero() {
+		entitledUntil = entitlement.EntitledUntil.UTC()
+	}
+	if _, err := transaction.Exec(ctx, `
+		INSERT INTO app_store_entitlements (
+			app_transaction_id, environment, product_id,
+			subscription_group_id, status, entitled_until,
+			source_signed_at, last_verified_at, updated_at
+		)
+		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $8)
+		ON CONFLICT (app_transaction_id) DO UPDATE SET
+			environment = EXCLUDED.environment,
+			product_id = EXCLUDED.product_id,
+			subscription_group_id = EXCLUDED.subscription_group_id,
+			status = EXCLUDED.status,
+			entitled_until = EXCLUDED.entitled_until,
+			source_signed_at = EXCLUDED.source_signed_at,
+			last_verified_at = EXCLUDED.last_verified_at,
+			updated_at = EXCLUDED.updated_at
+		WHERE EXCLUDED.source_signed_at > app_store_entitlements.source_signed_at
+		   OR (
+		       EXCLUDED.source_signed_at = app_store_entitlements.source_signed_at
+		       AND EXCLUDED.last_verified_at >= app_store_entitlements.last_verified_at
+		   )
+	`, entitlement.AppTransactionID, entitlement.Environment,
+		entitlement.ProductID, entitlement.SubscriptionGroupID,
+		string(entitlement.Status), entitledUntil,
+		entitlement.SourceSignedAt.UTC(), entitlement.VerifiedAt.UTC()); err != nil {
+		return entitlementRecord{}, fmt.Errorf("upsert App Store entitlement: %w", err)
+	}
+	var record entitlementRecord
+	if err := transaction.QueryRow(ctx, `
+		SELECT app_transaction_id, environment, product_id,
+		       subscription_group_id, status, entitled_until,
+		       source_signed_at, last_verified_at
+		FROM app_store_entitlements
+		WHERE app_transaction_id = $1
+		FOR UPDATE
+	`, entitlement.AppTransactionID).Scan(
+		&record.AppTransactionID,
+		&record.Environment,
+		&record.ProductID,
+		&record.SubscriptionGroupID,
+		&record.Status,
+		&record.EntitledUntil,
+		&record.SourceSignedAt,
+		&record.LastVerifiedAt,
+	); err != nil {
+		return entitlementRecord{}, fmt.Errorf("lock App Store entitlement: %w", err)
+	}
+	if record.Environment != entitlement.Environment {
+		return entitlementRecord{}, ErrSubscriptionConflict
+	}
+	return record, nil
+}
+
+func bindEntitlementToGrant(
+	ctx context.Context,
+	transaction pgx.Tx,
+	appTransactionID string,
+	grantID string,
+	claimCreatedAt time.Time,
+	now time.Time,
+) error {
+	var previousGrantID string
+	var previousClaimCreatedAt time.Time
+	err := transaction.QueryRow(ctx, `
+		SELECT grant_id::text, bound_claim_created_at
+		FROM grant_entitlements
+		WHERE app_transaction_id = $1
+		FOR UPDATE
+	`, appTransactionID).Scan(&previousGrantID, &previousClaimCreatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock subscription grant binding: %w", err)
+	}
+	if err == nil && previousGrantID != grantID {
+		if previousClaimCreatedAt.After(claimCreatedAt) {
+			return ErrSubscriptionSuperseded
+		}
+		if err := revokeGrant(ctx, transaction, previousGrantID, now); err != nil {
+			return err
+		}
+		if _, err := transaction.Exec(ctx, `
+			DELETE FROM grant_entitlements WHERE grant_id = $1
+		`, previousGrantID); err != nil {
+			return fmt.Errorf("release previous subscription grant: %w", err)
+		}
+	}
+
+	var targetAppTransactionID string
+	err = transaction.QueryRow(ctx, `
+		SELECT app_transaction_id
+		FROM grant_entitlements
+		WHERE grant_id = $1
+		FOR UPDATE
+	`, grantID).Scan(&targetAppTransactionID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock target subscription grant: %w", err)
+	}
+	if err == nil && targetAppTransactionID != appTransactionID {
+		return ErrSubscriptionConflict
+	}
+	if err == nil {
+		return nil
+	}
+	if _, err := transaction.Exec(ctx, `
+		INSERT INTO grant_entitlements (
+			grant_id, app_transaction_id, bound_claim_created_at, bound_at
+		)
+		VALUES ($1, $2, $3, $4)
+	`, grantID, appTransactionID, claimCreatedAt, now); err != nil {
+		if isUniqueViolation(err) {
+			return ErrSubscriptionConflict
+		}
+		return fmt.Errorf("bind subscription to grant: %w", err)
+	}
+	return nil
+}
+
+func requireGrantEntitlement(
+	ctx context.Context,
+	transaction pgx.Tx,
+	grantID string,
+	expectedAppTransactionID string,
+	now time.Time,
+) error {
+	var record entitlementRecord
+	if err := transaction.QueryRow(ctx, `
+		SELECT entitlement.app_transaction_id, entitlement.status,
+		       entitlement.entitled_until
+		FROM grant_entitlements AS binding
+		JOIN app_store_entitlements AS entitlement
+		  ON entitlement.app_transaction_id = binding.app_transaction_id
+		WHERE binding.grant_id = $1
+	`, grantID).Scan(
+		&record.AppTransactionID,
+		&record.Status,
+		&record.EntitledUntil,
+	); errors.Is(err, pgx.ErrNoRows) {
+		return ErrSubscriptionRequired
+	} else if err != nil {
+		return fmt.Errorf("read grant subscription: %w", err)
+	}
+	if expectedAppTransactionID != "" && record.AppTransactionID != expectedAppTransactionID {
+		return ErrSubscriptionConflict
+	}
+	if !record.active(now) {
+		return ErrSubscriptionRequired
+	}
+	return nil
+}
+
+func requireActiveGrantEntitlement(
+	ctx context.Context,
+	transaction pgx.Tx,
+	grantID string,
+	now time.Time,
+) error {
+	return requireGrantEntitlement(ctx, transaction, grantID, "", now)
+}
+
+func (b *Broker) ApplyEntitlementNotification(
+	ctx context.Context,
+	notification appstore.Notification,
+) error {
+	transaction, err := b.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin App Store notification: %w", err)
+	}
+	defer rollback(transaction)
+	now := b.now().UTC()
+	if _, err := upsertAndLockEntitlement(
+		ctx,
+		transaction,
+		notification.Entitlement,
+		now,
+	); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(ctx, `
+		DELETE FROM app_store_notifications WHERE received_at <= $1
+	`, now.Add(-appStoreNotificationRetention)); err != nil {
+		return fmt.Errorf("prune App Store notifications: %w", err)
+	}
+	result, err := transaction.Exec(ctx, `
+		INSERT INTO app_store_notifications (
+			notification_uuid, app_transaction_id,
+			source_signed_at, received_at
+		)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT DO NOTHING
+	`, notification.UUID, notification.Entitlement.AppTransactionID,
+		notification.Entitlement.SourceSignedAt, now)
+	if err != nil {
+		return fmt.Errorf("record App Store notification: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return transaction.Commit(ctx)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		return fmt.Errorf("commit App Store notification: %w", err)
+	}
+	return nil
+}
+
 func lockPairingClaim(ctx context.Context, transaction pgx.Tx, claimID string) (pairingClaim, error) {
 	var claim pairingClaim
 	var secretHash []byte
@@ -880,7 +1404,7 @@ func lockPairingClaim(ctx context.Context, transaction pgx.Tx, claimID string) (
 	var bootstrapHash []byte
 	var approvedEndpointID pgtype.Text
 	err := transaction.QueryRow(ctx, `
-		SELECT id, claim_secret_hash, host_node_id, expires_at,
+		SELECT id, claim_secret_hash, host_node_id, created_at, expires_at,
 		       grant_id::text, bootstrap_host_refresh_hash,
 		       approved_app_endpoint_id::text, approved_at
 		FROM pairing_claims
@@ -890,6 +1414,7 @@ func lockPairingClaim(ctx context.Context, transaction pgx.Tx, claimID string) (
 		&claim.ID,
 		&secretHash,
 		&claim.HostNodeID,
+		&claim.CreatedAt,
 		&claim.ExpiresAt,
 		&grantID,
 		&bootstrapHash,

@@ -26,7 +26,7 @@ Daemon and app clients reject cross-deployment broker overrides for these built-
 
 ## Persistence and production blockers
 
-PostgreSQL is the broker's only state store. Embedded, checksummed migrations create `grants`, `endpoints`, `pairing_claims`, `consumed_app_check_tokens`, and `schema_migrations`. Approval consumes the verified App Check `jti`, creates or validates the grant and endpoints, and approves the claim in one transaction. Exchange, refresh throttling, expiry, and revocation use row locks, so replicas share one durable authority and restarts retain state.
+PostgreSQL is the broker's only state store. Embedded, checksummed migrations create grants, endpoints, pairing claims, App Check replay records, App Store entitlements and notifications, grant-entitlement bindings, and migration history. Migration 0002 explicitly revokes every pre-entitlement grant; there are no users to grandfather, and development pairings must bootstrap again. Approval consumes the verified App Check `jti`, locks the Apple `appTransactionID`, revokes any older daemon grant bound to that subscription, and creates the replacement grant and endpoints in one transaction. Exchange, refresh throttling, subscription suspension, expiry, and revocation use the same durable authority across replicas and restarts.
 
 Remaining production blockers:
 
@@ -60,8 +60,8 @@ Each app can revoke itself. The host can revoke one app endpoint or the complete
 1. The daemon generates and durably stores a `vpc_` claim secret and `vrr_` host refresh secret.
 2. The daemon creates a bootstrap claim with its node ID and the SHA-256 hashes of those secrets. The broker returns only `claimId` and `expiresAt`.
 3. The reviewed app-facing pairing payload carries `claimId`, never either plaintext daemon secret.
-4. The app generates and stores its own `vrr_` refresh secret, obtains a limited-use App Check token, and approves the claim with its endpoint node ID and refresh-secret hash.
-5. Approval creates one grant plus separate host/app endpoint records and returns only an app access JWT.
+4. The app generates and stores its own `vrr_` refresh secret, obtains a limited-use App Check token, obtains an App Store-signed device-bound AppTransaction, and approves the claim with its endpoint node ID, refresh-secret hash, signed AppTransaction, and device-verification ID.
+5. The broker verifies Apple's certificate chain, recent receipt creation time, and device digest; consumes the semantic proof identity for this claim; queries the App Store Server API; and accepts only configured Volt Pro products in active or billing-grace state. Approval atomically moves the subscription to this daemon, revoking every refresh key on the previously bound daemon, then returns only the new app access JWT.
 6. The daemon polls exchange with its claim secret and receives only a host access JWT. Its pre-persisted host refresh secret is now active, and it records the approved app node/endpoint.
 7. The daemon consumes the pairing secret only from that broker-approved app node. Each endpoint presents its own access JWT to the relay, which requires JWT `sub` to equal the Iroh-handshake-proven endpoint ID.
 
@@ -72,7 +72,7 @@ Each app can revoke itself. The host can revoke one app endpoint or the complete
 3. The broker adds the app endpoint to the existing grant.
 4. Exchange returns the same host endpoint/grant IDs and identifies the newly approved app endpoint.
 
-Refresh never returns or changes the refresh secret. It issues a new access JWT and extends the endpoint's inactivity expiry. Exact approval/exchange retries preserve endpoint and grant identity while issuing a fresh access JWT.
+Refresh never returns or changes the refresh secret. It issues a new access JWT and extends the endpoint's inactivity expiry. Suspended subscriptions record a no-JWT heartbeat so a running daemon does not lose pairing authority during a long lapse. Refresh also reconciles cached Apple status when inactive or past the configured freshness interval, recovering missed renewal, refund, or revocation notifications without putting Apple in the relay data path. A separate, fixed one-hour cooldown limits refresh-triggered reconciliation attempts per Apple identity across all endpoints, replicas, and restarts. PostgreSQL reserves each attempt before calling Apple; failures and cancelled requests consume the cooldown without changing successful-verification time. During cooldown, refresh skips Apple and uses cached entitlement state: active service retains normal JWT throttling, while inactive service returns `402` and records its no-JWT heartbeat. An admitted inactive attempt that encounters an Apple outage returns `503` after its heartbeat; subsequent cooldown requests return cached `402`. Renewal notifications can restore service immediately without waiting for cooldown expiry. Exact approval/exchange retries preserve endpoint and grant identity while issuing a fresh access JWT.
 
 ## Run locally
 
@@ -84,6 +84,8 @@ export VOLT_CREDENTIAL_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432
 export VOLT_CREDENTIAL_SIGNING_MODE=local
 export VOLT_APP_CHECK_MODE=development
 export VOLT_DEVELOPMENT_APP_CHECK_TOKEN="$(openssl rand -base64 32)"
+export VOLT_APP_STORE_MODE=development
+export VOLT_DEVELOPMENT_APP_STORE_PROOF="$(openssl rand -base64 32)"
 go run ./cmd/relay-credential-service
 ```
 
@@ -119,12 +121,16 @@ Database-backed tests isolate each case in a random schema and cover migration i
 
 The following commands print credentials and are only for an isolated local POC.
 
+In development mode, `signedAppTransaction` must be `<nonce>.<shared secret>`, where the nonce is exactly 64 lowercase hexadecimal characters (32 random bytes) and the secret is the unchanged `VOLT_DEVELOPMENT_APP_STORE_PROOF` value. Bare-secret submissions are no longer accepted. Generate one nonce per new proof instance and retain the composed proof for retries; do not regenerate it inside a retry loop. Retry the same claim with the exact same proof, device-verification ID, app node ID, and app refresh-token hash. New pairings use a fresh nonce while keeping the device-verification ID stable. Reusing the same proof and device on another claim is rejected as a replay. No database reset is required; Apple-mode proofs are unchanged.
+
 ```sh
 HOST_NODE_ID="$(printf 'a%.0s' $(seq 1 64))"
 APP_NODE_ID="$(printf 'b%.0s' $(seq 1 64))"
 CLAIM_SECRET="vpc_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
 HOST_REFRESH_TOKEN="vrr_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
 APP_REFRESH_TOKEN="vrr_$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+APP_STORE_PROOF_NONCE="$(openssl rand -hex 32)"
+APP_STORE_PROOF="${APP_STORE_PROOF_NONCE}.${VOLT_DEVELOPMENT_APP_STORE_PROOF}"
 BASE_URL="http://127.0.0.1:8085"
 
 hash_secret() {
@@ -144,7 +150,7 @@ curl -i -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/exchange" \
 APP_CREDENTIAL="$(curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/approve" \
   -H 'Content-Type: application/json' \
   -H "X-Firebase-AppCheck: $VOLT_DEVELOPMENT_APP_CHECK_TOKEN" \
-  -d "{\"appNodeId\":\"$APP_NODE_ID\",\"appRefreshTokenHash\":\"$(hash_secret "$APP_REFRESH_TOKEN")\"}")"
+  -d "{\"appNodeId\":\"$APP_NODE_ID\",\"appRefreshTokenHash\":\"$(hash_secret "$APP_REFRESH_TOKEN")\",\"signedAppTransaction\":\"$APP_STORE_PROOF\",\"appStoreDeviceVerificationId\":\"11111111-1111-4111-8111-111111111111\"}")"
 
 HOST_CREDENTIAL="$(curl -sS -X POST "$BASE_URL/v1/pairing-claims/$CLAIM_ID/exchange" \
   -H "Authorization: Bearer $CLAIM_SECRET")"
@@ -186,9 +192,10 @@ The service uses Application Default Credentials. Its runtime identity needs per
 | --- | --- | --- |
 | `POST /v1/pairing-claims` | None for bootstrap | Creates a claim from `{hostNodeId,claimSecretHash,hostRefreshTokenHash}`. |
 | `POST /v1/pairing-claims` | Host refresh bearer | Creates a later-pairing claim from `{claimSecretHash}` under the existing grant. |
-| `POST /v1/pairing-claims/{id}/approve` | Exactly one App Check header | Approves with `{appNodeId,appRefreshTokenHash}` and returns app endpoint metadata plus an access JWT. |
+| `POST /v1/pairing-claims/{id}/approve` | Exactly one App Check header plus Apple proof | Approves with `{appNodeId,appRefreshTokenHash,signedAppTransaction,appStoreDeviceVerificationId}` and returns app endpoint metadata plus an access JWT. A newer daemon claim moves the subscription and revokes the previous grant. |
 | `POST /v1/pairing-claims/{id}/exchange` | Claim-secret bearer | Returns `202` while pending, then host/app endpoint metadata plus a host access JWT. |
-| `POST /v1/tokens/refresh` | Endpoint refresh bearer | Extends inactivity and returns a new access JWT. Body must be empty. |
+| `POST /v1/app-store/notifications` | Apple-signed V2 payload | Verifies `{signedPayload}`, reconciles current Apple status, and durably updates the entitlement. Configure this as the App Store Server Notifications V2 URL. |
+| `POST /v1/tokens/refresh` | Endpoint refresh bearer | Extends inactivity and returns a new access JWT only while the bound subscription is active or in billing grace. Inactive subscriptions return `402 subscription_inactive` without deleting refresh authority. Body must be empty. |
 | `POST /v1/tokens/revoke` | Endpoint refresh bearer | Idempotently revokes that app endpoint; a host endpoint revokes the complete grant. |
 | `POST /v1/grant/endpoints/revoke` | Host refresh bearer | Idempotently revokes one app `{endpointId}` in the host's grant. |
 | `POST /v1/grant/revoke` | Host refresh bearer | Idempotently revokes the complete daemon identity grant. Body must be empty. |
@@ -332,6 +339,18 @@ The dashboard covers pairing outcomes and logs, broker status and latency, Cloud
 | `VOLT_DEVELOPMENT_APP_CHECK_TOKEN` | required in development | Constant-time local approval token, minimum 32 characters. |
 | `VOLT_FIREBASE_PROJECT_NUMBER` | required in Firebase mode | Exact Firebase project authority. |
 | `VOLT_ALLOWED_FIREBASE_APP_IDS` | required in Firebase mode | Comma-separated exact app-ID allowlist. |
+| `VOLT_APP_STORE_MODE` | `development` | `development` for a private local broker or `apple` for App Store verification. Public deployments must use `apple`. |
+| `VOLT_DEVELOPMENT_APP_STORE_PROOF` | required in development | Shared secret for constant-time local entitlement authentication, minimum 32 characters. Submit `<64-lowercase-hex nonce>.<shared secret>` as the development proof; retain the nonce for retries and generate a fresh one for each new proof instance. Never expose this mode publicly. |
+| `VOLT_APP_STORE_PRIVATE_KEY` | required in Apple mode | App Store Server API `.p8` private key from Secret Manager. Never log it. |
+| `VOLT_APP_STORE_KEY_ID` | required in Apple mode | App Store Server API key ID. |
+| `VOLT_APP_STORE_ISSUER_ID` | required in Apple mode | App Store Connect issuer ID. |
+| `VOLT_APP_STORE_BUNDLE_ID` | `com.hansjm10.volt` | Exact bundle identifier accepted in Apple-signed data. |
+| `VOLT_APP_STORE_APP_APPLE_ID` | required in Apple mode | Numeric App Store app identifier. |
+| `VOLT_APP_STORE_SUBSCRIPTION_GROUP_ID` | required in Apple mode | Exact Volt Pro subscription-group identifier. |
+| `VOLT_APP_STORE_PRODUCT_IDS` | Volt Pro monthly and annual IDs | Comma-separated allowed subscription products. |
+| `VOLT_APP_STORE_ENVIRONMENTS` | `Production` | Accepted Apple environments. Canary explicitly uses `Sandbox`; the production issuer refuses mixed or Sandbox authority. Xcode and local receipts are always rejected. |
+| `VOLT_APP_STORE_RECONCILE_INTERVAL` | `24h` | Active-cache freshness interval that makes refresh reconciliation due; inactive status is also due. A separate fixed one-hour per-identity attempt cooldown applies, including failed attempts. Active cached service continues through transient Apple failures; inactive service fails closed until reconciliation or a notification restores entitlement. |
+| `VOLT_APP_STORE_ROOT_CERTIFICATES_BASE64` | required in Apple mode | Comma-separated DER Apple root certificates encoded as standard base64 and loaded from reviewed Apple PKI artifacts. The JWS-provided root is never trusted. |
 | `VOLT_CREDENTIAL_CLAIM_TTL` | `10m` | Claim lifetime; hard maximum `30m`. |
 | `VOLT_CREDENTIAL_ACCESS_TTL` | `15m` | Access JWT lifetime; hard maximum `1h`. |
 | `VOLT_CREDENTIAL_REFRESH_INACTIVITY_TTL` | `2160h` | Sliding refresh inactivity lifetime; hard maximum 90 days. |

@@ -73,7 +73,11 @@ func Open(t *testing.T) *pgxpool.Pool {
 func Count(t *testing.T, pool *pgxpool.Pool, table string) int {
 	t.Helper()
 	allowed := map[string]bool{
+		"app_store_approval_proofs": true,
+		"app_store_entitlements":    true,
+		"app_store_notifications":   true,
 		"consumed_app_check_tokens": true,
+		"grant_entitlements":        true,
 		"endpoints":                 true,
 		"grants":                    true,
 		"pairing_claims":            true,

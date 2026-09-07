@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/appstore"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/broker"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/credential"
 	"github.com/volt-hq/Volt/services/relay-credential-broker/internal/database"
@@ -40,6 +43,18 @@ type config struct {
 	DevAppCheck                string
 	FirebaseProjectNumber      string
 	AllowedFirebaseAppIDs      []string
+	AppStoreMode               string
+	DevelopmentAppStoreProof   string
+	AppStoreRootCertificates   []*x509.Certificate
+	AppStorePrivateKey         string
+	AppStoreKeyID              string
+	AppStoreIssuerID           string
+	AppStoreBundleID           string
+	AppStoreAppAppleID         int64
+	AppStoreSubscriptionGroup  string
+	AppStoreProductIDs         []string
+	AppStoreEnvironments       []string
+	AppStoreReconcileInterval  time.Duration
 	ClaimTTL                   time.Duration
 	AccessTTL                  time.Duration
 	RefreshInactivityTTL       time.Duration
@@ -111,6 +126,33 @@ func main() {
 		logger.Error("configure App Check verifier", "error", err)
 		os.Exit(2)
 	}
+	var appStoreVerifier appstore.Verifier
+	switch configuration.AppStoreMode {
+	case "development":
+		appStoreVerifier, err = appstore.NewDevelopmentVerifier(
+			configuration.DevelopmentAppStoreProof,
+			time.Now,
+		)
+	case "apple":
+		appStoreVerifier, err = appstore.NewAppleVerifier(appstore.AppleConfig{
+			RootCertificates:     configuration.AppStoreRootCertificates,
+			SigningPrivateKeyPEM: configuration.AppStorePrivateKey,
+			KeyID:                configuration.AppStoreKeyID,
+			IssuerID:             configuration.AppStoreIssuerID,
+			BundleID:             configuration.AppStoreBundleID,
+			AppAppleID:           configuration.AppStoreAppAppleID,
+			SubscriptionGroupID:  configuration.AppStoreSubscriptionGroup,
+			ProductIDs:           configuration.AppStoreProductIDs,
+			AllowedEnvironments:  configuration.AppStoreEnvironments,
+			Now:                  time.Now,
+		})
+	default:
+		err = fmt.Errorf("unsupported App Store mode %q", configuration.AppStoreMode)
+	}
+	if err != nil {
+		logger.Error("configure App Store verifier", "error", err)
+		os.Exit(2)
+	}
 	databaseConfig, err := pgxpool.ParseConfig(configuration.DatabaseURL)
 	if err != nil {
 		logger.Error("invalid PostgreSQL configuration")
@@ -146,9 +188,10 @@ func main() {
 		logger.Error("configure credential broker", "error", err)
 		os.Exit(2)
 	}
-	handler, err := httpapi.NewServer(brokerService, signer, appCheck, httpapi.Config{
+	handler, err := httpapi.NewServer(brokerService, signer, appCheck, appStoreVerifier, httpapi.Config{
 		MaxConcurrentRequests:         configuration.MaxConcurrentRequests,
 		RefreshMinInterval:            configuration.RefreshMinInterval,
+		EntitlementReconcileInterval:  configuration.AppStoreReconcileInterval,
 		MaxBootstrapRequestsPerMinute: configuration.MaxBootstrapRequestsPerMin,
 		MaxApprovalRequestsPerMinute:  configuration.MaxApprovalRequestsPerMin,
 		MaxExchangeRequestsPerMinute:  configuration.MaxExchangeRequestsPerMin,
@@ -164,7 +207,7 @@ func main() {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      20 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 	}
@@ -182,6 +225,7 @@ func main() {
 			"acceptedKeyIds", signer.KeyIDs(),
 			"signingMode", configuration.SigningMode,
 			"appCheckMode", configuration.AppCheckMode,
+			"appStoreMode", configuration.AppStoreMode,
 		)
 		serverErrors <- server.ListenAndServe()
 	}()
@@ -220,6 +264,13 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	appStoreReconcileInterval, err := durationEnv(
+		"VOLT_APP_STORE_RECONCILE_INTERVAL",
+		24*time.Hour,
+	)
+	if err != nil {
+		return config{}, err
+	}
 	maxClaims, err := positiveIntEnv("VOLT_CREDENTIAL_MAX_CLAIMS", 10_000)
 	if err != nil {
 		return config{}, err
@@ -248,6 +299,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	credentialIssuer := stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer)
 	databaseURL := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_DATABASE_URL"))
 	if databaseURL == "" {
 		return config{}, errors.New("VOLT_CREDENTIAL_DATABASE_URL is required")
@@ -260,6 +312,41 @@ func loadConfig() (config, error) {
 	allowedFirebaseAppIDs := commaSeparatedEnv(
 		os.Getenv("VOLT_ALLOWED_FIREBASE_APP_IDS"),
 	)
+	appStoreMode := stringEnv("VOLT_APP_STORE_MODE", "development")
+	if credentialIssuer == "https://credentials.volt-cli.dev" && appStoreMode != "apple" {
+		return config{}, errors.New("production credential issuer requires VOLT_APP_STORE_MODE=apple")
+	}
+	developmentAppStoreProof := os.Getenv("VOLT_DEVELOPMENT_APP_STORE_PROOF")
+	appStorePrivateKey := os.Getenv("VOLT_APP_STORE_PRIVATE_KEY")
+	appStoreKeyID := strings.TrimSpace(os.Getenv("VOLT_APP_STORE_KEY_ID"))
+	appStoreIssuerID := strings.TrimSpace(os.Getenv("VOLT_APP_STORE_ISSUER_ID"))
+	appStoreBundleID := stringEnv("VOLT_APP_STORE_BUNDLE_ID", "com.hansjm10.volt")
+	appStoreSubscriptionGroup := strings.TrimSpace(
+		os.Getenv("VOLT_APP_STORE_SUBSCRIPTION_GROUP_ID"),
+	)
+	appStoreProductIDs := commaSeparatedEnv(
+		stringEnv(
+			"VOLT_APP_STORE_PRODUCT_IDS",
+			"com.hansjm10.volt.pro.monthly,com.hansjm10.volt.pro.annual",
+		),
+	)
+	appStoreEnvironments := commaSeparatedEnv(
+		stringEnv("VOLT_APP_STORE_ENVIRONMENTS", "Production"),
+	)
+	var appStoreAppAppleID int64
+	var appStoreRootCertificates []*x509.Certificate
+	if appStoreMode == "apple" {
+		appStoreAppAppleID, err = positiveInt64Env("VOLT_APP_STORE_APP_APPLE_ID")
+		if err != nil {
+			return config{}, err
+		}
+		appStoreRootCertificates, err = rootCertificatesEnv(
+			os.Getenv("VOLT_APP_STORE_ROOT_CERTIFICATES_BASE64"),
+		)
+		if err != nil {
+			return config{}, err
+		}
+	}
 	signingMode := strings.TrimSpace(os.Getenv("VOLT_CREDENTIAL_SIGNING_MODE"))
 	if signingMode == "" {
 		return config{}, errors.New("VOLT_CREDENTIAL_SIGNING_MODE is required")
@@ -295,10 +382,28 @@ func loadConfig() (config, error) {
 	if appCheckMode == "firebase" && (firebaseProjectNumber == "" || len(allowedFirebaseAppIDs) == 0) {
 		return config{}, errors.New("VOLT_FIREBASE_PROJECT_NUMBER and VOLT_ALLOWED_FIREBASE_APP_IDS are required in firebase mode")
 	}
+	switch appStoreMode {
+	case "development":
+		if len(developmentAppStoreProof) < 32 {
+			return config{}, errors.New("VOLT_DEVELOPMENT_APP_STORE_PROOF must contain at least 32 characters in development mode")
+		}
+	case "apple":
+		if credentialIssuer == "https://credentials.volt-cli.dev" &&
+			(len(appStoreEnvironments) != 1 || appStoreEnvironments[0] != "Production") {
+			return config{}, errors.New("production credential issuer requires Production-only App Store receipts")
+		}
+		if appStorePrivateKey == "" || appStoreKeyID == "" ||
+			appStoreIssuerID == "" || appStoreSubscriptionGroup == "" ||
+			len(appStoreProductIDs) == 0 || len(appStoreEnvironments) == 0 {
+			return config{}, errors.New("App Store API authority is incomplete in apple mode")
+		}
+	default:
+		return config{}, fmt.Errorf("unsupported App Store mode %q", appStoreMode)
+	}
 
 	return config{
 		ListenAddress:              stringEnv("VOLT_CREDENTIAL_LISTEN", defaultListenAddress),
-		Issuer:                     stringEnv("VOLT_CREDENTIAL_ISSUER", defaultIssuer),
+		Issuer:                     credentialIssuer,
 		Audience:                   stringEnv("VOLT_CREDENTIAL_AUDIENCE", defaultAudience),
 		SigningMode:                signingMode,
 		SigningKeyPath:             signingKeyPath,
@@ -309,6 +414,18 @@ func loadConfig() (config, error) {
 		DevAppCheck:                devAppCheck,
 		FirebaseProjectNumber:      firebaseProjectNumber,
 		AllowedFirebaseAppIDs:      allowedFirebaseAppIDs,
+		AppStoreMode:               appStoreMode,
+		DevelopmentAppStoreProof:   developmentAppStoreProof,
+		AppStoreRootCertificates:   appStoreRootCertificates,
+		AppStorePrivateKey:         appStorePrivateKey,
+		AppStoreKeyID:              appStoreKeyID,
+		AppStoreIssuerID:           appStoreIssuerID,
+		AppStoreBundleID:           appStoreBundleID,
+		AppStoreAppAppleID:         appStoreAppAppleID,
+		AppStoreSubscriptionGroup:  appStoreSubscriptionGroup,
+		AppStoreProductIDs:         appStoreProductIDs,
+		AppStoreEnvironments:       appStoreEnvironments,
+		AppStoreReconcileInterval:  appStoreReconcileInterval,
 		ClaimTTL:                   claimTTL,
 		AccessTTL:                  accessTTL,
 		RefreshInactivityTTL:       refreshInactivityTTL,
@@ -357,6 +474,35 @@ func keyVersionsEnv(value string) ([]string, error) {
 		result = append(result, name)
 	}
 	return result, nil
+}
+
+func positiveInt64Env(name string) (int64, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return parsed, nil
+}
+
+func rootCertificatesEnv(value string) ([]*x509.Certificate, error) {
+	encodedCertificates := commaSeparatedEnv(value)
+	if len(encodedCertificates) == 0 {
+		return nil, errors.New("VOLT_APP_STORE_ROOT_CERTIFICATES_BASE64 is required in apple mode")
+	}
+	certificates := make([]*x509.Certificate, 0, len(encodedCertificates))
+	for _, encoded := range encodedCertificates {
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, errors.New("VOLT_APP_STORE_ROOT_CERTIFICATES_BASE64 contains invalid base64")
+		}
+		certificate, err := x509.ParseCertificate(raw)
+		if err != nil || !certificate.IsCA {
+			return nil, errors.New("VOLT_APP_STORE_ROOT_CERTIFICATES_BASE64 contains an invalid root certificate")
+		}
+		certificates = append(certificates, certificate)
+	}
+	return certificates, nil
 }
 
 func durationEnv(name string, fallback time.Duration) (time.Duration, error) {

@@ -11,6 +11,17 @@ const STEADY_PENDING_RETRY_MS = 2_000;
 const MAX_EXCHANGE_FAILURE_RETRY_MS = 30_000;
 const RETRY_JITTER_RATIO = 0.2;
 const MAX_RATE_LIMIT_RETRY_AFTER_SECONDS = 60;
+const MAX_SUBSCRIPTION_RETRY_AFTER_SECONDS = 24 * 60 * 60;
+
+export class IrohRelayCredentialSubscriptionInactiveError extends Error {
+	readonly retryAfterMs: number;
+
+	constructor(retryAfterMs: number) {
+		super("Volt Pro subscription is inactive");
+		this.name = "IrohRelayCredentialSubscriptionInactiveError";
+		this.retryAfterMs = retryAfterMs;
+	}
+}
 
 export interface IrohManagedRelayCredential {
 	schemaVersion: 2;
@@ -354,6 +365,25 @@ export async function refreshIrohManagedRelayCredential(
 	const response = await requestCredentialService(validated.serviceUrl, "/v1/tokens/refresh", {
 		authorization: validated.refreshToken,
 	});
+	if (response.status === 402 && isJSONContentType(response.headers.get("content-type"))) {
+		const retryAfter = response.headers.get("retry-after");
+		const retryAfterSeconds = Number(retryAfter);
+		const body = expectExactRecord(
+			JSON.parse(await readBoundedResponse(response)),
+			["error"],
+			"relay credential subscription response",
+		);
+		if (
+			body.error !== "subscription_inactive" ||
+			retryAfter === null ||
+			!Number.isInteger(retryAfterSeconds) ||
+			retryAfterSeconds < 1 ||
+			retryAfterSeconds > MAX_SUBSCRIPTION_RETRY_AFTER_SECONDS
+		) {
+			throw new Error("relay credential subscription response is invalid");
+		}
+		throw new IrohRelayCredentialSubscriptionInactiveError(retryAfterSeconds * 1000);
+	}
 	if (response.status !== 200 || !isJSONContentType(response.headers.get("content-type"))) {
 		await cancelResponseBody(response);
 		throw new Error(`relay credential refresh failed with status ${response.status}`);
