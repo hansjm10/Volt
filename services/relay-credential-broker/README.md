@@ -312,6 +312,19 @@ The production authority cutover completed on 2026-08-23:
 
 Production rollback must retain the production database and key authority. DNS rollback to the canary service or restoring the pre-strict relay binary is invalid after production grants exist.
 
+### Production cost suspension
+
+Suspend the production Cloud SQL compute when the credential authority is intentionally unavailable, or resume it and wait for broker readiness:
+
+```sh
+cd services/relay-credential-broker
+./deploy/production-database.sh status
+./deploy/production-database.sh off
+./deploy/production-database.sh on
+```
+
+`off` requires an exact interactive confirmation; automation must pass `--yes`. It changes only the production instance's activation policy and never deletes data or changes Cloud Run, load-balancer, Cloud Armor, KMS, relay, or DNS resources. Pairing, token refresh, and revocation are unavailable while SQL is stopped, and already issued relay JWTs remain valid until their short expiry. Storage, backups, the load balancer, and Cloud Armor continue to incur charges.
+
 ### Canary monitoring
 
 Deploy or update the checked-in Cloud Monitoring dashboard and its bounded-cardinality pairing request metric:
