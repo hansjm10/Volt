@@ -3,7 +3,8 @@
 LLMs have limited context windows. When conversations grow too long, volt uses compaction to summarize older content while preserving recent work. This page covers both auto-compaction and branch summarization.
 
 **Source files**:
-- [`packages/coding-agent/src/core/compaction/compaction.ts`](../src/core/compaction/compaction.ts) - Auto-compaction logic
+- [`packages/coding-agent/src/core/compaction/context-compaction.ts`](../src/core/compaction/context-compaction.ts) - Cache-preserving session compaction
+- [`packages/coding-agent/src/core/compaction/compaction.ts`](../src/core/compaction/compaction.ts) - Cut-point preparation and chunked fallback
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](../src/core/compaction/branch-summarization.ts) - Branch summarization
 - [`packages/coding-agent/src/core/compaction/utils.ts`](../src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
 - [`packages/coding-agent/src/core/session-manager.ts`](../src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
@@ -40,7 +41,7 @@ You can also trigger manually with `/compact [instructions]`, where optional ins
 
 1. **Find cut point**: Walk backwards from the newest message, accumulating token estimates up to `keepRecentTokens` (default 20k). When active tool definitions would consume too much of the selected model's context, Volt lowers this message budget to leave the configured reserve and tool definitions room.
 2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
-3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
+3. **Generate summary**: Make one request with the current system prompt, tool definitions, reasoning setting, and native older-message prefix (including the previous checkpoint). Append a summarization instruction rather than serializing or rewriting the prefix. Recent messages beyond the cut remain outside this request.
 4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
 5. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards; the completion result reports a fresh token estimate for the rebuilt messages and active tool definitions
 
@@ -78,6 +79,16 @@ What the LLM sees:
 
 On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Volt also recalculates `tokensBefore` from the rebuilt session context and active tool definitions before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
 
+### Summary Budget and Failure Handling
+
+Built-in compaction requests at most 4096 summary tokens per request, independently of `reserveTokens`. It also stops and rejects generated text above 16,384 characters per response, including on providers that do not enforce the requested token limit. File-operation metadata is appended separately.
+
+The normal single-pass request preserves the session's reasoning level, Fast mode, transport, routing identity and cache policy. This enables prefix-cache reuse; cache hits are not guaranteed, particularly after provider/extension transformations or cache expiry. Compaction never executes returned tool calls.
+
+If the native request is estimated not to fit, or the provider reports a context overflow, Volt uses the existing chronological chunked summarizer with a small fixed output allowance and minimal supported reasoning. Other errors do not select the fallback. Built-in summary generation has a five-minute deadline covering context conversion, requests, retry delays and any fallback. Transient failures have at most two compaction-level retries per request; provider-level retries are disabled for session compaction.
+
+Cancellation, timeout, empty responses, truncated output and tool-calling responses do not install a checkpoint. The original conversation remains intact. Custom extension-provided summaries retain their extension hook behavior.
+
 ### Split Turns
 
 A "turn" starts with a user message and includes all assistant responses and tool calls until the next user message. Normally, compaction cuts at turn boundaries.
@@ -102,9 +113,7 @@ Split turn (one huge turn exceeds budget):
   turnPrefixMessages = [usr, ass, tool, ass, tool, tool]
 ```
 
-For split turns, volt generates two summaries and merges them:
-1. **History summary**: Previous context (if any)
-2. **Turn prefix summary**: The early part of the split turn
+The normal single-pass request summarizes history and the turn prefix together. The oversized-input fallback generates history and turn-prefix summaries separately and merges them; each stream processes its chunks chronologically.
 
 ### Cut Point Rules
 
@@ -252,7 +261,7 @@ path/to/changed.ts
 
 ### Message Serialization
 
-Before summarization, messages are serialized to text via [`serializeConversation()`](../src/core/compaction/utils.ts):
+The normal compaction path keeps native messages and signatures unchanged through the configured context/conversion pipeline. Only the chunked fallback and branch summarization serialize messages to text via [`serializeConversation()`](../src/core/compaction/utils.ts):
 
 ```
 [User]: What they said

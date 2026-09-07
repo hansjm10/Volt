@@ -358,7 +358,7 @@ describe("AgentSession compaction characterization", () => {
 		expect(getStreamCallCount()).toBe(1);
 	});
 
-	it("uses the model's lowest supported reasoning for compaction instead of the session level", async () => {
+	it("preserves the session reasoning level for cache-preserving compaction", async () => {
 		const harness = await createHarness({
 			withConfiguredAuth: false,
 			models: [{ id: "reasoning-model", reasoning: true }],
@@ -377,7 +377,7 @@ describe("AgentSession compaction characterization", () => {
 
 		await harness.session.compact();
 
-		expect(reasoningLevels).toEqual(["low"]);
+		expect(reasoningLevels).toEqual(["xhigh"]);
 	});
 
 	it("retries transient auto-compaction summarization failures", async () => {

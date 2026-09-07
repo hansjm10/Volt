@@ -389,10 +389,6 @@ describe("regression #199: approved plan finalization", () => {
 		const requestSnapshots: Array<{ tools: string[]; systemPrompt: string }> = [];
 		let compactedRequestContainedQueuedInput: boolean | undefined;
 		let clearedQueuedDeliveries: number | undefined;
-		harness.faux.setSimpleResponses([
-			fauxAssistantMessage("compacted final-response context"),
-			fauxAssistantMessage("compacted active-turn prefix"),
-		]);
 		harness.setResponses([
 			fauxAssistantMessage(
 				fauxToolCall("update_plan_progress", {
@@ -410,6 +406,7 @@ describe("regression #199: approved plan finalization", () => {
 				harness.control.queueFollowUp(createUserMessage("queued during final-response compaction"));
 				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" });
 			},
+			fauxAssistantMessage("compacted final-response context"),
 			async (context) => {
 				requestSnapshots.push({
 					tools: context.tools?.map((tool) => tool.name) ?? [],
@@ -432,7 +429,9 @@ describe("regression #199: approved plan finalization", () => {
 			expect(snapshot.tools).toEqual([]);
 			expect(snapshot.systemPrompt).toContain("[VOLT FINAL RESPONSE — TRUSTED RUNTIME POLICY]");
 		}
-		expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		const compactions = harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction");
+		expect(compactions).toHaveLength(1);
+		expect(compactions[0]?.summary).toContain("compacted final-response context");
 		expect(harness.session.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			content: [{ type: "text", text: "Final response after compaction" }],

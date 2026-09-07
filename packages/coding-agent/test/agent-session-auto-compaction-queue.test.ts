@@ -81,6 +81,15 @@ vi.mock("../src/core/compaction/index.js", () => ({
 	) => settings.enabled && contextTokens > contextWindow - settings.reserveTokens,
 }));
 
+vi.mock("../src/core/compaction/context-compaction.ts", () => ({
+	compactContext: async () => ({
+		summary: "compacted",
+		firstKeptEntryId: compactionMockState.firstKeptEntryId ?? "missing-first-kept-entry",
+		tokensBefore: 100,
+		details: {},
+	}),
+}));
+
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
 		super(

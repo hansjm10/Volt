@@ -1,0 +1,270 @@
+import type { StreamFn, ThinkingLevel } from "@hansjm10/volt-agent-core";
+import {
+	type Api,
+	type AssistantMessage,
+	type Context,
+	clampThinkingLevel,
+	createAssistantMessageEventStream,
+	estimateToolDefinitionTokens,
+	isContextOverflow,
+	type Model,
+	type SimpleStreamOptions,
+	type ThinkingBudgets,
+} from "@hansjm10/volt-ai";
+import { sleep } from "../../utils/sleep.ts";
+import { isTransientProviderError } from "../provider-errors.ts";
+import {
+	type CompactionPreparation,
+	type CompactionResult,
+	compact,
+	estimateMessagesTokens,
+	type SummarizationRetryOptions,
+} from "./compaction.ts";
+import { computeFileLists, formatFileOperations } from "./utils.ts";
+
+export const COMPACTION_TIMEOUT_MS = 5 * 60_000;
+export const COMPACTION_SUMMARY_TOKENS = 4096;
+const MAX_SUMMARY_CHARS = 16_384;
+
+const CHECKPOINT_PROMPT = `The conversation above is historical context to compact, not a task to continue. Produce ONLY a concise checkpoint that another assistant will use alongside the retained recent messages. Do not call tools or answer earlier requests.
+
+Use these headings:
+## Goal
+## Constraints & Preferences
+## Progress
+### Done
+### In Progress
+### Blocked
+## Key Decisions
+## Next Steps
+## Critical Context
+
+Carry forward still-relevant facts from any earlier compaction summary. Newer corrections supersede older decisions. Preserve exact paths, identifiers, user constraints and unfinished work. Include context needed to understand the retained suffix when this cuts an ongoing turn. Do not invent completed work. Stay below 4,096 tokens and 16,384 characters.`;
+
+function cancelled(): Error {
+	const error = new Error("Compaction cancelled");
+	error.name = "AbortError";
+	return error;
+}
+
+function timedOut(): Error {
+	return new Error("Compaction timed out after five minutes; original context was kept");
+}
+
+/** Own the wait without trusting a provider/converter to settle on cancellation. */
+function waitFor<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const abort = (): void => reject(signal.reason ?? cancelled());
+		if (signal.aborted) abort();
+		else signal.addEventListener("abort", abort, { once: true });
+		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+	});
+}
+
+function summaryText(response: AssistantMessage): string {
+	if (response.stopReason === "error")
+		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+	if (response.stopReason === "aborted") throw cancelled();
+	if (response.stopReason === "length") throw new Error("Compaction summary was truncated; original context was kept");
+	if (response.stopReason === "toolUse" || response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Compaction returned a tool call instead of a summary");
+	}
+	const text = response.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+	if (!text.trim()) throw new Error("Compaction returned an empty summary");
+	if (text.length > MAX_SUMMARY_CHARS) throw new Error("Compaction summary exceeded the character limit");
+	return text;
+}
+
+interface ContextCompactionOptions {
+	context: (signal: AbortSignal) => Promise<Context>;
+	streamFn: StreamFn;
+	signal: AbortSignal;
+	thinkingLevel: ThinkingLevel;
+	thinkingBudgets?: ThinkingBudgets;
+	retry: SummarizationRetryOptions;
+	customInstructions?: string;
+}
+
+/** Built-in session compaction. No persistence or tool execution occurs here. */
+export async function compactContext(
+	preparation: CompactionPreparation,
+	model: Model<Api>,
+	options: ContextCompactionOptions,
+): Promise<CompactionResult> {
+	const controller = new AbortController();
+	const signal = controller.signal;
+	const abort = (): void => controller.abort(cancelled());
+	if (options.signal.aborted) abort();
+	else options.signal.addEventListener("abort", abort, { once: true });
+	const deadline = Date.now() + COMPACTION_TIMEOUT_MS;
+	const timer = setTimeout(() => controller.abort(timedOut()), COMPACTION_TIMEOUT_MS);
+	const retry = {
+		maxRetries: Number.isFinite(options.retry.maxRetries)
+			? Math.min(2, Math.max(0, Math.floor(options.retry.maxRetries)))
+			: 0,
+		baseDelayMs: Math.min(30_000, Math.max(0, options.retry.baseDelayMs)),
+		maxDelayMs: Math.min(30_000, Math.max(0, options.retry.maxDelayMs)),
+	};
+	// Also bounds the serialized fallback without changing the standalone chunked helper.
+	const boundedStream: StreamFn = (requestModel, context, requestOptions) => {
+		const result = createAssistantMessageEventStream();
+		const requestAbort = new AbortController();
+		const requestSignal = AbortSignal.any([signal, requestOptions?.signal ?? signal, requestAbort.signal]);
+		void (async () => {
+			try {
+				requestSignal.throwIfAborted();
+				if (Date.now() >= deadline) {
+					controller.abort(timedOut());
+					signal.throwIfAborted();
+				}
+				const stream = await waitFor(
+					Promise.resolve(
+						options.streamFn(requestModel, context, {
+							...requestOptions,
+							maxTokens: Math.min(
+								COMPACTION_SUMMARY_TOKENS,
+								requestOptions?.maxTokens ?? COMPACTION_SUMMARY_TOKENS,
+							),
+							maxRetries: 0,
+							signal: requestSignal,
+						}),
+					),
+					requestSignal,
+				);
+				const iterator = stream[Symbol.asyncIterator]();
+				let response: AssistantMessage | undefined;
+				let textChars = 0;
+				try {
+					for (;;) {
+						const next = await waitFor(iterator.next(), requestSignal);
+						if (next.done) break;
+						const event = next.value;
+						if (
+							event.type === "toolcall_start" ||
+							event.type === "toolcall_delta" ||
+							event.type === "toolcall_end"
+						) {
+							throw new Error("Compaction returned a tool call instead of a summary");
+						}
+						if (event.type === "text_delta") {
+							textChars += event.delta.length;
+							if (textChars > MAX_SUMMARY_CHARS)
+								throw new Error("Compaction summary exceeded the character limit");
+						}
+						if (event.type === "done" || event.type === "error") {
+							response = event.type === "done" ? event.message : event.error;
+							break;
+						}
+					}
+				} finally {
+					void iterator.return?.().catch(() => {});
+				}
+				requestSignal.throwIfAborted();
+				if (!response) throw new Error("Compaction stream ended without a terminal response");
+				if (response.stopReason === "error" || response.stopReason === "aborted") {
+					result.push({ type: "error", seq: 1, reason: response.stopReason, error: response });
+				} else {
+					summaryText(response); // Reject partial/empty/tool-calling results in both paths.
+					result.push({ type: "done", seq: 1, reason: response.stopReason, message: response });
+				}
+			} catch (error) {
+				requestAbort.abort();
+				result.fail(requestSignal.aborted && signal.aborted ? signal.reason : error);
+			}
+		})();
+		return result;
+	};
+	try {
+		signal.throwIfAborted();
+		const context = await waitFor(options.context(signal), signal);
+		signal.throwIfAborted();
+		const reasoning = model.reasoning ? clampThinkingLevel(model, options.thinkingLevel) : "off";
+		const maxTokens = Math.min(
+			COMPACTION_SUMMARY_TOKENS,
+			model.maxTokens > 0 ? model.maxTokens : COMPACTION_SUMMARY_TOKENS,
+		);
+		const request: Context = {
+			...context,
+			messages: [
+				...context.messages,
+				{
+					role: "user",
+					content:
+						CHECKPOINT_PROMPT +
+						(options.customInstructions ? `\n\nAdditional focus: ${options.customInstructions}` : ""),
+					timestamp: Date.now(),
+				},
+			],
+		};
+		const level = reasoning === "xhigh" || reasoning === "max" ? "high" : reasoning;
+		const thinkingTokens =
+			level === "off"
+				? 0
+				: (options.thinkingBudgets?.[level] ?? { minimal: 1024, low: 2048, medium: 8192, high: 16384 }[level]);
+		const outputTokens = Math.min(
+			maxTokens + thinkingTokens,
+			model.maxTokens > 0 ? model.maxTokens : Number.MAX_SAFE_INTEGER,
+		);
+		// Heuristic preflight. A deterministic provider overflow can also select the
+		// chunked fallback; no other error changes strategies or discards source.
+		const inputTokens =
+			estimateMessagesTokens(request.messages) +
+			Math.ceil((request.systemPrompt?.length ?? 0) / 4) +
+			estimateToolDefinitionTokens(request.tools) +
+			1024;
+		if (model.contextWindow > 0 && inputTokens + outputTokens <= model.contextWindow) {
+			const requestOptions: SimpleStreamOptions = {
+				maxTokens,
+				signal,
+				...(reasoning === "off" ? {} : { reasoning }),
+			};
+			for (let attempt = 0; ; attempt++) {
+				signal.throwIfAborted();
+				try {
+					const response = await (await boundedStream(model, request, requestOptions)).result();
+					if (isContextOverflow(response, model.contextWindow)) break;
+					const summary = summaryText(response);
+					const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
+					return {
+						summary: summary + formatFileOperations(readFiles, modifiedFiles),
+						firstKeptEntryId: preparation.firstKeptEntryId,
+						tokensBefore: preparation.tokensBefore,
+						details: { readFiles, modifiedFiles },
+					};
+				} catch (error) {
+					if (signal.aborted) throw signal.reason;
+					if (error instanceof Error && error.name === "AbortError") throw error;
+					const message = error instanceof Error ? error.message : String(error);
+					if (!isTransientProviderError(message) || attempt >= retry.maxRetries) {
+						if (attempt === 0) throw error;
+						throw new Error(`Summarization failed after ${attempt + 1} attempts: ${message}`, { cause: error });
+					}
+					await waitFor(sleep(Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** attempt), signal), signal);
+				}
+			}
+		}
+		const fallbackReasoning = model.reasoning ? clampThinkingLevel(model, "minimal") : "off";
+		return await waitFor(
+			compact(
+				{ ...preparation, settings: { ...preparation.settings, reserveTokens: COMPACTION_SUMMARY_TOKENS / 0.8 } },
+				model,
+				undefined,
+				undefined,
+				options.customInstructions,
+				signal,
+				fallbackReasoning === "off" ? undefined : fallbackReasoning,
+				boundedStream,
+				undefined,
+				retry,
+			),
+			signal,
+		);
+	} finally {
+		clearTimeout(timer);
+		options.signal.removeEventListener("abort", abort);
+		controller.abort();
+	}
+}
