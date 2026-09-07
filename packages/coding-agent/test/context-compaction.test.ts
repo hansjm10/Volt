@@ -5,6 +5,7 @@ import {
 	fauxAssistantMessage,
 	type Model,
 	type SimpleStreamOptions,
+	type Usage,
 } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CompactionPreparation } from "../src/core/compaction/compaction.ts";
@@ -43,10 +44,12 @@ function streamResponse(
 	text = "## Goal\nPreserve original goal",
 	stopReason: "stop" | "length" | "toolUse" | "error" | "aborted" = "stop",
 	errorMessage?: string,
+	usage?: Partial<Usage>,
 ) {
 	const stream = createAssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message = fauxAssistantMessage(text, { stopReason, errorMessage });
+		message.usage = { ...message.usage, ...usage };
 		if (stopReason === "error" || stopReason === "aborted")
 			stream.push({ type: "error", seq: 1, reason: stopReason, error: message });
 		else stream.push({ type: "done", seq: 1, reason: stopReason, message });
@@ -114,6 +117,51 @@ describe("cache-preserving compaction", () => {
 			expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("<previous-summary>") })]),
 		);
 		expect(result.summary).toContain("Preserve original goal");
+	});
+
+	it.each([
+		{ name: "length-stop overflow", stopReason: "length", usage: { input: model.contextWindow, output: 0 } },
+		{
+			name: "length-stop overflow at the detection threshold",
+			stopReason: "length",
+			usage: { input: model.contextWindow * 0.99, output: 0 },
+		},
+		{
+			name: "cached length-stop overflow",
+			stopReason: "length",
+			usage: { input: model.contextWindow * 0.01, cacheRead: model.contextWindow * 0.98, output: 0 },
+		},
+		{ name: "silent overflow", stopReason: "stop", usage: { input: model.contextWindow + 1, output: 0 } },
+	] as const)("uses chunking for $name before validating an empty response", async ({ stopReason, usage }) => {
+		const calls: Context[] = [];
+		const result = await compactContext(
+			preparation(),
+			model,
+			options((_model, request) => {
+				calls.push(request);
+				return calls.length === 1
+					? streamResponse("", stopReason, undefined, usage)
+					: streamResponse("Recovered checkpoint");
+			}),
+		);
+		expect(calls).toHaveLength(2);
+		expect(calls[0].messages.slice(0, -1)).toEqual(context.messages);
+		expect(calls[0].systemPrompt).toBe(context.systemPrompt);
+		expect(calls[1].systemPrompt).not.toBe(context.systemPrompt);
+		expect(calls[1].messages[0].content).toEqual(
+			expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("Original goal") })]),
+		);
+		expect(result.summary).toContain("Recovered checkpoint");
+		expect(result.firstKeptEntryId).toBe("kept");
+	});
+
+	it.each([
+		{ input: model.contextWindow * 0.99 - 1, output: 0 },
+		{ input: model.contextWindow, output: 1 },
+	])("rejects non-overflow length stops with usage %j without changing strategies", async (usage) => {
+		const stream = vi.fn(() => streamResponse(usage.output === 0 ? "" : "partial", "length", undefined, usage));
+		await expect(compactContext(preparation(), model, options(stream))).rejects.toThrow("truncated");
+		expect(stream).toHaveBeenCalledTimes(1);
 	});
 
 	it("keeps split context in a single request", async () => {
@@ -208,21 +256,30 @@ describe("cache-preserving compaction", () => {
 		expect(requestSignal?.aborted).toBe(true);
 	});
 
-	it("applies summary validation and fixed budgets to the oversized fallback too", async () => {
-		const calls: SimpleStreamOptions[] = [];
-		await expect(
-			compactContext(
-				preparation(),
-				{ ...model, contextWindow: 16_384 },
-				options((_model, _context, opts) => {
-					calls.push(opts!);
-					return streamResponse("partial", "length");
-				}),
-			),
-		).rejects.toThrow("truncated");
-		expect(calls).toHaveLength(1);
-		expect(calls[0].maxTokens).toBeLessThanOrEqual(4096);
-	});
+	it.each([
+		{ name: "truncated", text: "partial", stopReason: "length", input: 0, error: "truncated" },
+		{ name: "length-stop overflow", text: "", stopReason: "length", input: 16_384, error: "truncated" },
+		{ name: "empty", text: "", stopReason: "stop", input: 0, error: "empty summary" },
+		{ name: "tool-calling", text: "", stopReason: "toolUse", input: 0, error: "tool call" },
+		{ name: "overlong", text: "x".repeat(16_385), stopReason: "stop", input: 0, error: "character limit" },
+	] as const)(
+		"rejects $name summaries in the bounded chunked fallback",
+		async ({ text, stopReason, input, error }) => {
+			const calls: SimpleStreamOptions[] = [];
+			await expect(
+				compactContext(
+					preparation(),
+					{ ...model, contextWindow: 16_384 },
+					options((_model, _context, opts) => {
+						calls.push(opts!);
+						return streamResponse(text, stopReason, undefined, { input, output: 0 });
+					}),
+				),
+			).rejects.toThrow(error);
+			expect(calls).toHaveLength(1);
+			expect(calls[0].maxTokens).toBeLessThanOrEqual(4096);
+		},
+	);
 
 	it.each(["provider", "context", "fallback"] as const)(
 		"bounds an uncooperative %s with the overall deadline",

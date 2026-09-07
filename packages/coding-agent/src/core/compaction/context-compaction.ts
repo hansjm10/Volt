@@ -109,7 +109,12 @@ export async function compactContext(
 		maxDelayMs: Math.min(30_000, Math.max(0, options.retry.maxDelayMs)),
 	};
 	// Also bounds the serialized fallback without changing the standalone chunked helper.
-	const boundedStream: StreamFn = (requestModel, context, requestOptions) => {
+	const boundedStream = (
+		requestModel: Model<Api>,
+		context: Context,
+		requestOptions: SimpleStreamOptions | undefined,
+		validateSummary?: (response: AssistantMessage) => void,
+	) => {
 		const result = createAssistantMessageEventStream();
 		const requestAbort = new AbortController();
 		const requestSignal = AbortSignal.any([signal, requestOptions?.signal ?? signal, requestAbort.signal]);
@@ -167,7 +172,7 @@ export async function compactContext(
 				if (response.stopReason === "error" || response.stopReason === "aborted") {
 					result.push({ type: "error", seq: 1, reason: response.stopReason, error: response });
 				} else {
-					summaryText(response); // Reject partial/empty/tool-calling results in both paths.
+					validateSummary?.(response);
 					result.push({ type: "done", seq: 1, reason: response.stopReason, message: response });
 				}
 			} catch (error) {
@@ -225,6 +230,7 @@ export async function compactContext(
 				signal.throwIfAborted();
 				try {
 					const response = await (await boundedStream(model, request, requestOptions)).result();
+					// Classify overflow before validating a candidate summary, including zero-output length stops.
 					if (isContextOverflow(response, model.contextWindow)) break;
 					const summary = summaryText(response);
 					const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
@@ -256,7 +262,9 @@ export async function compactContext(
 				options.customInstructions,
 				signal,
 				fallbackReasoning === "off" ? undefined : fallbackReasoning,
-				boundedStream,
+				// The chunked helper must only receive valid summaries or provider errors.
+				(requestModel, context, requestOptions) =>
+					boundedStream(requestModel, context, requestOptions, summaryText),
 				undefined,
 				retry,
 			),
