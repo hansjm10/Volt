@@ -1837,7 +1837,8 @@ describe("review presentation and repository helpers", () => {
 			expect(await listBaseBranches(harness.tempDir)).toEqual(["main", "develop", "origin/remote-only"]);
 			expect(await listRecentCommits(harness.tempDir, 1)).toMatchObject([{ subject: "initial value" }]);
 		} finally {
-			harness.cleanup();
+			// Drain background Git/session shutdown before removing the Windows fixture.
+			await harness.cleanupAsync();
 		}
 	});
 

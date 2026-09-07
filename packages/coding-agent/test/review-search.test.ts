@@ -362,6 +362,7 @@ describe("direct-tree review snapshot search", () => {
 		return repository;
 	}
 
+	// Exhaustive parity reads every cursor page through real Git processes; allow for full-suite I/O contention.
 	it("matches the legacy observable result across semantic fallbacks and every cursor page", async () => {
 		const repository = createRepository();
 		const supportsNewlinePaths = process.platform !== "win32";
@@ -499,7 +500,7 @@ describe("direct-tree review snapshot search", () => {
 				{ path: "oversized.txt", reason: expect.stringContaining("12 KiB") },
 			]),
 		);
-	}, 60_000);
+	}, 120_000);
 
 	it("returns bounded pages without retaining every repository match", async () => {
 		const repository = createRepository();

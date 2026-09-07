@@ -12,7 +12,7 @@ describe("ProjectTrustStore", () => {
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `trust-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
-		tempDir = realpathSync(tempDir);
+		tempDir = realpathSync.native(tempDir);
 		agentDir = join(tempDir, "agent");
 		cwd = join(tempDir, "project");
 		mkdirSync(agentDir, { recursive: true });

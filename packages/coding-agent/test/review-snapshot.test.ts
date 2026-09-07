@@ -1415,34 +1415,44 @@ if (!args.includes("--numstat")) {
 		process.env.PATH = `${join(repository, "bin")}${delimiter}${initialPath ?? ""}`;
 
 		const resolution = resolveReviewSnapshot({ kind: "pr", number: "7" }, repository, OPTIONS);
-		await vi.waitFor(() => {
-			const initialRequests = readFileSync(logPath, "utf8")
-				.trim()
-				.split("\n")
-				.map((line) => JSON.parse(line) as { variables?: { cursor?: unknown } })
-				.filter((request) => request.variables?.cursor === null);
-			expect(initialRequests).toHaveLength(5);
-		});
+		try {
+			await vi.waitFor(
+				() => {
+					const initialRequests = readFileSync(logPath, "utf8")
+						.trim()
+						.split("\n")
+						.map((line) => JSON.parse(line) as { variables?: { cursor?: unknown } })
+						.filter((request) => request.variables?.cursor === null);
+					expect(initialRequests).toHaveLength(5);
+				},
+				// Allow real gh shim processes to start under parallel Windows load.
+				{ timeout: 10_000 },
+			);
 
-		writeFileSync(join(repository, "main-only.txt"), "later main change\n");
-		git(repository, "add", "main-only.txt");
-		git(repository, "commit", "-m", "advance main");
-		const advancedBase = git(repository, "rev-parse", "HEAD");
-		git(repository, "push", "origin", "main");
-		writeFileSync(graphqlGatePath, "release\n");
+			writeFileSync(join(repository, "main-only.txt"), "later main change\n");
+			git(repository, "add", "main-only.txt");
+			git(repository, "commit", "-m", "advance main");
+			const advancedBase = git(repository, "rev-parse", "HEAD");
+			git(repository, "push", "origin", "main");
+			writeFileSync(graphqlGatePath, "release\n");
 
-		const result = await resolution;
-		if ("error" in result) throw new Error(result.error);
-		snapshots.push(result);
-		expect(result.identity).toMatchObject({
-			baseCommit: capturedBase,
-			mergeBaseCommit: capturedBase,
-			headCommit: headOid,
-		});
-		expect(result.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
-		expect(await result.readFile("base", "main-only.txt")).toBeUndefined();
-		expect(await result.readFile("head", "main-only.txt")).toBeUndefined();
-		expect(git(remote, "rev-parse", "main")).toBe(advancedBase);
+			const result = await resolution;
+			if ("error" in result) throw new Error(result.error);
+			expect(result.identity).toMatchObject({
+				baseCommit: capturedBase,
+				mergeBaseCommit: capturedBase,
+				headCommit: headOid,
+			});
+			expect(result.changedFiles.map((file) => file.path)).toEqual(["feature.txt"]);
+			expect(await result.readFile("base", "main-only.txt")).toBeUndefined();
+			expect(await result.readFile("head", "main-only.txt")).toBeUndefined();
+			expect(git(remote, "rev-parse", "main")).toBe(advancedBase);
+		} finally {
+			// Release and drain every request even if readiness or a later assertion fails.
+			writeFileSync(graphqlGatePath, "release\n");
+			const result = await resolution;
+			if (!("error" in result)) await result.dispose();
+		}
 	});
 
 	it("detaches fetched PR snapshots from borrowed local objects and rejects moved metadata", async () => {
@@ -1764,15 +1774,24 @@ if (!args.includes("--numstat")) {
 			number: "7",
 			maxPullRequestNumber: OPTIONS.maxPullRequestNumber,
 		});
-		await vi.waitFor(() => {
-			const initialRequests = readFileSync(logPath, "utf8")
-				.trim()
-				.split("\n")
-				.map((line) => JSON.parse(line) as { variables?: { cursor?: unknown } })
-				.filter((request) => request.variables?.cursor === null);
-			expect(initialRequests).toHaveLength(5);
-		});
-		writeFileSync(graphqlGatePath, "release\n");
+		try {
+			await vi.waitFor(
+				() => {
+					const initialRequests = readFileSync(logPath, "utf8")
+						.trim()
+						.split("\n")
+						.map((line) => JSON.parse(line) as { variables?: { cursor?: unknown } })
+						.filter((request) => request.variables?.cursor === null);
+					expect(initialRequests).toHaveLength(5);
+				},
+				// Allow real gh shim processes to start under parallel Windows load.
+				{ timeout: 10_000 },
+			);
+		} finally {
+			// Drain the gated commands before afterEach can delete their working directory.
+			writeFileSync(graphqlGatePath, "release\n");
+			await capturePromise;
+		}
 		const captured = await capturePromise;
 		expect(captured.ok).toBe(true);
 		if (!captured.ok) throw new Error(captured.error);

@@ -86,16 +86,16 @@ describe("AgentSession projectCwd propagation", () => {
 		});
 		try {
 			expect(services.cwd).toBe(runtimeCwd);
-			expect(services.projectCwd).toBe(realpathSync(projectCwd));
+			expect(services.projectCwd).toBe(realpathSync.native(projectCwd));
 			expect(session.getLspStatus()).toMatchObject({
 				enabled: true,
-				workspaceRoot: realpathSync(projectCwd),
+				workspaceRoot: realpathSync.native(projectCwd),
 			});
 
 			await session.reload();
 			expect(session.getLspStatus()).toMatchObject({
 				enabled: true,
-				workspaceRoot: realpathSync(projectCwd),
+				workspaceRoot: realpathSync.native(projectCwd),
 				servers: [],
 			});
 		} finally {
@@ -136,7 +136,7 @@ describe("AgentSession projectCwd propagation", () => {
 			expect(first.content).toEqual([
 				expect.objectContaining({ text: expect.stringContaining("error: found ERROR on line 1") }),
 			]);
-			expect(session.getLspStatus().workspaceRoot).toBe(realpathSync(paths.projectCwd));
+			expect(session.getLspStatus().workspaceRoot).toBe(realpathSync.native(paths.projectCwd));
 
 			await session.reload();
 			const reloadedTool = session.getToolDefinition("lsp");
@@ -180,7 +180,7 @@ describe("AgentSession projectCwd propagation", () => {
 			expect(result.content).toEqual([
 				expect.objectContaining({ text: expect.stringContaining("error: found ERROR on line 1") }),
 			]);
-			expect(session.getLspStatus().workspaceRoot).toBe(realpathSync(paths.projectCwd));
+			expect(session.getLspStatus().workspaceRoot).toBe(realpathSync.native(paths.projectCwd));
 		} finally {
 			session.dispose();
 			await session.waitForClosed();

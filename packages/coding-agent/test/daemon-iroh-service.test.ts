@@ -1084,7 +1084,7 @@ describe.skipIf(!nativeAvailable)("TUI Work observation receipt revisions", () =
 		const unresolvedWorkspaceDir = join(agentDir, "ws");
 		mkdirSync(join(unresolvedWorkspaceDir, ".git"), { recursive: true });
 		writeFileSync(join(unresolvedWorkspaceDir, ".git", "HEAD"), "ref: refs/heads/main\n");
-		const workspaceDir = realpathSync(unresolvedWorkspaceDir);
+		const workspaceDir = realpathSync.native(unresolvedWorkspaceDir);
 		const sessionId = randomUUID();
 		const session = await SessionManager.create(workspaceDir, getDefaultSessionDir(workspaceDir, agentDir), {
 			id: sessionId,
@@ -1239,9 +1239,11 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 		const agentDir = mkdtempSync(join(tmpdir(), "voltd-iroh-rekey-alias-"));
 		const unresolvedWorkspaceDir = join(agentDir, "ws");
 		mkdirSync(unresolvedWorkspaceDir, { recursive: true });
-		const workspaceDir = realpathSync(unresolvedWorkspaceDir);
+		const workspaceDir = realpathSync.native(unresolvedWorkspaceDir);
 		const sourceSessionId = randomUUID();
 		const replacementSessionId = randomUUID();
+		// Native relay replacement also drains the previous stream under host load.
+		const relayOfferTimeout = 15_000;
 		const sessionDir = getDefaultSessionDir(workspaceDir, agentDir);
 		const sourceSession = await SessionManager.create(workspaceDir, sessionDir, { id: sourceSessionId });
 		const replacementSession = await SessionManager.create(workspaceDir, sessionDir, { id: replacementSessionId });
@@ -1369,7 +1371,9 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 			});
 			await Promise.race([
 				expect
-					.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, { timeout: 5_000 })
+					.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, {
+						timeout: relayOfferTimeout,
+					})
 					.toBe(1),
 				initialResponse,
 			]);
@@ -1411,7 +1415,9 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 				conversation: { target: "session", sessionId: sourceSessionId },
 			});
 			await expect
-				.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, { timeout: 5_000 })
+				.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, {
+					timeout: relayOfferTimeout,
+				})
 				.toBe(2);
 			const aliasOffer = tuiEvents.filter((event) => event.type === "relay_offer")[1];
 			if (aliasOffer?.type !== "relay_offer") throw new Error("alias relay offer missing");
@@ -1466,9 +1472,17 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 				workspace: "ws",
 				conversation: { target: "session", sessionId: replacementSessionId },
 			});
-			await expect
-				.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, { timeout: 5_000 })
-				.toBe(3);
+			const directResponse = readJsonLine(directStream).then((response) => {
+				throw new Error(`canonical relay failed before offer: ${JSON.stringify(response.value)}`);
+			});
+			await Promise.race([
+				expect
+					.poll(() => tuiEvents.filter((event) => event.type === "relay_offer").length, {
+						timeout: relayOfferTimeout,
+					})
+					.toBe(3),
+				directResponse,
+			]);
 			const directOffer = tuiEvents.filter((event) => event.type === "relay_offer")[2];
 			if (directOffer?.type !== "relay_offer") throw new Error("canonical relay offer missing");
 			expect(directOffer.sessionId).toBe(replacementSessionId);
@@ -1508,7 +1522,7 @@ describe.skipIf(!nativeAvailable)("TUI rekey alias relay admission (#259)", () =
 			faux.unregister();
 			rmSync(agentDir, { recursive: true, force: true });
 		}
-	}, 30_000);
+	}, 60_000);
 });
 
 describe.skipIf(!nativeAvailable)("voltd iroh service (loopback)", () => {
