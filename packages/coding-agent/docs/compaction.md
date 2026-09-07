@@ -89,6 +89,22 @@ If the native request is estimated not to fit, or the provider reports a context
 
 Cancellation, timeout, empty responses, truncated output and tool-calling responses do not install a checkpoint. The original conversation remains intact. Custom extension-provided summaries retain their extension hook behavior.
 
+### Compaction Cache Usage
+
+After a successful manual or automatic compaction, interactive mode shows a separate line for each summarization request, for example:
+
+```text
+Native compaction request 1 (stop): 68,000 cached / 70,000 prompt tokens — 97.1% hit
+```
+
+These are the compaction requests themselves, not the first conversation request after compaction or the footer's latest cache-hit rate. The percentage is `cacheRead / (input + cacheRead + cacheWrite) * 100`; output tokens are excluded. Missing, invalid, or zero-prompt usage is shown as unavailable, not as a cache miss.
+
+Built-in session compaction saves these records in `CompactionEntry.details.requests` and returns them in the completion result. Each record contains the strategy (`native` or `chunked`), a one-based `attempt` in dispatch order across all chunks and retries, the requested provider/model, the terminal `stopReason`, and the provider-reported `input`, `output`, `cacheRead`, `cacheWrite`, and `totalTokens` under `usage`. A request that fails before a terminal response has neither `stopReason` nor `usage`; invalid token counts are omitted. Retries and fallback requests remain separate even when they finish out of order. See [session storage](session-format.md) for inspecting entries through `SessionManager` or a JSONL snapshot.
+
+Records cover only that compaction, including earlier failed attempts if it eventually succeeds. A failed or cancelled compaction still installs no entry. Custom extension summaries and the standalone chunked helper do not automatically collect these records. The metadata is not inserted into the summary or provider context, and does not change provider requests or footer totals.
+
+To check prefix-cache reuse, run `/compact` shortly after a normal reply without changing the model, reasoning, system prompt, or tools, then inspect the **native** request's line. Cache expiry and provider routing can still affect the result. The first conversation request after compaction uses a new summary prefix, so its cache-hit rate measures something different.
+
 ### Split Turns
 
 A "turn" starts with a user message and includes all assistant responses and tool calls until the next user message. Normally, compaction cuts at turn boundaries.
@@ -146,6 +162,7 @@ interface CompactionEntry {
 interface CompactionDetails {
   readFiles: string[];
   modifiedFiles: string[];
+  requests?: CompactionRequestUsage[]; // Per-request usage from built-in session compaction
 }
 ```
 

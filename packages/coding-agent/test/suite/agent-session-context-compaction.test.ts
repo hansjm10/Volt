@@ -1,16 +1,27 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type Context, fauxAssistantMessage, fauxToolCall, type SimpleStreamOptions } from "@hansjm10/volt-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { prepareCompaction } from "../../src/core/compaction/compaction.ts";
+import { type CompactionDetails, prepareCompaction } from "../../src/core/compaction/compaction.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 const harnesses: Harness[] = [];
+const sessionDirectories: string[] = [];
 afterEach(async () => {
 	while (harnesses.length) await harnesses.pop()!.cleanupAsync();
+	while (sessionDirectories.length) {
+		await rm(sessionDirectories.pop()!, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+	}
 });
 
 describe("AgentSession cache-preserving compaction", () => {
-	it("preserves the preceding provider prefix, tool definitions, reasoning, routing and Fast mode", async () => {
+	it("preserves the provider prefix and policy while persisting compaction request usage", async () => {
+		const sessionDirectory = await mkdtemp(join(tmpdir(), "volt-compaction-usage-"));
+		sessionDirectories.push(sessionDirectory);
 		const harness = await createHarness({
+			sessionManager: await SessionManager.create(sessionDirectory, sessionDirectory),
 			models: [{ id: "large", reasoning: true, contextWindow: 1_000_000, maxTokens: 32_768 }],
 			settings: { compaction: { keepRecentTokens: 1 }, retry: { provider: { maxRetries: 9 } } },
 			extensionFactories: [
@@ -82,6 +93,47 @@ describe("AgentSession cache-preserving compaction", () => {
 			role: "assistant",
 			content: [{ type: "text", text: "Recent answer retained verbatim" }],
 		});
+		const details = result.details as CompactionDetails;
+		expect(details.requests).toEqual([
+			{
+				strategy: "native",
+				attempt: 1,
+				provider: harness.getModel().provider,
+				model: "large",
+				stopReason: "stop",
+				usage: {
+					input: expect.any(Number),
+					output: expect.any(Number),
+					cacheRead: expect.any(Number),
+					cacheWrite: expect.any(Number),
+					totalTokens: expect.any(Number),
+				},
+			},
+		]);
+		expect(details.requests?.[0].usage?.cacheRead).toBeGreaterThan(0);
+		expect(harness.eventsOfType("compaction_end").at(-1)?.result?.details).toEqual(details);
+		await harness.sessionManager.flush();
+		const reopened = await SessionManager.open(harness.sessionManager.getSessionRef()!);
+		try {
+			expect(
+				reopened
+					.getBranch()
+					.filter((entry) => entry.type === "compaction")
+					.at(-1),
+			).toMatchObject({
+				summary: result.summary,
+				details,
+			});
+			// Usage is host metadata, not part of the replacement summary sent to the model.
+			expect(reopened.buildSessionContext().messages[0]).toEqual({
+				role: "compactionSummary",
+				summary: result.summary,
+				tokensBefore: result.tokensBefore,
+				timestamp: expect.any(Number),
+			});
+		} finally {
+			await reopened.closePersistence();
+		}
 	});
 
 	it.each(["length", "toolUse", "empty"] as const)(
@@ -131,7 +183,19 @@ describe("AgentSession cache-preserving compaction", () => {
 		expect(calls).toBe(1);
 		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			aborted: false,
-			result: { summary: "automatic checkpoint" },
+			result: {
+				summary: "automatic checkpoint",
+				details: {
+					requests: [
+						{
+							strategy: "native",
+							attempt: 1,
+							stopReason: "stop",
+							usage: { input: expect.any(Number), cacheRead: expect.any(Number) },
+						},
+					],
+				},
+			},
 		});
 	});
 

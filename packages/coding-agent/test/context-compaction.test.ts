@@ -79,7 +79,13 @@ describe("cache-preserving compaction", () => {
 		const result = await compactContext(preparation(), model, {
 			...options((_model, request, requestOptions) => {
 				calls.push({ context: request, options: requestOptions });
-				return streamResponse();
+				return streamResponse(undefined, "stop", undefined, {
+					input: 1000,
+					output: 300,
+					cacheRead: 68000,
+					cacheWrite: 1000,
+					totalTokens: 70300,
+				});
 			}),
 			context: async () => source,
 			customInstructions: "Keep the active deadline",
@@ -96,6 +102,163 @@ describe("cache-preserving compaction", () => {
 			details: { readFiles: ["src/example.ts"], modifiedFiles: [] },
 		});
 		expect(result.summary).toContain("<read-files>");
+		expect(result.details.requests).toEqual([
+			{
+				strategy: "native",
+				attempt: 1,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "stop",
+				usage: { input: 1000, output: 300, cacheRead: 68000, cacheWrite: 1000, totalTokens: 70300 },
+			},
+		]);
+	});
+
+	it("copies provider token counts without retaining mutable response usage", async () => {
+		const response = fauxAssistantMessage("checkpoint");
+		response.usage = { ...response.usage, input: 100, cacheRead: 900, totalTokens: 1000 };
+		const result = await compactContext(
+			preparation(),
+			model,
+			options(() => {
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "done", seq: 1, reason: "stop", message: response });
+				return stream;
+			}),
+		);
+		expect(result.details.requests?.[0].usage).not.toBe(response.usage);
+		response.usage.cacheRead = 0;
+		expect(result.details.requests?.[0].usage).toEqual({
+			input: 100,
+			output: 0,
+			cacheRead: 900,
+			cacheWrite: 0,
+			totalTokens: 1000,
+		});
+	});
+
+	it.each([NaN, Infinity, -1, -0, 0.5])("omits invalid usage (%s) without failing a valid summary", async (output) => {
+		const result = await compactContext(
+			preparation(),
+			model,
+			options(() => streamResponse("valid checkpoint", "stop", undefined, { output })),
+		);
+		expect(result.summary).toContain("valid checkpoint");
+		expect(result.details.requests).toEqual([
+			{ strategy: "native", attempt: 1, provider: model.provider, model: model.id, stopReason: "stop" },
+		]);
+	});
+
+	it("keeps reported errors, missing responses, and successful retries separate", async () => {
+		let calls = 0;
+		const result = await compactContext(
+			preparation(),
+			model,
+			options(() => {
+				calls++;
+				if (calls === 1) return streamResponse("", "error", "service unavailable", { input: 10, totalTokens: 10 });
+				if (calls === 2) throw new Error("service unavailable");
+				return streamResponse("retry checkpoint", "stop", undefined, {
+					input: 20,
+					cacheRead: 80,
+					totalTokens: 100,
+				});
+			}),
+		);
+		expect(calls).toBe(3);
+		expect(result.details.requests).toEqual([
+			{
+				strategy: "native",
+				attempt: 1,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "error",
+				usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 10 },
+			},
+			{ strategy: "native", attempt: 2, provider: model.provider, model: model.id },
+			{
+				strategy: "native",
+				attempt: 3,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "stop",
+				usage: { input: 20, output: 0, cacheRead: 80, cacheWrite: 0, totalTokens: 100 },
+			},
+		]);
+	});
+
+	it("records each chunk and retry without inventing a native preflight request", async () => {
+		const prepared = preparation();
+		prepared.messagesToSummarize = Array.from({ length: 3 }, (_, index) => ({
+			role: "user",
+			content: `${index}: ${"source".repeat(500)}`,
+			timestamp: index + 1,
+		}));
+		let calls = 0;
+		const result = await compactContext(
+			prepared,
+			{ ...model, contextWindow: 16_384 },
+			options(() => {
+				calls++;
+				return streamResponse(
+					calls === 1 ? "" : `checkpoint ${calls}`,
+					calls === 1 ? "error" : "stop",
+					calls === 1 ? "service unavailable" : undefined,
+					{ input: calls * 10, cacheRead: calls * 100, totalTokens: calls * 110 },
+				);
+			}),
+		);
+		expect(calls).toBe(4);
+		expect(result.summary).toContain("checkpoint 4");
+		expect(result.details.requests).toEqual(
+			Array.from({ length: 4 }, (_, index) => ({
+				strategy: "chunked",
+				attempt: index + 1,
+				provider: model.provider,
+				model: model.id,
+				stopReason: index === 0 ? "error" : "stop",
+				usage: {
+					input: (index + 1) * 10,
+					output: 0,
+					cacheRead: (index + 1) * 100,
+					cacheWrite: 0,
+					totalTokens: (index + 1) * 110,
+				},
+			})),
+		);
+	});
+
+	it("keeps parallel split fallback records in dispatch order", async () => {
+		const prepared = preparation();
+		prepared.isSplitTurn = true;
+		prepared.turnPrefixMessages = [{ role: "user", content: "turn prefix", timestamp: 2 }];
+		const historyStream = createAssistantMessageEventStream();
+		let calls = 0;
+		const result = await compactContext(
+			prepared,
+			{ ...model, contextWindow: 16_384 },
+			options(() => {
+				calls++;
+				if (calls === 1) return historyStream;
+				const prefixStream = streamResponse("Prefix checkpoint", "stop", undefined, {
+					input: 200,
+					totalTokens: 200,
+				});
+				void prefixStream.result().then(() => {
+					const message = fauxAssistantMessage("History checkpoint");
+					message.usage = { ...message.usage, input: 100, totalTokens: 100 };
+					historyStream.push({ type: "done", seq: 1, reason: "stop", message });
+				});
+				return prefixStream;
+			}),
+		);
+		expect(calls).toBe(2);
+		expect(result.summary).toContain("History checkpoint");
+		expect(result.summary).toContain("Prefix checkpoint");
+		expect(result.details.requests).toMatchObject([
+			{ strategy: "chunked", attempt: 1, usage: { input: 100 } },
+			{ strategy: "chunked", attempt: 2, usage: { input: 200 } },
+		]);
 	});
 
 	it.each(["preflight", "provider"] as const)("uses chunking only for %s overflow", async (overflow) => {
@@ -117,6 +280,14 @@ describe("cache-preserving compaction", () => {
 			expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("<previous-summary>") })]),
 		);
 		expect(result.summary).toContain("Preserve original goal");
+		expect(result.details.requests).toMatchObject(
+			overflow === "preflight"
+				? [{ strategy: "chunked", attempt: 1, stopReason: "stop" }]
+				: [
+						{ strategy: "native", attempt: 1, stopReason: "error" },
+						{ strategy: "chunked", attempt: 2, stopReason: "stop" },
+					],
+		);
 	});
 
 	it.each([
@@ -153,6 +324,10 @@ describe("cache-preserving compaction", () => {
 		);
 		expect(result.summary).toContain("Recovered checkpoint");
 		expect(result.firstKeptEntryId).toBe("kept");
+		expect(result.details.requests).toMatchObject([
+			{ strategy: "native", attempt: 1, stopReason, usage },
+			{ strategy: "chunked", attempt: 2, stopReason: "stop" },
+		]);
 	});
 
 	it.each([

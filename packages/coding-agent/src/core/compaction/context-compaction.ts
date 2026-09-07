@@ -14,7 +14,9 @@ import {
 import { sleep } from "../../utils/sleep.ts";
 import { isTransientProviderError } from "../provider-errors.ts";
 import {
+	type CompactionDetails,
 	type CompactionPreparation,
+	type CompactionRequestUsage,
 	type CompactionResult,
 	compact,
 	estimateMessagesTokens,
@@ -93,7 +95,8 @@ export async function compactContext(
 	preparation: CompactionPreparation,
 	model: Model<Api>,
 	options: ContextCompactionOptions,
-): Promise<CompactionResult> {
+): Promise<CompactionResult<CompactionDetails> & { details: CompactionDetails }> {
+	const requests: CompactionRequestUsage[] = [];
 	const controller = new AbortController();
 	const signal = controller.signal;
 	const abort = (): void => controller.abort(cancelled());
@@ -113,6 +116,7 @@ export async function compactContext(
 		requestModel: Model<Api>,
 		context: Context,
 		requestOptions: SimpleStreamOptions | undefined,
+		strategy: CompactionRequestUsage["strategy"],
 		validateSummary?: (response: AssistantMessage) => void,
 	) => {
 		const result = createAssistantMessageEventStream();
@@ -125,6 +129,13 @@ export async function compactContext(
 					controller.abort(timedOut());
 					signal.throwIfAborted();
 				}
+				const requestUsage: CompactionRequestUsage = {
+					strategy,
+					attempt: requests.length + 1,
+					provider: requestModel.provider,
+					model: requestModel.id,
+				};
+				requests.push(requestUsage);
 				const stream = await waitFor(
 					Promise.resolve(
 						options.streamFn(requestModel, context, {
@@ -169,6 +180,24 @@ export async function compactContext(
 				}
 				requestSignal.throwIfAborted();
 				if (!response) throw new Error("Compaction stream ended without a terminal response");
+				requestUsage.stopReason = response.stopReason;
+				// Copy only reported counts. Invalid telemetry must not fail a valid summary
+				// at the session's lossless-JSON persistence boundary.
+				const usage = response.usage;
+				if (
+					usage &&
+					[usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens].every(
+						(count) => Number.isSafeInteger(count) && count >= 0 && !Object.is(count, -0),
+					)
+				) {
+					requestUsage.usage = {
+						input: usage.input,
+						output: usage.output,
+						cacheRead: usage.cacheRead,
+						cacheWrite: usage.cacheWrite,
+						totalTokens: usage.totalTokens,
+					};
+				}
 				if (response.stopReason === "error" || response.stopReason === "aborted") {
 					result.push({ type: "error", seq: 1, reason: response.stopReason, error: response });
 				} else {
@@ -229,7 +258,7 @@ export async function compactContext(
 			for (let attempt = 0; ; attempt++) {
 				signal.throwIfAborted();
 				try {
-					const response = await (await boundedStream(model, request, requestOptions)).result();
+					const response = await (await boundedStream(model, request, requestOptions, "native")).result();
 					// Classify overflow before validating a candidate summary, including zero-output length stops.
 					if (isContextOverflow(response, model.contextWindow)) break;
 					const summary = summaryText(response);
@@ -238,7 +267,7 @@ export async function compactContext(
 						summary: summary + formatFileOperations(readFiles, modifiedFiles),
 						firstKeptEntryId: preparation.firstKeptEntryId,
 						tokensBefore: preparation.tokensBefore,
-						details: { readFiles, modifiedFiles },
+						details: { readFiles, modifiedFiles, requests },
 					};
 				} catch (error) {
 					if (signal.aborted) throw signal.reason;
@@ -253,7 +282,7 @@ export async function compactContext(
 			}
 		}
 		const fallbackReasoning = model.reasoning ? clampThinkingLevel(model, "minimal") : "off";
-		return await waitFor(
+		const result = await waitFor(
 			compact(
 				{ ...preparation, settings: { ...preparation.settings, reserveTokens: COMPACTION_SUMMARY_TOKENS / 0.8 } },
 				model,
@@ -264,12 +293,13 @@ export async function compactContext(
 				fallbackReasoning === "off" ? undefined : fallbackReasoning,
 				// The chunked helper must only receive valid summaries or provider errors.
 				(requestModel, context, requestOptions) =>
-					boundedStream(requestModel, context, requestOptions, summaryText),
+					boundedStream(requestModel, context, requestOptions, "chunked", summaryText),
 				undefined,
 				retry,
 			),
 			signal,
 		);
+		return { ...result, details: { ...result.details, requests } };
 	} finally {
 		clearTimeout(timer);
 		options.signal.removeEventListener("abort", abort);

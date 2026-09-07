@@ -33,10 +33,25 @@ import {
 // File Operation Tracking
 // ============================================================================
 
-/** Details stored in CompactionEntry.details for file tracking */
+/** One dispatched session-compaction request, including retries and fallback chunks. */
+export type CompactionRequestUsage = {
+	strategy: "native" | "chunked";
+	/** One-based dispatch order across the entire compaction, not completion order. */
+	attempt: number;
+	provider: string;
+	model: string;
+	/** Omitted when the request failed before a terminal provider response. */
+	stopReason?: AssistantMessage["stopReason"];
+	/** Provider-reported token counts; omitted when unavailable or invalid. */
+	usage?: Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "totalTokens">;
+};
+
+/** Details stored in CompactionEntry.details for file tracking and request accounting. */
 export type CompactionDetails = {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/** Captured by built-in session compaction, not the standalone summarization helper. */
+	requests?: CompactionRequestUsage[];
 };
 
 /**

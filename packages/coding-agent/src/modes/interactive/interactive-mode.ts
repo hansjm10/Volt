@@ -213,6 +213,7 @@ import { ensureTool } from "../../utils/tools-manager.ts";
 import { checkForNewVoltVersion, type LatestVoltRelease } from "../../utils/version-check.ts";
 import { getVoltUserAgent } from "../../utils/volt-user-agent.ts";
 import { runIrohRemoteRpcMode } from "../rpc/iroh-remote-rpc-mode.ts";
+import { formatCompactionUsage } from "./compaction-usage.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
@@ -4255,6 +4256,9 @@ export class InteractiveMode {
 							new Date().toISOString(),
 						),
 					);
+					for (const line of formatCompactionUsage(event.result.details)) {
+						this.chatContainer.addChild(new Text(theme.fg("dim", line), 1, 0));
+					}
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
