@@ -18,6 +18,10 @@ Run from source:
 
 The script can be run from any directory. Volt keeps the caller's current working directory. `volt-test.sh` and `volt-test.ps1` enable private review diagnostics for source-development runs. Model-reported limitations, verifier assessments and bounded completeness challenges, and bounded failed-tool output are written as one owner-only JSONL file per review with diagnostics under `~/.volt/agent/review-diagnostics/` (or the configured agent directory). The `verification_assessment` record retains the verifier's `assessment` and optional `challenge` even when no limitations or findings were reported; the public PR result still redacts the challenge. These records are untrusted and may contain sensitive GitHub context. They are not added to sessions, RPC responses, exports, or model context, and only the 20 newest files are retained.
 
+On Windows, Volt uses the system Windows PowerShell and [.NET ACL-aware creation](https://learn.microsoft.com/en-us/dotnet/api/system.security.accesscontrol.directorysecurity?view=netframework-4.8.1) to restrict the diagnostic directory and newly created files to the current account. New files have a protected DACL installed at creation, before any diagnostic text is written. An existing diagnostic directory must belong to the current account and must not be a junction or symbolic link. The existing agent-directory ACL is not changed. Administrators with ownership/backup privileges remain outside this privacy boundary.
+
+If Windows PowerShell is unavailable, times out, or cannot establish these ACLs, Volt does not fall back to chmod-only storage. Any diagnostic retention failure produces the local warning `Could not retain optional private review diagnostics.` after the TUI handoff, or on host stderr for headless execution. Raw errors, paths, and model prose are not included. The warning is transient and never added to review results, sessions, RPC events, or exports; diagnostic failures do not change the review verdict.
+
 Set `VOLT_REVIEW_PRIVATE_DIAGNOSTICS=0` before launching either script to disable these records.
 
 ## Forking / Rebranding

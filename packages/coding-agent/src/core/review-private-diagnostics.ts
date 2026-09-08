@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ensurePrivateDirectorySync, writePrivateNewFile } from "../utils/private-files.ts";
 import type { ReviewPass } from "./review.ts";
 import type { ReviewVerificationReport } from "./review-report.ts";
+import { writeWindowsReviewDiagnostic } from "./windows-review-private-diagnostics.ts";
 
 export const REVIEW_PRIVATE_DIAGNOSTICS_ENV = "VOLT_REVIEW_PRIVATE_DIAGNOSTICS";
 export const MAX_RETAINED_REVIEW_PRIVATE_DIAGNOSTIC_FILES = 20;
@@ -160,11 +161,16 @@ export function createReviewPrivateDiagnostics(options: {
 			flushPromise = (async () => {
 				if (records.length === 0) return undefined;
 				const directoryPath = getReviewPrivateDiagnosticsDirectory(options.agentDir);
-				ensurePrivateDirectorySync(directoryPath);
 				const timestamp = createdAt.toISOString().replace(/[:.]/g, "-");
 				const runHash = createHash("sha256").update(runId).digest("hex").slice(0, 16);
 				const filePath = join(directoryPath, `${timestamp}_${runHash}.jsonl`);
-				await writePrivateNewFile(filePath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+				const content = `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+				if (process.platform === "win32") {
+					await writeWindowsReviewDiagnostic(filePath, content);
+				} else {
+					ensurePrivateDirectorySync(directoryPath);
+					await writePrivateNewFile(filePath, content);
+				}
 				await prunePrivateDiagnosticFiles(directoryPath);
 				return filePath;
 			})();

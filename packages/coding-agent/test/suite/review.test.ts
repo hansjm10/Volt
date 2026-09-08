@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@hansjm10/volt-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -164,6 +164,38 @@ function attachGitHubContext(snapshot: ReviewSnapshot, marker: string): void {
 		discussionEntries: [{ id: "comment-1", kind: "pr-comment", body: marker }],
 		rendered: marker,
 	};
+}
+
+const DIAGNOSTIC_RETENTION_WARNING = "Could not retain optional private review diagnostics.";
+
+function privateReviewResponses(marker: string, assessment: "complete" | "incomplete" = "complete") {
+	return [
+		fauxAssistantMessage(fauxToolCall("review_context", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("review_diff", { path: "src/value.ts" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage(
+			fauxToolCall("report_review_candidates", {
+				summary: marker,
+				candidates: [],
+				limitations: [marker, marker],
+			}),
+			{ stopReason: "toolUse" },
+		),
+		fauxAssistantMessage(fauxToolCall("review_context", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("review_changed_files", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("review_diff", { path: "src/value.ts" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage(
+			fauxToolCall("report_review_verification", {
+				summary: marker,
+				assessment,
+				...(assessment === "incomplete" ? { challenge: marker } : {}),
+				decisions: [],
+				priorFindingDecisions: [],
+				limitations: [marker],
+			}),
+			{ stopReason: "toolUse" },
+		),
+	];
 }
 
 describe("review command controls", () => {
@@ -674,8 +706,241 @@ describe("review pipeline", () => {
 		vi.unstubAllEnvs();
 		for (const snapshot of snapshots.splice(0)) await snapshot.dispose();
 		await managerOwner.drain();
+		vi.restoreAllMocks();
 		for (const harness of harnesses.splice(0)) await harness.cleanupAsync();
 	});
+
+	it.each([
+		"disabled",
+		"retained",
+		"stderr",
+		"observer",
+		"throwing observer",
+		"rejecting observer",
+		"pending observer",
+		"throwing stderr",
+	] as const)("keeps optional diagnostic warnings local and passive (%s)", async (delivery) => {
+		vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, delivery === "disabled" ? "0" : "1");
+		const privateMarker = "private-retention-model-prose";
+		const observerError = "private-warning-observer-error";
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const snapshot = await createSnapshotRepository(harness);
+		attachGitHubContext(snapshot, privateMarker);
+		snapshots.push(snapshot);
+		const checkout = await snapshot.materializeHead();
+		expect(existsSync(checkout)).toBe(true);
+		const diagnosticsDirectory = getReviewPrivateDiagnosticsDirectory(harness.tempDir);
+		if (delivery !== "retained") writeFileSync(diagnosticsDirectory, "Not a directory");
+		harness.setResponses(privateReviewResponses(privateMarker));
+		const stderrWarning = vi.spyOn(console, "warn").mockImplementation(() => {
+			if (delivery === "throwing stderr") throw new Error(observerError);
+		});
+		const onDiagnosticRetentionWarning = vi.fn((_message: string): void | Promise<void> => {
+			if (delivery === "throwing observer") throw new Error(observerError);
+			if (delivery === "rejecting observer") return Promise.reject(new Error(observerError));
+			if (delivery === "pending observer") return new Promise<void>(() => {});
+		});
+		const useObserver = delivery.includes("observer") || delivery === "disabled" || delivery === "retained";
+		const events: Array<Record<string, unknown>> = [];
+		const result = await runReview({
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			model: harness.getModel(),
+			authStorage: harness.authStorage,
+			modelRegistry: harness.session.modelRegistry,
+			settingsManager: harness.settingsManager,
+			resolved: snapshot,
+			controls: { scopeMode: "full", scope: ["src/**"] },
+			workflowId: "review:local-retention-warning",
+			workflowAction: "review.pr",
+			onEvent: (event) => events.push(event),
+			...(useObserver ? { onDiagnosticRetentionWarning } : {}),
+		});
+		expect(result).toMatchObject({
+			aborted: false,
+			parsed: { completionStatus: "complete", overallCorrectness: "correct", findings: [] },
+		});
+		expect(result.errorMessage).toBeUndefined();
+		expect(existsSync(checkout)).toBe(false);
+		expect(harness.faux.state.callCount).toBe(8);
+		const failedRetention = delivery !== "disabled" && delivery !== "retained";
+		expect(onDiagnosticRetentionWarning.mock.calls).toEqual(
+			failedRetention && useObserver ? [[DIAGNOSTIC_RETENTION_WARNING]] : [],
+		);
+		expect(stderrWarning.mock.calls).toEqual(
+			failedRetention && delivery !== "observer" && delivery !== "pending observer"
+				? [[`Warning: ${DIAGNOSTIC_RETENTION_WARNING}`]]
+				: [],
+		);
+		const publicData = JSON.stringify({ result, events, entries: harness.sessionManager.getEntries() });
+		for (const forbidden of [privateMarker, observerError, diagnosticsDirectory, DIAGNOSTIC_RETENTION_WARNING]) {
+			expect(publicData).not.toContain(forbidden);
+		}
+		if (delivery === "retained") {
+			const files = readdirSync(diagnosticsDirectory);
+			expect(files).toHaveLength(1);
+			expect(readFileSync(join(diagnosticsDirectory, files[0]!), "utf8").trim().split("\n")).toHaveLength(4);
+		}
+	});
+
+	it.each(["complete", "incomplete", "failed", "cancelled"] as const)(
+		"preserves the durable %s outcome when diagnostics and the warning observer fail",
+		async (status) => {
+			vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, "1");
+			const privateMarker = "private-durable-retention-prose";
+			const observerError = "private-retention-observer-failure";
+			const harness = await createHarness({ settings: { retry: { enabled: false } } });
+			harnesses.push(harness);
+			const snapshot = await createSnapshotRepository(harness);
+			attachGitHubContext(snapshot, privateMarker);
+			snapshots.push(snapshot);
+			const checkout = await snapshot.materializeHead();
+			const diagnosticsDirectory = getReviewPrivateDiagnosticsDirectory(harness.tempDir);
+			writeFileSync(diagnosticsDirectory, "Not a directory");
+			const controller = new AbortController();
+			const responses = privateReviewResponses(privateMarker, status === "incomplete" ? "incomplete" : "complete");
+			harness.setResponses(
+				status === "failed" || status === "cancelled"
+					? [
+							...responses.slice(0, 4),
+							() => {
+								if (status === "cancelled") controller.abort();
+								return fauxAssistantMessage("", {
+									stopReason: "error",
+									errorMessage: "Review provider failed.",
+								});
+							},
+						]
+					: responses,
+			);
+			const sessionManager = await SessionManager.create(harness.tempDir, join(harness.tempDir, "sessions"));
+			const workflowId = `review:retention-${status}`;
+			const events: Array<Record<string, unknown>> = [];
+			const stderrWarning = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const onDiagnosticRetentionWarning = vi.fn((_message: string) => {
+				throw new Error(observerError);
+			});
+			const result = await executeReviewWorkflow({
+				prepared: {
+					workflowId,
+					action: "review.pr",
+					target: { kind: "pr", number: "348" },
+					controls: { scope: ["src/**"], effort: "standard", includeOptional: false, scopeMode: "full" },
+					resolution: snapshot,
+					model: harness.getModel(),
+					verifierModel: harness.getModel(),
+					startedAt: 1,
+					incrementalPlan: {
+						mode: "full",
+						changedPaths: ["src/value.ts"],
+						priorOpenFindings: [],
+						suppressedDismissedFingerprints: [],
+					},
+				},
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				authStorage: harness.authStorage,
+				modelRegistry: harness.session.modelRegistry,
+				settingsManager: harness.settingsManager,
+				sessionManager,
+				signal: controller.signal,
+				onDiagnosticRetentionWarning,
+				onEvent: (event) => events.push(event),
+			});
+			expect(existsSync(checkout)).toBe(false);
+			expect(onDiagnosticRetentionWarning.mock.calls).toEqual([[DIAGNOSTIC_RETENTION_WARNING]]);
+			expect(stderrWarning.mock.calls).toEqual([[`Warning: ${DIAGNOSTIC_RETENTION_WARNING}`]]);
+			if (status === "complete" || status === "incomplete") {
+				expect(result).toMatchObject({
+					status: "completed",
+					completionStatus: status,
+					durableRecordCommitted: true,
+				});
+				if (result.status !== "completed") throw new Error("Expected a completed review");
+				expect(result.parsed.overallCorrectness).toBe(status === "complete" ? "correct" : undefined);
+			} else {
+				expect(result.status).toBe(status);
+				if (status === "failed") expect(result).toMatchObject({ errorMessage: "Review provider failed." });
+			}
+			const ref = sessionManager.getSessionRef()!;
+			await sessionManager.closePersistence();
+			const reopened = await SessionManager.open(ref);
+			expect(getReviewRun(reopened, workflowId)?.status).toBe(status === "complete" ? "completed" : status);
+			const exportPath = join(harness.tempDir, "retention-review.jsonl");
+			await SessionManager.exportJsonlSnapshot(ref, exportPath);
+			const publicData = JSON.stringify({ result, events, entries: reopened.getEntries() });
+			const exported = readFileSync(exportPath, "utf8");
+			for (const forbidden of [privateMarker, observerError, diagnosticsDirectory, DIAGNOSTIC_RETENTION_WARNING]) {
+				expect(publicData).not.toContain(forbidden);
+				expect(exported).not.toContain(forbidden);
+			}
+		},
+	);
+
+	it.each([false, true])(
+		"threads the warning outside workflow events and handoff data (managed=%s)",
+		async (managed) => {
+			vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, "1");
+			const privateMarker = "private-workflow-retention-prose";
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const initialSnapshot = await createSnapshotRepository(harness);
+			await initialSnapshot.dispose();
+			const diagnosticsDirectory = getReviewPrivateDiagnosticsDirectory(harness.tempDir);
+			writeFileSync(diagnosticsDirectory, "Not a directory");
+			harness.setResponses(privateReviewResponses(privateMarker));
+			const events: Array<Record<string, unknown>> = [];
+			const workflowManager = new ReviewWorkflowManager({ publishEvent: (event) => events.push(event) });
+			const stderrWarning = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const onDiagnosticRetentionWarning = vi.fn((_message: string) => {});
+			const newSession = vi.fn(async () => ({ cancelled: true, seeded: false }));
+			const cleanup = vi.fn();
+			try {
+				const result = await runReviewWorkflow({
+					target: { kind: "uncommitted" },
+					controls: { scope: ["src/**"], scopeMode: "full" },
+					cwd: harness.tempDir,
+					agentDir: harness.tempDir,
+					session: harness.session,
+					newSession,
+					authStorage: harness.authStorage,
+					settingsManager: harness.settingsManager,
+					onDiagnosticRetentionWarning,
+					...(managed ? { workflowManager } : { onEvent: (event) => events.push(event) }),
+					createHooks: () => ({
+						onPrepared: (snapshot) => {
+							attachGitHubContext(snapshot, privateMarker);
+							snapshots.push(snapshot);
+						},
+						cleanup,
+					}),
+				});
+				expect(result).toMatchObject({
+					status: "completed",
+					completionStatus: "complete",
+					sessionSwitchCancelled: true,
+				});
+				expect(cleanup).toHaveBeenCalledOnce();
+				expect(newSession).toHaveBeenCalledOnce();
+				expect(onDiagnosticRetentionWarning.mock.calls).toEqual([[DIAGNOSTIC_RETENTION_WARNING]]);
+				expect(stderrWarning).not.toHaveBeenCalled();
+				expect(events.at(-1)).toMatchObject({ type: "workflow_end", status: "completed" });
+				const publicData = JSON.stringify({
+					events,
+					entries: harness.sessionManager.getEntries(),
+					messages: harness.session.messages,
+					workflows: workflowManager.list().map((workflow) => workflowManager.get(workflow.workflowId)),
+				});
+				expect(harness.session.messages).toHaveLength(1);
+				for (const forbidden of [privateMarker, diagnosticsDirectory, DIAGNOSTIC_RETENTION_WARNING]) {
+					expect(publicData).not.toContain(forbidden);
+				}
+			} finally {
+				await workflowManager.abortAll();
+			}
+		},
+	);
 
 	it("keeps context-exposed prose private and presents findings from code in a fresh context", async () => {
 		vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, "1");
