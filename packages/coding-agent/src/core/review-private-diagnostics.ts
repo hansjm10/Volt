@@ -4,6 +4,8 @@ import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { ensurePrivateDirectorySync, writePrivateNewFile } from "../utils/private-files.ts";
 import type { ReviewPass } from "./review.ts";
+import type { ReviewVerificationReport } from "./review-report.ts";
+import { writeWindowsReviewDiagnostic } from "./windows-review-private-diagnostics.ts";
 
 export const REVIEW_PRIVATE_DIAGNOSTICS_ENV = "VOLT_REVIEW_PRIVATE_DIAGNOSTICS";
 export const MAX_RETAINED_REVIEW_PRIVATE_DIAGNOSTIC_FILES = 20;
@@ -22,6 +24,11 @@ interface ReviewPrivateDiagnosticBase {
 
 type ReviewPrivateDiagnosticRecord =
 	| (ReviewPrivateDiagnosticBase & {
+			kind: "verification_assessment";
+			assessment: ReviewVerificationReport["assessment"];
+			challenge?: string;
+	  })
+	| (ReviewPrivateDiagnosticBase & {
 			kind: "model_limitation";
 			message: string;
 	  })
@@ -33,6 +40,7 @@ type ReviewPrivateDiagnosticRecord =
 	  });
 
 export interface ReviewPrivateDiagnostics {
+	recordVerificationAssessment(report: Pick<ReviewVerificationReport, "assessment" | "challenge">): void;
 	recordModelLimitations(phase: ReviewPass, limitations: readonly string[]): void;
 	recordToolFailure(phase: ReviewPass, failure: { toolName: string; command?: string; result: unknown }): void;
 	flush(): Promise<string | undefined>;
@@ -91,6 +99,7 @@ export function createReviewPrivateDiagnostics(options: {
 	const setting = process.env[REVIEW_PRIVATE_DIAGNOSTICS_ENV]?.toLowerCase();
 	if ((setting !== "1" && setting !== "true") || !options.workflowId || !options.workflowAction) {
 		return {
+			recordVerificationAssessment: () => {},
 			recordModelLimitations: () => {},
 			recordToolFailure: () => {},
 			flush: () => Promise.resolve(undefined),
@@ -104,6 +113,8 @@ export function createReviewPrivateDiagnostics(options: {
 	let flushPromise: Promise<string | undefined> | undefined;
 	const append = (record: ReviewPrivateDiagnosticRecord): void => {
 		if (records.length < MAX_PRIVATE_DIAGNOSTIC_RECORDS) records.push(record);
+		// Preserve the verifier's conclusion even if earlier tool failures filled the log.
+		else if (record.kind === "verification_assessment") records[records.length - 1] = record;
 	};
 	const baseRecord = (phase: ReviewPass): ReviewPrivateDiagnosticBase => ({
 		schemaVersion: 1,
@@ -114,6 +125,16 @@ export function createReviewPrivateDiagnostics(options: {
 	});
 
 	return {
+		recordVerificationAssessment(report) {
+			append({
+				...baseRecord("verification"),
+				kind: "verification_assessment",
+				assessment: report.assessment,
+				...(report.challenge
+					? { challenge: truncateUtf8(report.challenge, MAX_PRIVATE_DIAGNOSTIC_MESSAGE_BYTES) }
+					: {}),
+			});
+		},
 		recordModelLimitations(phase, limitations) {
 			for (const limitation of limitations) {
 				append({
@@ -140,11 +161,16 @@ export function createReviewPrivateDiagnostics(options: {
 			flushPromise = (async () => {
 				if (records.length === 0) return undefined;
 				const directoryPath = getReviewPrivateDiagnosticsDirectory(options.agentDir);
-				ensurePrivateDirectorySync(directoryPath);
 				const timestamp = createdAt.toISOString().replace(/[:.]/g, "-");
 				const runHash = createHash("sha256").update(runId).digest("hex").slice(0, 16);
 				const filePath = join(directoryPath, `${timestamp}_${runHash}.jsonl`);
-				await writePrivateNewFile(filePath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+				const content = `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+				if (process.platform === "win32") {
+					await writeWindowsReviewDiagnostic(filePath, content);
+				} else {
+					ensurePrivateDirectorySync(directoryPath);
+					await writePrivateNewFile(filePath, content);
+				}
 				await prunePrivateDiagnosticFiles(directoryPath);
 				return filePath;
 			})();

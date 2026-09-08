@@ -9341,6 +9341,7 @@ export class InteractiveMode {
 			return { status: "cancelled" };
 		}
 		this.activeInteractiveReview = true;
+		let diagnosticRetentionWarning: string | undefined;
 		try {
 			const result = await runReviewWorkflow({
 				target,
@@ -9358,6 +9359,9 @@ export class InteractiveMode {
 				confirm: ({ title, message, signal }) =>
 					this.showExtensionConfirm(title, message, signal ? { signal } : undefined),
 				onReviewModelWarning: (message) => this.showWarning(message),
+				onDiagnosticRetentionWarning: (message) => {
+					diagnosticRetentionWarning = message;
+				},
 				createHooks: () => this.createReviewWorkflowHooks(),
 				workflowManager: this.runtimeHost.reviewWorkflows,
 			});
@@ -9384,6 +9388,19 @@ export class InteractiveMode {
 			return { status: "cancelled" };
 		} finally {
 			this.activeInteractiveReview = false;
+			// Handoff and renderCurrentSessionState clear transient chat rows. Warn only
+			// after they settle, including cancellation and failure paths, without persistence.
+			if (diagnosticRetentionWarning) {
+				try {
+					this.showWarning(diagnosticRetentionWarning);
+				} catch {
+					try {
+						console.warn(`Warning: ${diagnosticRetentionWarning}`);
+					} catch {
+						// A warning observer cannot turn a completed review into a failure.
+					}
+				}
+			}
 		}
 	}
 
