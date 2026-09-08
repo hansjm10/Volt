@@ -665,14 +665,12 @@ describe("SubagentManager", () => {
 		const { manager, getDisposedSessionCount } = await createTestManager({
 			responses: [
 				fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" }),
-				fauxAssistantMessage("continued after compaction"),
-			],
-			simpleResponses: [
 				async () => {
 					compactionStarted.resolve();
 					await finishCompaction.promise;
 					return fauxAssistantMessage("compacted context");
 				},
+				fauxAssistantMessage("continued after compaction"),
 			],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1 } },
 			onRuntimeCreated: (event) => {
@@ -840,6 +838,7 @@ describe("SubagentManager", () => {
 		);
 		const { manager } = await createTestManager({
 			responses: [
+				fauxAssistantMessage("compacted previous child context"),
 				fauxAssistantMessage("recovered previous child turn"),
 				async () => {
 					taskResponseStarted.resolve();
@@ -847,7 +846,6 @@ describe("SubagentManager", () => {
 					return fauxAssistantMessage("completed delegated task");
 				},
 			],
-			simpleResponses: [fauxAssistantMessage("compacted previous child context")],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1 } },
 			onRuntimeCreated: (event) => {
 				event.runtime.session.setSessionName("resumed child");

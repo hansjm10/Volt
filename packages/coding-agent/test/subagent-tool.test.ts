@@ -1185,13 +1185,13 @@ describe("subagent tool", () => {
 			definitions: [createDefinition("scout", { source: "project" })],
 			responses: [
 				fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" }),
+				fauxAssistantMessage("compacted child context"),
 				async () => {
 					continuationStarted.resolve(undefined);
 					await finishContinuation.promise;
 					return fauxAssistantMessage("recovered child answer");
 				},
 			],
-			simpleResponses: [fauxAssistantMessage("compacted child context")],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1 } },
 			onRuntimeCreated: (event) => {
 				childSessionManager = event.runtime.session.sessionManager;
