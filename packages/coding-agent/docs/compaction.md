@@ -40,8 +40,8 @@ You can also trigger manually with `/compact [instructions]`, where optional ins
 ### How It Works
 
 1. **Find cut point**: Walk backwards from the newest message, accumulating token estimates up to `keepRecentTokens` (default 20k). When active tool definitions would consume too much of the selected model's context, Volt lowers this message budget to leave the configured reserve and tool definitions room.
-2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
-3. **Generate summary**: Make one request with the current system prompt, tool definitions, reasoning setting, and native older-message prefix (including the previous checkpoint). Append a summarization instruction rather than serializing or rewriting the prefix. Recent messages beyond the cut remain outside this request.
+2. **Identify summary scope**: Collect the older messages from the previous kept boundary (or session start) up to the cut point, and identify the recent suffix that will remain verbatim.
+3. **Generate summary**: Make one request with the current system prompt, tool definitions, reasoning setting, and full native conversation, including the previous checkpoint and recent suffix. Append a checkpoint instruction defining the older summary scope using the saved suffix's message count and, when the context pipeline preserves message counts, a bounded, quoted excerpt of its transformed beginning. Do not insert boundary markers into, shorten, or rewrite the existing conversation. The recent suffix is available for corrections and continuity, not to duplicate its narrative in the summary.
 4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
 5. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards; the completion result reports a fresh token estimate for the rebuilt messages and active tool definitions
 
@@ -83,9 +83,9 @@ On repeated compactions, the summarized span starts at the previous compaction's
 
 Built-in compaction requests at most 4096 summary tokens per request, independently of `reserveTokens`. It also stops and rejects generated text above 16,384 characters per response, including on providers that do not enforce the requested token limit. File-operation metadata is appended separately.
 
-The normal single-pass request preserves the session's reasoning level, Fast mode, transport, routing identity and cache policy. This enables prefix-cache reuse; cache hits are not guaranteed, particularly after provider/extension transformations or cache expiry. Compaction never executes returned tool calls.
+The normal single-pass request preserves the session's reasoning level, Fast mode, transport, routing identity and cache policy. Keeping the full conversation avoids relying on a shorter intermediate prefix having been cached, and can preserve append-only WebSocket continuation. Cache hits are not guaranteed, particularly after provider/extension transformations or cache expiry. Context hooks receive the full history once. Boundary excerpts use only content already present after context hooks and conversion, never saved raw content that they may have removed or redacted. If message counts change, the excerpt is omitted rather than guessed. Arbitrary reordering can still make the boundary reference less precise. Compaction never executes returned tool calls.
 
-If the native request is estimated not to fit, or the provider reports a context overflow, Volt uses the existing chronological chunked summarizer with a small fixed output allowance and minimal supported reasoning. Other errors do not select the fallback. Built-in summary generation has a five-minute deadline covering context conversion, requests, retry delays and any fallback. Transient failures have at most two compaction-level retries per request; provider-level retries are disabled for session compaction.
+If the full native request (including the recent suffix, checkpoint instruction, and output/thinking allowance) is estimated not to fit, or the provider reports a context overflow, Volt uses the existing chronological chunked summarizer with a small fixed output allowance and minimal supported reasoning. This fallback still summarizes only the older source; it does not add the retained suffix to its chunks. Other errors do not select the fallback. Built-in summary generation has a five-minute deadline covering context conversion, requests, retry delays and any fallback. Transient failures have at most two compaction-level retries per request; provider-level retries are disabled for session compaction.
 
 Cancellation, timeout, empty responses, truncated output and tool-calling responses do not install a checkpoint. The original conversation remains intact. Custom extension-provided summaries retain their extension hook behavior.
 
@@ -104,6 +104,37 @@ Built-in session compaction saves these records in `CompactionEntry.details.requ
 Records cover only that compaction, including earlier failed attempts if it eventually succeeds. A failed or cancelled compaction still installs no entry. Custom extension summaries and the standalone chunked helper do not automatically collect these records. The metadata is not inserted into the summary or provider context, and does not change provider requests or footer totals.
 
 To check prefix-cache reuse, run `/compact` shortly after a normal reply without changing the model, reasoning, system prompt, or tools, then inspect the **native** request's line. Cache expiry and provider routing can still affect the result. The first conversation request after compaction uses a new summary prefix, so its cache-hit rate measures something different.
+
+#### Codex Request Diagnostics
+
+For an OpenAI Codex cache investigation, enable redacted request diagnostics **before starting Volt**:
+
+```bash
+VOLT_CODEX_REQUEST_DIAGNOSTICS=1 volt --session <session-id>
+```
+
+PowerShell:
+
+```powershell
+$env:VOLT_CODEX_REQUEST_DIAGNOSTICS = "1"
+volt --session <session-id>
+```
+
+Use the updated runtime, including the daemon if it owns the session. Setting the variable in a bash tool invocation does not enable it in the already-running parent process. Only the exact value `1` enables capture; a provider-scoped environment override takes precedence. Unset it or set it to `0` when finished.
+
+Normal responses save `codex_request` records in `message.diagnostics`. Successful built-in compactions copy them into `details.requests[].diagnostics`, alongside each summarization request's usage. Records contain:
+
+- Actual `transport` (`websocket` or `sse`), configured transport, and `requestMode` (`full` or `delta`).
+- `continuationReason`: `eligible`, `no_previous_response`, `non_input_changed`, `input_shorter`, `input_prefix_changed`, or `missing_response_id`; disabled/unavailable continuation reports `cache_disabled`, `transport_not_cached`, or `connection_not_cached`. SSE reports `sse_requested` or `websocket_fallback`.
+- `connectionReused` for WebSocket dispatches only. This does not assert a provider cache hit.
+- A one-based dispatch `attempt` within that provider invocation. WebSocket send failures, subsequent SSE fallback, and SSE retries retain separate records; this counter is independent of the outer compaction request's `attempt`. Connection failures before a send do not create a request record.
+- Full and wire input-item counts, plus SHA-256 `hashes` for the cache key, instructions, tools, non-input `configuration`, ordered full-context `inputItems`, actual `wireInput`, and `previousResponseId`. Missing scalar fields hash JSON `null`. The configuration fingerprint excludes the WebSocket envelope's `type`, `input`, and `previous_response_id`.
+
+Fingerprints use serialized post-hook payload snapshots, preserving property order without re-evaluating hook-owned getters or `toJSON`. Full requests use the actual wire snapshot. For delta requests, `inputItems` describes the already-serialized full context before transport selection, while `wireInput` describes the actual transmitted suffix. WebSocket dispatch decisions are captured after full/delta selection, unlike `onPayload`, which sees the full request before that selection. Per-item hashes cover the first 2,048 items, with `inputItemsTruncated` indicating a longer input; the full wire-input hash is not truncated. If hashing fails or does not finish within 250 ms, `hashesAvailable` is false and the request continues with transport metadata only. Hashing is not awaited before request dispatch; terminal diagnostics may wait for that bounded hashing interval.
+
+Capture a normal reply and promptly run `/compact` without changing settings. Compare the records' configuration fingerprints and ordered input hashes, then their full/delta decisions and cache-hit usage. The native request keeps the full conversation and appends a checkpoint instruction, so an eligible cached WebSocket can send just that appended instruction. If continuation is unavailable, a full replay may still hit the provider's prompt cache; these records do not identify server-side routing, eviction, or cache-breakpoint decisions.
+
+These diagnostics are off by default and contain no raw prompts, tool definitions, credentials, cache keys, or response IDs. Hashes are comparison fingerprints, not anonymization. Enabled records are session metadata and travel with session snapshots and metadata-bearing events/results; review them before sharing. Built-in provider conversion does not send them to the model, and they do not enter compaction summaries, footer totals, or request payloads. No extra diagnostic transcript lines are displayed. Failed overall compactions still install no entry.
 
 ### Split Turns
 
@@ -129,7 +160,7 @@ Split turn (one huge turn exceeds budget):
   turnPrefixMessages = [usr, ass, tool, ass, tool, tool]
 ```
 
-The normal single-pass request summarizes history and the turn prefix together. The oversized-input fallback generates history and turn-prefix summaries separately and merges them; each stream processes its chunks chronologically.
+The normal single-pass request summarizes older history and the turn prefix together, with the retained suffix visible for continuity and newer corrections. The cut point and verbatim retained messages are unchanged. The oversized-input fallback generates history and turn-prefix summaries separately and merges them; each stream processes its chunks chronologically.
 
 ### Cut Point Rules
 
@@ -278,7 +309,7 @@ path/to/changed.ts
 
 ### Message Serialization
 
-The normal compaction path keeps native messages and signatures unchanged through the configured context/conversion pipeline. Only the chunked fallback and branch summarization serialize messages to text via [`serializeConversation()`](../src/core/compaction/utils.ts):
+The normal compaction path keeps the full native message history and signatures unchanged through the configured context/conversion pipeline. Its appended scope instruction includes only a bounded text reference to the start of the retained suffix, not a serialized replacement for the history. The chunked fallback and branch summarization serialize their source messages to text via [`serializeConversation()`](../src/core/compaction/utils.ts):
 
 ```
 [User]: What they said

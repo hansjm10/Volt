@@ -44,6 +44,8 @@ export type CompactionRequestUsage = {
 	stopReason?: AssistantMessage["stopReason"];
 	/** Provider-reported token counts; omitted when unavailable or invalid. */
 	usage?: Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "totalTokens">;
+	/** Owned, redacted Codex request diagnostics; unrelated or invalid telemetry is omitted. */
+	diagnostics?: Pick<NonNullable<AssistantMessage["diagnostics"]>[number], "type" | "timestamp" | "details">[];
 };
 
 /** Details stored in CompactionEntry.details for file tracking and request accounting. */

@@ -5326,12 +5326,13 @@ export class AgentSession {
 					(entry.type === "branch_summary" && entry.summary),
 			).length;
 		const messages = buildSessionContext(pathEntries).messages;
-		// Use the actual rebuilt prefix, including the previous checkpoint and its
-		// original metadata. Do not serialize it or duplicate the retained suffix.
-		const prefix = messages.slice(0, messages.length - retainedCount);
+		// Keep the full rebuilt conversation warm, including the latest response.
+		// Describe the retained suffix only in the appended checkpoint instruction.
 		return compactContext(preparation, model, {
+			sourceMessageCount: messages.length,
+			retainedMessageCount: retainedCount,
 			context: async (signal) => {
-				const transformed = await this._extensionRunner.emitContext(cloneAgentMessages(prefix));
+				const transformed = await this._extensionRunner.emitContext(cloneAgentMessages(messages));
 				signal.throwIfAborted();
 				const llmMessages = await this._convertToLlm(transformed);
 				signal.throwIfAborted();

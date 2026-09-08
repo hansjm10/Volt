@@ -1,5 +1,6 @@
 import type { StreamFn } from "@hansjm10/volt-agent-core";
 import {
+	type AssistantMessage,
 	type Context,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
@@ -45,11 +46,13 @@ function streamResponse(
 	stopReason: "stop" | "length" | "toolUse" | "error" | "aborted" = "stop",
 	errorMessage?: string,
 	usage?: Partial<Usage>,
+	diagnostics?: AssistantMessage["diagnostics"],
 ) {
 	const stream = createAssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message = fauxAssistantMessage(text, { stopReason, errorMessage });
 		message.usage = { ...message.usage, ...usage };
+		if (diagnostics !== undefined) message.diagnostics = diagnostics;
 		if (stopReason === "error" || stopReason === "aborted")
 			stream.push({ type: "error", seq: 1, reason: stopReason, error: message });
 		else stream.push({ type: "done", seq: 1, reason: stopReason, message });
@@ -59,6 +62,8 @@ function streamResponse(
 const retry = { maxRetries: 3, baseDelayMs: 0, maxDelayMs: 30_000 };
 const options = (streamFn: StreamFn, signal = new AbortController().signal) => ({
 	context: async () => context,
+	sourceMessageCount: context.messages.length,
+	retainedMessageCount: 0,
 	streamFn,
 	signal,
 	thinkingLevel: "high" as const,
@@ -70,7 +75,7 @@ afterEach(() => {
 });
 
 describe("cache-preserving compaction", () => {
-	it("sends one unchanged native prefix plus a bounded checkpoint request", async () => {
+	it("sends the full unchanged native context plus a bounded checkpoint request", async () => {
 		const calls: Array<{ context: Context; options?: SimpleStreamOptions }> = [];
 		const source = {
 			...context,
@@ -114,6 +119,72 @@ describe("cache-preserving compaction", () => {
 		]);
 	});
 
+	it("keeps retained messages and signatures untouched while appending a bounded summary boundary", async () => {
+		const retained: AssistantMessage = {
+			...fauxAssistantMessage(""),
+			content: [
+				{ type: "thinking", thinking: "Recent reasoning", thinkingSignature: "unchanged-reasoning-signature" },
+				{
+					type: "text",
+					text: `RETAINED-BEGIN ${"recent content ".repeat(2000)} RETAINED-END`,
+					textSignature: "unchanged-text-signature",
+				},
+			],
+		};
+		const source: Context = { ...context, messages: [...context.messages, retained] };
+		const original = structuredClone(source);
+		let request: Context | undefined;
+		await compactContext(preparation(), model, {
+			...options((_model, sent) => {
+				request = sent;
+				return streamResponse();
+			}),
+			context: async () => source,
+			sourceMessageCount: source.messages.length,
+			retainedMessageCount: 1,
+		});
+		expect(source).toEqual(original);
+		expect(request?.messages.slice(0, -1)).toEqual(original.messages);
+		expect(request?.messages.at(-2)).toEqual(retained);
+		const instruction = request?.messages.at(-1)?.content;
+		expect(typeof instruction).toBe("string");
+		expect(instruction).toContain("Summarize only the older history");
+		expect(instruction).toContain("last 1 saved conversation messages");
+		expect(instruction).toContain("RETAINED-BEGIN");
+		expect(instruction).not.toContain("RETAINED-END");
+		expect(instruction!.length).toBeLessThan(4096);
+	});
+
+	it.each(["preflight", "provider"] as const)(
+		"keeps the fallback older-only when the full warm context exceeds the %s budget",
+		async (overflow) => {
+			const retained = { role: "user" as const, content: `RECENT-ONLY ${"r".repeat(160_000)}`, timestamp: 2 };
+			const source: Context = { ...context, messages: [...context.messages, retained] };
+			const calls: Context[] = [];
+			const result = await compactContext(
+				preparation(),
+				overflow === "preflight" ? { ...model, contextWindow: 40_000 } : model,
+				{
+					...options((_model, request) => {
+						calls.push(request);
+						return overflow === "provider" && calls.length === 1
+							? streamResponse("", "error", "Your input exceeds the context window of this model")
+							: streamResponse("Older-only checkpoint");
+					}),
+					context: async () => source,
+					sourceMessageCount: source.messages.length,
+					retainedMessageCount: 1,
+				},
+			);
+			expect(calls).toHaveLength(overflow === "preflight" ? 1 : 2);
+			if (overflow === "provider") expect(calls[0].messages.slice(0, -1)).toEqual(source.messages);
+			expect(JSON.stringify(calls.at(-1))).toContain("Original goal");
+			expect(JSON.stringify(calls.at(-1))).not.toContain("RECENT-ONLY");
+			expect(result.firstKeptEntryId).toBe("kept");
+			expect(result.details.requests?.at(-1)?.strategy).toBe("chunked");
+		},
+	);
+
 	it("copies provider token counts without retaining mutable response usage", async () => {
 		const response = fauxAssistantMessage("checkpoint");
 		response.usage = { ...response.usage, input: 100, cacheRead: 900, totalTokens: 1000 };
@@ -137,6 +208,107 @@ describe("cache-preserving compaction", () => {
 		});
 	});
 
+	it("owns only redacted Codex request diagnostics without raw errors or undefined properties", async () => {
+		const details = { payload: { sha256: "a".repeat(64) }, transport: { sseAttempts: 1 } };
+		const expectedDetails = structuredClone(details);
+		const response = fauxAssistantMessage("checkpoint");
+		response.diagnostics = [
+			{ type: "codex_request", timestamp: 1, details, error: { message: "RAW TRANSPORT ERROR" } },
+			{ type: "websocket_fallback", timestamp: 2, error: { message: "UNRELATED ERROR" } },
+			{ type: "codex_request", timestamp: 3, details: undefined },
+		];
+		const result = await compactContext(
+			preparation(),
+			model,
+			options(() => {
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "done", seq: 1, reason: "stop", message: response });
+				return stream;
+			}),
+		);
+		const captured = result.details.requests?.[0].diagnostics;
+		expect(captured).not.toBe(response.diagnostics);
+		expect(captured?.[0]).not.toBe(response.diagnostics[0]);
+		expect(captured?.[0].details).not.toBe(details);
+		response.diagnostics[0].timestamp = 99;
+		details.payload.sha256 = "mutated";
+		details.transport.sseAttempts = 99;
+		response.diagnostics.length = 0;
+		expect(captured).toEqual([
+			{ type: "codex_request", timestamp: 1, details: expectedDetails },
+			{ type: "codex_request", timestamp: 3 },
+		]);
+		expect(JSON.parse(JSON.stringify(result.details))).toEqual(result.details);
+		expect(result.summary).not.toContain("codex_request");
+	});
+
+	it("omits malformed diagnostic records without failing a valid summary or losing valid records", async () => {
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		const invalidDetails: unknown[] = [
+			cyclic,
+			{ count: NaN },
+			{ count: Infinity },
+			{ count: -0 },
+			{ missing: undefined },
+			{ date: new Date() },
+			{ callback: () => "invalid" },
+			Object.defineProperty({}, "count", {
+				enumerable: true,
+				get: () => {
+					throw new Error("Invalid diagnostic getter");
+				},
+			}),
+			null,
+			"not an object",
+			42,
+			[],
+		];
+		const valid = { type: "codex_request", timestamp: 1, details: { sha256: "b".repeat(64) } };
+		const response = Object.assign(fauxAssistantMessage("valid checkpoint"), {
+			diagnostics: [
+				valid,
+				...invalidDetails.map((details) => ({ type: "codex_request", timestamp: 2, details })),
+				...[undefined, null, "3", NaN, Infinity, -0].map((timestamp) => ({ type: "codex_request", timestamp })),
+				null,
+				undefined,
+				{ type: 42, timestamp: 3 },
+				{ type: "unrelated", timestamp: 4, details: cyclic },
+				{ type: "codex_request", timestamp: 5 },
+			],
+		});
+		const result = await compactContext(
+			preparation(),
+			model,
+			options(() => {
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "done", seq: 1, reason: "stop", message: response });
+				return stream;
+			}),
+		);
+		expect(result.summary).toContain("valid checkpoint");
+		expect(result.details.requests?.[0].diagnostics).toEqual([valid, { type: "codex_request", timestamp: 5 }]);
+		expect(JSON.parse(JSON.stringify(result.details))).toEqual(result.details);
+	});
+
+	it.each([undefined, null, "invalid", {}, [], [{ type: "unrelated", timestamp: 1 }]])(
+		"omits unavailable diagnostics (%j) without failing a valid summary",
+		async (diagnostics) => {
+			const response = Object.assign(fauxAssistantMessage("valid checkpoint"), { diagnostics });
+			const result = await compactContext(
+				preparation(),
+				model,
+				options(() => {
+					const stream = createAssistantMessageEventStream();
+					stream.push({ type: "done", seq: 1, reason: "stop", message: response });
+					return stream;
+				}),
+			);
+			expect(result.summary).toContain("valid checkpoint");
+			expect(result.details.requests?.[0]).not.toHaveProperty("diagnostics");
+		},
+	);
+
 	it.each([NaN, Infinity, -1, -0, 0.5])("omits invalid usage (%s) without failing a valid summary", async (output) => {
 		const result = await compactContext(
 			preparation(),
@@ -156,13 +328,18 @@ describe("cache-preserving compaction", () => {
 			model,
 			options(() => {
 				calls++;
-				if (calls === 1) return streamResponse("", "error", "service unavailable", { input: 10, totalTokens: 10 });
+				if (calls === 1)
+					return streamResponse("", "error", "service unavailable", { input: 10, totalTokens: 10 }, [
+						{ type: "codex_request", timestamp: 1, details: { sseAttempts: 1 } },
+					]);
 				if (calls === 2) throw new Error("service unavailable");
-				return streamResponse("retry checkpoint", "stop", undefined, {
-					input: 20,
-					cacheRead: 80,
-					totalTokens: 100,
-				});
+				return streamResponse(
+					"retry checkpoint",
+					"stop",
+					undefined,
+					{ input: 20, cacheRead: 80, totalTokens: 100 },
+					[{ type: "codex_request", timestamp: 3, details: { sseAttempts: 1 } }],
+				);
 			}),
 		);
 		expect(calls).toBe(3);
@@ -174,6 +351,7 @@ describe("cache-preserving compaction", () => {
 				model: model.id,
 				stopReason: "error",
 				usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 10 },
+				diagnostics: [{ type: "codex_request", timestamp: 1, details: { sseAttempts: 1 } }],
 			},
 			{ strategy: "native", attempt: 2, provider: model.provider, model: model.id },
 			{
@@ -183,6 +361,7 @@ describe("cache-preserving compaction", () => {
 				model: model.id,
 				stopReason: "stop",
 				usage: { input: 20, output: 0, cacheRead: 80, cacheWrite: 0, totalTokens: 100 },
+				diagnostics: [{ type: "codex_request", timestamp: 3, details: { sseAttempts: 1 } }],
 			},
 		]);
 	});
@@ -205,6 +384,7 @@ describe("cache-preserving compaction", () => {
 					calls === 1 ? "error" : "stop",
 					calls === 1 ? "service unavailable" : undefined,
 					{ input: calls * 10, cacheRead: calls * 100, totalTokens: calls * 110 },
+					[{ type: "codex_request", timestamp: calls, details: { sha256: String(calls).repeat(64) } }],
 				);
 			}),
 		);
@@ -224,6 +404,9 @@ describe("cache-preserving compaction", () => {
 					cacheWrite: 0,
 					totalTokens: (index + 1) * 110,
 				},
+				diagnostics: [
+					{ type: "codex_request", timestamp: index + 1, details: { sha256: String(index + 1).repeat(64) } },
+				],
 			})),
 		);
 	});
@@ -311,7 +494,9 @@ describe("cache-preserving compaction", () => {
 			options((_model, request) => {
 				calls.push(request);
 				return calls.length === 1
-					? streamResponse("", stopReason, undefined, usage)
+					? streamResponse("", stopReason, undefined, usage, [
+							{ type: "codex_request", timestamp: 1, details: { sseAttempts: 1 } },
+						])
 					: streamResponse("Recovered checkpoint");
 			}),
 		);
@@ -325,7 +510,13 @@ describe("cache-preserving compaction", () => {
 		expect(result.summary).toContain("Recovered checkpoint");
 		expect(result.firstKeptEntryId).toBe("kept");
 		expect(result.details.requests).toMatchObject([
-			{ strategy: "native", attempt: 1, stopReason, usage },
+			{
+				strategy: "native",
+				attempt: 1,
+				stopReason,
+				usage,
+				diagnostics: [{ type: "codex_request", timestamp: 1, details: { sseAttempts: 1 } }],
+			},
 			{ strategy: "chunked", attempt: 2, stopReason: "stop" },
 		]);
 	});
