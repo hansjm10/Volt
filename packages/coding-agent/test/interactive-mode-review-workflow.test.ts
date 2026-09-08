@@ -4,6 +4,7 @@ import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { ReviewWorkflowHooks, ReviewWorkflowOptions, ReviewWorkflowResult } from "../src/core/review.ts";
 import { ReviewWorkflowManager } from "../src/core/review-workflows.ts";
 import { initTheme } from "../src/core/theme/runtime.ts";
+import { stripAnsi } from "../src/utils/ansi.ts";
 
 const reviewMocks = vi.hoisted(() => ({
 	runReviewWorkflow: vi.fn<(options: ReviewWorkflowOptions) => Promise<ReviewWorkflowResult>>(),
@@ -26,6 +27,11 @@ interface ReviewContext {
 	};
 	ui: TUI;
 	editorContainer: Container;
+	chatContainer: Container;
+	pendingMessagesContainer: Container;
+	pendingTools: Map<string, never>;
+	renderInitialMessages: ReturnType<typeof vi.fn>;
+	refreshPlanningUi: ReturnType<typeof vi.fn>;
 	editor: Text;
 	footer: { setTransientUsage: ReturnType<typeof vi.fn> };
 	activeInteractiveReview: boolean;
@@ -64,6 +70,7 @@ function createContext(): ReviewContext {
 		sessionManager,
 		resourceLoader: {},
 	};
+	const chatContainer = new Container();
 	const view = { regularComponents: [editorContainer], fullscreenRoot: editorContainer };
 	return Object.assign(Object.create(InteractiveMode.prototype), {
 		runtimeHost: {
@@ -74,13 +81,18 @@ function createContext(): ReviewContext {
 		},
 		ui,
 		editorContainer,
+		chatContainer,
+		pendingMessagesContainer: new Container(),
+		pendingTools: new Map(),
+		renderInitialMessages: vi.fn(() => chatContainer.addChild(new Text("Seeded review findings"))),
+		refreshPlanningUi: vi.fn(),
 		editor,
 		footer: { setTransientUsage: vi.fn() },
 		activeInteractiveReview: false,
 		activeView: view,
 		conversationView: view,
 		createInlineSessionRenderer: vi.fn(() => ({ onSessionEvent: vi.fn(), dispose: vi.fn() })),
-		showWarning: vi.fn(),
+		showWarning: vi.fn(InteractiveMode.prototype.showWarning),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 	}) as ReviewContext;
@@ -121,11 +133,100 @@ function run(context: ReviewContext, requireConfirmation = false): Promise<Revie
 	);
 }
 
+const DIAGNOSTIC_RETENTION_WARNING = "Could not retain optional private review diagnostics.";
+
 afterEach(() => {
 	reviewMocks.runReviewWorkflow.mockReset();
+	vi.restoreAllMocks();
 });
 
 describe("InteractiveMode review workflow", () => {
+	it.each(["handoff", "cancelled handoff", "cancelled review", "failed review"] as const)(
+		"renders the local diagnostic warning once after %s settles",
+		async (outcome) => {
+			const context = createContext();
+			context.chatContainer.addChild(new Text("Original session"));
+			const completed: ReviewWorkflowResult = {
+				status: "completed",
+				resolution,
+				findingsCount: 0,
+				completionStatus: "complete",
+				sessionSwitchCancelled: outcome === "cancelled handoff",
+			};
+			context.runtimeHost.newSession.mockImplementationOnce(async () => {
+				context.chatContainer.clear();
+				context.chatContainer.addChild(new Text("Replacement session before render"));
+				return { cancelled: false, seeded: true };
+			});
+			reviewMocks.runReviewWorkflow.mockImplementationOnce(async (options) => {
+				const hooks = await options.createHooks?.();
+				try {
+					await hooks?.onPrepared?.(resolution, { id: "review-model" } as never);
+					await options.onDiagnosticRetentionWarning?.(DIAGNOSTIC_RETENTION_WARNING);
+					expect(context.showWarning).not.toHaveBeenCalled();
+					if (outcome === "failed review") throw new Error("Review failed.");
+					if (outcome === "cancelled review") return { status: "cancelled", resolution };
+					if (outcome === "handoff") await options.newSession();
+					return completed;
+				} finally {
+					hooks?.cleanup?.();
+				}
+			});
+
+			const result = await run(context);
+			expect(result.status).toBe(outcome.endsWith("review") ? "cancelled" : "completed");
+			expect(context.showWarning.mock.calls).toEqual([[DIAGNOSTIC_RETENTION_WARNING]]);
+			const rendered = context.chatContainer.render(120).lines.map(stripAnsi).join("\n");
+			expect(rendered.match(/Warning: Could not retain optional private review diagnostics\./g)).toHaveLength(1);
+			if (outcome === "handoff") {
+				expect(context.runtimeHost.newSession).toHaveBeenCalledOnce();
+				expect(context.renderInitialMessages).toHaveBeenCalledOnce();
+				expect(rendered).toContain("Seeded review findings");
+				expect(rendered).not.toContain("Original session");
+				expect(rendered).not.toContain("Replacement session before render");
+				expect(rendered.indexOf("Warning:")).toBeGreaterThan(rendered.indexOf("Seeded review findings"));
+			} else {
+				expect(context.renderInitialMessages).not.toHaveBeenCalled();
+				expect(rendered).toContain("Original session");
+			}
+			expect(JSON.stringify(result)).not.toContain(DIAGNOSTIC_RETENTION_WARNING);
+			expect(context.editorContainer.children).toEqual([context.editor]);
+			expect(context.footer.setTransientUsage).toHaveBeenLastCalledWith(undefined);
+			expect(context.activeInteractiveReview).toBe(false);
+		},
+	);
+
+	it.each([false, true])(
+		"contains a failed warning renderer after successful handoff (stderr throws=%s)",
+		async (stderrThrows) => {
+			const context = createContext();
+			const privateError = "private-warning-renderer-error /private/path";
+			context.showWarning.mockImplementationOnce(() => {
+				throw new Error(privateError);
+			});
+			const stderrWarning = vi.spyOn(console, "warn").mockImplementation(() => {
+				if (stderrThrows) throw new Error(privateError);
+			});
+			const completed: ReviewWorkflowResult = {
+				status: "completed",
+				resolution,
+				findingsCount: 0,
+				completionStatus: "complete",
+				sessionSwitchCancelled: false,
+			};
+			reviewMocks.runReviewWorkflow.mockImplementationOnce(async (options) => {
+				await options.onDiagnosticRetentionWarning?.(DIAGNOSTIC_RETENTION_WARNING);
+				return completed;
+			});
+
+			await expect(run(context)).resolves.toBe(completed);
+			expect(context.showError).not.toHaveBeenCalled();
+			expect(context.showWarning.mock.calls).toEqual([[DIAGNOSTIC_RETENTION_WARNING]]);
+			expect(stderrWarning.mock.calls).toEqual([[`Warning: ${DIAGNOSTIC_RETENTION_WARNING}`]]);
+			expect(context.activeInteractiveReview).toBe(false);
+		},
+	);
+
 	it("installs and focuses the cancellable loader before preparation resolves", async () => {
 		const context = createContext();
 		let releasePreparation!: () => void;

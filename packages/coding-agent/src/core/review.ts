@@ -788,6 +788,8 @@ export interface RunReviewOptions {
 	onEvent?: (event: ReviewWorkflowToolEvent) => void;
 	onSessionEvent?: (event: AgentSessionEvent) => void;
 	onUsage?: (usage: ReviewUsageSnapshot) => void;
+	/** Local-only observer; never forward this warning into review/session/protocol data. */
+	onDiagnosticRetentionWarning?: (message: string) => void | Promise<void>;
 	workflowId?: string;
 	workflowAction?: string;
 }
@@ -902,6 +904,7 @@ export interface ReviewWorkflowOptions {
 	}) => Promise<boolean>;
 	createHooks?: () => Promise<ReviewWorkflowHooks> | ReviewWorkflowHooks;
 	onReviewModelWarning?: (message: string) => void;
+	onDiagnosticRetentionWarning?: RunReviewOptions["onDiagnosticRetentionWarning"];
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 	/** Runtime-scoped registry used to expose a local TUI review to attached RPC clients. */
 	workflowManager?: ReviewWorkflowManager;
@@ -969,6 +972,7 @@ export interface ExecuteReviewWorkflowOptions {
 	onEvent?: (event: ReviewWorkflowEvent | ReviewWorkflowToolEvent) => void;
 	onSessionEvent?: (event: AgentSessionEvent) => void;
 	onUsage?: (usage: ReviewUsageSnapshot) => void;
+	onDiagnosticRetentionWarning?: RunReviewOptions["onDiagnosticRetentionWarning"];
 }
 
 export type ExecuteReviewWorkflowResult =
@@ -1508,6 +1512,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 		});
 		const verificationReport = verificationPass.report;
 		privateDiagnostics.recordModelLimitations("verification", verificationReport.limitations);
+		privateDiagnostics.recordVerificationAssessment(verificationReport);
 		const suppressedFingerprints = new Set(options.incrementalPlan?.suppressedDismissedFingerprints ?? []);
 		const declassifiedFindings = declassifyReviewFindings(validatedCandidates, verificationReport).filter(
 			(finding) => !suppressedFingerprints.has(finding.fingerprint),
@@ -1593,8 +1598,31 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 			return { aborted: true, raw: "" };
 		return { aborted: false, raw: "", errorMessage: error instanceof Error ? error.message : String(error) };
 	} finally {
-		await privateDiagnostics.flush().catch(() => undefined);
-		await snapshot.dispose();
+		try {
+			await privateDiagnostics.flush();
+		} catch {
+			const warning = "Could not retain optional private review diagnostics.";
+			const warnToStderr = (): void => {
+				try {
+					console.warn(`Warning: ${warning}`);
+				} catch {
+					// Optional diagnostics and their warning must not change the review outcome.
+				}
+			};
+			try {
+				if (options.onDiagnosticRetentionWarning) {
+					// Local observers are passive: a never-settling promise cannot hold
+					// review completion or snapshot disposal open.
+					void Promise.resolve(options.onDiagnosticRetentionWarning(warning)).catch(warnToStderr);
+				} else {
+					warnToStderr();
+				}
+			} catch {
+				warnToStderr();
+			}
+		} finally {
+			await snapshot.dispose();
+		}
 	}
 }
 
@@ -1631,6 +1659,7 @@ export async function executeReviewWorkflow(
 		onEvent: options.onEvent,
 		onSessionEvent: options.onSessionEvent,
 		onUsage: options.onUsage,
+		onDiagnosticRetentionWarning: options.onDiagnosticRetentionWarning,
 		workflowId: prepared.workflowId,
 		workflowAction: prepared.action,
 		incrementalPlan: prepared.incrementalPlan,
@@ -1846,6 +1875,7 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 						onProgress: hooks?.onProgress,
 						onSessionEvent: hooks?.onSessionEvent,
 						onUsage: hooks?.onUsage,
+						onDiagnosticRetentionWarning: options.onDiagnosticRetentionWarning,
 						onEvent: managedHooks.onEvent,
 					});
 					return managedExecutionResult.status === "failed"
@@ -2015,6 +2045,7 @@ export async function runReviewWorkflow(options: ReviewWorkflowOptions): Promise
 				onProgress: hooks?.onProgress,
 				onSessionEvent: hooks?.onSessionEvent,
 				onUsage: hooks?.onUsage,
+				onDiagnosticRetentionWarning: options.onDiagnosticRetentionWarning,
 				onEvent: emit,
 			});
 			if (result.status === "cancelled") {
