@@ -8,6 +8,7 @@ distributed by Jordan Hans and derived from Mario Zechner's Pi project under
 the MIT License.
 
 - `src/pages/index.astro` — marketing landing page.
+- `src/pages/privacy.md` and `src/pages/terms.md` — public policy pages at `/privacy` and `/terms`, using `src/layouts/LegalShell.astro`. The initial text is a draft pending release-owner/legal review; do not merge or deploy it before that review. Confirm actual collection, SDK disclosures, retention, international-processing obligations, and subscription terms. Submission copy and unresolved owner decisions are in `volt-app/docs/app-store-submission.md` in the companion app repository. Merging site changes to `main` can publish them automatically.
 - `src/content/blog/` — Markdown or MDX blog posts published under `/blog/`. Posts with `draft: true` are visible during local development but excluded from production builds; the landing-page Blog link appears after the first post is published. Published posts are also listed in `/rss.xml`.
 - `packages/coding-agent/docs/` — the documentation source of truth. `scripts/sync-docs.mjs` copies it into the Starlight content collection at build time, deriving the sidebar and redirects from `docs.json`. Do not edit `src/content/docs/docs/` or `src/generated/`; both are generated and gitignored.
 - The sync step preserves the canonical package identities used by the source documentation, including `@hansjm10/volt-coding-agent`.
@@ -25,7 +26,7 @@ npm run build      # syncs docs, then builds to dist/
 
 Docs edits go in `packages/coding-agent/docs/`; re-run `npm run sync-docs` (or restart dev) to pick them up. New pages must be added to `docs.json` to appear in the sidebar.
 
-Blog posts go in `src/content/blog/` and require `title`, `description`, and `publishedAt` frontmatter. `author` defaults to Jordan Hans, `tags` defaults to an empty list, and `draft` defaults to `false`. Set optional `image` to a public-root path for a 1200×630 hero/social card and provide `imageAlt`; the post page, blog index, Open Graph, Twitter, and structured data all use it. Start posts with `draft: true`, review them through the local or Cloudflare preview, then remove the flag to publish.
+Blog posts go in `src/content/blog/` and require `title`, `description`, and `publishedAt` frontmatter. `author` defaults to Jordan Hans, `tags` defaults to an empty list, and `draft` defaults to `false`. Set optional `image` to a public-root path for a 1200×630 hero/social card and provide `imageAlt`; the post page, blog index, Open Graph, Twitter, and structured data all use it. Start posts with `draft: true`, review them through the local development server (`npm run dev`), then remove the flag to publish.
 
 ## Deploying to Cloudflare (Workers Builds)
 
@@ -39,7 +40,7 @@ The site deploys as an assets-only Worker (`wrangler.jsonc`, no server code). On
 3. Set the production branch to `main`. Optionally restrict builds to the `site/` and `packages/coding-agent/docs/` paths (Settings → Builds → Build watch paths) so unrelated commits don't redeploy.
 4. Custom domain: after the first deploy, add `volt-cli.dev` under the Worker's Settings → Domains & Routes (the domain must be on Cloudflare DNS or delegated there).
 
-Every push to `main` that touches the site or docs then deploys automatically; PRs get preview URLs. Manual deploys also work locally with `npm run deploy` (needs `wrangler login`).
+Every push to `main` that touches the site or docs then deploys automatically. The checked-in Worker configuration disables `workers_dev` and `preview_urls`, so do not expect public PR preview URLs. Review changes locally with `npm run dev` (including draft blog posts), or use `npm run preview` to inspect an existing production build. Manual deploys also work locally with `npm run deploy` (needs `wrangler login`); neither deployment nor enabling public previews is part of the local review process.
 
 ## Beta launch checklist
 

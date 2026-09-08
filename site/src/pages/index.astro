@@ -130,6 +130,8 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
         {hasPublishedPosts && <a href="/blog/">Blog</a>}
         <a href="/docs/">Docs</a>
         <a href="/docs/security/">Security</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
         <a href="https://github.com/volt-hq/Volt/blob/main/CONTRIBUTING.md">Contributing</a>
       </nav>
     </footer>
@@ -240,7 +242,7 @@ const hasPublishedPosts = (await getCollection("blog", ({ data }) => !data.draft
         display: flex; justify-content: space-between; flex-wrap: wrap; gap: 1rem;
         max-width: 62rem; margin: 0 auto; font-size: 0.9rem;
       }
-      footer nav { display: flex; gap: 1.2rem; }
+      footer nav { display: flex; flex-wrap: wrap; gap: 1.2rem; }
 
       @media (max-width: 600px) {
         .install { flex-direction: column; gap: 0.6rem; align-items: stretch; text-align: center; }
