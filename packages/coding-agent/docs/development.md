@@ -16,7 +16,7 @@ Run from source:
 /path/to/volt/volt-test.sh
 ```
 
-The script can be run from any directory. Volt keeps the caller's current working directory. `volt-test.sh` and `volt-test.ps1` enable private review diagnostics for source-development runs. Exact model-reported limitations and bounded failed-tool output are written as one owner-only JSONL file per affected review under `~/.volt/agent/review-diagnostics/` (or the configured agent directory). These records are untrusted and may contain sensitive GitHub context. They are not added to sessions, RPC responses, exports, or model context, and only the 20 newest files are retained.
+The script can be run from any directory. Volt keeps the caller's current working directory. `volt-test.sh` and `volt-test.ps1` enable private review diagnostics for source-development runs. Model-reported limitations, verifier assessments and bounded completeness challenges, and bounded failed-tool output are written as one owner-only JSONL file per review with diagnostics under `~/.volt/agent/review-diagnostics/` (or the configured agent directory). The `verification_assessment` record retains the verifier's `assessment` and optional `challenge` even when no limitations or findings were reported; the public PR result still redacts the challenge. These records are untrusted and may contain sensitive GitHub context. They are not added to sessions, RPC responses, exports, or model context, and only the 20 newest files are retained.
 
 Set `VOLT_REVIEW_PRIVATE_DIAGNOSTICS=0` before launching either script to disable these records.
 

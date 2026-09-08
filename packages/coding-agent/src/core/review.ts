@@ -1508,6 +1508,7 @@ export async function runReview(options: RunReviewOptions): Promise<ReviewRunRes
 		});
 		const verificationReport = verificationPass.report;
 		privateDiagnostics.recordModelLimitations("verification", verificationReport.limitations);
+		privateDiagnostics.recordVerificationAssessment(verificationReport);
 		const suppressedFingerprints = new Set(options.incrementalPlan?.suppressedDismissedFingerprints ?? []);
 		const declassifiedFindings = declassifyReviewFindings(validatedCandidates, verificationReport).filter(
 			(finding) => !suppressedFingerprints.has(finding.fingerprint),

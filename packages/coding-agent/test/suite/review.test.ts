@@ -665,7 +665,10 @@ describe("review pipeline", () => {
 	const snapshots: ReviewSnapshot[] = [];
 	const managerOwner = createSessionManagerTestOwner();
 
-	beforeEach(() => managerOwner.start());
+	beforeEach(() => {
+		managerOwner.start();
+		vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, "0");
+	});
 
 	afterEach(async () => {
 		vi.unstubAllEnvs();
@@ -854,11 +857,15 @@ describe("review pipeline", () => {
 		expect(privateRecords).toEqual([
 			expect.objectContaining({ kind: "model_limitation", phase: "discovery", message: privateMarker }),
 			expect.objectContaining({ kind: "model_limitation", phase: "verification", message: privateMarker }),
+			expect.objectContaining({ kind: "verification_assessment", phase: "verification", assessment: "complete" }),
 		]);
 	});
 
-	it("skips presentation for a no-finding PR and replaces private incomplete prose", async () => {
+	it.each([false, true])("keeps PR challenges private (limitations=%s)", async (withLimitations) => {
+		vi.stubEnv(REVIEW_PRIVATE_DIAGNOSTICS_ENV, "1");
 		const privateMarker = "private-incomplete-challenge-marker";
+		const limitations = withLimitations ? [privateMarker] : [];
+		const workflowEvents: Array<Record<string, unknown>> = [];
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const snapshot = await createSnapshotRepository(harness);
@@ -882,7 +889,7 @@ describe("review pipeline", () => {
 					fauxToolCall("report_review_candidates", {
 						summary: privateMarker,
 						candidates: [],
-						limitations: [privateMarker],
+						limitations,
 					}),
 					{ stopReason: "toolUse" },
 				),
@@ -902,26 +909,43 @@ describe("review pipeline", () => {
 						challenge: privateMarker,
 						decisions: [],
 						priorFindingDecisions: [],
-						limitations: [privateMarker],
+						limitations,
 					}),
 					{ stopReason: "toolUse" },
 				),
 			),
 		]);
 
-		const run = await runReview({
+		const sessionManager = await SessionManager.create(harness.tempDir, join(harness.tempDir, "sessions"));
+		const workflowId = "review:private-incomplete-challenge";
+		const run = await executeReviewWorkflow({
+			prepared: {
+				workflowId,
+				action: "review.pr",
+				target: { kind: "pr", number: "1" },
+				controls: { scopeMode: "full", scope: ["src/**"], effort: "standard", includeOptional: false },
+				resolution: snapshot,
+				model: harness.getModel(),
+				verifierModel: harness.getModel(),
+				startedAt: Date.now(),
+				incrementalPlan: {
+					mode: "full",
+					changedPaths: ["src/value.ts"],
+					priorOpenFindings: [],
+					suppressedDismissedFingerprints: [],
+				},
+			},
 			cwd: harness.tempDir,
 			agentDir: harness.tempDir,
-			model: harness.getModel(),
-			verifierModel: harness.getModel(),
 			authStorage: harness.authStorage,
 			modelRegistry: harness.session.modelRegistry,
 			settingsManager: harness.settingsManager,
-			resolved: snapshot,
-			controls: { scopeMode: "full" },
+			sessionManager,
+			onEvent: (event) => workflowEvents.push(event),
 		});
 		snapshots.splice(snapshots.indexOf(snapshot), 1);
-		expect(run.errorMessage).toBeUndefined();
+		expect(run.status).toBe("completed");
+		if (run.status !== "completed") throw new Error(`Review ended with ${run.status}`);
 		expect(modelRequests).toBe(8);
 		expect(JSON.stringify(run.parsed)).not.toContain(privateMarker);
 		expect(run.parsed).toMatchObject({
@@ -929,11 +953,48 @@ describe("review pipeline", () => {
 			summary: "Review incomplete with 0 verified findings.",
 			verificationChallenge: "Independent verification reported a completeness challenge.",
 			coverage: {
-				modelReportedLimitations: [
-					"Discovery reported 1 model limitation(s).",
-					"Verification reported 1 model limitation(s).",
-				],
+				uncheckedAreas: [],
+				modelReportedLimitations: withLimitations
+					? ["Discovery reported 1 model limitation(s).", "Verification reported 1 model limitation(s)."]
+					: [],
 			},
+		});
+		expect(run.parsed.overallCorrectness).toBeUndefined();
+		expect(JSON.stringify(createReviewSeedMessage(snapshot, { parsed: run.parsed }))).not.toContain(privateMarker);
+		expect(JSON.stringify(run.record)).not.toContain(privateMarker);
+		const ref = sessionManager.getSessionRef()!;
+		await sessionManager.closePersistence();
+		const reopened = await SessionManager.open(ref);
+		expect(getReviewRun(reopened, workflowId)).toMatchObject({
+			status: "incomplete",
+			result: {
+				findings: [],
+				verificationChallenge: "Independent verification reported a completeness challenge.",
+			},
+		});
+		expect(JSON.stringify(reopened.getEntries())).not.toContain(privateMarker);
+		const exportPath = join(harness.tempDir, "review-session.jsonl");
+		await SessionManager.exportJsonlSnapshot(ref, exportPath);
+		expect(readFileSync(exportPath, "utf8")).not.toContain(privateMarker);
+		expect(JSON.stringify(workflowEvents)).not.toContain(privateMarker);
+		expect(harness.session.messages).toHaveLength(0);
+		const diagnosticsDirectory = getReviewPrivateDiagnosticsDirectory(harness.tempDir);
+		const diagnosticFiles = readdirSync(diagnosticsDirectory);
+		expect(diagnosticFiles).toHaveLength(1);
+		const privateRecords = readFileSync(join(diagnosticsDirectory, diagnosticFiles[0]!), "utf8")
+			.trim()
+			.split("\n")
+			.map((line): unknown => JSON.parse(line));
+		expect(privateRecords).toHaveLength(withLimitations ? 3 : 1);
+		expect(privateRecords.at(-1)).toEqual({
+			schemaVersion: 1,
+			timestamp: expect.any(String),
+			runId: "review:private-incomplete-challenge",
+			workflowAction: "review.pr",
+			phase: "verification",
+			kind: "verification_assessment",
+			assessment: "incomplete",
+			challenge: privateMarker,
 		});
 	});
 
